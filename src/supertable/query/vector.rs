@@ -1810,6 +1810,7 @@ mod tests {
                     RunRef {
                         superfile_uri: id.to_string(),
                         cell_id: 2,
+                        cluster_id: 0,
                         run_id: 3,
                         byte_range: (10, 20),
                         row_count: 4,
@@ -1817,6 +1818,7 @@ mod tests {
                     RunRef {
                         superfile_uri: id.to_string(),
                         cell_id: 2,
+                        cluster_id: 1,
                         run_id: 1,
                         byte_range: (30, 20),
                         row_count: 4,
