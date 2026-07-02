@@ -47,6 +47,10 @@ use crate::supertable::manifest::{
 /// manifest parts).
 pub const FORMAT_VERSION: &str = "1.0";
 
+/// RunRef cluster id used for legacy SPFresh leaves whose fine centroid is not
+/// available in the resident centroid blob. Query must fallback-scan these runs.
+pub const LEGACY_SPFRESH_CLUSTER_ID: u32 = u32::MAX;
+
 /// Default nearest cells always probed by the hidden VectorCell index — the
 /// recall floor before the distance-ratio threshold widens the probe set.
 const DEFAULT_CELL_NPROBE_MIN: usize = 4;
@@ -144,6 +148,10 @@ pub struct GlobalVectorIndex {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpfreshRoutingIndex {
     pub column: String,
+    /// Optional side blob containing hidden fine-centroid fp32 vectors. `None`
+    /// for user-table routing, where centroids are inline in `CellTreeNode`.
+    pub centroid_blob_uri: Option<String>,
+    pub centroid_blob_content_hash: Option<ContentHash>,
     /// One entry per global `VectorCell`; cells without SPFresh runs keep an
     /// empty tree so cell ids remain positional and stable.
     pub cells: Vec<CellTree>,
@@ -829,6 +837,10 @@ struct GlobalVectorIndexDto {
 #[derive(Serialize, Deserialize)]
 struct SpfreshRoutingIndexDto {
     column: String,
+    #[serde(default)]
+    centroid_blob_uri: Option<String>,
+    #[serde(default)]
+    centroid_blob_content_hash: Option<String>,
     cells: Vec<CellTreeDto>,
 }
 
@@ -1200,6 +1212,8 @@ fn entry_from_dto(d: ManifestPartEntryDto) -> Result<ManifestPartEntry, ListPars
 fn spfresh_routing_to_dto(index: &SpfreshRoutingIndex) -> SpfreshRoutingIndexDto {
     SpfreshRoutingIndexDto {
         column: index.column.clone(),
+        centroid_blob_uri: index.centroid_blob_uri.clone(),
+        centroid_blob_content_hash: index.centroid_blob_content_hash.as_ref().map(encode_hash),
         cells: index
             .cells
             .iter()
@@ -1263,6 +1277,12 @@ fn spfresh_routing_from_dto(
     }
     Ok(SpfreshRoutingIndex {
         column: dto.column,
+        centroid_blob_uri: dto.centroid_blob_uri,
+        centroid_blob_content_hash: dto
+            .centroid_blob_content_hash
+            .as_deref()
+            .map(decode_hash)
+            .transpose()?,
         cells,
     })
 }
@@ -2146,6 +2166,8 @@ mod tests {
         let mut list = empty_list();
         list.spfresh_routing = Some(SpfreshRoutingIndex {
             column: "emb".into(),
+            centroid_blob_uri: Some("spfresh-centroids/centroids-test.bin".into()),
+            centroid_blob_content_hash: Some(ContentHash([7u8; BLAKE3_DIGEST_BYTES])),
             cells: vec![
                 CellTree {
                     cell_id: 0,
