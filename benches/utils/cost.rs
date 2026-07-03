@@ -8,11 +8,12 @@
 //!
 //! Four blocks, kept separate:
 //!
-//!   1. **Rate card** — the headline dollars: storage $/month, the write
-//!      path (ingest + hidden-index drain) as a one-time total, and warm /
-//!      cold queries priced per **1M queries** (per-query costs are
-//!      sub-cent; a per-query dollar figure rounds to $0 and hides the
-//!      real number).
+//!   1. **Rate card** — the headline dollars, every figure in one of two
+//!      units: **$/1M docs** (write path; storage over the stated
+//!      retention) and **$/1M queries** (serving; per-query costs are
+//!      sub-cent, so a per-query dollar figure would round to $0 and hide
+//!      the real number). RAM appears as an instance-sizing fact, not a
+//!      dollar line.
 //!   2. **Object-store I/O ledger** — measured HEAD/GET/PUT counts and
 //!      byte volumes per lifecycle phase, with per-unit normalization
 //!      (PUT/commit, GET/query). Counts come from the
@@ -50,8 +51,6 @@ const BYTES_PER_GIB: f64 = (1u64 << 30) as f64;
 const BYTES_PER_GB: f64 = 1.0e9;
 /// Seconds per hour.
 const SECS_PER_HOUR: f64 = 3600.0;
-/// Hours per month (365.25 / 12 days), for standing $/month lines.
-const HOURS_PER_MONTH: f64 = 730.5;
 /// Queries per "per-million" pricing unit.
 const PER_MILLION: f64 = 1.0e6;
 
@@ -142,15 +141,6 @@ impl Instance {
     fn parallel_vcpu_seconds(&self, wall_s: f64, writers: u32) -> f64 {
         let cpu_share = f64::from(writers.min(self.vcpu)) / f64::from(self.vcpu.max(1));
         wall_s * cpu_share
-    }
-
-    /// Standing dollars per month for holding `resident_bytes` of RAM from
-    /// allocation until drop — billed on wall-clock like storage capacity,
-    /// independent of query volume. The per-query `max(cpu, ram)` marginal
-    /// already covers RAM *at saturation*; this line is what the resident
-    /// set costs while it merely sits open waiting for queries.
-    fn standing_ram_usd_per_month(&self, resident_bytes: u64) -> f64 {
-        self.ram_share(resident_bytes) * self.usd_per_hour * HOURS_PER_MONTH
     }
 
     fn per_query_usd(&self, p50_s: f64, resident_anon_bytes: u64) -> f64 {
@@ -496,9 +486,9 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         vec![
             text("Storage"),
             text(format!(
-                "{} × {retention_months:.0} mo → {}/mo",
+                "{}/1M docs ({} × {retention_months:.0} mo retention)",
+                usd(per_million_docs(storage_month)),
                 usd_per_gb(USD_PER_GB_MONTH),
-                usd(storage_month),
             )),
         ],
         vec![
@@ -512,14 +502,14 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             )),
         ],
         vec![
-            text("Serving RAM (standing, allocation → drop)"),
+            text("Serving RAM (instance sizing)"),
             text(format!(
-                "{} resident = {:.0}% of {:.0} GiB RAM → {}/mo while the consumer is open \
-                 (wall-clock, independent of query volume)",
+                "{} resident = {:.0}% of {:.0} GiB RAM — sizing fact, not a dollar line: \
+                 RAM held during a query is already inside $/1M queries via the \
+                 binding-resource rule",
                 fmt_bytes(c.resident_anon_bytes),
                 inst.ram_share(c.resident_anon_bytes) * 100.0,
                 inst.ram_gib,
-                usd(inst.standing_ram_usd_per_month(c.resident_anon_bytes)),
             )),
         ],
         vec![
@@ -601,12 +591,14 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     };
     match (c.store.ingest, c.unmetered_put_count) {
         (Some(io), _) => {
-            let per_commit = io.put_count as f64 / c.n_commits.max(1) as f64;
             io_rows.push(vec![
                 text(format!("Ingest ({} commits)", c.n_commits)),
                 text(fmt_requests(&io)),
                 text(fmt_io_bytes(&io)),
-                text(format!("{per_commit:.1} PUT/commit")),
+                text(format!(
+                    "{}/1M docs",
+                    usd(per_million_docs(request_usd(&io)))
+                )),
                 metric(request_usd(&io), usd(request_usd(&io)), Better::Lower),
             ]);
         }
@@ -616,7 +608,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 text(format!("Ingest ({} commits)", c.n_commits)),
                 text(format!("{puts} PUT (exact, unmetered)")),
                 text(format!("{} up", fmt_bytes(c.stored_bytes))),
-                text("—"),
+                text(format!("{}/1M docs", usd(per_million_docs(req)))),
                 metric(req, usd(req), Better::Lower),
             ]);
         }
@@ -1026,10 +1018,11 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                **NOT METERED**. **RAM billing:** per-query and per-phase marginals bill the \
                *binding* resource — `max(CPU share, resident-RSS share)` — because at packing \
                density the non-binding resource is stranded capacity that cannot be sold twice \
-               (dominant-resource pricing, so CPU and RAM are not summed); the standing \
-               **Serving RAM** line separately bills the resident set on wall-clock from \
-               allocation to drop, which is what RAM costs when query volume does *not* \
-               saturate the box. Per-query costs are per **1M queries** (warm = marginal \
+               (dominant-resource pricing, so CPU and RAM are not summed); the **Serving \
+               RAM** line is an instance-sizing fact, not a dollar line — query-time RAM is \
+               already inside the per-query marginal. Every dollar figure is normalized per \
+               **1M docs** (write path; storage over the stated retention) or per **1M \
+               queries** (serving). Per-query costs are per **1M queries** (warm = marginal \
                binding resource; cold = the same + measured GET requests). Warm/filtered I/O \
                rows average a multi-query window on the **same cache-hot consumer the warm \
                latency battery timed**; the fill-lag probe row is a diagnostic (repeat query \
@@ -1146,16 +1139,6 @@ mod tests {
     }
 
     #[test]
-    fn standing_ram_bills_resident_share_on_wall_clock() {
-        let inst = test_instance();
-        // 4 GiB resident on a 16 GiB box = 25% of the instance rate.
-        let four_gib = 4u64 << 30;
-        let per_month = inst.standing_ram_usd_per_month(four_gib);
-        let expected = 0.25 * inst.usd_per_hour * HOURS_PER_MONTH;
-        assert!((per_month - expected).abs() < 1e-9);
-    }
-
-    #[test]
     fn lower_latency_yields_more_queries_per_dollar() {
         let inst = test_instance();
         let fast = inst.per_query_usd(0.001, 1 << 20);
@@ -1197,6 +1180,7 @@ mod tests {
             get_bytes: 0,
             put_count: 1000,
             put_bytes: 0,
+            ..Default::default()
         };
         // 1000 PUT × $5e-6 + 100 reads × $4e-7.
         let expected = 1000.0 * 5.0e-6 + 100.0 * 4.0e-7;

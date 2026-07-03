@@ -369,7 +369,13 @@ fn on_storage_bytes(table: &Supertable) -> u64 {
     total
 }
 
-/// Log one metered cold split (open / first query / repeat query).
+/// Cap on printed first-cold-query trace lines; the tail is summarized so a
+/// pre-drain fan (hundreds of GETs) can't flood the log.
+const COLD_TRACE_PRINT_MAX: usize = 200;
+
+/// Log one metered cold split (open / first query / repeat query), each
+/// window followed by its per-class GET attribution (user vs hidden table,
+/// data vs manifest namespace).
 fn log_cold_split(prefix: &str, split: &storage_meter::ColdStoreSplit) {
     eprintln!(
         "[{prefix}] metered cold: open {} GET + {} HEAD ({} down), first query {} GET ({} down), repeat query {} GET ({} down)",
@@ -381,6 +387,53 @@ fn log_cold_split(prefix: &str, split: &storage_meter::ColdStoreSplit) {
         split.repeat_query.get_count,
         rss::fmt_bytes(split.repeat_query.get_bytes),
     );
+    eprintln!(
+        "[{prefix}]   open: {} | first query: {} | repeat query: {}",
+        split.open.fmt_get_class_breakdown(),
+        split.first_query.fmt_get_class_breakdown(),
+        split.repeat_query.fmt_get_class_breakdown(),
+    );
+}
+
+/// Print the first cold query's per-request read trace — the exact files
+/// and byte ranges behind the fan count — in request order (fetch waves
+/// stay visible). Each line: class, URI (hidden prefix elided — the class
+/// label already names the table), range, length.
+fn log_cold_first_query_trace(prefix: &str, trace: &[storage_meter::TraceEntry]) {
+    if trace.is_empty() {
+        return;
+    }
+    eprintln!(
+        "[{prefix}] first cold query read trace ({} requests):",
+        trace.len()
+    );
+    for entry in trace.iter().take(COLD_TRACE_PRINT_MAX) {
+        let class = storage_meter::UriClass::of(&entry.uri);
+        // Elide the `_infino_<uuid>_vector_index/` prefix: the class label
+        // already says "hidden", and the tail is the interesting part.
+        let shown = match entry.uri.split_once("_vector_index/") {
+            Some((_, tail)) => tail,
+            None => entry.uri.as_str(),
+        };
+        match entry.range {
+            Some((start, end)) => eprintln!(
+                "[{prefix}]   {:<15} {shown}  [{start}..{end})  ({})",
+                class.label(),
+                rss::fmt_bytes(entry.bytes),
+            ),
+            None => eprintln!(
+                "[{prefix}]   {:<15} {shown}  (whole/tail, {})",
+                class.label(),
+                rss::fmt_bytes(entry.bytes),
+            ),
+        }
+    }
+    if trace.len() > COLD_TRACE_PRINT_MAX {
+        eprintln!(
+            "[{prefix}]   … and {} more requests",
+            trace.len() - COLD_TRACE_PRINT_MAX
+        );
+    }
 }
 
 /// Spread one cold consumer's metered windows into the cost model's phase
@@ -810,9 +863,11 @@ pub mod fts {
         let reader = consumer.reader();
         let terms = query.terms.join(" ");
         let mode = exec_fts::to_infino_mode(query.mode);
+        meter.start_trace();
         let _ = reader
             .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
             .expect("metered cold bm25_search");
+        let first_query_trace = meter.take_trace();
         let after_first = meter.snapshot();
         let _ = reader
             .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
@@ -826,6 +881,7 @@ pub mod fts {
             repeat_query: after_repeat.since(&after_first),
         };
         log_cold_split("supertable_fts", &split);
+        log_cold_first_query_trace("supertable_fts", &first_query_trace);
         Some(split)
     }
 
@@ -1045,7 +1101,9 @@ pub mod vector {
                 )
                 .unwrap_or_else(|e| panic!("metered {label} vector_search: {e}"));
         };
+        meter.start_trace();
         search("cold");
+        let first_query_trace = meter.take_trace();
         let after_first = meter.snapshot();
         search("repeat");
         let after_repeat = meter.snapshot();
@@ -1057,6 +1115,7 @@ pub mod vector {
             repeat_query: after_repeat.since(&after_first),
         };
         log_cold_split("supertable_vector", &split);
+        log_cold_first_query_trace("supertable_vector", &first_query_trace);
         Some(split)
     }
 
