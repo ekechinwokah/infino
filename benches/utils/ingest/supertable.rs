@@ -24,6 +24,8 @@ use crate::{
     corpus::{self, DIM, MmapTextCorpus, MmapVectorCorpus},
     harness::{emb_for, scatter_key, sql_options, sql_schema},
     markdown::fmt_count,
+    rss::fmt_bytes,
+    storage_meter::{self, ObjectStoreMeter},
     tiers,
 };
 
@@ -92,6 +94,12 @@ pub struct IngestResult {
     pub storage_label: &'static str,
     pub n_superfiles: usize,
     pub total_index_bytes: u64,
+    /// Measured object-store requests + bytes during the ingest window
+    /// (superfile uploads incl. multipart parts, manifest writes, pointer
+    /// CAS). `None` when the table was opened pre-built (dataset /
+    /// existing-prefix modes) — the cost model then says "not metered"
+    /// instead of guessing.
+    pub ingest_io: Option<ObjectStoreMeter>,
     /// Remote prefix this build wrote under, to delete when the run ends.
     pub cleanup: Option<tiers::PrefixCleanup>,
     pub sql_sample_title: Option<String>,
@@ -331,12 +339,17 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
         }
     });
     let cleanup = storage_backend.cleanup.clone();
+    // Meter the whole ingest window so the cost model prices measured PUT
+    // counts (multipart parts included), never the old superfiles+commits
+    // estimate. The wrapper forwards everything; the producer is dropped
+    // right after ingest so later phases meter their own windows.
+    let ingest_meter = storage_meter::wrap(Arc::clone(&storage_backend.storage));
     // Disk cache attached only to keep superfile bytes out of the unbounded
     // in-memory store; this producer is dropped right after ingest, so skip
     // the post-commit warm-fill (pure waste + "budget exceeded" log spam).
-    let (cache_dir, cache) = tiers::fresh_disk_cache(Arc::clone(&storage_backend.storage));
+    let (cache_dir, cache) = tiers::fresh_disk_cache(ingest_meter.provider());
 
-    let opts = options_for(modality, Some(storage_backend.storage.clone()))
+    let opts = options_for(modality, Some(ingest_meter.provider()))
         .with_disk_cache(cache.clone())
         .with_memory_budget(WRITER_MEMORY_BUDGET_BYTES)
         .with_cache_prepopulation(false);
@@ -406,10 +419,19 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
     drop(st);
     drop(cache);
     drop(cache_dir);
+    let ingest_io = ingest_meter.snapshot();
     eprintln!(
         "[supertable_ingest] ingest complete: {n_superfiles} superfiles, {:.2} GiB index bytes on {}",
         total_index_bytes as f64 / GIB_BYTES as f64,
         storage_backend.storage_label,
+    );
+    eprintln!(
+        "[supertable_ingest] object-store I/O during ingest: {} PUT ({} up), {} GET ({} down), {} HEAD",
+        ingest_io.put_count,
+        fmt_bytes(ingest_io.put_bytes),
+        ingest_io.get_count,
+        fmt_bytes(ingest_io.get_bytes),
+        ingest_io.head_count,
     );
     // SQL query predicates sample the mid-corpus row (one mmap page
     // touch — not a corpus materialization).
@@ -438,6 +460,7 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
         storage_label: storage_backend.storage_label,
         n_superfiles,
         total_index_bytes,
+        ingest_io: Some(ingest_io),
         cleanup,
         sql_sample_title,
         sql_sample_key,
@@ -493,6 +516,7 @@ pub fn open_dataset(modality: Modality) -> IngestResult {
         storage_label: storage_backend.storage_label,
         n_superfiles: meta.n_superfiles,
         total_index_bytes: meta.total_index_bytes,
+        ingest_io: None,
         cleanup: None,
         sql_sample_title: meta.sql_sample_title,
         sql_sample_key: meta.sql_sample_key,
@@ -532,6 +556,7 @@ pub(crate) fn open_existing(modality: Modality, fixture: tiers::StorageFixture) 
         storage_label: fixture.storage_label,
         n_superfiles,
         total_index_bytes,
+        ingest_io: None,
         cleanup: None,
         sql_sample_title: None,
         sql_sample_key: None,

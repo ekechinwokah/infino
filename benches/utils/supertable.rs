@@ -45,7 +45,10 @@ use std::{
     sync::Arc,
 };
 
-use infino::supertable::{Supertable, manifest::SuperfileEntry};
+use infino::{
+    OptimizeOptions,
+    supertable::{Supertable, manifest::SuperfileEntry},
+};
 use tempfile::TempDir;
 
 use crate::{
@@ -366,6 +369,36 @@ fn on_storage_bytes(table: &Supertable) -> u64 {
     total
 }
 
+/// Log one metered cold split (open / first query / repeat query).
+fn log_cold_split(prefix: &str, split: &storage_meter::ColdStoreSplit) {
+    eprintln!(
+        "[{prefix}] metered cold: open {} GET + {} HEAD ({} down), first query {} GET ({} down), repeat query {} GET ({} down)",
+        split.open.get_count,
+        split.open.head_count,
+        rss::fmt_bytes(split.open.get_bytes),
+        split.first_query.get_count,
+        rss::fmt_bytes(split.first_query.get_bytes),
+        split.repeat_query.get_count,
+        rss::fmt_bytes(split.repeat_query.get_bytes),
+    );
+}
+
+/// Spread one cold consumer's metered windows into the cost model's phase
+/// slots (open / first query / fill-lag repeat probe). Steady-state warm
+/// I/O is a separate window on a cache-hot consumer, filled by the caller.
+fn store_phases_from_split(split: Option<storage_meter::ColdStoreSplit>) -> cost::StorePhases {
+    cost::StorePhases {
+        cold_open: split.map(|s| s.open),
+        cold_query: split.map(|s| s.first_query),
+        cold_repeat_query: split.map(|s| s.repeat_query),
+        ..Default::default()
+    }
+}
+
+/// Pre-drain (transient-shape) latency rows: the warm battery and the
+/// cold `(open, search)` rows measured before hidden-index maintenance.
+type PreDrainLatencies<'a> = (&'a [(String, f64)], &'a [cost::ColdQuery]);
+
 #[allow(clippy::too_many_arguments)]
 fn emit_cost_warm(
     report: &mut Report,
@@ -376,11 +409,18 @@ fn emit_cost_warm(
     n_docs: usize,
     warm: &[(String, f64)],
     cold: Option<&[cost::ColdQuery]>,
-    cold_store: Option<storage_meter::ObjectStoreMeter>,
+    pre_drain: Option<PreDrainLatencies<'_>>,
+    vector_cell: bool,
+    mut store: cost::StorePhases,
     stored_bytes_override: Option<u64>,
 ) {
     if warm.is_empty() && cold.is_none() {
         return;
+    }
+    // The ingest window was metered inside `build_on_storage`; pre-built
+    // tables (dataset / existing-prefix) carry `None` and report as such.
+    if store.ingest.is_none() {
+        store.ingest = built.ingest_io;
     }
     let resident = rss::current_anon_rss_bytes().unwrap_or(0);
     let (wall_s, corpus_bytes) = match metrics {
@@ -394,14 +434,19 @@ fn emit_cost_warm(
         &cost::CellCost {
             ingest_wall_s: wall_s,
             writers: supertable::n_writers() as u32,
-            put_count: cost::supertable_ingest_puts(built.n_superfiles),
+            ingest_peak_rss_bytes: metrics.map(|m| m.peak_rss_bytes),
+            n_commits: supertable::n_commits() as u64,
+            unmetered_put_count: None,
             stored_bytes: stored_bytes_override.unwrap_or(built.total_index_bytes),
             corpus_bytes,
             n_docs,
             resident_anon_bytes: resident,
             warm,
             cold,
-            cold_store,
+            warm_pre: pre_drain.map(|(w, _)| w),
+            cold_pre: pre_drain.map(|(_, c)| c),
+            store,
+            vector_cell,
             storage_months: None,
             cold_open_amortized: true,
         },
@@ -640,8 +685,11 @@ pub mod fts {
 
         if phases.warm || phases.cold {
             let warm_vec = warm.as_deref().map(cost::warm_from_fts).unwrap_or_default();
-            let cold_vec = cold.as_ref().map(cost::cold_from_fts).unwrap_or_default();
-            let cold_store = phases.cold.then(|| measure_cold_store(&built)).flatten();
+            let cold_vec = cold
+                .as_ref()
+                .map(cost::cold_from_timings)
+                .unwrap_or_default();
+            let cold_split = phases.cold.then(|| measure_cold_store(&built)).flatten();
             if !warm_vec.is_empty() || !cold_vec.is_empty() {
                 emit_cost_warm(
                     &mut report,
@@ -656,7 +704,9 @@ pub mod fts {
                     } else {
                         Some(&cold_vec)
                     },
-                    cold_store,
+                    None,
+                    false,
+                    store_phases_from_split(cold_split),
                     None,
                 );
             }
@@ -739,13 +789,14 @@ pub mod fts {
         )
     }
 
-    /// One metered cold iteration (`ten_term_or`) on a real object-store backend.
+    /// One metered cold consumer (`ten_term_or`), split at the phase
+    /// boundaries the cost model prices: open window, first query on the
+    /// cold cache, then the same query repeated on the warm cache.
     fn measure_cold_store(
         built: &supertable::IngestResult,
-    ) -> Option<storage_meter::ObjectStoreMeter> {
-        built.cleanup.as_ref()?;
+    ) -> Option<storage_meter::ColdStoreSplit> {
         let query = FTS_BATTERY.iter().find(|q| q.name == "ten_term_or")?;
-        let meter = storage_meter::wrap(std::sync::Arc::clone(&built.storage));
+        let meter = storage_meter::wrap(Arc::clone(&built.storage));
         let (cache_dir, cache) =
             tiers::fresh_supertable_search_cache(meter.provider(), Some(built.total_index_bytes));
         let opts = tiers::consumer_options(
@@ -755,15 +806,27 @@ pub mod fts {
         );
         let consumer = tiers::open_consumer(opts);
         crate::executors::open_all_superfiles(&consumer);
+        let open = meter.snapshot();
         let reader = consumer.reader();
         let terms = query.terms.join(" ");
         let mode = exec_fts::to_infino_mode(query.mode);
         let _ = reader
             .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
             .expect("metered cold bm25_search");
+        let after_first = meter.snapshot();
+        let _ = reader
+            .bm25_search(supertable::TEXT_COLUMN, &terms, TOP_K, mode, None)
+            .expect("metered repeat bm25_search");
+        let after_repeat = meter.snapshot();
         drop(consumer);
         drop(cache_dir);
-        Some(meter.snapshot())
+        let split = storage_meter::ColdStoreSplit {
+            open,
+            first_query: after_first.since(&open),
+            repeat_query: after_repeat.since(&after_first),
+        };
+        log_cold_split("supertable_fts", &split);
+        Some(split)
     }
 
     /// Cold-tier guard: a fresh disk cache + consumer per open. The
@@ -941,15 +1004,17 @@ pub mod vector {
         log_hidden_stats(hidden, "after drain");
     }
 
-    /// One metered cold public `vector_search` iteration on an object-store backend.
+    /// One metered cold public `vector_search` consumer, split at the phase
+    /// boundaries the cost model prices: open window (consumer + manifest),
+    /// first query on the cold cache (the per-query GET fan), then the same
+    /// query repeated on the warm cache (expected ~0 GETs).
     fn measure_cold_store(
         built: &supertable::IngestResult,
         query: &[f32],
         nprobe: usize,
         rerank: usize,
         cache_budget_bytes: u64,
-    ) -> Option<storage_meter::ObjectStoreMeter> {
-        built.cleanup.as_ref()?;
+    ) -> Option<storage_meter::ColdStoreSplit> {
         let meter = storage_meter::wrap(Arc::clone(&built.storage));
         let (cache_dir, cache) =
             tiers::fresh_supertable_search_cache(meter.provider(), Some(cache_budget_bytes));
@@ -959,27 +1024,33 @@ pub mod vector {
             cache,
         );
         let consumer = tiers::open_consumer(opts);
+        let open = meter.snapshot();
         let reader = consumer.reader();
-        let _ = reader
-            .vector_search(
-                supertable::VEC_COLUMN,
-                query,
-                TOP_K,
-                exec_vec::search_opts(nprobe, rerank),
-                None,
-                None,
-            )
-            .expect("metered cold vector_search");
+        let search = |label: &str| {
+            let _ = reader
+                .vector_search(
+                    supertable::VEC_COLUMN,
+                    query,
+                    TOP_K,
+                    exec_vec::search_opts(nprobe, rerank),
+                    None,
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("metered {label} vector_search: {e}"));
+        };
+        search("cold");
+        let after_first = meter.snapshot();
+        search("repeat");
+        let after_repeat = meter.snapshot();
         drop(consumer);
         drop(cache_dir);
-        let snapshot = meter.snapshot();
-        eprintln!(
-            "[supertable_vector] metered cold public vector_search: {} HEAD, {} GET, {} fetched",
-            snapshot.head_count,
-            snapshot.get_count,
-            rss::fmt_bytes(snapshot.get_bytes),
-        );
-        Some(snapshot)
+        let split = storage_meter::ColdStoreSplit {
+            open,
+            first_query: after_first.since(&open),
+            repeat_query: after_repeat.since(&after_first),
+        };
+        log_cold_split("supertable_vector", &split);
+        Some(split)
     }
 
     /// Build a vector-only supertable, then measure warm + cold kNN search
@@ -1145,14 +1216,30 @@ pub mod vector {
                 )
             };
 
-            let (cache_dir, consumer) = open_consumer(Modality::Vector, &built);
+            // Metered shared consumer: the drain runs on this handle, so its
+            // object-store I/O (user-vector reads + hidden cell-superfile
+            // writes) is captured as a snapshot delta around the drain call.
+            let consumer_meter = storage_meter::wrap(Arc::clone(&built.storage));
+            let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
+                consumer_meter.provider(),
+                Some(built.total_index_bytes),
+            );
+            let consumer = tiers::open_consumer(tiers::consumer_options(
+                supertable::options_for(Modality::Vector, None),
+                consumer_meter.provider(),
+                cache,
+            ));
+            let mut drain_stats: Option<(f64, storage_meter::ObjectStoreMeter, u64)> = None;
+            let mut filtered_stats: Option<(storage_meter::ObjectStoreMeter, u64)> = None;
+            let mut cold_split_pre: Option<storage_meter::ColdStoreSplit> = None;
+            let mut pre_search_rows = None;
 
             let recall_rows = if pre_post_drain {
                 if phases.warm {
                     log_hidden_stats(&consumer, "at warm open (pre-drain)");
                 }
                 eprintln!("[supertable_vector] === pre-drain search (incoming staging) ===");
-                let _pre = exec_vec::run_search(
+                pre_search_rows = Some(exec_vec::run_search(
                     &mut report,
                     &consumer,
                     || SupertableVecColdGuard::open(&built),
@@ -1173,9 +1260,38 @@ pub mod vector {
                     "bench/vector/supertable/search/pre-drain",
                     search_title("pre-drain"),
                     PRE_DRAIN_NOTE,
-                );
+                ));
 
+                // Pre-drain metered cold split: the transient GET fan a fresh
+                // table serves before maintenance drains the hidden index.
+                if phases.cold {
+                    eprintln!("[supertable_vector] metered cold split (pre-drain)...");
+                    cold_split_pre = measure_cold_store(
+                        &built,
+                        &q_cal[0],
+                        nprobe,
+                        rerank,
+                        built.total_index_bytes,
+                    );
+                }
+
+                let before_drain = consumer_meter.snapshot();
+                let drain_sampler = PeakSampler::start_default();
+                let drain_t0 = Instant::now();
                 drain_hidden_incoming(&consumer);
+                let drain_wall_s = drain_t0.elapsed().as_secs_f64();
+                let drain_peak_rss = drain_sampler.stop_stats().peak_rss_bytes;
+                let drain_io = consumer_meter.snapshot().since(&before_drain);
+                eprintln!(
+                    "[supertable_vector] drain object-store I/O: {} PUT ({} up), {} GET ({} down), {} HEAD in {drain_wall_s:.1}s (peak RSS {})",
+                    drain_io.put_count,
+                    rss::fmt_bytes(drain_io.put_bytes),
+                    drain_io.get_count,
+                    rss::fmt_bytes(drain_io.get_bytes),
+                    drain_io.head_count,
+                    rss::fmt_bytes(drain_peak_rss),
+                );
+                drain_stats = Some((drain_wall_s, drain_io, drain_peak_rss));
 
                 if phases.warm {
                     log_hidden_stats(&consumer, "at warm open (post-drain)");
@@ -1252,6 +1368,7 @@ pub mod vector {
                 }
                 let mut recalls = Vec::new();
                 let mut latencies = Vec::new();
+                let filtered_before = consumer_meter.snapshot();
                 for (q, gt) in q_correct.iter().zip(filtered_gt) {
                     let t0 = Instant::now();
                     let hits = tiers::block_on(consumer_reader.vector_hits_global_allow_async(
@@ -1276,6 +1393,16 @@ pub mod vector {
                         })
                         .collect();
                     recalls.push(corpus::recall_at_k(&global_hits, gt));
+                }
+                let filtered_io = consumer_meter.snapshot().since(&filtered_before);
+                if !q_correct.is_empty() {
+                    filtered_stats = Some((filtered_io, q_correct.len() as u64));
+                    eprintln!(
+                        "[supertable_vector] filtered warm window: {} GET ({} down) over {} queries",
+                        filtered_io.get_count,
+                        rss::fmt_bytes(filtered_io.get_bytes),
+                        q_correct.len(),
+                    );
                 }
                 if recalls.is_empty() || latencies.is_empty() {
                     eprintln!(
@@ -1336,10 +1463,67 @@ pub mod vector {
             }
 
             if phases.warm || phases.cold {
+                // Steady-state warm I/O: replay the correctness queries on
+                // the shared, cache-hot consumer — the same consumer the
+                // warm latency battery timed — so the ledger's warm GET/query
+                // and the compute ledger's warm CPU describe one path.
+                let warm_io = (phases.warm && !q_correct.is_empty()).then(|| {
+                    let before = consumer_meter.snapshot();
+                    let reader = consumer.reader();
+                    for q in &q_correct {
+                        let _ = reader
+                            .vector_search(
+                                supertable::VEC_COLUMN,
+                                q,
+                                TOP_K,
+                                exec_vec::search_opts(nprobe, rerank),
+                                None,
+                                None,
+                            )
+                            .expect("warm-window vector_search");
+                    }
+                    let io = consumer_meter.snapshot().since(&before);
+                    eprintln!(
+                        "[supertable_vector] warm window (cache hot): {} GET ({} down) over {} queries",
+                        io.get_count,
+                        rss::fmt_bytes(io.get_bytes),
+                        q_correct.len(),
+                    );
+                    (io, q_correct.len() as u64)
+                });
+
+                // Maintenance compaction (user + hidden tables), metered.
+                // Runs only on tables this process just built — never on a
+                // retained dataset / existing prefix — and after all search
+                // measurement so it cannot perturb the search rows above.
+                let compaction_stats = pre_post_drain.then(|| {
+                    eprintln!("[supertable_vector] compacting (optimize: user + hidden)...");
+                    let before = consumer_meter.snapshot();
+                    let sampler = PeakSampler::start_default();
+                    let t0 = Instant::now();
+                    consumer
+                        .optimize(&OptimizeOptions::default())
+                        .expect("optimize (compaction)");
+                    let wall_s = t0.elapsed().as_secs_f64();
+                    let peak_rss = sampler.stop_stats().peak_rss_bytes;
+                    let io = consumer_meter.snapshot().since(&before);
+                    eprintln!(
+                        "[supertable_vector] compaction object-store I/O: {} PUT ({} up), {} GET ({} down) in {wall_s:.1}s (peak RSS {})",
+                        io.put_count,
+                        rss::fmt_bytes(io.put_bytes),
+                        io.get_count,
+                        rss::fmt_bytes(io.get_bytes),
+                        rss::fmt_bytes(peak_rss),
+                    );
+                    log_hidden_stats(&consumer, "after compaction");
+                    (wall_s, io, peak_rss)
+                });
+
                 // Steady-state footprint = user table + derived hidden vector
                 // index. `built.total_index_bytes` is ingest-time user-only
                 // (hidden empty then); the post-drain hidden per-cell IVF is a
                 // second on-storage copy of the vectors, so price the sum.
+                // Computed after compaction so it reflects the merged layout.
                 let user_stored = on_storage_bytes(&consumer);
                 let hidden_stored = consumer
                     .vector_index_table()
@@ -1358,12 +1542,35 @@ pub mod vector {
                 );
                 let warm_vec = cost::warm_from_vector(&recall_rows);
                 let cold_vec = cost::cold_from_vector(&recall_rows);
-                let cold_store = phases
+                let cold_split = phases
                     .cold
                     .then(|| {
                         measure_cold_store(&built, &q_cal[0], nprobe, rerank, post_drain_stored)
                     })
                     .flatten();
+                let store = cost::StorePhases {
+                    drain: drain_stats.map(|(_, io, _)| io),
+                    drain_wall_s: drain_stats.map(|(wall_s, _, _)| wall_s),
+                    drain_peak_rss_bytes: drain_stats.map(|(_, _, peak)| peak),
+                    compaction: compaction_stats.map(|(_, io, _)| io),
+                    compaction_wall_s: compaction_stats.map(|(wall_s, _, _)| wall_s),
+                    compaction_peak_rss_bytes: compaction_stats.map(|(_, _, peak)| peak),
+                    cold_open_pre: cold_split_pre.map(|s| s.open),
+                    cold_query_pre: cold_split_pre.map(|s| s.first_query),
+                    warm_query: warm_io.map(|(io, _)| io),
+                    warm_query_iters: warm_io.map(|(_, n)| n).unwrap_or(0),
+                    filtered_query: filtered_stats.map(|(io, _)| io),
+                    filtered_query_iters: filtered_stats.map(|(_, n)| n).unwrap_or(0),
+                    ..store_phases_from_split(cold_split)
+                };
+                let warm_pre_vec = pre_search_rows
+                    .as_deref()
+                    .map(cost::warm_from_vector)
+                    .unwrap_or_default();
+                let cold_pre_vec = pre_search_rows
+                    .as_deref()
+                    .map(cost::cold_from_vector)
+                    .unwrap_or_default();
                 emit_cost_warm(
                     &mut report,
                     "bench/vector/supertable/cost",
@@ -1377,7 +1584,11 @@ pub mod vector {
                     n_docs,
                     &warm_vec,
                     (!cold_vec.is_empty()).then_some(cold_vec.as_slice()),
-                    cold_store,
+                    pre_search_rows
+                        .is_some()
+                        .then_some((warm_pre_vec.as_slice(), cold_pre_vec.as_slice())),
+                    true,
+                    store,
                     Some(post_drain_stored),
                 );
             }
@@ -1484,7 +1695,7 @@ pub mod sql {
             drop(cache_dir);
         }
 
-        if phases.warm {
+        let warm_sets = if phases.warm {
             eprintln!("[supertable_sql] warm: opening consumer...");
             let (cache_dir, consumer) = open_consumer(Modality::Sql, &built);
             let sets =
@@ -1501,21 +1712,12 @@ pub mod sql {
                 "Warm = committed table reopened with a disk cache sized to the index; each query runs once untimed then p50 over repeated `query_sql` calls, all through infino's own path (the DataFusion-only control arms are not run here). Δ is vs the previous run.",
                 &sets,
             );
-            emit_cost_warm(
-                &mut report,
-                "bench/sql/supertable/cost",
-                format!("Supertable SQL — cost model ({} rows)", fmt_count(n_docs)),
-                &built,
-                ingest_metrics.as_ref(),
-                n_docs,
-                &cost::warm_from_sql(&sets),
-                None,
-                None,
-                None,
-            );
-        }
+            Some(sets)
+        } else {
+            None
+        };
 
-        if phases.cold {
+        let cold = if phases.cold {
             let cold = exec_sql::measure_cold(
                 || SupertableSqlColdGuard::open(&built),
                 COLD_ITERS,
@@ -1531,6 +1733,35 @@ pub mod sql {
                 "Cold = fresh disk cache + consumer per iteration, so each query pays the object-store cold open. Δ is vs the previous run.",
                 &cold,
             );
+            Some(cold)
+        } else {
+            None
+        };
+
+        let warm_vec = warm_sets
+            .as_ref()
+            .map(cost::warm_from_sql)
+            .unwrap_or_default();
+        let cold_vec = cold
+            .as_ref()
+            .map(cost::cold_from_timings)
+            .unwrap_or_default();
+        let cold_split = phases.cold.then(|| measure_cold_store(&built)).flatten();
+        if !warm_vec.is_empty() || !cold_vec.is_empty() {
+            emit_cost_warm(
+                &mut report,
+                "bench/sql/supertable/cost",
+                format!("Supertable SQL — cost model ({} rows)", fmt_count(n_docs)),
+                &built,
+                ingest_metrics.as_ref(),
+                n_docs,
+                &warm_vec,
+                (!cold_vec.is_empty()).then_some(cold_vec.as_slice()),
+                None,
+                false,
+                store_phases_from_split(cold_split),
+                None,
+            );
         }
 
         report.save();
@@ -1539,6 +1770,39 @@ pub mod sql {
             eprintln!("[supertable_sql] cleaning up object-store prefix...");
             tiers::cleanup_prefix(cleanup);
         }
+    }
+
+    /// One metered cold `query_sql` consumer (first scalar-battery query),
+    /// split at the phase boundaries the cost model prices: open window,
+    /// first query on the cold cache, then the same query repeated warm.
+    fn measure_cold_store(
+        built: &supertable::IngestResult,
+    ) -> Option<storage_meter::ColdStoreSplit> {
+        let query = exec_sql::SQL_BATTERY.first()?;
+        let meter = storage_meter::wrap(Arc::clone(&built.storage));
+        let (cache_dir, cache) =
+            tiers::fresh_supertable_search_cache(meter.provider(), Some(built.total_index_bytes));
+        let opts = tiers::consumer_options(
+            supertable::options_for(Modality::Sql, None),
+            meter.provider(),
+            cache,
+        );
+        let consumer = tiers::open_consumer(opts);
+        crate::executors::open_all_superfiles(&consumer);
+        let open = meter.snapshot();
+        let _ = consumer.query_rows(query.sql);
+        let after_first = meter.snapshot();
+        let _ = consumer.query_rows(query.sql);
+        let after_repeat = meter.snapshot();
+        drop(consumer);
+        drop(cache_dir);
+        let split = storage_meter::ColdStoreSplit {
+            open,
+            first_query: after_first.since(&open),
+            repeat_query: after_repeat.since(&after_first),
+        };
+        log_cold_split("supertable_sql", &split);
+        Some(split)
     }
 
     /// Cold-tier guard: fresh disk cache + consumer per open; the timed
