@@ -804,7 +804,6 @@ mod tests {
         let centroid: Vec<f32> = (0..dim).map(|i| seed + i as f32 * 0.001).collect();
         VectorSummary {
             centroid,
-            radius: seed * 1.7,
             clusters: ClusterCentroids::empty(),
         }
     }
@@ -937,11 +936,6 @@ mod tests {
                 .vector_summary
                 .get(k)
                 .unwrap_or_else(|| panic!("missing vec col {k}"));
-            assert_eq!(
-                av.radius.to_bits(),
-                bv.radius.to_bits(),
-                "vec {k} radius bits"
-            );
             assert_eq!(av.centroid.len(), bv.centroid.len(), "vec {k} dim");
             for (i, (af, bf)) in av.centroid.iter().zip(bv.centroid.iter()).enumerate() {
                 assert_eq!(

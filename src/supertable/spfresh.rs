@@ -11,7 +11,7 @@
 //!   2. For each touched cell only: append one delta superfile (no GETs).
 //!   3. Compaction merges multiple small IVF superfiles per cell toward one packed
 //!      base via the standard `merge_superfiles` path.
-//!   4. Locally refresh touched cell centroids and member radii.
+//!   4. Locally refresh touched cell centroids and counts.
 //!   5. Split overflow cells (Sq8+ε k-means, N→N+1 centroids).
 //!   6. Reassign vectors in the split neighborhood (P−1, P, P₂, P+1).
 //!   7. Redrive reassigned rows through the incoming staging region; route
@@ -70,27 +70,12 @@ pub(crate) fn apply_cell_count_updates(
     updated
 }
 
-/// Apply count and radius updates from maintenance (incoming routing / compaction).
+/// Apply count updates from maintenance (incoming routing / compaction).
 pub(crate) fn apply_cell_updates(
     base: &ClusterCentroids,
     count_updates: &HashMap<u32, u32>,
-    radii_updates: &HashMap<u32, f32>,
 ) -> ClusterCentroids {
-    let mut updated = apply_cell_count_updates(base, count_updates);
-    if radii_updates.is_empty() {
-        return updated;
-    }
-    if updated.radii.len() != updated.n_cent as usize {
-        updated.radii = vec![0.0; updated.n_cent as usize];
-    }
-    for (&cell, &radius) in radii_updates {
-        if let Some(slot) = updated.radii.get_mut(cell as usize)
-            && radius > *slot
-        {
-            *slot = radius;
-        }
-    }
-    updated
+    apply_cell_count_updates(base, count_updates)
 }
 
 fn score_row_against_cell(
@@ -268,15 +253,7 @@ pub(crate) fn insert_split_centroid(
     fp32[old_n * dim..new_n * dim].copy_from_slice(&sub_centroids[dim..2 * dim]);
 
     let counts = base.counts.clone();
-    let mut radii = if base.radii.len() == old_n {
-        base.radii.clone()
-    } else {
-        vec![0.0; old_n]
-    };
-    radii.resize(new_n, 0.0);
-
-    let updated =
-        ClusterCentroids::from_fp32(new_n as u32, base.dim, &fp32, counts).with_radii(radii);
+    let updated = ClusterCentroids::from_fp32(new_n as u32, base.dim, &fp32, counts);
     (updated, new_cell_id)
 }
 
@@ -300,16 +277,13 @@ pub(crate) fn reassign_neighborhood(
     ids
 }
 
-/// Clear per-cell counts/radii when superfiles for those cells are removed and
+/// Clear per-cell counts when superfiles for those cells are removed and
 /// rows are redriven through the incoming staging region.
 pub(crate) fn zero_cell_counts(clusters: &mut ClusterCentroids, cells: &[u32]) {
     for &cell in cells {
         let c = cell as usize;
         if c < clusters.counts.len() {
             clusters.counts[c] = 0;
-        }
-        if c < clusters.radii.len() {
-            clusters.radii[c] = 0.0;
         }
     }
 }

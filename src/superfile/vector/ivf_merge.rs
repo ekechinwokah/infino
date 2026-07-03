@@ -52,7 +52,6 @@ pub(crate) struct Sq8IvfMergeInput {
     pub stride: usize,
     pub scale: Vec<f32>,
     pub offset: Vec<f32>,
-    pub summary_radius_x100: u32,
     /// Inline stable-`_id`s for this input, indexed by its local doc id, when
     /// the source subsection carries the region (materialized/hidden cells).
     /// `None` for region-less sources (streaming/incoming). The merge produces a
@@ -137,12 +136,6 @@ pub(crate) fn merge_sq8_ivf_subsections(
 
     let summary_centroid = mean_f32_cluster_major(&out_centroids, dim, n_cent);
 
-    let summary_radius_x100 = parsed
-        .iter()
-        .map(|p| p.summary_radius_x100)
-        .max()
-        .unwrap_or(0);
-
     let mut dst_scale = vec![1.0f32; n_cent * dim];
     let mut dst_offset = vec![0.0f32; n_cent * dim];
     for c in 0..n_cent {
@@ -184,7 +177,6 @@ pub(crate) fn merge_sq8_ivf_subsections(
     let mut bytes = alloc_ivf_subsection_with_header(
         &layout,
         codec_meta_size,
-        summary_radius_x100,
         &summary_centroid,
         &out_centroids,
     );
@@ -398,13 +390,8 @@ pub(crate) fn splice_fragments_into_cell(
         dst_offset[k * dim..(k + 1) * dim].copy_from_slice(&inp.offset[c * dim..c * dim + dim]);
     }
 
-    // Summary centroid = mean of fragment centroids; radius = max over fragments.
+    // Summary centroid = mean of fragment centroids.
     let summary_centroid = mean_f32_cluster_major(&out_centroids, dim, out_n_cent);
-    let summary_radius_x100 = fragments
-        .iter()
-        .map(|(inp, _, _)| inp.summary_radius_x100)
-        .max()
-        .unwrap_or(0);
 
     let codec_meta_size = codec.codec_meta_bytes(dim, n_docs as usize, out_n_cent, metric);
     let cluster_stride = code_bytes + id_bytes + per_vec_bytes;
@@ -421,7 +408,6 @@ pub(crate) fn splice_fragments_into_cell(
     let mut bytes = alloc_ivf_subsection_with_header(
         &layout,
         codec_meta_size,
-        summary_radius_x100,
         &summary_centroid,
         &out_centroids,
     );

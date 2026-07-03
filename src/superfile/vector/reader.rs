@@ -55,12 +55,6 @@ const OUTER_HEADER_SIZE: usize = format::vec::OUTER_HEADER_SIZE;
 const DIR_ENTRY_SIZE: usize = format::vec::DIR_ENTRY_SIZE;
 const SUB_HEADER_SIZE: usize = format::vec::SUB_HEADER_SIZE;
 
-/// Fixed-point scale for the per-subsection summary radius. The
-/// builder stores `round(radius × 100)` in a `u32`; the reader
-/// recovers the radius by dividing by this. Must match
-/// `builder::SUMMARY_RADIUS_SCALE`.
-const SUMMARY_RADIUS_SCALE: f32 = 100.0;
-
 /// Shortlist multiplier for the Sq8ResidualEpsilon refine pass. After the
 /// first-pass Sq8 scan, only the top `SQ8_RESIDUAL_REFINE_MULT × k`
 /// survivors are re-scored with the more expensive residual leg.
@@ -127,7 +121,6 @@ pub struct ColumnReader {
     subsection_range: Range<usize>,
     /// Offsets relative to the subsection start.
     summary_off: usize,
-    summary_radius: f32,
     centroids_off: usize,
     cluster_idx_off: usize,
     /// relative offset of the per-column
@@ -942,8 +935,7 @@ impl VectorReader {
             //   [ 8..12] SUBSECTION_VERSION
             //   [12..16] codec_meta_size (u32 LE)
             //   [16..24] summary_centroid_offset (u64 LE)
-            //   [24..28] summary_radius_x100 (u32 LE)
-            //   [28..32] reserved (u32)
+            //   [24..32] reserved (u64)
             //   [32..40] centroids_off (u64 LE)
             //   [40..48] cluster_idx_off (u64 LE)
             //   [48..56] per_cluster_blocks_off (u64 LE)
@@ -976,10 +968,6 @@ impl VectorReader {
             let summary_off = read_u64_le(
                 &sub_header[sub_hdr::SUMMARY_OFF_OFF..sub_hdr::SUMMARY_OFF_OFF + U64_BYTES],
             ) as usize;
-            let summary_radius_x100 = read_u32_le(
-                &sub_header[sub_hdr::SUMMARY_RADIUS_X100_OFF
-                    ..sub_hdr::SUMMARY_RADIUS_X100_OFF + U32_BYTES],
-            );
             let centroids_off = read_u64_le(
                 &sub_header[sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES],
             ) as usize;
@@ -1074,8 +1062,6 @@ impl VectorReader {
                 ))));
             }
 
-            let summary_radius = (summary_radius_x100 as f32) / SUMMARY_RADIUS_SCALE;
-
             let sq8_meta = if matches!(rerank_codec, RerankCodec::Sq8ResidualEpsilon) {
                 let meta_abs_start = subsection_off + codec_meta_off;
                 let meta_abs_end = meta_abs_start + actual_codec_meta_size;
@@ -1154,7 +1140,6 @@ impl VectorReader {
                 lazy_sq8_parsed: OnceLock::new(),
                 subsection_range: subsection_off..sub_end,
                 summary_off,
-                summary_radius,
                 centroids_off,
                 cluster_idx_off,
                 codec_meta_off,
@@ -1190,9 +1175,9 @@ impl VectorReader {
         base
     }
 
-    /// Per-column summary centroid + radius, used by the storage plan
-    /// for cross-superfile skip pruning.
-    pub fn summary(&self, column: &str) -> Option<(Vec<f32>, f32)> {
+    /// Per-column summary centroid, copied into the manifest's
+    /// per-superfile [`VectorSummary`] at commit time.
+    pub fn summary(&self, column: &str) -> Option<Vec<f32>> {
         let cid = *self.column_id_by_name.get(column)?;
         let col = &self.columns[cid as usize];
         // byte access routed through `Source::try_get_range_sync`
@@ -1204,7 +1189,7 @@ impl VectorReader {
         let dim = col.dim;
         let mut centroid = vec![0f32; dim];
         decode_f32_le_into(&sub[off..off + dim * 4], &mut centroid);
-        Some((centroid, col.summary_radius))
+        Some(centroid)
     }
 
     /// The column's per-cluster IVF centroids (fp32, cluster-major,
@@ -1423,12 +1408,6 @@ impl VectorReader {
             .source
             .try_get_range_sync(col.subsection_range.clone())
             .ok_or(BuildError::VectorReadError)?;
-        let summary_radius_x100 = u32::from_le_bytes([
-            sub[sub_hdr::SUMMARY_RADIUS_X100_OFF],
-            sub[sub_hdr::SUMMARY_RADIUS_X100_OFF + 1],
-            sub[sub_hdr::SUMMARY_RADIUS_X100_OFF + 2],
-            sub[sub_hdr::SUMMARY_RADIUS_X100_OFF + 3],
-        ]);
         // Inline stable-`_id` region (materialized/hidden cells): parse it out of
         // the already-materialized `sub` so a compaction merge can carry it
         // forward. Indexed by local doc id; one i128 per doc.
@@ -1459,7 +1438,6 @@ impl VectorReader {
             stride: col.per_cluster_doc_stride(),
             scale,
             offset,
-            summary_radius_x100,
             stable_ids,
         })
     }
@@ -3666,12 +3644,11 @@ mod tests {
     }
 
     #[test]
-    fn summary_returns_dim_centroid_and_radius() {
+    fn summary_returns_dim_centroid() {
         let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open VectorReader");
-        let (centroid, radius) = r.summary("embedding").expect("vector summary");
+        let centroid = r.summary("embedding").expect("vector summary");
         assert_eq!(centroid.len(), 16);
-        assert!(radius >= 0.0);
         assert!(r.summary("nonexistent").is_none());
     }
 
@@ -6974,9 +6951,8 @@ mod tests {
         let r = VectorReader::open(blob, &json).expect("open");
         assert!(r.summary("missing").is_none());
         // Sanity on the present column too.
-        let (centroid, radius) = r.summary("embedding").expect("present");
+        let centroid = r.summary("embedding").expect("present");
         assert_eq!(centroid.len(), 16);
-        assert!(radius >= 0.0);
     }
 
     #[tokio::test]

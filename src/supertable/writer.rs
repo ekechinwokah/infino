@@ -537,7 +537,6 @@ fn bootstrap_centroids_from_batch(
     batches: &[BufferedBatch],
     vec_dim: usize,
     n_cells: usize,
-    metric: Metric,
 ) -> Option<ClusterCentroids> {
     let mut vectors = Vec::new();
     for batch in batches {
@@ -566,37 +565,12 @@ fn bootstrap_centroids_from_batch(
     for &a in &assignments {
         counts[a as usize] += 1;
     }
-    let clusters = ClusterCentroids::from_fp32(k as u32, vec_dim as u32, &centroids, counts);
-    Some(clusters.clone().with_radii(per_cell_radii(
-        &clusters,
-        &vectors,
-        &assignments,
-        vec_dim,
-        metric,
-    )))
-}
-
-fn per_cell_radii(
-    clusters: &ClusterCentroids,
-    vectors: &[f32],
-    assignments: &[u32],
-    vec_dim: usize,
-    metric: Metric,
-) -> Vec<f32> {
-    let n_cent = clusters.n_cent as usize;
-    let mut radii = vec![0.0f32; n_cent];
-    for (doc_idx, &cell) in assignments.iter().enumerate() {
-        let c = cell as usize;
-        if c >= n_cent {
-            continue;
-        }
-        let member = &vectors[doc_idx * vec_dim..(doc_idx + 1) * vec_dim];
-        let dist = clusters.score_one(metric, c, member);
-        if dist > radii[c] {
-            radii[c] = dist;
-        }
-    }
-    radii
+    Some(ClusterCentroids::from_fp32(
+        k as u32,
+        vec_dim as u32,
+        &centroids,
+        counts,
+    ))
 }
 
 impl SupertableWriter {
@@ -1190,7 +1164,6 @@ impl SupertableWriter {
                     &buffer,
                     vc.dim,
                     super::handle::GLOBAL_VECTOR_CELL_COUNT,
-                    vc.metric,
                 ) {
                     let index = super::manifest::GlobalVectorIndex {
                         column: vc.column.clone(),
@@ -1788,7 +1761,7 @@ pub(super) fn prepare_superfile_with_uri(
     let mut vector_summary: HashMap<String, VectorSummary> = HashMap::new();
     if let Some(vec_reader) = reader.vec() {
         for vc in &inner.options.vector_columns {
-            if let Some((centroid, radius)) = vec_reader.summary(&vc.column) {
+            if let Some(centroid) = vec_reader.summary(&vc.column) {
                 // Stage the per-cluster centroids (Sq8) into the
                 // manifest so a query can rank this superfile's clusters
                 // globally without opening the superfile.
@@ -1798,14 +1771,7 @@ pub(super) fn prepare_superfile_with_uri(
                         ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts)
                     })
                     .unwrap_or_default();
-                vector_summary.insert(
-                    vc.column.clone(),
-                    VectorSummary {
-                        centroid,
-                        radius,
-                        clusters,
-                    },
-                );
+                vector_summary.insert(vc.column.clone(), VectorSummary { centroid, clusters });
             }
         }
     }
@@ -2184,11 +2150,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     let drain_t0 = std::time::Instant::now();
     let drain_rss0 = proc_rss_mib();
     let n_batches = batches.len();
-    // Carries per-cell counts/radii cumulatively across batches; the centroids
+    // Carries per-cell counts cumulatively across batches; the centroids
     // are immutable (owned by the user manifest), so each batch's
     // `apply_cell_updates` builds on the prior batches' running totals.
     let mut running_clusters = clusters;
-    let radii_updates: HashMap<u32, f32> = HashMap::new();
 
     for (batch_idx, (batch_versions, batch_sources)) in batches.iter().enumerate() {
         let batch_t0 = std::time::Instant::now();
@@ -2468,14 +2433,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         }
         // Publish this batch's cell superfiles (append — no removals; the user
         // superfiles stay as the durable source). In the SAME hidden commit,
-        // advance the derived grid (counts/radii) AND mark this batch's user
+        // advance the derived grid (counts) AND mark this batch's user
         // versions drained — so cells-written and watermark-advanced are one
         // atomic CAS (a crash can only drop uncommitted work, never re-drive or
         // exclude committed work). Re-read drained_ranges so sequential batches
         // (and a prior drainer's progress) compose.
         let publish_batch = collect_prepared_superfiles(&hidden_inner, prepared)?;
-        running_clusters =
-            spfresh::apply_cell_updates(&running_clusters, &cell_updates, &radii_updates);
+        running_clusters = spfresh::apply_cell_updates(&running_clusters, &cell_updates);
         let mut new_drained = hidden_inner.manifest.load_full().get_drained_ranges();
         // Advance as a CONTIGUOUS range up to this batch's max version, starting
         // from just past the existing genesis-anchored prefix. This absorbs
@@ -3732,7 +3696,6 @@ mod tests {
             .get("emb")
             .expect("emb vector summary present");
         assert_eq!(vs.centroid.len(), dim);
-        assert!(vs.radius >= 0.0);
         // Per-cluster centroids are staged into the manifest for
         // cross-superfile global cluster selection.
         assert!(

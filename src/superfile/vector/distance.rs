@@ -105,14 +105,6 @@ pub(crate) fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
     l2_sq_wide(a, b)
 }
 
-/// Euclidean (L2) distance — `sqrt` of [`l2_sq`]. Used by manifest
-/// centroid-envelope bounding-ball math where the metric is true L2
-/// (not L2²).
-#[inline]
-pub(crate) fn l2(a: &[f32], b: &[f32]) -> f32 {
-    l2_sq(a, b).sqrt()
-}
-
 /// Horizontal sum `Σ a[d]`. Dispatches AVX-512 → `wide::f32x8` like
 /// [`dot`]. Precompute once per query for RaBitQ's `q_total` term.
 #[inline]
@@ -1583,13 +1575,6 @@ mod tests {
         let mut out = vec![0f32; values.len()];
         decode_f32_le_into(&bytes, &mut out);
         assert_eq!(out, values);
-    }
-
-    #[test]
-    fn l2_matches_sqrt_l2_sq() {
-        let a: Vec<f32> = (0..12).map(|i| i as f32 * 0.1).collect();
-        let b: Vec<f32> = (0..12).map(|i| (i as f32 + 1.0) * 0.07).collect();
-        assert!(approx(l2(&a, &b), l2_sq(&a, &b).sqrt(), 1e-5));
     }
 
     #[test]

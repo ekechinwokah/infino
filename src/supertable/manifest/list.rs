@@ -30,9 +30,8 @@ use crate::supertable::manifest::{
     bloom::Bloom,
     column_hll, column_min_max, column_sum,
     encoding::{
-        DecodeError, EncodeError, decode_centroid_envelope, decode_cluster_centroids,
-        decode_length1_array, encode_centroid_envelope, encode_cluster_centroids,
-        encode_length1_array, l2_distance,
+        DecodeError, EncodeError, decode_cluster_centroids, decode_length1_array,
+        encode_cluster_centroids, encode_length1_array,
     },
     hll::HllSketch,
     merge_min_max_arrays,
@@ -49,16 +48,16 @@ use crate::supertable::manifest::{
 pub const FORMAT_VERSION: &str = "1.0";
 
 /// Default nearest cells always probed by the hidden VectorCell index — the
-/// recall floor before the radius-aware threshold widens the probe set.
+/// recall floor before the distance-ratio threshold widens the probe set.
 const DEFAULT_CELL_NPROBE_MIN: usize = 4;
 /// Default hard cap on cells probed per query (bounds the object-store GET fan).
-/// Held at the nprobe floor so adaptive expansion is off by default: with the
-/// current (poorly-separated, large-radius) cells the radius-aware threshold
-/// otherwise widens to ~all cells, fanning every query out across the whole
-/// index. Raise it (or `INFINO_CELL_NPROBE_MAX`) once cells separate well
-/// enough that a few probes recall the neighbors.
+/// Held at the nprobe floor so adaptive expansion is off by default: with
+/// poorly-separated cells the ratio threshold otherwise widens to ~all cells,
+/// fanning every query out across the whole index. Raise it (or
+/// `INFINO_CELL_NPROBE_MAX`) once cells separate well enough that a few
+/// probes recall the neighbors.
 const DEFAULT_CELL_NPROBE_MAX: usize = 8;
-/// Default margin on the radius-aware probe threshold (`τ = d* + slack·r*`).
+/// Default margin on the distance-ratio probe threshold (`τ = d*·(1+slack)`).
 const DEFAULT_CELL_SLACK: f32 = 1.0;
 
 // ---------- Public in-memory shapes ----------
@@ -106,7 +105,7 @@ pub struct ManifestList {
     /// table. Source of truth for the immutable global cell grid, trained from
     /// the first committed batch. The hidden cell-index sibling mirrors the
     /// grid into its own `PartitionStrategy::VectorCell` (a derived copy the
-    /// drain writes, carrying live per-cell counts/radii on top). `None` until
+    /// drain writes, carrying live per-cell counts on top). `None` until
     /// the first commit with vectors, and on tables without vector columns.
     pub global_vector_index: Option<GlobalVectorIndex>,
     /// Drained user commit-versions — **hidden manifest only** (empty on the
@@ -242,7 +241,7 @@ pub struct CellRoutingParams {
     pub nprobe_min: usize,
     /// Hard cap on cells probed per query (GET budget).
     pub nprobe_max: usize,
-    /// Margin on the radius-aware probe threshold (`τ = d* + slack·r*`).
+    /// Margin on the distance-ratio probe threshold (`τ = d*·(1+slack)`).
     pub slack: f32,
 }
 
@@ -314,9 +313,6 @@ pub struct ManifestPartEntry {
     /// Per-FTS-column aggregate bloom-union + range-union.
     /// Empty → always-keep.
     pub fts_summary_agg: BTreeMap<String, FtsSummaryAgg>,
-    /// Per-vector-column aggregate centroid envelope.
-    /// Empty → always-keep.
-    pub vector_summary_agg: BTreeMap<String, VectorSummaryAgg>,
 }
 
 /// Aggregate scalar stats across a part's superfiles. Min/max
@@ -710,101 +706,6 @@ fn union_blooms(a: &Bloom, b: &Bloom) -> Option<Bloom> {
     Bloom::from_bytes(&ab)
 }
 
-/// Aggregate vector summary across a part's superfiles —
-/// mean-of-centroids + max-distance-with-superfile-radius (one
-/// outer ball bounding every superfile's vector ball). The
-/// `Default` shape is treated as "always-keep" by the list-
-/// level pruner.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct VectorSummaryAgg {
-    /// Packed LE f32 — the **mean** centroid (the envelope center),
-    /// same encoding as `VectorSummary.centroid`. Empty ⇒ "no info",
-    /// which the list-level pruner treats as always-keep.
-    pub centroid_envelope: Vec<u8>,
-    /// Number of superfile centroids folded into this envelope. Lets
-    /// [`VectorSummaryAgg::merge`] update the mean exactly (Welford) when
-    /// folding in one more superfile without re-reading the others. `0`
-    /// is the empty/no-info default.
-    pub n_vectors: u32,
-    pub envelope_radius: f32,
-}
-
-impl VectorSummaryAgg {
-    /// Merge `other` aggregate into `self` — the union of two part-level
-    /// envelopes (aggregate-to-aggregate merging).
-    ///
-    /// The merged envelope encloses both input envelopes:
-    ///
-    /// - **Center**: the weighted mean of the two centroids, weighted by
-    ///   `n_vectors` to preserve the overall mean-of-centroids invariant.
-    /// - **Radius**: a conservative triangle bound covering both balls around
-    ///   the new center — `max(dist(center1, new_center) + radius1,
-    ///   dist(center2, new_center) + radius2)`. This may be looser than the
-    ///   batch optimum but is computed without re-reading individual centroids.
-    ///
-    /// An empty base (`n_vectors == 0`) adopts the incoming envelope. A `other`
-    /// with no centroid (no-info) is a no-op. A dimension mismatch poisons the
-    /// envelope to a sticky always-keep.
-    pub fn merge_with(&mut self, other: &VectorSummaryAgg) {
-        if other.n_vectors == 0 {
-            return;
-        }
-        if self.centroid_envelope.is_empty() && self.n_vectors > 0 {
-            // Poisoned envelope; stay always-keep.
-            return;
-        }
-        if self.n_vectors == 0 {
-            self.centroid_envelope = other.centroid_envelope.clone();
-            self.n_vectors = other.n_vectors;
-            self.envelope_radius = other.envelope_radius;
-            return;
-        }
-        let self_center = decode_centroid_envelope(&self.centroid_envelope);
-        let other_center = decode_centroid_envelope(&other.centroid_envelope);
-        if self_center.len() != other_center.len() {
-            // Dim mismatch; poison to always-keep.
-            self.centroid_envelope.clear();
-            self.envelope_radius = 0.0;
-            return;
-        }
-        let n_total = (self.n_vectors as f32) + (other.n_vectors as f32);
-        let mut new_center = vec![0.0; self_center.len()];
-        for (i, &self_c) in self_center.iter().enumerate() {
-            new_center[i] = (self_c * self.n_vectors as f32
-                + other_center[i] * other.n_vectors as f32)
-                / n_total;
-        }
-        let self_reach = l2_distance(&self_center, &new_center) + self.envelope_radius;
-        let other_reach = l2_distance(&other_center, &new_center) + other.envelope_radius;
-        self.centroid_envelope = encode_centroid_envelope(&new_center);
-        // Saturate rather than wrap: this count only weights the running mean,
-        // so pinning at u32::MAX past the (practically unreachable) overflow is
-        // safe, whereas a silent wrap to a tiny value would skew the centroid.
-        self.n_vectors = self.n_vectors.saturating_add(other.n_vectors);
-        self.envelope_radius = self_reach.max(other_reach);
-    }
-
-    /// Merge two per-vector-column summary tables
-    /// (`BTreeMap<String, VectorSummaryAgg>`), folding `other` into `into`.
-    ///
-    /// Column **union**: a column present only in `other` is inserted; a
-    /// column present in both is merged per-column via
-    /// [`VectorSummaryAgg::merge`]. Folding this over a set of per-part
-    /// tables yields the table-level aggregate.
-    pub fn merge(
-        into: &mut BTreeMap<String, VectorSummaryAgg>,
-        other: &BTreeMap<String, VectorSummaryAgg>,
-    ) {
-        for (col, other_agg) in other {
-            if let Some(existing) = into.get_mut(col) {
-                existing.merge_with(other_agg);
-            } else {
-                into.insert(col.clone(), other_agg.clone());
-            }
-        }
-    }
-}
-
 // ---------- Errors ----------
 
 #[derive(Debug, Error)]
@@ -993,7 +894,6 @@ struct ManifestPartEntryDto {
     id_range: (String, String),
     scalar_stats_agg: BTreeMap<String, ScalarStatsAggDto>,
     fts_summary_agg: BTreeMap<String, FtsSummaryAggDto>,
-    vector_summary_agg: BTreeMap<String, VectorSummaryAggDto>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1029,16 +929,6 @@ struct FtsSummaryAggDto {
 struct TermRangeUnionDto {
     min: String, // base64
     max: String, // base64
-}
-
-#[derive(Serialize, Deserialize)]
-struct VectorSummaryAggDto {
-    centroid_envelope: String, // base64
-    // Absent in pre-existing manifests (written before incremental merge);
-    // serde defaults it to 0, which reads as the empty/no-info count.
-    #[serde(default)]
-    n_vectors: u32,
-    envelope_radius: f32,
 }
 
 // ---------- DTO conversions ----------
@@ -1132,20 +1022,6 @@ fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncod
                 )
             })
             .collect(),
-        vector_summary_agg: e
-            .vector_summary_agg
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.clone(),
-                    VectorSummaryAggDto {
-                        centroid_envelope: encode_b64(&v.centroid_envelope),
-                        n_vectors: v.n_vectors,
-                        envelope_radius: v.envelope_radius,
-                    },
-                )
-            })
-            .collect(),
     })
 }
 
@@ -1225,17 +1101,6 @@ fn entry_from_dto(d: ManifestPartEntryDto) -> Result<ManifestPartEntry, ListPars
             },
         );
     }
-    let mut vector_summary_agg = BTreeMap::new();
-    for (k, v) in d.vector_summary_agg {
-        vector_summary_agg.insert(
-            k,
-            VectorSummaryAgg {
-                centroid_envelope: decode_b64(&v.centroid_envelope, "centroid_envelope")?,
-                n_vectors: v.n_vectors,
-                envelope_radius: v.envelope_radius,
-            },
-        );
-    }
     Ok(ManifestPartEntry {
         part_id,
         uri: d.uri,
@@ -1257,7 +1122,6 @@ fn entry_from_dto(d: ManifestPartEntryDto) -> Result<ManifestPartEntry, ListPars
         },
         scalar_stats_agg,
         fts_summary_agg,
-        vector_summary_agg,
     })
 }
 
@@ -1956,16 +1820,6 @@ mod tests {
             },
         );
 
-        let mut vec_agg = BTreeMap::new();
-        vec_agg.insert(
-            "emb".into(),
-            VectorSummaryAgg {
-                centroid_envelope: 0.5_f32.to_le_bytes().repeat(8),
-                n_vectors: 3,
-                envelope_radius: 0.71_f32,
-            },
-        );
-
         ManifestPartEntry {
             part_id: PartId(Uuid::from_bytes([seed; 16])),
             uri: format!("manifests/part-{seed:02x}.avro.zst"),
@@ -1977,7 +1831,6 @@ mod tests {
             id_range: (0, 245_678_901),
             scalar_stats_agg: scalar,
             fts_summary_agg: fts,
-            vector_summary_agg: vec_agg,
         }
     }
 
@@ -2026,23 +1879,6 @@ mod tests {
         assert_eq!(a.id_range, b.id_range, "id_range");
         assert_eq!(a.scalar_stats_agg, b.scalar_stats_agg, "scalar_stats_agg");
         assert_eq!(a.fts_summary_agg, b.fts_summary_agg, "fts_summary_agg");
-        assert_eq!(
-            a.vector_summary_agg.len(),
-            b.vector_summary_agg.len(),
-            "vector_summary_agg count"
-        );
-        for (k, av) in &a.vector_summary_agg {
-            let bv = b
-                .vector_summary_agg
-                .get(k)
-                .unwrap_or_else(|| panic!("missing vec {k}"));
-            assert_eq!(av.centroid_envelope, bv.centroid_envelope, "vec {k} env");
-            assert_eq!(
-                av.envelope_radius.to_bits(),
-                bv.envelope_radius.to_bits(),
-                "vec {k} radius bits"
-            );
-        }
     }
 
     fn assert_lists_equal(a: &ManifestList, b: &ManifestList) {
@@ -2736,356 +2572,5 @@ mod tests {
         FtsSummaryAgg::merge(&mut into, &other);
         // Both had None blooms, result should be None (dropped)
         assert!(into.is_empty());
-    }
-
-    // ----- Tests for VectorSummaryAgg::merge_agg -----
-
-    #[test]
-    fn vector_merge_empty_other_is_noop() {
-        let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0, 3.0]),
-            n_vectors: 5,
-            envelope_radius: 0.5,
-        };
-        let other = VectorSummaryAgg::default();
-        let before = agg.clone();
-        agg.merge_with(&other);
-        assert_eq!(agg, before, "merging empty other should be a no-op");
-    }
-
-    #[test]
-    fn vector_merge_empty_self_adopts_other() {
-        let mut agg = VectorSummaryAgg::default();
-        let other = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0, 3.0]),
-            n_vectors: 3,
-            envelope_radius: 0.75,
-        };
-        agg.merge_with(&other);
-        assert_eq!(
-            decode_centroid_envelope(&agg.centroid_envelope),
-            vec![1.0, 2.0, 3.0]
-        );
-        assert_eq!(agg.n_vectors, 3);
-        assert_eq!(agg.envelope_radius, 0.75);
-    }
-
-    #[test]
-    fn vector_merge_poisoned_stays_poisoned() {
-        let mut agg = VectorSummaryAgg {
-            centroid_envelope: Vec::new(),
-            n_vectors: 5,
-            envelope_radius: 0.0,
-        };
-        let other = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0]),
-            n_vectors: 3,
-            envelope_radius: 0.5,
-        };
-        agg.merge_with(&other);
-        // Poisoned envelope should stay empty and never merge
-        assert!(agg.centroid_envelope.is_empty());
-        assert_eq!(agg.n_vectors, 5, "poisoned count should not change");
-    }
-
-    #[test]
-    fn vector_merge_weighted_mean_centroid() {
-        let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[0.0, 0.0, 0.0]),
-            n_vectors: 3,
-            envelope_radius: 0.0,
-        };
-        let other = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[6.0, 6.0, 6.0]),
-            n_vectors: 3,
-            envelope_radius: 0.0,
-        };
-        agg.merge_with(&other);
-        let merged_center = decode_centroid_envelope(&agg.centroid_envelope);
-        // Weighted mean: (0*3 + 6*3)/(3+3) = 3.0 per coordinate
-        for &c in &merged_center {
-            assert!((c - 3.0).abs() < 1e-4);
-        }
-        assert_eq!(agg.n_vectors, 6);
-    }
-
-    #[test]
-    fn vector_merge_unequal_weights() {
-        let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[0.0, 0.0]),
-            n_vectors: 1,
-            envelope_radius: 0.0,
-        };
-        let other = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[10.0, 10.0]),
-            n_vectors: 9,
-            envelope_radius: 0.0,
-        };
-        agg.merge_with(&other);
-        let merged_center = decode_centroid_envelope(&agg.centroid_envelope);
-        // Weighted mean: (0*1 + 10*9)/(1+9) = 9.0 per coordinate
-        for &c in &merged_center {
-            assert!((c - 9.0).abs() < 1e-4);
-        }
-    }
-
-    #[test]
-    fn vector_merge_dimension_mismatch_poisons() {
-        let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0, 3.0]),
-            n_vectors: 2,
-            envelope_radius: 0.5,
-        };
-        let other = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0]),
-            n_vectors: 3,
-            envelope_radius: 0.4,
-        };
-        agg.merge_with(&other);
-        // Dimension mismatch should poison to always-keep
-        assert!(agg.centroid_envelope.is_empty());
-        assert_eq!(agg.envelope_radius, 0.0);
-        assert!(agg.n_vectors > 0, "count should not change");
-    }
-
-    #[test]
-    fn vector_merge_encloses_both_balls() {
-        let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[0.0, 0.0]),
-            n_vectors: 1,
-            envelope_radius: 1.0,
-        };
-        let other = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[10.0, 0.0]),
-            n_vectors: 1,
-            envelope_radius: 1.0,
-        };
-        agg.merge_with(&other);
-        let merged_center = decode_centroid_envelope(&agg.centroid_envelope);
-        // Center should be at (5, 0)
-        assert!((merged_center[0] - 5.0).abs() < 1e-4);
-        assert!(merged_center[1].abs() < 1e-4);
-        // Radius should enclose both: dist(0,5) + 1 = 6, dist(10,5) + 1 = 6
-        assert!(agg.envelope_radius >= 6.0 - 1e-4);
-    }
-
-    #[test]
-    fn vector_merge_radius_conservative_bound() {
-        // Test that the radius is conservative (no false negatives)
-        let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[5.0, 0.0]),
-            n_vectors: 2,
-            envelope_radius: 3.0,
-        };
-        let other = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[5.0, 4.0]),
-            n_vectors: 2,
-            envelope_radius: 2.0,
-        };
-        agg.merge_with(&other);
-        let merged_center = decode_centroid_envelope(&agg.centroid_envelope);
-        // Both original balls should be enclosed by the merged envelope
-        let reach1 = l2_distance(&[5.0, 0.0], &merged_center) + 3.0;
-        let reach2 = l2_distance(&[5.0, 4.0], &merged_center) + 2.0;
-        assert!(
-            reach1 <= agg.envelope_radius + 1e-4,
-            "first ball should be enclosed"
-        );
-        assert!(
-            reach2 <= agg.envelope_radius + 1e-4,
-            "second ball should be enclosed"
-        );
-    }
-
-    #[test]
-    fn vector_merge_updates_n_vectors_count() {
-        let mut agg = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[1.0]),
-            n_vectors: 7,
-            envelope_radius: 0.1,
-        };
-        let other = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[2.0]),
-            n_vectors: 5,
-            envelope_radius: 0.2,
-        };
-        agg.merge_with(&other);
-        assert_eq!(agg.n_vectors, 12);
-    }
-
-    // ----- Tests for VectorSummaryAgg::merge_tables -----
-
-    #[test]
-    fn vector_merge_empty_into_and_empty_other() {
-        let mut into = BTreeMap::new();
-        let other = BTreeMap::new();
-        VectorSummaryAgg::merge(&mut into, &other);
-        assert!(into.is_empty());
-    }
-
-    #[test]
-    fn vector_merge_empty_into_adopts_other() {
-        let mut into = BTreeMap::new();
-        let mut other = BTreeMap::new();
-        let summary = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0, 3.0]),
-            n_vectors: 4,
-            envelope_radius: 0.5,
-        };
-        other.insert("vec_col".to_string(), summary.clone());
-        VectorSummaryAgg::merge(&mut into, &other);
-        assert_eq!(into.len(), 1);
-        assert_eq!(into["vec_col"], summary);
-    }
-
-    #[test]
-    fn vector_merge_preserves_columns_only_in_into() {
-        let mut into = BTreeMap::new();
-        let other = BTreeMap::new();
-        let summary = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0]),
-            n_vectors: 2,
-            envelope_radius: 0.3,
-        };
-        into.insert("only_in_into".to_string(), summary.clone());
-        VectorSummaryAgg::merge(&mut into, &other);
-        assert_eq!(into.len(), 1);
-        assert_eq!(into["only_in_into"], summary);
-    }
-
-    #[test]
-    fn vector_merge_merges_shared_columns() {
-        let mut into = BTreeMap::new();
-        let mut other = BTreeMap::new();
-        let summary1 = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[0.0, 0.0]),
-            n_vectors: 2,
-            envelope_radius: 1.0,
-        };
-        let summary2 = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[10.0, 0.0]),
-            n_vectors: 2,
-            envelope_radius: 1.0,
-        };
-        into.insert("shared".to_string(), summary1);
-        other.insert("shared".to_string(), summary2);
-        VectorSummaryAgg::merge(&mut into, &other);
-        assert_eq!(into.len(), 1);
-        // After merge: n_vectors should be sum, centroid should be weighted mean
-        assert_eq!(into["shared"].n_vectors, 4);
-        let merged_center = decode_centroid_envelope(&into["shared"].centroid_envelope);
-        assert!((merged_center[0] - 5.0).abs() < 1e-4);
-    }
-
-    #[test]
-    fn vector_merge_poisons_on_dimension_mismatch() {
-        let mut into = BTreeMap::new();
-        let mut other = BTreeMap::new();
-        let summary1 = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0, 3.0]),
-            n_vectors: 2,
-            envelope_radius: 0.5,
-        };
-        let summary2 = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0]),
-            n_vectors: 2,
-            envelope_radius: 0.5,
-        };
-        into.insert("col".to_string(), summary1);
-        other.insert("col".to_string(), summary2);
-        VectorSummaryAgg::merge(&mut into, &other);
-        // On dimension mismatch, the column is poisoned but not dropped
-        assert_eq!(into.len(), 1);
-        assert!(into["col"].centroid_envelope.is_empty());
-        assert_eq!(into["col"].envelope_radius, 0.0);
-    }
-
-    #[test]
-    fn vector_merge_union_of_columns() {
-        let mut into = BTreeMap::new();
-        let mut other = BTreeMap::new();
-        into.insert(
-            "vec1".to_string(),
-            VectorSummaryAgg {
-                centroid_envelope: encode_centroid_envelope(&[1.0, 2.0]),
-                n_vectors: 2,
-                envelope_radius: 0.1,
-            },
-        );
-        other.insert(
-            "vec2".to_string(),
-            VectorSummaryAgg {
-                centroid_envelope: encode_centroid_envelope(&[3.0, 4.0]),
-                n_vectors: 2,
-                envelope_radius: 0.2,
-            },
-        );
-        VectorSummaryAgg::merge(&mut into, &other);
-        assert_eq!(into.len(), 2);
-        assert!(into.contains_key("vec1"));
-        assert!(into.contains_key("vec2"));
-    }
-
-    #[test]
-    fn vector_merge_with_default_other() {
-        let mut into = BTreeMap::new();
-        let mut other = BTreeMap::new();
-        let summary = VectorSummaryAgg {
-            centroid_envelope: encode_centroid_envelope(&[1.0, 2.0]),
-            n_vectors: 2,
-            envelope_radius: 0.5,
-        };
-        into.insert("col".to_string(), summary.clone());
-        let default_other = VectorSummaryAgg::default();
-        other.insert("col".to_string(), default_other);
-        VectorSummaryAgg::merge(&mut into, &other);
-        // Merging with default (empty) other should be a no-op
-        assert_eq!(into["col"], summary);
-    }
-
-    #[test]
-    fn vector_merge_tables_complex_scenario() {
-        let mut into = BTreeMap::new();
-        let mut other = BTreeMap::new();
-        // into has vec1 and vec2
-        into.insert(
-            "vec1".to_string(),
-            VectorSummaryAgg {
-                centroid_envelope: encode_centroid_envelope(&[1.0, 2.0]),
-                n_vectors: 1,
-                envelope_radius: 0.1,
-            },
-        );
-        into.insert(
-            "vec2".to_string(),
-            VectorSummaryAgg {
-                centroid_envelope: encode_centroid_envelope(&[3.0, 4.0]),
-                n_vectors: 1,
-                envelope_radius: 0.2,
-            },
-        );
-        // other has vec1 (to merge), vec3 (to add)
-        other.insert(
-            "vec1".to_string(),
-            VectorSummaryAgg {
-                centroid_envelope: encode_centroid_envelope(&[1.0, 2.0]),
-                n_vectors: 1,
-                envelope_radius: 0.1,
-            },
-        );
-        other.insert(
-            "vec3".to_string(),
-            VectorSummaryAgg {
-                centroid_envelope: encode_centroid_envelope(&[5.0, 6.0]),
-                n_vectors: 1,
-                envelope_radius: 0.3,
-            },
-        );
-        VectorSummaryAgg::merge(&mut into, &other);
-        // into should now have vec1 (merged), vec2 (unchanged), vec3 (added)
-        assert_eq!(into.len(), 3);
-        assert_eq!(into["vec1"].n_vectors, 2);
-        assert_eq!(into["vec2"].n_vectors, 1);
-        assert_eq!(into["vec3"].n_vectors, 1);
     }
 }

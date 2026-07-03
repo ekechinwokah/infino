@@ -25,7 +25,7 @@
 //!   as length-prefixed bytes.
 //! - [`encode_vector_summary`] / [`decode_vector_summary`] —
 //!   custom packed: dim (LE u32), centroid (dim × LE f32),
-//!   radius (LE f32).
+//!   then the cluster-centroid block.
 //!
 //! Wrapped variants — [`encode_fts_summary_map`] /
 //! [`encode_vector_summary_map`] — emit the
@@ -456,16 +456,16 @@ pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummaryAgg, DecodeError> {
 // Layout (all LE):
 //   u32 dim
 //   [dim × f32]   (centroid)
-//   f32 radius
+//   cluster-centroid block
 // ---------------------------------------------------------
 
 /// fp32 cluster-centroid block: `n_cent, dim, tag, counts[n_cent],
-/// centroids[n_cent*dim], radii[n_cent]?` — all little-endian.
+/// centroids[n_cent*dim]` — all little-endian.
 pub fn encode_cluster_centroids(cl: &ClusterCentroids) -> Vec<u8> {
     let nc = cl.n_cent as usize;
     let cd = cl.dim as usize;
     let body = nc * cd;
-    let mut out = Vec::with_capacity(12 + nc * 4 + body * 4 + nc * 4);
+    let mut out = Vec::with_capacity(12 + nc * 4 + body * 4);
     out.extend_from_slice(&cl.n_cent.to_le_bytes());
     out.extend_from_slice(&cl.dim.to_le_bytes());
     out.extend_from_slice(&CLUSTER_CENTROIDS_WIRE_FP32.to_le_bytes());
@@ -474,11 +474,6 @@ pub fn encode_cluster_centroids(cl: &ClusterCentroids) -> Vec<u8> {
     }
     for &v in &cl.centroids {
         out.extend_from_slice(&v.to_le_bytes());
-    }
-    if cl.radii.len() == nc {
-        for &r in &cl.radii {
-            out.extend_from_slice(&r.to_le_bytes());
-        }
     }
     out
 }
@@ -519,19 +514,11 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, Decode
     }
     let centroids = decode_f32_le_vec(&centroids_b);
 
-    let tail = c.position() as usize;
-    let radii = if tail + n_cent * 4 <= bytes.len() {
-        decode_f32_le_vec(&bytes[tail..tail + n_cent * 4])
-    } else {
-        Vec::new()
-    };
-
     Ok(ClusterCentroids {
         n_cent: n_cent as u32,
         dim: cdim as u32,
         centroids,
         counts,
-        radii,
     })
 }
 
@@ -540,12 +527,11 @@ pub fn encode_vector_summary(s: &VectorSummary) -> Vec<u8> {
     let cl = &s.clusters;
     let nc = cl.n_cent as usize;
     let cd = cl.dim as usize;
-    let mut out = Vec::with_capacity(4 + dim * 4 + 4 + 12 + nc * 4 + nc * cd * 4 + nc * 4);
+    let mut out = Vec::with_capacity(4 + dim * 4 + 12 + nc * 4 + nc * cd * 4);
     out.extend_from_slice(&(dim as u32).to_le_bytes());
     for &v in &s.centroid {
         out.extend_from_slice(&v.to_le_bytes());
     }
-    out.extend_from_slice(&s.radius.to_le_bytes());
     out.extend_from_slice(&encode_cluster_centroids(cl));
     out
 }
@@ -562,43 +548,11 @@ pub fn decode_vector_summary(bytes: &[u8]) -> Result<VectorSummary, DecodeError>
         )));
     }
     let centroid = decode_f32_le_vec(&centroid_bytes);
-    let rb = read_n(&mut c, 4, "radius")?;
-    if rb.len() != 4 {
-        return Err(DecodeError::InvalidVectorSummary("truncated radius".into()));
-    }
-    let radius = f32::from_le_bytes([rb[0], rb[1], rb[2], rb[3]]);
 
     let tail = &bytes[c.position() as usize..];
     let clusters = decode_cluster_centroids(tail)?;
-    Ok(VectorSummary {
-        centroid,
-        radius,
-        clusters,
-    })
+    Ok(VectorSummary { centroid, clusters })
 }
-
-// ---------------------------------------------------------
-// Centroid-envelope blob helpers, shared by the vector
-// skip-summary aggregate (`VectorSummaryAgg`) writer
-// (`aggregates`), incremental merge (`list`), and reader-side
-// prune (`list_prune`). The blob is a packed little-endian
-// f32 array; `l2_distance` is the bounding-ball metric the
-// envelope uses (cosine/negdot over normalized centroids
-// reduce to L2).
-// ---------------------------------------------------------
-
-/// Pack floats into the packed little-endian f32 centroid-envelope blob.
-pub(crate) fn encode_centroid_envelope(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-
-/// Decode a packed little-endian f32 centroid-envelope blob back to floats.
-pub(crate) fn decode_centroid_envelope(bytes: &[u8]) -> Vec<f32> {
-    decode_f32_le_vec(bytes)
-}
-
-/// Euclidean (L2) distance between two equal-length centroid vectors.
-pub(crate) use crate::superfile::vector::distance::l2 as l2_distance;
 
 // ---------------------------------------------------------
 // Map-of-summary wrappers.
@@ -1138,13 +1092,11 @@ mod vector_summary_tests {
         let clusters = ClusterCentroids::from_fp32(n_cent, dim, &centroids, counts.clone());
         let s = VectorSummary {
             centroid: vec![1.0, 2.0, 3.0, 4.0],
-            radius: 9.0,
             clusters,
         };
 
         let got = decode_vector_summary(&encode_vector_summary(&s)).expect("decode");
         assert_eq!(got.centroid, s.centroid);
-        assert!((got.radius - s.radius).abs() < 1e-9);
         assert_eq!(got.clusters.n_cent, n_cent);
         assert_eq!(got.clusters.dim, dim);
         assert_eq!(got.clusters.counts, counts);
@@ -1159,7 +1111,6 @@ mod vector_summary_tests {
     fn round_trips_with_empty_clusters() {
         let s = VectorSummary {
             centroid: vec![0.5, -0.5],
-            radius: 1.0,
             clusters: ClusterCentroids::empty(),
         };
         let got = decode_vector_summary(&encode_vector_summary(&s)).expect("decode");

@@ -5,7 +5,7 @@
 //! self-contained subsections.
 //!
 //! Each column's subsection is a self-contained IVF + RaBitQ index:
-//! summary centroid + radius, IVF centroids (from k-means), cluster
+//! summary centroid, IVF centroids (from k-means), cluster
 //! index, 1-bit codes, full-precision vectors, doc_ids — all in
 //! cluster-contiguous order so the rerank loop stays in cache.
 //!
@@ -98,11 +98,6 @@ const N_CENT_MEDIUM_DOC_THRESHOLD: usize = 100_000;
 const N_CENT_MEDIUM: usize = 1024;
 /// Maximum IVF centroids for small physical vector indexes.
 const N_CENT_SMALL: usize = 64;
-
-/// Fixed-point scale for the per-subsection summary radius. The
-/// radius is stored as `round(radius × 100)` in a `u32` and decoded
-/// back by the reader as `value / 100.0`.
-const SUMMARY_RADIUS_SCALE: f32 = 100.0;
 
 /// Maximum Sq8 code value: each component quantizes to one unsigned
 /// byte, so the per-dim scale maps a cluster's value span onto
@@ -776,7 +771,7 @@ fn chunk_rows_for_dim(dim: usize) -> usize {
 ///
 /// ```text
 ///   [Sub-header — 56 bytes]
-///   [Summary centroid + radius]   — dim f32s
+///   [Summary centroid]            — dim f32s
 ///   [IVF centroids]               — n_cent × dim × f32
 ///   [Cluster index]               — n_cent × (u32 doc_off, u32 doc_count)
 ///   [1-bit codes]                 — n_docs × ceil(dim/8) (cluster-contiguous)
@@ -795,8 +790,7 @@ fn chunk_rows_for_dim(dim: usize) -> usize {
 ///    vectors from the input source: assign on unrotated rows,
 ///    rotate, encode to 1-bit codes, append the
 ///    `(local_doc_id, code, full_vec)` tuple to the assigned
-///    centroid's bucket file, and fold the row into the
-///    summary radius. Per-centroid bucket files preserve
+///    centroid's bucket file. Per-centroid bucket files preserve
 ///    cluster-contiguity for pass 3 without a third corpus
 ///    pass.
 /// 3. **Pass 3 (sequential):** read each bucket file in
@@ -953,23 +947,8 @@ fn build_subsection_from_materialized(
         });
 
     let mut bucket_counts = vec![0u32; n_cent];
-    let mut summary_radius_sq_max = 0.0f32;
-    let mut row_fp = vec![0f32; dim];
     for (c, bucket) in buckets.iter().enumerate() {
         bucket_counts[c] = bucket.len() as u32;
-        for row in bucket {
-            dequantize_sq8_residual_into(
-                &row.encoded.scale,
-                &row.encoded.offset,
-                &row.encoded.codes,
-                &row.encoded.residuals,
-                &mut row_fp,
-            );
-            let r_sq = l2_sq(&row_fp, &summary_centroid);
-            if r_sq > summary_radius_sq_max {
-                summary_radius_sq_max = r_sq;
-            }
-        }
     }
 
     // Per-cluster Sq8 quantizer: calibrate from the cluster's per-dim min/max,
@@ -1003,10 +982,6 @@ fn build_subsection_from_materialized(
                 .collect()
         });
 
-    let summary_radius_x100 = (summary_radius_sq_max.sqrt() * SUMMARY_RADIUS_SCALE)
-        .max(0.0)
-        .min(u32::MAX as f32) as u32;
-
     let cluster_order = centroid_storage_order(&centroids, n_cent, dim);
     let codec_meta_size = codec.codec_meta_bytes(dim, n_docs, n_cent, cfg.metric);
     let per_vec_bytes = codec.per_vector_bytes(dim);
@@ -1025,13 +1000,8 @@ fn build_subsection_from_materialized(
     );
     let total_size_before_crc = layout.total_size_before_crc;
 
-    let mut bytes = alloc_ivf_subsection_with_header(
-        &layout,
-        codec_meta_size,
-        summary_radius_x100,
-        &summary_centroid,
-        &centroids,
-    );
+    let mut bytes =
+        alloc_ivf_subsection_with_header(&layout, codec_meta_size, &summary_centroid, &centroids);
 
     let sq8_scale_block_off = layout.codec_meta_off;
     let sq8_offset_block_off = sq8_scale_block_off + n_cent * dim * 4;
@@ -1177,9 +1147,7 @@ fn build_subsection_streaming(
         (n_cent, centroids)
     };
 
-    // Summary centroid: mean of trained centroids. Cheap and only
-    // depends on centroids, so compute now before pass 2 so we can
-    // fold each row's distance into `summary_radius_sq_max` inline.
+    // Summary centroid: mean of trained centroids.
     let summary_centroid = mean_f32_cluster_major(&centroids, dim, n_cent);
 
     let rotation = RandomRotation::new(dim, cfg.rot_seed);
@@ -1209,7 +1177,6 @@ fn build_subsection_streaming(
     //     MmapVectorSource. Pass 2 iterates over the mmap, with
     //     the kernel page cache handling streaming reads.
     let chunk_rows = chunk_rows_for_dim(dim);
-    let mut summary_radius_sq_max: f32 = 0.0;
     let codec = cfg.rerank_codec;
     // `Sq8ResidualEpsilon` uses per-cluster scale/offset codec_meta plus
     // an i8 residual sidecar in `full[]`.
@@ -1259,10 +1226,8 @@ fn build_subsection_streaming(
             &centroids,
             &rotation,
             &quant,
-            &summary_centroid,
             &mut bucket_writers,
             &mut bucket_counts,
-            &mut summary_radius_sq_max,
             codec,
             sq8_acc,
         )?;
@@ -1295,10 +1260,6 @@ fn build_subsection_streaming(
         bucket_files.push(inner);
     }
     drop(bucket_files);
-
-    let summary_radius_x100 = (summary_radius_sq_max.sqrt() * SUMMARY_RADIUS_SCALE)
-        .max(0.0)
-        .min(u32::MAX as f32) as u32;
 
     // ---- Pass 3: stream buckets into the final subsection bytes ----
     //
@@ -1365,13 +1326,8 @@ fn build_subsection_streaming(
         IvfSubsectionLayout::compute(dim, n_cent, n_docs, cluster_stride, codec_meta_size, 0);
     let total_size_before_crc = layout.total_size_before_crc;
 
-    let mut bytes = alloc_ivf_subsection_with_header(
-        &layout,
-        codec_meta_size,
-        summary_radius_x100,
-        &summary_centroid,
-        &centroids,
-    );
+    let mut bytes =
+        alloc_ivf_subsection_with_header(&layout, codec_meta_size, &summary_centroid, &centroids);
 
     let sq8_scale_block_off = layout.codec_meta_off;
     let sq8_offset_block_off = sq8_scale_block_off + n_cent * dim * 4;
@@ -1648,7 +1604,6 @@ impl IvfSubsectionLayout {
 pub(crate) fn alloc_ivf_subsection_with_header(
     layout: &IvfSubsectionLayout,
     codec_meta_size: usize,
-    summary_radius_x100: u32,
     summary_centroid: &[f32],
     centroids: &[f32],
 ) -> Vec<u8> {
@@ -1660,8 +1615,6 @@ pub(crate) fn alloc_ivf_subsection_with_header(
         .copy_from_slice(&(codec_meta_size as u32).to_le_bytes());
     bytes[sub_hdr::SUMMARY_OFF_OFF..sub_hdr::SUMMARY_OFF_OFF + U64_BYTES]
         .copy_from_slice(&(layout.summary_off as u64).to_le_bytes());
-    bytes[sub_hdr::SUMMARY_RADIUS_X100_OFF..sub_hdr::SUMMARY_RADIUS_X100_OFF + U32_BYTES]
-        .copy_from_slice(&summary_radius_x100.to_le_bytes());
     bytes[sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES]
         .copy_from_slice(&(layout.centroids_off as u64).to_le_bytes());
     bytes[sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES]
@@ -1744,7 +1697,7 @@ where
 /// Pass 2 of `build_subsection_streaming`: walk the input
 /// corpus chunk-by-chunk, assign each row to its centroid,
 /// rotate + 1-bit encode it, fold its un-rotated distance into
-/// the summary radius, and append the `(local_doc_id, code,
+/// and append the `(local_doc_id, code,
 /// full_vec)` tuple to the assigned centroid's bucket writer.
 ///
 /// Extracted as a helper so the (long) match between
@@ -1760,10 +1713,8 @@ fn run_pass2(
     centroids: &[f32],
     rotation: &RandomRotation,
     quant: &BitQuantizer,
-    summary_centroid: &[f32],
     bucket_writers: &mut [BufWriter<File>],
     bucket_counts: &mut [u32],
-    summary_radius_sq_max: &mut f32,
     codec: RerankCodec,
     mut sq8_min_max: Option<(&mut [f32], &mut [f32])>,
 ) -> Result<(), BuildError> {
@@ -1805,20 +1756,6 @@ fn run_pass2(
                 let rot_row = &chunk_rotated[r * dim..(r + 1) * dim];
                 quant.encode_rotated_into(rot_row, code_out);
             });
-
-        // Summary radius: max over rows of L2² distance to
-        // summary_centroid (un-rotated input space). Parallel
-        // reduce — final sqrt is applied once in the caller.
-        let chunk_max = (0..actual_rows)
-            .into_par_iter()
-            .map(|r| {
-                let v = &chunk[r * dim..(r + 1) * dim];
-                l2_sq(v, summary_centroid)
-            })
-            .reduce(|| 0.0f32, f32::max);
-        if chunk_max > *summary_radius_sq_max {
-            *summary_radius_sq_max = chunk_max;
-        }
 
         // Route rows to bucket writers. Sequential per-bucket
         // — BufWriter is !Sync and a per-bucket Mutex would

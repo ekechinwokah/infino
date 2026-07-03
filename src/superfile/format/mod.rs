@@ -182,8 +182,7 @@ pub mod vec {
     /// [12..16] codec_meta_size (u32 LE) — 0 when no codec_meta
     ///                                     (Fp32 / RabitqOnly)
     /// [16..24] summary_centroid_offset (u64 LE)
-    /// [24..28] summary_radius_x100 (u32 LE)
-    /// [28..32] reserved (u32)
+    /// [24..32] reserved (u64)
     /// [32..40] centroids_off (u64 LE)
     /// [40..48] cluster_idx_off (u64 LE)
     /// [48..56] per_cluster_blocks_off (u64 LE)
@@ -274,9 +273,7 @@ pub mod vec {
         pub const CODEC_META_SIZE_OFF: usize = 12;
         /// `[16..24]` summary-centroid offset (`u64` LE).
         pub const SUMMARY_OFF_OFF: usize = 16;
-        /// `[24..28]` summary radius ×100 (`u32` LE).
-        pub const SUMMARY_RADIUS_X100_OFF: usize = 24;
-        // `[28..32]` reserved (`u32`).
+        // `[24..32]` reserved (`u64`).
         /// `[32..40]` centroids offset (`u64` LE).
         pub const CENTROIDS_OFF_OFF: usize = 32;
         /// `[40..48]` cluster-index offset (`u64` LE).

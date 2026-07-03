@@ -206,7 +206,6 @@ fn entry_for(part: &ManifestPart) -> ManifestPartEntry {
         id_range: (0, 0),
         scalar_stats_agg: Default::default(),
         fts_summary_agg: Default::default(),
-        vector_summary_agg: Default::default(),
     }
 }
 

@@ -16,11 +16,6 @@
 //!   [`FtsSummaryAgg`]s — bloom bit-OR union + `(min(min_term),
 //!   max(max_term))` term-range union — folded via
 //!   [`FtsSummaryAgg::merge`].
-//! - `vector_summary_agg`: per vector column, mean-of-
-//!   centroids + max(distance + superfile_radius). Bounds every
-//!   superfile's vector ball with one outer ball, so the
-//!   list-level vector skip is correct by construction (no
-//!   false negatives).
 //!
 //! The bloom union is exact for "any superfile contained this term"
 //! (the block-and-mask scheme is positional). `n_terms_distinct` is a
@@ -33,23 +28,18 @@ use std::{
     sync::Arc,
 };
 
-use crate::{
-    superfile::vector::distance::{add_f32_to_f64_acc, f64_acc_mean_into_f32},
-    supertable::manifest::{
-        SuperfileEntry,
-        encoding::{encode_centroid_envelope, l2_distance},
-        list::{FtsSummaryAgg, ManifestPartEntry, ScalarStatsAgg, VectorSummaryAgg},
-    },
+use crate::supertable::manifest::{
+    SuperfileEntry,
+    list::{FtsSummaryAgg, ManifestPartEntry, ScalarStatsAgg},
 };
 
-/// All four aggregate buckets for one [`ManifestListEntry`].
+/// All three aggregate buckets for one [`ManifestListEntry`].
 /// Built by [`compute`] and inserted verbatim into the entry.
 #[derive(Debug, Default)]
 pub struct AggregateSet {
     pub id_range: (i128, i128),
     pub scalar_stats_agg: HashMap<String, ScalarStatsAgg>,
     pub fts_summary_agg: BTreeMap<String, FtsSummaryAgg>,
-    pub vector_summary_agg: BTreeMap<String, VectorSummaryAgg>,
 }
 
 /// Build the aggregate set for one manifest part from its
@@ -69,7 +59,6 @@ pub fn compute(
                 id_range: (b.id_range.0, b.id_range.1),
                 scalar_stats_agg: b.scalar_stats_agg.clone(),
                 fts_summary_agg: b.fts_summary_agg.clone(),
-                vector_summary_agg: b.vector_summary_agg.clone(),
             })
             .unwrap_or_default();
     }
@@ -78,21 +67,18 @@ pub fn compute(
     let mut id_max = superfiles.iter().map(|s| s.id_max).max().unwrap_or(0);
     let mut scalar_stats_agg = scalar_stats_agg(superfiles);
     let mut fts_summary_agg = fts_summary_agg(superfiles);
-    let mut vector_summary_agg = vector_summary_agg(superfiles);
 
     if let Some(base_part) = base_part {
         id_min = min(id_min, base_part.id_range.0);
         id_max = max(id_max, base_part.id_range.1);
         ScalarStatsAgg::merge(&mut scalar_stats_agg, &base_part.scalar_stats_agg);
         FtsSummaryAgg::merge(&mut fts_summary_agg, &base_part.fts_summary_agg);
-        VectorSummaryAgg::merge(&mut vector_summary_agg, &base_part.vector_summary_agg);
     }
 
     AggregateSet {
         id_range: (id_min, id_max),
         scalar_stats_agg,
         fts_summary_agg,
-        vector_summary_agg,
     }
 }
 
@@ -135,65 +121,6 @@ fn fts_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, FtsSu
     out
 }
 
-// ---------------------------------------------------------
-// Vector summary aggregate: mean centroid + envelope radius.
-// ---------------------------------------------------------
-
-fn vector_summary_agg(superfiles: &[Arc<SuperfileEntry>]) -> BTreeMap<String, VectorSummaryAgg> {
-    let mut per_column: HashMap<String, Vec<(&[f32], f32)>> = HashMap::new();
-    for seg in superfiles {
-        for (col, summary) in &seg.vector_summary {
-            per_column
-                .entry(col.clone())
-                .or_default()
-                .push((summary.centroid.as_slice(), summary.radius));
-        }
-    }
-    let mut out = BTreeMap::new();
-    for (col, entries) in per_column {
-        let Some(first_dim) = entries.first().map(|(c, _)| c.len()) else {
-            continue;
-        };
-        if entries.iter().any(|(c, _)| c.len() != first_dim) {
-            // Skip columns with inconsistent dim (shouldn't
-            // happen — schema enforces a single dim per column).
-            continue;
-        }
-        let mut mean = vec![0.0_f64; first_dim];
-        for (centroid, _) in &entries {
-            add_f32_to_f64_acc(&mut mean, centroid);
-        }
-        let n = entries.len() as f64;
-        let mut mean_f32 = vec![0f32; first_dim];
-        f64_acc_mean_into_f32(&mean, 1.0 / n, &mut mean_f32);
-
-        // envelope_radius = max(distance(seg_centroid, mean) +
-        // seg_radius) over all superfiles. Distance = L2 — works
-        // for the L2sq/cosine/negdot metrics (cosine over
-        // normalized centroids is equivalent to L2 distance).
-        // Conservative: a metric-specific tightening is a
-        // follow-up optimization.
-        let mut envelope_radius: f32 = 0.0;
-        for (centroid, radius) in &entries {
-            let dist = l2_distance(centroid, &mean_f32);
-            envelope_radius = envelope_radius.max(dist + radius);
-        }
-
-        let centroid_envelope = encode_centroid_envelope(&mean_f32);
-        out.insert(
-            col,
-            VectorSummaryAgg {
-                centroid_envelope,
-                // Per-column count of folded superfile centroids, so an
-                // incremental `merge` and this batch build agree on the mean.
-                n_vectors: entries.len() as u32,
-                envelope_radius,
-            },
-        );
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -224,7 +151,6 @@ mod tests {
             id_range,
             scalar_stats_agg,
             fts_summary_agg: BTreeMap::new(),
-            vector_summary_agg: BTreeMap::new(),
         }
     }
 
@@ -406,9 +332,8 @@ mod tests {
         let n = aggs.scalar_stats_agg.get("n").expect("n carried forward");
         assert_eq!(i64_val(&n.min), 5);
         assert_eq!(i64_val(&n.max), 9);
-        // fts/vector aggregates are carried over as-is (empty here).
+        // fts aggregates are carried over as-is (empty here).
         assert!(aggs.fts_summary_agg.is_empty());
-        assert!(aggs.vector_summary_agg.is_empty());
     }
 
     #[test]

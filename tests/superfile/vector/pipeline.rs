@@ -230,13 +230,11 @@ fn end_to_end_summary_per_column() {
     let (blob, json) = build_two_column_blob(SUMMARY_TEST_N_DOCS);
     let r = VectorReader::open(blob, &json).expect("open VectorReader");
 
-    let (text_centroid, text_radius) = r.summary("text_emb").expect("vector summary");
+    let text_centroid = r.summary("text_emb").expect("vector summary");
     assert_eq!(text_centroid.len(), TEXT_EMB_DIM);
-    assert!(text_radius >= 0.0);
 
-    let (img_centroid, img_radius) = r.summary("image_emb").expect("vector summary");
+    let img_centroid = r.summary("image_emb").expect("vector summary");
     assert_eq!(img_centroid.len(), IMAGE_EMB_DIM);
-    assert!(img_radius >= 0.0);
 
     // Different columns should have different summary centroids
     // (different data, different dim). Just sanity-check shapes.

@@ -680,15 +680,17 @@ impl Manifest {
         }
     }
 
-    pub(crate) async fn get_pruned_superfiles_for_vector(
+    /// All superfile entries, loaded through the hierarchical part loader in
+    /// manifest (time) order. Vector search fans over every entry — cell
+    /// routing (nearest global centroids) is the selection mechanism, not a
+    /// part-level prune.
+    pub(crate) async fn get_all_superfiles_loaded(
         &self,
-        column: &str,
-        query: &[f32],
     ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
         match &self.list {
             Some(list) => {
-                let kept = list_prune::prune_parts_for_vector(list, column, query, f32::INFINITY);
-                hierarchical_iter::load_and_flatten(self, &kept).await
+                let all: Vec<PartId> = list.parts.iter().map(|p| p.part_id).collect();
+                hierarchical_iter::load_and_flatten(self, &all).await
             }
             None => Ok(hierarchical_iter::fallback_to_flat_superfiles(self)),
         }
@@ -1304,7 +1306,6 @@ fn rebuild_part_and_entry(
         id_range: aggregates.id_range,
         scalar_stats_agg: aggregates.scalar_stats_agg,
         fts_summary_agg: aggregates.fts_summary_agg,
-        vector_summary_agg: aggregates.vector_summary_agg,
     };
     (entry, part, compressed)
 }
@@ -1435,9 +1436,9 @@ pub struct SuperfileEntry {
     /// list-level aggregate uses; built per superfile via
     /// [`FtsSummaryAgg::from_superfile`].
     pub fts_summary: HashMap<String, FtsSummaryAgg>,
-    /// Per-vector-column centroid + radius. Drives vector skip via
-    /// triangle-inequality against the bounding sphere. Keyed by
-    /// vector column name.
+    /// Per-vector-column summary centroid + per-cluster IVF centroids,
+    /// driving global cluster selection at query time. Keyed by vector
+    /// column name.
     pub vector_summary: HashMap<String, VectorSummary>,
     /// Partition assignment, encoded opaquely per the strategy
     /// (time_range = 8-byte LE u64 bucket index; hash = 4-byte LE
@@ -1923,21 +1924,16 @@ pub(crate) fn column_min_max(col: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
     }
 }
 
-/// Per-vector-column summary: cluster centroid + bounding radius.
-/// Already produced by the superfile vector builder (per-column,
-/// inside the vector blob's outer header KV metadata); the writer
-/// copies them into the manifest at commit time. Vector skip uses
-/// centroid + radius for triangle-inequality pruning of superfiles
-/// whose bounding sphere is too far from a query to contain any
-/// possible top-k hit.
+/// Per-vector-column summary: the summary centroid plus the per-cluster
+/// IVF centroids. Already produced by the superfile vector builder
+/// (per-column, inside the vector blob's outer header KV metadata); the
+/// writer copies them into the manifest at commit time. The per-cluster
+/// centroids drive global cluster selection at query time.
 #[derive(Debug, Clone)]
 pub struct VectorSummary {
     /// Cluster centroid; length matches the vector column's `dim`
     /// declared in `SupertableOptions::vector_columns`.
     pub centroid: Vec<f32>,
-    /// Maximum distance from any indexed vector in this superfile to
-    /// `centroid`, in the same metric the column was built with.
-    pub radius: f32,
     /// Per-cluster IVF centroids (Sq8+ε, same codec as rerank rows) for
     /// cross-superfile global cluster selection. Empty when the superfile
     /// has no vector index for this column.
@@ -1964,10 +1960,6 @@ pub struct ClusterCentroids {
     /// Per-cluster indexed doc count; length `n_cent`. Count-0 clusters
     /// are skipped by the selector.
     pub counts: Vec<u32>,
-    /// Per-cluster max member distance from the centroid (same units as
-    /// [`Self::score_one`]). Empty when unset; adaptive probing
-    /// falls back to centroid distance when a cell has no radius.
-    pub radii: Vec<f32>,
 }
 
 impl PartialEq for ClusterCentroids {
@@ -1976,7 +1968,6 @@ impl PartialEq for ClusterCentroids {
             && self.dim == other.dim
             && self.centroids == other.centroids
             && self.counts == other.counts
-            && self.radii == other.radii
     }
 }
 
@@ -2019,16 +2010,7 @@ impl ClusterCentroids {
             dim,
             centroids: stored,
             counts,
-            radii: Vec::new(),
         }
-    }
-
-    /// Attach per-cell member radii (must match `n_cent` when non-empty).
-    pub fn with_radii(mut self, radii: Vec<f32>) -> Self {
-        if radii.len() == self.n_cent as usize {
-            self.radii = radii;
-        }
-        self
     }
 
     /// Score cluster `c` against `query`: [`distance`] on the fp32 centroid
@@ -2039,8 +2021,9 @@ impl ClusterCentroids {
     }
 
     /// Adaptive cell selection for hidden-index routing: score every populated
-    /// cell, apply the triangle-inequality lower bound (`d − r`), and return
-    /// the probe set (nearest-first by centroid distance).
+    /// cell by centroid distance and return the probe set — the `nprobe_min`
+    /// nearest cells, extended (up to `nprobe_max`) with every cell whose
+    /// centroid distance is within `(1 + slack)` of the nearest.
     pub fn select_cells_adaptive(
         &self,
         metric: Metric,
@@ -2061,38 +2044,20 @@ impl ClusterCentroids {
             return Vec::new();
         }
         let d_star = scored[0].1;
-        let r_star = self.radii.get(scored[0].0 as usize).copied().unwrap_or(0.0);
-        let tau = if r_star > 0.0 {
-            d_star + routing.slack * r_star
-        } else {
-            d_star * (1.0 + routing.slack)
-        };
-        let lb = |idx: usize| {
-            let (c, d) = scored[idx];
-            let r = self.radii.get(c as usize).copied().unwrap_or(0.0);
-            (d - r).max(0.0)
-        };
+        let tau = d_star * (1.0 + routing.slack);
         let nprobe_min = nprobe_floor.max(routing.nprobe_min).max(1);
         let nprobe_max = routing.nprobe_max.max(nprobe_min);
         let n = scored.len();
         let floor = nprobe_min.min(n);
-        let mut chosen = vec![false; n];
-        let mut order: Vec<usize> = Vec::with_capacity(nprobe_max.min(n));
-        for (i, slot) in chosen.iter_mut().enumerate().take(floor) {
-            *slot = true;
-            order.push(i);
-        }
-        let mut by_lb: Vec<usize> = (0..n).filter(|&i| !chosen[i]).collect();
-        by_lb.sort_by(|&a, &b| lb(a).partial_cmp(&lb(b)).unwrap_or(Ordering::Equal));
-        for i in by_lb {
+        let mut order: Vec<usize> = (0..floor).collect();
+        for i in floor..n {
             if order.len() >= nprobe_max {
                 break;
             }
-            if lb(i) <= tau {
+            if scored[i].1 <= tau {
                 order.push(i);
             }
         }
-        order.sort_unstable();
         order.into_iter().map(|i| scored[i].0).collect()
     }
 
@@ -2187,9 +2152,12 @@ mod tests {
         (cc, centroids)
     }
 
+    /// `select_cells_adaptive` honors the nprobe floor and cap and returns
+    /// the nearest cell first. Wire roundtrip of the centroid block is
+    /// covered separately in `encoding::tests`.
     #[test]
-    fn cluster_centroids_radii_roundtrip_and_adaptive_floor() {
-        use crate::supertable::manifest::{encoding, list::CellRoutingParams};
+    fn select_cells_adaptive_floor_cap_and_nearest_first() {
+        use crate::supertable::manifest::list::CellRoutingParams;
 
         let clusters = ClusterCentroids::from_fp32(
             4,
@@ -2198,11 +2166,7 @@ mod tests {
                 0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0, 10.0, 0.0,
             ],
             vec![1, 1, 1, 1],
-        )
-        .with_radii(vec![0.5, 1.0, 2.0, 3.0]);
-        let bytes = encoding::encode_cluster_centroids(&clusters);
-        let decoded = encoding::decode_cluster_centroids(&bytes).expect("decode");
-        assert_eq!(decoded.radii, clusters.radii);
+        );
 
         let query = [0.1, 0.0, 0.0, 0.0];
         let routing = CellRoutingParams {
@@ -2210,10 +2174,10 @@ mod tests {
             nprobe_max: 4,
             slack: 0.0,
         };
-        let routed = decoded.select_cells_adaptive(Metric::L2Sq, &query, 1, routing);
+        let routed = clusters.select_cells_adaptive(Metric::L2Sq, &query, 1, routing);
         assert!(routed.len() >= 2);
         assert!(routed.len() <= 4);
-        assert_eq!(routed[0], decoded.nearest_cell(Metric::L2Sq, &query));
+        assert_eq!(routed[0], clusters.nearest_cell(Metric::L2Sq, &query));
     }
 
     /// `score_clusters_into` must match [`distance`] on the fp32 centroid slice.
@@ -2605,7 +2569,6 @@ mod tests {
                     id_range: (0, 0),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
-                    vector_summary_agg: Default::default(),
                 });
             }
             (objects, entries)
@@ -2875,7 +2838,6 @@ mod tests {
                 id_range: (0, 0),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
-                vector_summary_agg: Default::default(),
             }],
         };
         let m = Manifest {
@@ -3132,7 +3094,6 @@ mod tests {
                 id_range: (0, 99),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
-                vector_summary_agg: Default::default(),
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -3250,7 +3211,6 @@ mod tests {
                 id_range: (0, 0),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
-                vector_summary_agg: Default::default(),
             }
         };
 
@@ -3500,7 +3460,6 @@ mod tests {
                 id_range: (0, 149),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
-                vector_summary_agg: Default::default(),
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -3601,7 +3560,6 @@ mod tests {
                 id_range: (0, 149),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
-                vector_summary_agg: Default::default(),
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -3742,7 +3700,6 @@ mod tests {
                     id_range: (0, 99),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
-                    vector_summary_agg: Default::default(),
                 },
                 ManifestPartEntry {
                     part_id: pw_latest.part_id,
@@ -3755,7 +3712,6 @@ mod tests {
                     id_range: (0, 149),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
-                    vector_summary_agg: Default::default(),
                 },
             ],
         };
@@ -3877,7 +3833,6 @@ mod tests {
                     id_range: (0, 99),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
-                    vector_summary_agg: Default::default(),
                 },
                 ManifestPartEntry {
                     part_id: pw_b.part_id,
@@ -3890,7 +3845,6 @@ mod tests {
                     id_range: (0, 199),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
-                    vector_summary_agg: Default::default(),
                 },
             ],
         };
@@ -4014,7 +3968,6 @@ mod tests {
                     id_range: (0, 99),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
-                    vector_summary_agg: Default::default(),
                 },
                 ManifestPartEntry {
                     part_id: pw_b.part_id,
@@ -4027,7 +3980,6 @@ mod tests {
                     id_range: (0, 199),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
-                    vector_summary_agg: Default::default(),
                 },
             ],
         };
@@ -4172,7 +4124,6 @@ mod tests {
                     id_range: (0, 99),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
-                    vector_summary_agg: Default::default(),
                 },
                 ManifestPartEntry {
                     part_id: pw_a_latest.part_id,
@@ -4185,7 +4136,6 @@ mod tests {
                     id_range: (0, 149),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
-                    vector_summary_agg: Default::default(),
                 },
                 ManifestPartEntry {
                     part_id: pw_b_old.part_id,
@@ -4198,7 +4148,6 @@ mod tests {
                     id_range: (0, 199),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
-                    vector_summary_agg: Default::default(),
                 },
                 ManifestPartEntry {
                     part_id: pw_b_latest.part_id,
@@ -4211,7 +4160,6 @@ mod tests {
                     id_range: (0, 249),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
-                    vector_summary_agg: Default::default(),
                 },
             ],
         };
@@ -4333,7 +4281,6 @@ mod tests {
                 id_range: (0, 149),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
-                vector_summary_agg: Default::default(),
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -4430,7 +4377,6 @@ mod tests {
                 id_range: (0, 149),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
-                vector_summary_agg: Default::default(),
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -4544,7 +4490,6 @@ mod tests {
                     id_range: (0, 149),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
-                    vector_summary_agg: Default::default(),
                 },
                 ManifestPartEntry {
                     part_id: pw_b.part_id,
@@ -4557,7 +4502,6 @@ mod tests {
                     id_range: (0, 199),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
-                    vector_summary_agg: Default::default(),
                 },
             ],
         };
@@ -4688,7 +4632,6 @@ mod tests {
                     id_range: (0, 99),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
-                    vector_summary_agg: Default::default(),
                 },
                 ManifestPartEntry {
                     part_id: pw_a_latest.part_id,
@@ -4701,7 +4644,6 @@ mod tests {
                     id_range: (0, 199),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
-                    vector_summary_agg: Default::default(),
                 },
             ],
         };
@@ -4821,7 +4763,6 @@ mod tests {
                 id_range: (0, 149),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
-                vector_summary_agg: Default::default(),
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -4909,7 +4850,6 @@ mod tests {
                 id_range: (0, 149),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
-                vector_summary_agg: Default::default(),
             }],
         };
         let loader = ManifestPartLoader::new(storage, &list);
@@ -5019,7 +4959,6 @@ mod tests {
                     id_range: (0, 149),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
-                    vector_summary_agg: Default::default(),
                 },
                 ManifestPartEntry {
                     part_id: pw_a_latest.part_id,
@@ -5032,7 +4971,6 @@ mod tests {
                     id_range: (0, 199),
                     scalar_stats_agg: Default::default(),
                     fts_summary_agg: Default::default(),
-                    vector_summary_agg: Default::default(),
                 },
             ],
         };
@@ -5117,7 +5055,6 @@ mod tests {
                 id_range: (0, 0),
                 scalar_stats_agg: Default::default(),
                 fts_summary_agg: Default::default(),
-                vector_summary_agg: Default::default(),
             })
             .collect();
         ManifestList {

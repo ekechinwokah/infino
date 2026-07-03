@@ -589,7 +589,7 @@ fn build_fts_summary(
     out
 }
 
-/// Per-vector-column centroid + radius summary. `None` from the
+/// Per-vector-column centroid summary. `None` from the
 /// reader → column absent from this superfile's vector blob → no
 /// entry in the summary map.
 fn build_vector_summary(
@@ -601,21 +601,14 @@ fn build_vector_summary(
         return out;
     };
     for vc in &options.vector_columns {
-        if let Some((centroid, radius)) = vec_reader.summary(&vc.column) {
+        if let Some(centroid) = vec_reader.summary(&vc.column) {
             let clusters = vec_reader
                 .cluster_centroids(&vc.column)
                 .map(|(n_cent, dim, fp32, counts)| {
                     ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts)
                 })
                 .unwrap_or_default();
-            out.insert(
-                vc.column.clone(),
-                VectorSummary {
-                    centroid,
-                    radius,
-                    clusters,
-                },
-            );
+            out.insert(vc.column.clone(), VectorSummary { centroid, clusters });
         }
     }
     out

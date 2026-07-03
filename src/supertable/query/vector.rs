@@ -54,10 +54,8 @@
 //!
 //!   1. **Score & sort** — compute `distance(query, centroid)`
 //!      for each superfile (SIMD-accelerated: AVX-512 / AVX2 /
-//!      NEON). Derive a lower bound per superfile:
-//!      `max(0, centroid_dist − radius)`. Sort ascending.
-//!      This is free — centroids are manifest metadata, no
-//!      S3 GETs.
+//!      NEON) and sort ascending. This is free — centroids are
+//!      manifest metadata, no S3 GETs.
 //!   2. **Search closest** — search the top `k*2` (min 3)
 //!      superfiles in parallel (`tokio::spawn` per superfile).
 //!      Merge results via bounded heap.
@@ -850,7 +848,7 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let superfiles = self
-            .vector_pruned_superfiles_intersect(&manifest, column, query, &surviving)
+            .vector_pruned_superfiles_intersect(&manifest, &surviving)
             .await?;
         if superfiles.is_empty() {
             return Ok(Vec::new());
@@ -870,16 +868,15 @@ impl SupertableReader {
             .await
     }
 
-    /// Vector centroid prune intersected with a manifest-only survival set.
+    /// All loaded superfile entries intersected with a manifest-only
+    /// survival set.
     async fn vector_pruned_superfiles_intersect(
         &self,
         manifest: &Manifest,
-        column: &str,
-        query: &[f32],
         surviving: &HashSet<u128>,
     ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
         Ok(manifest
-            .get_pruned_superfiles_for_vector(column, query)
+            .get_all_superfiles_loaded()
             .await
             .map_err(QueryError::ManifestLoad)?
             .into_iter()
@@ -949,12 +946,12 @@ impl SupertableReader {
         let manifest = self.manifest();
         let superfiles = match plan.surviving_superfile_ids(&manifest).await? {
             None => manifest
-                .get_pruned_superfiles_for_vector(column, query)
+                .get_all_superfiles_loaded()
                 .await
                 .map_err(QueryError::ManifestLoad)?,
             Some(surviving) if surviving.is_empty() => return Ok(Vec::new()),
             Some(surviving) => {
-                self.vector_pruned_superfiles_intersect(&manifest, column, query, &surviving)
+                self.vector_pruned_superfiles_intersect(&manifest, &surviving)
                     .await?
             }
         };
@@ -989,7 +986,7 @@ impl SupertableReader {
         }
         let manifest = self.manifest();
         let superfiles = manifest
-            .get_pruned_superfiles_for_vector(column, query)
+            .get_all_superfiles_loaded()
             .await
             .map_err(QueryError::ManifestLoad)?;
         if superfiles.is_empty() {
@@ -1108,7 +1105,7 @@ impl SupertableReader {
         }
         let manifest = self.manifest();
         let superfiles = manifest
-            .get_pruned_superfiles_for_vector(column, query)
+            .get_all_superfiles_loaded()
             .await
             .map_err(QueryError::ManifestLoad)?;
         if superfiles.is_empty() {
