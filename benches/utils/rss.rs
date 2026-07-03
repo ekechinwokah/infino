@@ -289,11 +289,20 @@ mod tests {
     /// Pins the seed-with-current behavior in [`PeakSampler::start`].
     #[test]
     fn sampler_returns_at_least_start_rss() {
-        let start_rss = current_rss_bytes();
+        // Match the sampler's own seeding sequence (purge, then read), and
+        // bracket the seed with a second reading taken right after start.
+        // `start()` purges allocator-retained pages before seeding, and
+        // concurrent tests free memory at any time, so a single pre-start
+        // reading can legitimately exceed the seed; the seed is taken
+        // between these two reads, so it is at least their minimum.
+        purge_allocator();
+        let before = current_rss_bytes();
         let s = PeakSampler::start(Duration::from_millis(TEST_SAMPLER_INTERVAL_MS));
+        let after_start = current_rss_bytes();
         let peak = s.stop();
-        if let Some(start) = start_rss {
-            assert!(peak >= start, "peak {peak} < start {start} — seed missing");
+        if let (Some(before), Some(after)) = (before, after_start) {
+            let floor = before.min(after);
+            assert!(peak >= floor, "peak {peak} < floor {floor} — seed missing");
         }
     }
 
