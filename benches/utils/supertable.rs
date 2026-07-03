@@ -906,6 +906,13 @@ pub mod vector {
     // live in `crate::executors::vector` (shared by both tiers).
     const N_CORRECTNESS_QUERIES: usize = 20;
     const N_CALIBRATION_QUERIES: usize = 100;
+    /// Steady-state cache-budget multiple of the user index for the shared
+    /// vector consumer. The hidden per-cell IVF index is a second on-storage
+    /// copy of the vector payload, written by the drain *after* this consumer
+    /// opens — sizing from the user index alone leaves the cache ~2× under
+    /// budget post-drain, and the resulting evictions re-fetch on every query
+    /// (measured 62 GET/query on a supposedly warm consumer at 100K).
+    const SHARED_CONSUMER_CACHE_INDEX_FACTOR: u64 = 2;
     // Sourced from the engine's public defaults so the bench can't drift from
     // what an unfiltered `VectorSearchOptions::default()` query resolves to.
     const DEFAULT_NPROBE: usize = infino::superfile::reader::VectorSearchOptions::DEFAULT_NPROBE;
@@ -1219,10 +1226,17 @@ pub mod vector {
             // Metered shared consumer: the drain runs on this handle, so its
             // object-store I/O (user-vector reads + hidden cell-superfile
             // writes) is captured as a snapshot delta around the drain call.
+            // Cache budget covers the *post-drain* footprint (user + hidden
+            // index), not just the user index this pre-drain open can see —
+            // see [`SHARED_CONSUMER_CACHE_INDEX_FACTOR`].
             let consumer_meter = storage_meter::wrap(Arc::clone(&built.storage));
             let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
                 consumer_meter.provider(),
-                Some(built.total_index_bytes),
+                Some(
+                    built
+                        .total_index_bytes
+                        .saturating_mul(SHARED_CONSUMER_CACHE_INDEX_FACTOR),
+                ),
             );
             let consumer = tiers::open_consumer(tiers::consumer_options(
                 supertable::options_for(Modality::Vector, None),
