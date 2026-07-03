@@ -15,7 +15,7 @@
 //! and (via `Drop`) flips it false on release.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     future::Future,
     sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
@@ -758,12 +758,25 @@ impl Supertable {
         let hidden = self.inner.vector_index_table.as_ref()?;
         let reader = hidden.reader();
         let manifest = reader.manifest();
-        let mut by_cell: std::collections::HashMap<Vec<u8>, usize> =
-            std::collections::HashMap::new();
-        for entry in manifest.superfiles.iter() {
-            *by_cell.entry(entry.partition_key.clone()).or_default() += 1;
+        let mut by_cell: HashMap<Vec<u8>, usize> = HashMap::new();
+        let flat_superfiles = manifest.get_all_superfiles();
+        let total = if flat_superfiles.is_empty() {
+            let mut total = 0usize;
+            for entry in manifest.get_all_list_entries() {
+                let n_superfiles = entry.n_superfiles as usize;
+                total = total.saturating_add(n_superfiles);
+                *by_cell.entry(entry.partition_key.clone()).or_default() += n_superfiles;
+            }
+            total
+        } else {
+            for entry in flat_superfiles {
+                *by_cell.entry(entry.partition_key.clone()).or_default() += 1;
+            }
+            flat_superfiles.len()
+        };
+        if total == 0 {
+            return Some((0, 0));
         }
-        let total = manifest.superfiles.len();
         let max_per_cell = by_cell.values().copied().max().unwrap_or(0);
         Some((total, max_per_cell))
     }
@@ -2270,7 +2283,12 @@ mod tests {
             .expect("hidden index")
             .clone();
         assert_eq!(
-            hidden.reader().manifest().get_drained_ranges().intervals().len(),
+            hidden
+                .reader()
+                .manifest()
+                .get_drained_ranges()
+                .intervals()
+                .len(),
             1,
             "contiguous commits must leave drained_ranges as one interval"
         );

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Counts object-store `head`, `tail`, and `get_range` calls during a bench window.
+//! Counts object-store `head`, `get`, `tail`, and `get_range` calls during a bench window.
 //! Used by the cost model to price cold-query S3 requests.
 
 use std::{
@@ -97,7 +97,9 @@ impl StorageProvider for CountingStorage {
     }
 
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
-        self.inner.get(uri).await
+        let (bytes, meta) = self.inner.get(uri).await?;
+        self.counters.record_get(bytes.len() as u64);
+        Ok((bytes, meta))
     }
 
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {

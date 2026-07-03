@@ -45,7 +45,7 @@ use std::{
     sync::Arc,
 };
 
-use infino::supertable::Supertable;
+use infino::supertable::{Supertable, manifest::SuperfileEntry};
 use tempfile::TempDir;
 
 use crate::{
@@ -328,6 +328,44 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
     ]
 }
 
+/// Visit committed superfiles through the flat eager view, or through manifest
+/// parts when the manifest is lazy and the flat view is empty.
+fn visit_manifest_superfiles(table: &Supertable, mut visit: impl FnMut(&SuperfileEntry)) {
+    let reader = table.reader();
+    let manifest = reader.manifest();
+    let flat_superfiles = manifest.get_all_superfiles();
+    if !flat_superfiles.is_empty() {
+        for entry in flat_superfiles {
+            visit(entry);
+        }
+        return;
+    }
+    for part_entry in manifest.get_all_list_entries() {
+        let part = tiers::block_on(manifest.get_part_by_id(part_entry.part_id))
+            .expect("load manifest part for bench metadata");
+        for entry in part.superfiles.iter() {
+            visit(entry);
+        }
+    }
+}
+
+/// Sum of on-storage superfile bytes (full Parquet + embedded indexes) across
+/// a table's committed manifest — the same `subsection_offsets.total_size` sum
+/// the ingest path reports, but callable post-drain on either the user table
+/// or the derived hidden vector-index table. `IngestResult::total_index_bytes`
+/// is captured at ingest, when the hidden index is empty; this recomputes the
+/// live footprint so the steady-state (post-drain) total can include the
+/// hidden per-cell IVF superfiles.
+fn on_storage_bytes(table: &Supertable) -> u64 {
+    let mut total = 0u64;
+    visit_manifest_superfiles(table, |entry| {
+        if let Some(offsets) = entry.subsection_offsets.as_ref() {
+            total = total.saturating_add(offsets.total_size);
+        }
+    });
+    total
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_cost_warm(
     report: &mut Report,
@@ -339,6 +377,7 @@ fn emit_cost_warm(
     warm: &[(String, f64)],
     cold: Option<&[cost::ColdQuery]>,
     cold_store: Option<storage_meter::ObjectStoreMeter>,
+    stored_bytes_override: Option<u64>,
 ) {
     if warm.is_empty() && cold.is_none() {
         return;
@@ -356,7 +395,7 @@ fn emit_cost_warm(
             ingest_wall_s: wall_s,
             writers: supertable::n_writers() as u32,
             put_count: cost::supertable_ingest_puts(built.n_superfiles),
-            stored_bytes: built.total_index_bytes,
+            stored_bytes: stored_bytes_override.unwrap_or(built.total_index_bytes),
             corpus_bytes,
             n_docs,
             resident_anon_bytes: resident,
@@ -618,6 +657,7 @@ pub mod fts {
                         Some(&cold_vec)
                     },
                     cold_store,
+                    None,
                 );
             }
         }
@@ -853,6 +893,41 @@ pub mod vector {
         }
     }
 
+    fn log_hidden_open_stats(hidden: &Supertable, label: &str) {
+        let reader = hidden.reader();
+        let manifest = reader.manifest();
+        let parts = manifest.get_num_parts();
+        let loaded_before = manifest.get_num_parts_loaded();
+        let flat_superfiles = manifest.get_all_superfiles().len();
+        let mut total = 0usize;
+        let mut with_offsets = 0usize;
+        let mut with_open_blob = 0usize;
+        let mut open_blob_bytes = 0u64;
+        let mut vec_open_ranges = 0usize;
+        visit_manifest_superfiles(hidden, |entry| {
+            total += 1;
+            if let Some(offsets) = entry.subsection_offsets.as_ref() {
+                with_offsets += 1;
+                vec_open_ranges += offsets.vec_open_ranges.len();
+                if !offsets.open_blob.is_empty() {
+                    with_open_blob += 1;
+                    open_blob_bytes = open_blob_bytes.saturating_add(
+                        offsets
+                            .open_blob
+                            .iter()
+                            .map(|(_, bytes)| bytes.len() as u64)
+                            .sum::<u64>(),
+                    );
+                }
+            }
+        });
+        let loaded_after = manifest.get_num_parts_loaded();
+        eprintln!(
+            "[supertable_vector] hidden vector index {label}: manifest parts {parts} ({loaded_before} loaded before stats, {loaded_after} after), flat view {flat_superfiles} superfiles, entries {total}, offsets {with_offsets}/{total}, open_blob {with_open_blob}/{with_offsets} ({}), vec_open_ranges {vec_open_ranges}",
+            rss::fmt_bytes(open_blob_bytes),
+        );
+    }
+
     /// Drain hidden incoming IVF into per-cell superfiles via the existing
     /// SPFresh maintenance hook (same call integration tests use).
     fn drain_hidden_incoming(consumer: &Supertable) {
@@ -864,6 +939,47 @@ pub mod vector {
             .drain_vectors_to_cells_sync()
             .expect("hidden cell drain");
         log_hidden_stats(hidden, "after drain");
+    }
+
+    /// One metered cold public `vector_search` iteration on an object-store backend.
+    fn measure_cold_store(
+        built: &supertable::IngestResult,
+        query: &[f32],
+        nprobe: usize,
+        rerank: usize,
+        cache_budget_bytes: u64,
+    ) -> Option<storage_meter::ObjectStoreMeter> {
+        built.cleanup.as_ref()?;
+        let meter = storage_meter::wrap(Arc::clone(&built.storage));
+        let (cache_dir, cache) =
+            tiers::fresh_supertable_search_cache(meter.provider(), Some(cache_budget_bytes));
+        let opts = tiers::consumer_options(
+            supertable::options_for(Modality::Vector, None),
+            meter.provider(),
+            cache,
+        );
+        let consumer = tiers::open_consumer(opts);
+        let reader = consumer.reader();
+        let _ = reader
+            .vector_search(
+                supertable::VEC_COLUMN,
+                query,
+                TOP_K,
+                exec_vec::search_opts(nprobe, rerank),
+                None,
+                None,
+            )
+            .expect("metered cold vector_search");
+        drop(consumer);
+        drop(cache_dir);
+        let snapshot = meter.snapshot();
+        eprintln!(
+            "[supertable_vector] metered cold public vector_search: {} HEAD, {} GET, {} fetched",
+            snapshot.head_count,
+            snapshot.get_count,
+            rss::fmt_bytes(snapshot.get_bytes),
+        );
+        Some(snapshot)
     }
 
     /// Build a vector-only supertable, then measure warm + cold kNN search
@@ -1114,23 +1230,6 @@ pub mod vector {
                     LEGACY_NOTE,
                 )
             };
-            if phases.warm {
-                emit_cost_warm(
-                    &mut report,
-                    "bench/vector/supertable/cost",
-                    format!(
-                        "Supertable vector — cost model ({} docs × dim={})",
-                        fmt_count(n_docs),
-                        DIM
-                    ),
-                    &built,
-                    ingest_metrics.as_ref(),
-                    n_docs,
-                    &cost::warm_from_vector(&recall_rows),
-                    None,
-                    None,
-                );
-            }
             // Filtered vector recall + latency mirrors the superfile tier:
             // same every-Nth-row allow-set, same brute-force filtered ground
             // truth, same default config.
@@ -1234,6 +1333,53 @@ pub mod vector {
                         }],
                     });
                 }
+            }
+
+            if phases.warm || phases.cold {
+                // Steady-state footprint = user table + derived hidden vector
+                // index. `built.total_index_bytes` is ingest-time user-only
+                // (hidden empty then); the post-drain hidden per-cell IVF is a
+                // second on-storage copy of the vectors, so price the sum.
+                let user_stored = on_storage_bytes(&consumer);
+                let hidden_stored = consumer
+                    .vector_index_table()
+                    .map(|h| {
+                        log_hidden_open_stats(h, "post-measurement accounting");
+                        on_storage_bytes(h)
+                    })
+                    .unwrap_or(0);
+                let post_drain_stored = user_stored + hidden_stored;
+                eprintln!(
+                    "[supertable_vector] on-storage footprint (steady state): user {} + hidden index {} = {} (ingest-time user-only was {})",
+                    rss::fmt_bytes(user_stored),
+                    rss::fmt_bytes(hidden_stored),
+                    rss::fmt_bytes(post_drain_stored),
+                    rss::fmt_bytes(built.total_index_bytes),
+                );
+                let warm_vec = cost::warm_from_vector(&recall_rows);
+                let cold_vec = cost::cold_from_vector(&recall_rows);
+                let cold_store = phases
+                    .cold
+                    .then(|| {
+                        measure_cold_store(&built, &q_cal[0], nprobe, rerank, post_drain_stored)
+                    })
+                    .flatten();
+                emit_cost_warm(
+                    &mut report,
+                    "bench/vector/supertable/cost",
+                    format!(
+                        "Supertable vector — cost model ({} docs × dim={})",
+                        fmt_count(n_docs),
+                        DIM
+                    ),
+                    &built,
+                    ingest_metrics.as_ref(),
+                    n_docs,
+                    &warm_vec,
+                    (!cold_vec.is_empty()).then_some(cold_vec.as_slice()),
+                    cold_store,
+                    Some(post_drain_stored),
+                );
             }
 
             drop(consumer);
@@ -1363,6 +1509,7 @@ pub mod sql {
                 ingest_metrics.as_ref(),
                 n_docs,
                 &cost::warm_from_sql(&sets),
+                None,
                 None,
                 None,
             );

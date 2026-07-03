@@ -646,6 +646,26 @@ pub fn warm_from_vector(rows: &[crate::executors::vector::RecallRow]) -> Vec<(St
         .collect()
 }
 
+/// Flatten cold vector recall rows into `(label, open, search)` for the cost model.
+pub fn cold_from_vector(rows: &[crate::executors::vector::RecallRow]) -> Vec<ColdQuery> {
+    rows.iter()
+        .filter_map(|r| {
+            r.cold.map(|t| {
+                let label = if r.params.is_empty() || r.params == "—" {
+                    r.target.clone()
+                } else {
+                    format!("{} ({})", r.target, r.params)
+                };
+                ColdQuery {
+                    name: label,
+                    open_s: t.open.as_secs_f64(),
+                    search_s: t.search.as_secs_f64(),
+                }
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

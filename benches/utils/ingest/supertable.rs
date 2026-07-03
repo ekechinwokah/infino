@@ -80,7 +80,8 @@ const BENCH_METRIC: Metric = Metric::Cosine;
 const BENCH_RERANK: RerankCodec = RerankCodec::Sq8ResidualEpsilon;
 /// Writer auto-flush threshold (MiB) per superfile roll.
 const COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
-/// Producer memory budget in GiB, capping resident RSS during ingest.
+/// Producer memory budget in GiB — steers the attached disk cache's
+/// post-commit madvise sweep only; it does not cap ingest/build RSS.
 const WRITER_MEMORY_BUDGET_GIB: u64 = 8;
 /// Producer memory budget in bytes, derived from [`WRITER_MEMORY_BUDGET_GIB`].
 const WRITER_MEMORY_BUDGET_BYTES: u64 = WRITER_MEMORY_BUDGET_GIB * GIB_BYTES;
@@ -308,11 +309,12 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
 
 /// Stream the prepared on-disk corpus → append → commit → object
 /// storage, building only the index shapes named by `modality`. One
-/// loop for every modality — the corpus chunks are borrowed straight
-/// off the mmap, and SQL's extra columns are derived inline from
-/// `doc_id`. The text/vector corpus is identical across modalities
-/// (same seeds), so each shape is directly comparable to its
-/// single-modality competitor.
+/// loop for every modality — each chunk is copied into Arrow heap
+/// buffers in [`chunk_batch`], then corpus mmap pages are dropped
+/// before commit so ingest RSS reflects the engine, not harness
+/// dead weight. SQL's extra columns are derived inline from `doc_id`.
+/// The text/vector corpus is identical across modalities (same seeds),
+/// so each shape is directly comparable to its single-modality competitor.
 pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestResult {
     let n_docs = n_docs();
     let commits = n_commits();
@@ -360,6 +362,16 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
             );
         }
         let batch = chunk_batch(modality, corpus, &schema, start, end, len);
+        // `chunk_batch` materializes the chunk into Arrow heap buffers
+        // (vector `to_vec()`, text into UTF-8 values). Drop the now-dead
+        // corpus mmap pages before commit so the build plateau is not
+        // carrying an extra ~2.5 GiB of file-backed dead weight.
+        if let Some(text) = &corpus.text {
+            text.advise_consumed(start, len);
+        }
+        if let Some(vectors) = &corpus.vectors {
+            vectors.advise_consumed(start, len);
+        }
         let commit_t0 = std::time::Instant::now();
         w.append(&batch).expect("append");
         w.commit().expect("commit");
@@ -367,15 +379,6 @@ pub fn build_on_storage(modality: Modality, corpus: &PreparedCorpus) -> IngestRe
             "[supertable_ingest] commit {commit_idx}/{commits} took {} ms ({len} docs)",
             commit_t0.elapsed().as_millis(),
         );
-        // The chunk is committed; drop its corpus pages from RSS so the
-        // build sampler measures the engine, not the streamed harness
-        // pages (clean file-backed pages — they'd re-fault if touched).
-        if let Some(text) = &corpus.text {
-            text.advise_consumed(start, len);
-        }
-        if let Some(vectors) = &corpus.vectors {
-            vectors.advise_consumed(start, len);
-        }
         // Anonymous-vs-file split per commit: a monotonic anonymous
         // climb = producer-side retention (heap); a file-backed climb
         // = freshly written cache mmaps staying resident.
