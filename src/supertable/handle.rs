@@ -302,7 +302,12 @@ impl Supertable {
         } else {
             None
         };
-        open_table_async(options_arc, manifest, vector_index_table).await
+        let handle = open_table_async(options_arc, manifest, vector_index_table).await?;
+        // The manifests are loaded now, so the attached disk cache can be
+        // sized against the real footprint (user + hidden index) instead
+        // of whatever fixed default it was constructed with.
+        handle.reconcile_cache_budget();
+        Ok(handle)
     }
 
     /// Async create kernel. Sync [`Supertable::create`] bridges here.
@@ -515,7 +520,55 @@ impl Supertable {
                 Arc::clone(&hidden.inner),
             ),
             &self.query_runtime(),
-        )
+        )?;
+        // The drain writes the hidden per-cell index — roughly a second
+        // copy of the vector payload — so the cache budget floor moves.
+        self.reconcile_cache_budget();
+        Ok(())
+    }
+
+    /// Total on-storage bytes of the committed superfiles across the user
+    /// table and the hidden vector-index table, from the currently loaded
+    /// manifest views (lazy, not-yet-loaded manifest parts contribute 0 —
+    /// the reconcile below is raise-only, so an undercount is safe).
+    pub(crate) fn on_storage_footprint_bytes(&self) -> u64 {
+        let table_bytes = |inner: &SupertableInner| -> u64 {
+            inner
+                .manifest
+                .load_full()
+                .superfiles
+                .iter()
+                .filter_map(|e| e.subsection_offsets.as_ref())
+                .map(|o| o.total_size)
+                .sum()
+        };
+        let user = table_bytes(&self.inner);
+        let hidden = self
+            .inner
+            .vector_index_table
+            .as_ref()
+            .map(|h| table_bytes(&h.inner))
+            .unwrap_or(0);
+        user.saturating_add(hidden)
+    }
+
+    /// Reconcile the attached disk cache's budget with the table's current
+    /// on-storage footprint (user + hidden index + headroom). Called after
+    /// open — once the manifests are loaded — and again after the drain
+    /// grows the hidden index. Raise-only for engine-managed (auto-sized)
+    /// budgets; an explicit budget is never changed, but gets a one-shot
+    /// warning when the footprint exceeds it (steady-state reads would
+    /// churn the cache).
+    pub(crate) fn reconcile_cache_budget(&self) {
+        let Some(cache) = self.inner.options.disk_cache.as_ref() else {
+            return;
+        };
+        let footprint = self.on_storage_footprint_bytes();
+        if footprint == 0 {
+            return;
+        }
+        let floor = footprint.saturating_add(footprint / CACHE_BUDGET_HEADROOM_DIVISOR);
+        cache.reconcile_budget_floor(floor, footprint);
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
@@ -879,6 +932,12 @@ pub(crate) const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
 /// count. Eager instead loads all parts once at open, in parallel, and the query
 /// prunes cells in memory — reading only the routed cells' data.
 const HIDDEN_VECTOR_INDEX_EAGER_LOAD_THRESHOLD: u32 = 1_000_000;
+
+/// Headroom an engine-managed (auto-sized) cache budget keeps over the
+/// table's on-storage footprint, in divisor form (`footprint +
+/// footprint / this`). Slack for in-flight cold-fetch reservations while
+/// the full working set stays resident.
+const CACHE_BUDGET_HEADROOM_DIVISOR: u64 = 10;
 
 /// Hidden vector-index compaction: target packed per-cell superfile size. Smaller
 /// than the user table's default — cell superfiles are many and individually small.
@@ -1736,6 +1795,131 @@ mod tests {
             !hits2.is_empty(),
             "post-drain search must hit the hidden cells"
         );
+    }
+
+    /// An engine-managed (auto-sized) cache budget must be raised at open
+    /// to the table's real on-storage footprint — user superfiles plus the
+    /// hidden vector index — while an explicit budget is never changed.
+    #[test]
+    fn open_reconciles_auto_sized_cache_budget_with_footprint() {
+        use arrow_array::{Array, FixedSizeListArray, Float32Array};
+
+        use crate::{
+            superfile::{
+                builder::VectorConfig,
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::reader_cache::{DiskCacheConfig, DiskCacheStore},
+        };
+
+        /// Deliberately smaller than any committed superfile, so an
+        /// unreconciled budget is distinguishable from a raised one.
+        const TINY_BUDGET_BYTES: u64 = 4;
+
+        let dim = 16usize;
+        let n_rows = 64usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let vec_schema = Arc::new(Schema::new(vec![Field::new(
+            "emb",
+            DataType::FixedSizeList(item_field.clone(), dim as i32),
+            false,
+        )]));
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+        let make_options = || {
+            SupertableOptions::new(
+                vec_schema.clone(),
+                vec![],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim,
+                    n_cent: 4,
+                    rot_seed: 7,
+                    metric: Metric::Cosine,
+                    rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                    provided_centroids: None,
+                }],
+                None,
+            )
+            .expect("valid options")
+            .with_storage(Arc::clone(&storage))
+        };
+
+        // Producer: commit vectors and drain them into the hidden index so
+        // the on-storage footprint spans both tables.
+        {
+            let producer = Supertable::create(make_options()).expect("create");
+            let mut flat = Vec::<f32>::with_capacity(n_rows * dim);
+            for i in 0..n_rows {
+                for d in 0..dim {
+                    flat.push(if d == i % dim { 1.0 } else { 0.0 });
+                }
+            }
+            let fsl = FixedSizeListArray::new(
+                item_field,
+                dim as i32,
+                Arc::new(Float32Array::from(flat)),
+                None,
+            );
+            let batch = arrow_array::RecordBatch::try_new(
+                vec_schema.clone(),
+                vec![Arc::new(fsl) as Arc<dyn Array>],
+            )
+            .expect("batch");
+            let mut w = producer.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+            producer.drain_vectors_to_cells_sync().expect("drain");
+        }
+
+        // Auto-sized consumer: a tiny engine-managed budget must be raised
+        // to at least the footprint by the open-time reconcile.
+        let auto_cache_dir = TempDir::new().expect("cache tempdir");
+        let auto_cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: auto_cache_dir.path().to_path_buf(),
+                disk_budget_bytes: TINY_BUDGET_BYTES,
+                mmap_cold_threshold_secs: 0,
+                mmap_sweep_interval_secs: 0,
+                ..Default::default()
+            },
+        )
+        .expect("auto cache");
+        auto_cache.mark_budget_auto_sized();
+        let st = Supertable::open(make_options().with_disk_cache(Arc::clone(&auto_cache)))
+            .expect("open with auto-sized cache");
+        let footprint = st.on_storage_footprint_bytes();
+        assert!(footprint > 0, "committed + drained table has a footprint");
+        assert!(
+            auto_cache.disk_budget_bytes() >= footprint,
+            "auto-sized budget {} must cover the footprint {footprint}",
+            auto_cache.disk_budget_bytes(),
+        );
+        drop(st);
+
+        // Explicit-budget consumer: the same open leaves the budget alone.
+        let explicit_cache_dir = TempDir::new().expect("cache tempdir");
+        let explicit_cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: explicit_cache_dir.path().to_path_buf(),
+                disk_budget_bytes: TINY_BUDGET_BYTES,
+                mmap_cold_threshold_secs: 0,
+                mmap_sweep_interval_secs: 0,
+                ..Default::default()
+            },
+        )
+        .expect("explicit cache");
+        let st = Supertable::open(make_options().with_disk_cache(Arc::clone(&explicit_cache)))
+            .expect("open with explicit cache");
+        assert_eq!(
+            explicit_cache.disk_budget_bytes(),
+            TINY_BUDGET_BYTES,
+            "explicit budgets are warned about, never changed"
+        );
+        drop(st);
     }
 
     /// The hidden IVF superfiles must be made *resident* in the

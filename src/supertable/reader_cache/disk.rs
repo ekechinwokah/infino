@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -241,6 +241,20 @@ pub struct DiskCacheStore {
     /// `get_or_try_init`.
     coordinators: DashMap<SuperfileUri, Coordinator>,
     current_bytes: AtomicU64,
+    /// Live disk budget in bytes, seeded from `config.disk_budget_bytes`.
+    /// An engine-managed (auto-sized) budget is raised — never lowered —
+    /// by [`Self::reconcile_budget_floor`] as the table's on-storage
+    /// footprint grows (the hidden vector index roughly doubles a vector
+    /// table's working set after the drain). An explicitly configured
+    /// budget never changes.
+    budget_bytes: AtomicU64,
+    /// Whether the budget is engine-managed (the user configured a cache
+    /// directory but no byte budget). Set via
+    /// [`Self::mark_budget_auto_sized`] at construction time.
+    budget_auto_sized: AtomicBool,
+    /// One-shot latch so an explicit budget smaller than the table
+    /// footprint warns once, not on every reconcile.
+    budget_warned: AtomicBool,
     n_cold_fetches: AtomicU64,
     n_evictions: AtomicU64,
     n_madvise_calls: AtomicU64,
@@ -272,7 +286,7 @@ impl fmt::Debug for DiskCacheStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DiskCacheStore")
             .field("cache_root", &self.config.cache_root)
-            .field("budget_bytes", &self.config.disk_budget_bytes)
+            .field("budget_bytes", &self.disk_budget_bytes())
             .field("current_bytes", &self.current_bytes.load(Ordering::Acquire))
             .field("n_entries", &self.cached.len())
             .field(
@@ -297,6 +311,7 @@ impl DiskCacheStore {
         fs::create_dir_all(&config.cache_root)?;
         let threshold_secs = config.mmap_cold_threshold_secs;
         let interval_secs = config.mmap_sweep_interval_secs.max(1);
+        let configured_budget = config.disk_budget_bytes;
         let prefetch_semaphore = Arc::new(Semaphore::new(config.prefetch_concurrency.max(1)));
         let store = Arc::new(Self {
             storage,
@@ -305,6 +320,9 @@ impl DiskCacheStore {
             cached: DashMap::new(),
             coordinators: DashMap::new(),
             current_bytes: AtomicU64::new(0),
+            budget_bytes: AtomicU64::new(configured_budget),
+            budget_auto_sized: AtomicBool::new(false),
+            budget_warned: AtomicBool::new(false),
             n_cold_fetches: AtomicU64::new(0),
             n_evictions: AtomicU64::new(0),
             n_madvise_calls: AtomicU64::new(0),
@@ -694,10 +712,65 @@ impl DiskCacheStore {
         CacheStats {
             n_entries: self.cached.len() as u64,
             current_bytes: self.current_bytes.load(Ordering::Acquire),
-            budget_bytes: self.config.disk_budget_bytes,
+            budget_bytes: self.disk_budget_bytes(),
             n_cold_fetches: self.n_cold_fetches.load(Ordering::Acquire),
             n_evictions: self.n_evictions.load(Ordering::Acquire),
             n_madvise_calls: self.n_madvise_calls.load(Ordering::Acquire),
+        }
+    }
+
+    /// Current disk budget in bytes — the live value, not the
+    /// construction-time config (see [`Self::reconcile_budget_floor`]).
+    pub fn disk_budget_bytes(&self) -> u64 {
+        self.budget_bytes.load(Ordering::Acquire)
+    }
+
+    /// Mark this cache's budget as engine-managed: the user configured a
+    /// cache directory but no explicit byte budget, so the engine may
+    /// raise (never lower) the budget as the table's on-storage footprint
+    /// grows. Without this, a vector table silently outgrows any fixed
+    /// default the moment the drain writes the hidden index — a second
+    /// on-storage copy of the vector payload the user cannot be expected
+    /// to size for.
+    pub fn mark_budget_auto_sized(&self) {
+        self.budget_auto_sized.store(true, Ordering::Release);
+    }
+
+    /// Reconcile the budget against the table's current on-storage
+    /// footprint. `floor_bytes` is the caller-computed budget floor
+    /// (footprint + headroom); `footprint_bytes` is the raw footprint,
+    /// used for the undersized-budget warning.
+    ///
+    /// - **Auto-sized budget** ([`Self::mark_budget_auto_sized`]): raised
+    ///   to `floor_bytes` when larger. Never lowered — shrinking under
+    ///   live readers would force an eviction storm for no benefit.
+    /// - **Explicit budget**: respected verbatim. If the footprint
+    ///   exceeds it, warn once that steady-state reads will evict and
+    ///   re-fetch instead of staying cache-resident.
+    pub fn reconcile_budget_floor(&self, floor_bytes: u64, footprint_bytes: u64) {
+        if self.budget_auto_sized.load(Ordering::Acquire) {
+            let mut current = self.budget_bytes.load(Ordering::Acquire);
+            while floor_bytes > current {
+                match self.budget_bytes.compare_exchange_weak(
+                    current,
+                    floor_bytes,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => current = next,
+                }
+            }
+            return;
+        }
+        let budget = self.disk_budget_bytes();
+        if footprint_bytes > budget && !self.budget_warned.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                "disk cache budget ({budget} B) is below the table's on-storage footprint \
+                 ({footprint_bytes} B, hidden vector index included): steady-state queries \
+                 will evict and re-fetch. Raise ConnectOptions::with_cache_budget_bytes (or \
+                 storage.disk_budget_bytes), or omit the budget to let the engine size it."
+            );
         }
     }
 
@@ -1461,8 +1534,9 @@ impl DiskCacheStore {
     /// `tokio::spawn`-ed background finalizer.
     async fn reserve_manual(&self, bytes: u64) -> Result<(), DiskCacheError> {
         loop {
+            let budget = self.disk_budget_bytes();
             let cur = self.current_bytes.load(Ordering::Acquire);
-            if cur + bytes <= self.config.disk_budget_bytes {
+            if cur + bytes <= budget {
                 if self
                     .current_bytes
                     .compare_exchange_weak(cur, cur + bytes, Ordering::AcqRel, Ordering::Acquire)
@@ -1472,7 +1546,7 @@ impl DiskCacheStore {
                 }
                 continue;
             }
-            let needed = (cur + bytes).saturating_sub(self.config.disk_budget_bytes);
+            let needed = (cur + bytes).saturating_sub(budget);
             self.evict_at_least(needed).await?;
         }
     }
@@ -1482,8 +1556,9 @@ impl DiskCacheStore {
     /// retries until either reserved or `BudgetExceeded`.
     async fn reserve(&self, bytes: u64) -> Result<Reservation<'_>, DiskCacheError> {
         loop {
+            let budget = self.disk_budget_bytes();
             let cur = self.current_bytes.load(Ordering::Acquire);
-            if cur + bytes <= self.config.disk_budget_bytes {
+            if cur + bytes <= budget {
                 if self
                     .current_bytes
                     .compare_exchange_weak(cur, cur + bytes, Ordering::AcqRel, Ordering::Acquire)
@@ -1503,7 +1578,7 @@ impl DiskCacheStore {
             // Over budget — try eviction. If eviction frees
             // enough, the next loop iteration's CAS will
             // succeed.
-            let needed = (cur + bytes).saturating_sub(self.config.disk_budget_bytes);
+            let needed = (cur + bytes).saturating_sub(budget);
             self.evict_at_least(needed).await?;
         }
     }
@@ -2334,6 +2409,54 @@ mod tests {
             .expect_err("must exceed budget");
         assert!(matches!(err, DiskCacheError::BudgetExceeded));
         assert_eq!(store.stats().current_bytes, 0);
+    }
+
+    // ----- engine-managed (auto-sized) budget reconciliation -----
+
+    /// Tiny explicit budget used to prove reconciliation raises (or
+    /// refuses to raise) it; smaller than any real superfile.
+    const TEST_TINY_BUDGET_BYTES: u64 = 4;
+    /// A comfortably large budget floor for the raise paths.
+    const TEST_RAISED_FLOOR_BYTES: u64 = 1 << 20;
+
+    #[tokio::test]
+    async fn auto_budget_is_raised_and_admits_previously_oversized_entry() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.disk_budget_bytes = TEST_TINY_BUDGET_BYTES;
+        });
+        store.mark_budget_auto_sized();
+        // Undersized: the tiny superfile cannot be admitted.
+        let uri = SuperfileUri::new_v4();
+        let err = store
+            .insert_warm(&uri, tiny_superfile_bytes())
+            .await
+            .expect_err("undersized budget must reject");
+        assert!(matches!(err, DiskCacheError::BudgetExceeded));
+
+        // Reconcile raises the auto-sized budget; the same insert succeeds.
+        store.reconcile_budget_floor(TEST_RAISED_FLOOR_BYTES, TEST_RAISED_FLOOR_BYTES);
+        assert_eq!(store.disk_budget_bytes(), TEST_RAISED_FLOOR_BYTES);
+        store
+            .insert_warm(&uri, tiny_superfile_bytes())
+            .await
+            .expect("raised budget admits the entry");
+
+        // Raise-only: a smaller floor later never lowers the budget.
+        store.reconcile_budget_floor(TEST_TINY_BUDGET_BYTES, TEST_TINY_BUDGET_BYTES);
+        assert_eq!(store.disk_budget_bytes(), TEST_RAISED_FLOOR_BYTES);
+    }
+
+    #[tokio::test]
+    async fn explicit_budget_is_never_changed_by_reconcile() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.disk_budget_bytes = TEST_TINY_BUDGET_BYTES;
+        });
+        // No mark_budget_auto_sized(): the budget is explicit. Reconcile
+        // must warn (once) but leave the budget verbatim.
+        store.reconcile_budget_floor(TEST_RAISED_FLOOR_BYTES, TEST_RAISED_FLOOR_BYTES);
+        store.reconcile_budget_floor(TEST_RAISED_FLOOR_BYTES, TEST_RAISED_FLOOR_BYTES);
+        assert_eq!(store.disk_budget_bytes(), TEST_TINY_BUDGET_BYTES);
+        assert_eq!(store.stats().budget_bytes, TEST_TINY_BUDGET_BYTES);
     }
 
     #[tokio::test]
