@@ -186,10 +186,14 @@ fn fresh_cache(
 // ============================================================
 
 #[tokio::test]
-async fn hybrid_mode_is_default() {
-    // Just construct via Default and read the mode back.
+async fn lazy_mode_is_default() {
+    // Just construct via Default and read the mode back. The default cold-fetch
+    // mode is lazy foreground + background fill (lowest cold-query latency).
     let cfg = DiskCacheConfig::default();
-    assert_eq!(cfg.cold_fetch_mode, ColdFetchMode::HybridWithPrefetch);
+    assert_eq!(
+        cfg.cold_fetch_mode,
+        ColdFetchMode::LazyForegroundWithBackgroundFill
+    );
 }
 
 #[tokio::test]
