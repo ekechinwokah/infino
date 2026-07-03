@@ -109,10 +109,10 @@ static FOREGROUND_QUERIES: AtomicU64 = AtomicU64::new(0);
 
 /// RAII guard marking a foreground query in flight for its lifetime (held
 /// across the query's awaits). Background fills pause while any guard is live.
-pub struct ForegroundQueryGuard(());
+pub(crate) struct ForegroundQueryGuard(());
 
 impl ForegroundQueryGuard {
-    pub fn enter() -> Self {
+    pub(crate) fn enter() -> Self {
         FOREGROUND_QUERIES.fetch_add(1, Ordering::AcqRel);
         ForegroundQueryGuard(())
     }
