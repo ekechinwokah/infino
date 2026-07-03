@@ -107,12 +107,15 @@ const DOC_ID_PAD_WIDTH: usize = 7;
 const TERM_BYTES: usize = 10;
 /// Docs assigned to one text corpus scheduling chunk. Each worker streams its
 /// chunk through [`PARALLEL_CORPUS_WRITE_BUF_CAPACITY`] rather than buffering
-/// the whole chunk in memory.
-const TEXT_CORPUS_CHUNK_DOCS: usize = 1 << 20;
+/// the whole chunk in memory. `pub(crate)`: the sequential stream
+/// ([`combined::SequentialSyntheticCorpus`]) reseeds at these boundaries to
+/// stay bit-identical with the parallel writer.
+pub(crate) const TEXT_CORPUS_CHUNK_DOCS: usize = 1 << 20;
 /// Docs assigned to one vector corpus scheduling chunk. Each worker streams
 /// its chunk through [`PARALLEL_CORPUS_WRITE_BUF_CAPACITY`] rather than
-/// buffering the whole chunk in memory.
-const VECTOR_CORPUS_CHUNK_DOCS: usize = 1 << 19;
+/// buffering the whole chunk in memory. `pub(crate)` for the same
+/// boundary-reseed reason as [`TEXT_CORPUS_CHUNK_DOCS`].
+pub(crate) const VECTOR_CORPUS_CHUNK_DOCS: usize = 1 << 19;
 /// Per-worker output buffer before a positioned write flushes to the corpus
 /// file. This keeps memory bounded by roughly `rayon_threads × 8 MiB` while
 /// still issuing large writes to NVMe.
@@ -124,7 +127,9 @@ const CHUNK_SEED_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Deterministic per-chunk RNG seed: mixes the base `seed` with the chunk
 /// index so independent chunks draw disjoint, reproducible streams.
-fn chunk_seed(seed: u64, chunk_index: usize) -> u64 {
+/// `pub(crate)`: the sequential stream reseeds with the same function so
+/// streamed docs match the parallel-written corpus bytes.
+pub(crate) fn chunk_seed(seed: u64, chunk_index: usize) -> u64 {
     seed.wrapping_add(
         (chunk_index as u64)
             .wrapping_add(1)
