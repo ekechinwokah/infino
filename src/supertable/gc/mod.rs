@@ -13,6 +13,7 @@ use crate::{
         Manifest,
         error::GcError,
         handle::SupertableInner,
+        hidden_deleted::STORAGE_PREFIX as HIDDEN_DELETED_STORAGE_PREFIX,
         manifest::{
             SUPERFILE_DATA_DIR,
             commit::{MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, list_uri},
@@ -45,6 +46,9 @@ fn build_live_set(manifest: &Manifest) -> HashSet<String> {
     for sf in manifest.get_all_superfiles() {
         live.insert(sf.uri.storage_path());
     }
+    if let Some((uri, _)) = manifest.deleted_user_ids_blob() {
+        live.insert(uri.to_owned());
+    }
     live
 }
 
@@ -74,7 +78,12 @@ pub(super) async fn gc_storage_sweep_for_inner(
 
     let mut report = GcReport::default();
 
-    for prefix in [MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, SUPERFILE_DATA_DIR] {
+    for prefix in [
+        MANIFEST_LISTS_DIR,
+        MANIFEST_PARTS_DIR,
+        SUPERFILE_DATA_DIR,
+        HIDDEN_DELETED_STORAGE_PREFIX,
+    ] {
         let entries = storage.list_with_prefix_metadata(prefix).await?;
         for (key, meta) in entries {
             if live.contains(&key) {
@@ -104,16 +113,28 @@ pub(super) async fn gc_storage_sweep_for_inner(
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
+    use tempfile::tempdir;
     use uuid::Uuid;
 
     use super::*;
     use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
         supertable::{
-            SupertableOptions,
-            manifest::{Manifest, SuperfileEntry, SuperfileUri},
+            SupertableOptions, hidden_deleted,
+            manifest::{
+                Manifest, SuperfileEntry, SuperfileUri,
+                list::{FORMAT_VERSION, ManifestList, PartitionStrategy},
+                part::ContentHash,
+            },
         },
         test_helpers::default_supertable_options,
     };
+
+    /// Bucket count for a minimal hash-partitioned manifest list fixture.
+    const TEST_HASH_BUCKETS: u32 = 1;
+
+    /// Manifest id for a single-list live-set fixture.
+    const TEST_MANIFEST_ID: u64 = 0;
 
     fn opts() -> Arc<SupertableOptions> {
         Arc::new(default_supertable_options())
@@ -161,5 +182,41 @@ mod tests {
         let live = build_live_set(&manifest);
         assert!(!live.contains(&list_uri(0)));
         assert!(!live.contains(&list_uri(2)));
+    }
+
+    #[test]
+    fn build_live_set_contains_deleted_user_ids_blob() {
+        let dir = tempdir().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let hash = ContentHash::of(b"deleted ids");
+        let uri = hidden_deleted::storage_path(&hash);
+        let manifest = Manifest::new(
+            TEST_MANIFEST_ID,
+            opts(),
+            Vec::new(),
+            Some(storage),
+            Some(ManifestList {
+                format_version: FORMAT_VERSION.into(),
+                manifest_id: TEST_MANIFEST_ID,
+                options_hash: ContentHash::of(b"options"),
+                schema: Vec::new(),
+                id_column: "_id".into(),
+                fts_columns: Vec::new(),
+                vector_columns: Vec::new(),
+                partition_strategy: PartitionStrategy::Hash {
+                    column: "_id".into(),
+                    n_buckets: TEST_HASH_BUCKETS,
+                },
+                vector_index_storage_prefix: None,
+                global_vector_index: None,
+                drained_ranges: Default::default(),
+                deleted_user_ids_uri: Some(uri.clone()),
+                deleted_user_ids_content_hash: Some(hash),
+                parts: Vec::new(),
+            }),
+        );
+        let live = build_live_set(&manifest);
+        assert!(live.contains(&uri));
     }
 }

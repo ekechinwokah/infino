@@ -30,6 +30,7 @@ use tokio::runtime::Runtime;
 
 use super::{
     error::{BuildError, OpenError},
+    hidden_deleted::DeletedSetCache,
     manifest::Manifest,
     options::SupertableOptions,
 };
@@ -124,6 +125,9 @@ pub(super) struct SupertableInner {
     /// `query_sql` the `Arc::ptr_eq` check fails and the cache
     /// is rebuilt against the fresh snapshot.
     pub(super) sql_session_cache: Mutex<Option<(Arc<Manifest>, SessionContext)>>,
+    /// Per-handle decoded hidden deleted-set cache, keyed by the manifest's
+    /// `(uri, content_hash)` blob reference.
+    pub(super) hidden_deleted_cache: DeletedSetCache,
     /// Per-process reader-side cache of per-superfile tombstone
     /// bitmaps. `Some` when storage is attached (the cache
     /// fetches sidecars from `superfiles/<id>.tombstones`);
@@ -1128,6 +1132,7 @@ async fn build_handle(
         id_generator: Mutex::new(id_generator),
         query_runtime: OnceLock::new(),
         sql_session_cache: Mutex::new(None),
+        hidden_deleted_cache: DeletedSetCache::default(),
         tombstone_cache,
         handle_id,
         vector_index_table,
@@ -1335,6 +1340,10 @@ impl SupertableReader {
     /// [`SupertableReader::query_sql`] across queries on this snapshot.
     pub(crate) fn sql_session_cache(&self) -> &Mutex<Option<(Arc<Manifest>, SessionContext)>> {
         &self.inner.sql_session_cache
+    }
+
+    pub(crate) fn hidden_deleted_cache(&self) -> &DeletedSetCache {
+        &self.inner.hidden_deleted_cache
     }
 
     pub(crate) fn vector_index_table(&self) -> Option<&Arc<Supertable>> {

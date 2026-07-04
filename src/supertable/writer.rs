@@ -2896,10 +2896,10 @@ async fn record_hidden_deleted_ids(
         let bytes = encode_deleted_ids(&ids);
         let hash = ContentHash::of(&bytes);
         let uri = storage_path(&hash);
-        storage
-            .put_atomic(&uri, Bytes::from(bytes))
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
+        match storage.put_atomic(&uri, Bytes::from(bytes)).await {
+            Ok(_) | Err(StorageError::PreconditionFailed { .. }) => {}
+            Err(e) => return Err(BuildError::Store(e.to_string())),
+        }
         let new_manifest = old.with_deleted_user_ids(uri, hash);
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
             .await

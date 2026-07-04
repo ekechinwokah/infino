@@ -9,6 +9,8 @@
 //! instead of per-cell tombstone sidecars — which are never populated on the
 //! hidden index and would cost a wasted GET wave.
 
+use std::sync::{Arc, Mutex};
+
 use bytes::Bytes;
 
 use crate::{
@@ -28,9 +30,12 @@ const DELETED_IDS_HEADER_LEN: usize = 4 + 1 + 4;
 /// Bytes per serialized `_id` (a little-endian `i128`).
 const DELETED_ID_LEN: usize = 16;
 
+/// Object-storage prefix for content-addressed deleted-`_id` blobs.
+pub(crate) const STORAGE_PREFIX: &str = "hidden-deleted-ids/";
+
 /// Object-storage path for a content-addressed deleted-`_id` blob.
 pub(crate) fn storage_path(hash: &ContentHash) -> String {
-    format!("hidden-deleted-ids/deleted-{}.bin", hash.to_hex())
+    format!("{STORAGE_PREFIX}deleted-{}.bin", hash.to_hex())
 }
 
 /// Serialize the consolidated deleted user-`_id` set. The caller passes a
@@ -98,6 +103,57 @@ pub(crate) async fn load_deleted_user_ids(
     };
     let bytes = fetch_and_verify(storage, path, &expected).await?;
     decode_deleted_ids(&bytes)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeletedSetKey {
+    uri: String,
+    content_hash: ContentHash,
+}
+
+#[derive(Debug, Clone)]
+struct CachedDeletedSet {
+    key: Option<DeletedSetKey>,
+    ids: Arc<Vec<i128>>,
+}
+
+/// Per-handle cache of the hidden index's decoded deleted user-`_id` set.
+#[derive(Debug, Default)]
+pub(crate) struct DeletedSetCache {
+    inner: Mutex<Option<CachedDeletedSet>>,
+}
+
+impl DeletedSetCache {
+    pub(crate) async fn load(
+        &self,
+        manifest: &Manifest,
+        storage: &dyn StorageProvider,
+    ) -> Result<Arc<Vec<i128>>, HiddenDeletedError> {
+        let key = manifest
+            .deleted_user_ids_blob()
+            .map(|(uri, content_hash)| DeletedSetKey {
+                uri: uri.to_owned(),
+                content_hash,
+            });
+        if let Some(cached) = self
+            .inner
+            .lock()
+            .expect("hidden deleted-set cache mutex poisoned")
+            .as_ref()
+            .filter(|cached| cached.key == key)
+        {
+            return Ok(Arc::clone(&cached.ids));
+        }
+        let ids = Arc::new(load_deleted_user_ids(manifest, storage).await?);
+        *self
+            .inner
+            .lock()
+            .expect("hidden deleted-set cache mutex poisoned") = Some(CachedDeletedSet {
+            key,
+            ids: Arc::clone(&ids),
+        });
+        Ok(ids)
+    }
 }
 
 async fn fetch_and_verify(

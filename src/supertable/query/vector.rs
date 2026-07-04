@@ -91,7 +91,6 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader, is_hidden_vector_index_table},
-        hidden_deleted,
         manifest::{
             Manifest, SuperfileEntry, SuperfileUri,
             list::{CellRoutingParams, PartitionStrategy},
@@ -564,10 +563,12 @@ impl SupertableReader {
             let Some(storage) = manifest.options.storage.as_ref() else {
                 return Ok(Vec::new());
             };
-            let deleted = hidden_deleted::load_deleted_user_ids(manifest, storage.as_ref())
+            let deleted = self
+                .hidden_deleted_cache()
+                .load(manifest, storage.as_ref())
                 .await
                 .map_err(|e| QueryError::Store(e.to_string()))?;
-            Some(Arc::new(deleted))
+            Some(deleted)
         } else {
             None
         };
