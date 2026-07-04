@@ -210,6 +210,7 @@ mod tests {
                 },
                 vector_index_storage_prefix: None,
                 global_vector_index: None,
+                spfresh_routing: None,
                 drained_ranges: Default::default(),
                 deleted_user_ids_uri: Some(uri.clone()),
                 deleted_user_ids_content_hash: Some(hash),

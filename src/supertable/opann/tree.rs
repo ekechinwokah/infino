@@ -7,9 +7,7 @@
 //! internal nodes are coarse routing points (a member centroid nearest the
 //! group mean). Every node centroid is held in one [`ClusterCentroids`]
 //! block (index == node id), scored through
-//! [`ClusterCentroids::score_one`]. Descent ranks by centroid distance
-//! only — no ball-cover bounds anywhere (measured dead weight, removed end
-//! to end; recall comes from probing enough nearest leaves).
+//! [`ClusterCentroids::score_one`]; descent ranks by centroid distance.
 //!
 //! Ported from the `perf/hybrid-spfresh-sq8` branch's `opann::tree`. That
 //! branch stores node centroids as Sq8+residual under one shared quantizer;

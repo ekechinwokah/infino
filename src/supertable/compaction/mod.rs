@@ -9,6 +9,7 @@
 //! re-compacted.
 
 use std::{
+    cmp::Reverse,
     collections::{BTreeMap, HashMap, HashSet},
     mem, slice,
     sync::{
@@ -214,7 +215,7 @@ fn select_spfresh_fold_jobs(
             (worst > MAX_FRAGMENTS_PER_CENTROID).then_some((cell.cell_id, worst, total))
         })
         .collect();
-    overloaded.sort_by(|a, b| (b.1, b.2).cmp(&(a.1, a.2)));
+    overloaded.sort_by_key(|c| Reverse((c.1, c.2)));
 
     let mut jobs = Vec::new();
     for (cell_id, _, _) in overloaded {

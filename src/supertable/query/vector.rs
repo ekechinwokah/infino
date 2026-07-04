@@ -103,7 +103,6 @@ use crate::{
         handle::{
             PACKED_VECTOR_CELLS, Supertable, SupertableReader, is_hidden_vector_index_table,
         },
-        hidden_deleted,
         manifest::{
             Manifest, SuperfileEntry, SuperfileUri,
             list::{CellRoutingParams, PartitionStrategy},
@@ -1129,7 +1128,7 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let superfiles = self
-            .vector_pruned_superfiles_intersect(&manifest, &surviving)
+            .vector_pruned_superfiles_intersect(manifest, &surviving)
             .await?;
         if superfiles.is_empty() {
             return Ok(Vec::new());
@@ -1241,7 +1240,7 @@ impl SupertableReader {
                 .map_err(QueryError::ManifestLoad)?,
             Some(surviving) if surviving.is_empty() => return Ok(Vec::new()),
             Some(surviving) => {
-                self.vector_pruned_superfiles_intersect(&manifest, &surviving)
+                self.vector_pruned_superfiles_intersect(manifest, &surviving)
                     .await?
             }
         };
