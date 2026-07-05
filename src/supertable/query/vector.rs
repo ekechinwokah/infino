@@ -113,11 +113,6 @@ pub struct VectorFilter<'a> {
     pub mode: BoolMode,
 }
 
-enum Probe {
-    Clusters(Vec<u32>),
-    Nprobe,
-}
-
 /// Apply query-time diagnostic overrides to the persisted cell-routing params.
 /// `INFINO_CELL_NPROBE_MAX` caps (or sets) the adaptive probe ceiling without
 /// rebuilding the index — set it equal to the nprobe floor to disable adaptive
@@ -594,19 +589,22 @@ impl SupertableReader {
         // ---- Global cross-superfile cluster selection.
         //
         // Each kept superfile's manifest summary carries its per-cluster
-        // Sq8+ε centroids. Rank every (superfile, cluster) by dequantizing
-        // each centroid to fp32 and scoring with [`distance`], then probe
-        // only the globally-closest clusters.
+        // fp32 centroids. Rank every (superfile, cluster) with [`distance`]
+        // on the resident centroid slices (zero-copy, no dequant), then
+        // probe only the globally-closest clusters.
+        // Undeclared column = caller error, rejected here — not a silent
+        // L2Sq default that fails later with a per-superfile decode error.
         let metric = manifest
             .options
             .vector_columns
             .iter()
             .find(|vc| vc.column == column)
             .map(|vc| vc.metric)
-            .unwrap_or(Metric::L2Sq);
+            .ok_or_else(|| {
+                QueryError::Execute(format!("unknown vector column `{column}`"))
+            })?;
 
         let mut scored: Vec<(usize, u32, f32)> = Vec::new();
-        let mut fallback: Vec<usize> = Vec::new();
         for (si, entry) in superfiles.iter().enumerate() {
             // Filtered search: a superfile whose predicate matched no row
             // (absent from `allow`) is dropped here — it never scores a
@@ -614,13 +612,42 @@ impl SupertableReader {
             if allow.as_ref().is_some_and(|m| !m.contains_key(&entry.uri)) {
                 continue;
             }
+            // No fallback: an entry that can't be cluster-ranked is a hard
+            // error naming the superfile. The old silent per-superfile
+            // `nprobe` probe absorbed 100% of traffic when a build path
+            // shipped empty summaries, hiding both the defect and a large
+            // per-query metadata re-read behind normal-looking results.
             match entry.vector_summary.get(column) {
                 Some(vs) if !vs.clusters.is_empty() && vs.clusters.dim as usize == query.len() => {
                     vs.clusters.score_clusters_into(metric, query, |c, score| {
                         scored.push((si, c, score));
                     });
                 }
-                _ => fallback.push(si),
+                Some(vs) if vs.clusters.is_empty() => {
+                    return Err(QueryError::Execute(format!(
+                        "superfile {} has no cluster centroids in its vector summary for \
+                         column `{column}` — malformed build; refusing to degrade to a \
+                         blind per-superfile probe",
+                        entry.superfile_id
+                    )));
+                }
+                Some(vs) => {
+                    return Err(QueryError::Execute(format!(
+                        "vector summary dim {} for column `{column}` on superfile {} does \
+                         not match query dim {}",
+                        vs.clusters.dim,
+                        entry.superfile_id,
+                        query.len()
+                    )));
+                }
+                None => {
+                    return Err(QueryError::Execute(format!(
+                        "superfile {} has no vector summary for column `{column}` — \
+                         malformed build; refusing to degrade to a blind per-superfile \
+                         probe",
+                        entry.superfile_id
+                    )));
+                }
             }
         }
 
@@ -670,26 +697,23 @@ impl SupertableReader {
         }
 
         // Build fan-out units: selected superfiles probe their chosen
-        // clusters; fallback superfiles probe `nprobe` normally; superfiles
-        // with centroids but no globally-selected cluster are skipped
-        // (the cross-superfile win). For filtered search each unit also
-        // carries its per-superfile allow-set (a superfile reaching here
-        // is guaranteed present in `allow` — empties were dropped above).
-        let fallback: HashSet<usize> = fallback.into_iter().collect();
+        // clusters; superfiles with centroids but no globally-selected
+        // cluster are skipped (the cross-superfile win). For filtered
+        // search each unit also carries its per-superfile allow-set (a
+        // superfile reaching here is guaranteed present in `allow` —
+        // empties were dropped above).
+        //
         // Look the allow-set up only for a superfile that is actually
-        // selected (scored a kept cluster, or is a fallback) — a superfile
-        // that survived vector pruning but whose predicate matched no row
-        // is absent from `allow`, and must never be probed. Resolving the
-        // bitmap eagerly for every entry would `expect`-panic on exactly
-        // those filtered-out superfiles; gating it behind the selection
-        // guards keeps the lookup on the path where presence is invariant.
-        let mut units: Vec<(Arc<SuperfileEntry>, (Probe, Option<Arc<RoaringBitmap>>))> = Vec::new();
+        // selected (scored a kept cluster) — a superfile that survived
+        // vector pruning but whose predicate matched no row is absent from
+        // `allow`, and must never be probed. Resolving the bitmap eagerly
+        // for every entry would `expect`-panic on exactly those
+        // filtered-out superfiles; gating it behind the selection guard
+        // keeps the lookup on the path where presence is invariant.
+        let mut units: Vec<(Arc<SuperfileEntry>, (Vec<u32>, Option<Arc<RoaringBitmap>>))> =
+            Vec::new();
         for (si, entry) in superfiles.iter().enumerate() {
-            let probe = if let Some(ids) = per_seg.remove(&si) {
-                Probe::Clusters(ids)
-            } else if fallback.contains(&si) {
-                Probe::Nprobe
-            } else {
+            let Some(ids) = per_seg.remove(&si) else {
                 continue;
             };
             let bitmap = match allow.as_ref() {
@@ -699,7 +723,7 @@ impl SupertableReader {
                 },
                 None => None,
             };
-            units.push((Arc::clone(entry), (probe, bitmap)));
+            units.push((Arc::clone(entry), (ids, bitmap)));
         }
         if units.is_empty() {
             return Ok(Vec::new());
@@ -716,27 +740,16 @@ impl SupertableReader {
         let query_arc = Arc::new(query.to_vec());
         let kernel =
             move |reader: Arc<SuperfileReader>,
-                  (probe, bitmap): (Probe, Option<Arc<RoaringBitmap>>)| {
+                  (ids, bitmap): (Vec<u32>, Option<Arc<RoaringBitmap>>)| {
                 let column = Arc::clone(&column_arc);
                 let query = Arc::clone(&query_arc);
                 async move {
-                    let res = match probe {
-                        Probe::Clusters(ids) => {
-                            reader
-                                .vector_search_clusters_filtered(
-                                    &column, &query, k, &ids, options, bitmap, None,
-                                )
-                                .await
-                        }
-                        Probe::Nprobe => {
-                            reader
-                                .vector_hits_filtered_async(
-                                    &column, &query, k, options, bitmap, None,
-                                )
-                                .await
-                        }
-                    };
-                    res.map_err(|e| QueryError::Parquet(e.to_string()))
+                    reader
+                        .vector_search_clusters_filtered(
+                            &column, &query, k, &ids, options, bitmap, None,
+                        )
+                        .await
+                        .map_err(|e| QueryError::Parquet(e.to_string()))
                 }
             };
         // Filtered search holds a per-superfile RoaringBitmap while the
@@ -1744,7 +1757,13 @@ mod tests {
         let err = r
             .vector_hits("nope", &q, 5, VectorSearchOptions::new(), None)
             .expect_err("expected error");
-        assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
+        // Undeclared columns are rejected up front with a naming error —
+        // not the old shape (silent metric default + blind per-superfile
+        // probe, surfacing later as a kernel decode error).
+        assert!(
+            matches!(&err, QueryError::Execute(m) if m.contains("unknown vector column")),
+            "got {err:?}"
+        );
     }
 
     // ---- Tombstone filter helper: direct-call coverage --------------

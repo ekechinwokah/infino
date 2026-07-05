@@ -2496,6 +2496,288 @@ mod tests {
         assert_ne!(uri_c, uri_a, "new membership ⇒ new content-addressed blob");
     }
 
+    /// Every drain-built hidden cell superfile must carry a usable
+    /// `vector_summary` (summary centroid + non-empty per-cluster centroids,
+    /// correct dim). An entry without one would silently degrade cluster
+    /// selection — the fan-out hard-errors on it now, so the build path must
+    /// never produce such an entry.
+    #[test]
+    fn drain_built_entries_carry_vector_summaries() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        // Distinct directions so the drain builds more than one cell.
+        for i in 0..8usize {
+            let titles = LargeStringArray::from(vec![format!("doc{i}")]);
+            let mut v = vec![0.0f32; dim];
+            v[i % dim] = 1.0;
+            let flat = Float32Array::from(v);
+            let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(titles) as Arc<dyn Array>,
+                    Arc::new(fsl) as Arc<dyn Array>,
+                ],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden vector index")
+            .clone();
+        let manifest = Arc::clone(hidden.reader().manifest());
+        assert!(!manifest.superfiles.is_empty(), "drain built cell files");
+        for entry in manifest.superfiles.iter() {
+            let vs = entry.vector_summary.get("emb").unwrap_or_else(|| {
+                panic!(
+                    "drain-built hidden superfile {} has NO vector_summary",
+                    entry.superfile_id
+                )
+            });
+            assert_eq!(vs.centroid.len(), dim, "summary centroid dim");
+            assert!(
+                !vs.clusters.is_empty(),
+                "drain-built hidden superfile {} has EMPTY cluster centroids",
+                entry.superfile_id
+            );
+            assert_eq!(vs.clusters.dim as usize, dim, "cluster centroid dim");
+        }
+    }
+
+    /// Storage contract of the fast/slow split, end to end:
+    /// (1) once the drainer stamps the slow-CAS ref, the pointer object is
+    ///     THIN — no inline entries, so per-commit pointer churn neither
+    ///     uploads nor downloads the entry payload;
+    /// (2) `optimize` (whose membership `update`s clear the ref) ends
+    ///     re-stamped with a durable, non-empty blob — the state a
+    ///     post-maintenance footprint reads;
+    /// (3) a fresh process open hydrates the flat view FROM the blob —
+    ///     proven by deleting every hidden manifest part first, so nothing
+    ///     else can serve the entries.
+    #[test]
+    fn slow_state_thin_pointer_and_blob_serves_fresh_open() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            config::OptimizeOptions,
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                reader::VectorSearchOptions,
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::manifest::commit::{MANIFEST_PARTS_DIR, read_pointer},
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let make_options = || {
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                }],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim,
+                    n_cent: 4,
+                    rot_seed: 7,
+                    metric: Metric::Cosine,
+                    rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                    provided_centroids: None,
+                }],
+                Some(crate::test_helpers::default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(storage)
+            .with_writer_pool(Arc::clone(&pool))
+        };
+        let st = Supertable::create(make_options()).expect("create");
+
+        let append_one = |title: &str| {
+            let titles = LargeStringArray::from(vec![title.to_owned()]);
+            let flat = Float32Array::from(vec![1.0f32; dim]);
+            let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(titles) as Arc<dyn Array>,
+                    Arc::new(fsl) as Arc<dyn Array>,
+                ],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        };
+        append_one("alpha");
+        append_one("beta");
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden vector index")
+            .clone();
+        let hidden_storage = hidden
+            .reader()
+            .manifest()
+            .options
+            .storage
+            .clone()
+            .expect("hidden storage");
+
+        // (1) Ref stamped ⇒ pointer thin, blob durable and non-empty.
+        let (uri_a, _) = hidden
+            .reader()
+            .manifest()
+            .slow_vector_state_blob()
+            .map(|(u, h)| (u.to_owned(), h))
+            .expect("drain must stamp the slow-CAS ref");
+        let (ptr, _) = hidden
+            .block_on_query(read_pointer(hidden_storage.as_ref()))
+            .expect("read pointer")
+            .expect("pointer exists");
+        assert!(ptr.list_inline.is_some(), "pointer carries the (small) list");
+        assert!(
+            ptr.entries_inline.is_none(),
+            "ref present ⇒ pointer must NOT inline the entry payload"
+        );
+        let (blob, _) = hidden
+            .block_on_query(hidden_storage.get(&uri_a))
+            .expect("slow blob durable");
+        assert!(!blob.is_empty(), "slow blob carries the entry payload");
+
+        // (2) optimize (drain no-op + compaction membership updates clear the
+        // ref) must END re-stamped, thin-pointered, with a durable blob.
+        st.optimize(&OptimizeOptions::default()).expect("optimize");
+        let manifest_after = Arc::clone(hidden.reader().manifest());
+        let (uri_b, _) = manifest_after
+            .slow_vector_state_blob()
+            .map(|(u, h)| (u.to_owned(), h))
+            .expect("optimize must end with the ref re-stamped");
+        let (blob_b, _) = hidden
+            .block_on_query(hidden_storage.get(&uri_b))
+            .expect("slow blob durable after optimize");
+        assert!(!blob_b.is_empty());
+        let (ptr_b, _) = hidden
+            .block_on_query(read_pointer(hidden_storage.as_ref()))
+            .expect("read pointer")
+            .expect("pointer exists");
+        assert!(
+            ptr_b.entries_inline.is_none(),
+            "post-optimize pointer must stay thin"
+        );
+        let n_entries = manifest_after.superfiles.len();
+        assert!(n_entries > 0, "hidden flat view populated");
+
+        // (3) Fresh open must hydrate from the blob: delete every hidden
+        // manifest part so nothing else can serve the entries.
+        let parts = hidden
+            .block_on_query(hidden_storage.list_with_prefix(MANIFEST_PARTS_DIR))
+            .expect("list hidden parts");
+        assert!(!parts.is_empty(), "hidden parts exist as the audit trail");
+        for p in &parts {
+            hidden
+                .block_on_query(hidden_storage.delete(p))
+                .expect("delete hidden part");
+        }
+        drop(hidden);
+        drop(st);
+
+        let st2 = Supertable::open(make_options()).expect("reopen");
+        let hidden2 = st2
+            .reader()
+            .vector_index_table()
+            .expect("hidden vector index on reopen")
+            .clone();
+        assert_eq!(
+            hidden2.reader().manifest().superfiles.len(),
+            n_entries,
+            "fresh open hydrated the flat view from the blob (parts deleted)"
+        );
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let hits = st2
+            .reader()
+            .vector_hits("emb", &q, 2, VectorSearchOptions::new(), None)
+            .expect("vector search on blob-hydrated manifest");
+        assert!(!hits.is_empty(), "search serves from the hydrated view");
+    }
+
     /// Incremental drain: each drain consumes only user commits not already in
     /// the hidden manifest's `drained_ranges`, and a drain with no new commits
     /// is a no-op (no re-drive, no duplicate cells). The distinguishing signal

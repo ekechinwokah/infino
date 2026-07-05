@@ -522,26 +522,29 @@ impl Manifest {
             }),
             _ => None,
         };
+        // No silent degradation: a pointer that carries inline entries, or a
+        // list that carries a slow-state ref, IS the entry payload — if it
+        // fails to decode or disagrees with the list, that is corruption and
+        // the load fails loudly. The part fan below serves only manifests
+        // that carry neither (legacy / mid-maintenance windows).
         let inline_entries: Option<Vec<Arc<SuperfileEntry>>> = if reused.is_some() {
             None
         } else {
-            pointer.entries_inline.as_ref().and_then(|bytes| {
-                match decode_entries(bytes) {
-                    Ok(entries) if entries.len() as u64 == expected_n_superfiles => Some(entries),
-                    Ok(entries) => {
-                        tracing::warn!(
-                            "supertable: inline entries count {} != list total {}; ignoring",
-                            entries.len(),
-                            expected_n_superfiles
-                        );
-                        None
+            match pointer.entries_inline.as_ref() {
+                None => None,
+                Some(bytes) => {
+                    let entries = decode_entries(bytes).map_err(|e| {
+                        ManifestLoadError::PointerParse(format!("inline entries decode: {e}"))
+                    })?;
+                    if entries.len() as u64 != expected_n_superfiles {
+                        return Err(ManifestLoadError::PointerParse(format!(
+                            "inline entries count {} != list total {expected_n_superfiles}",
+                            entries.len()
+                        )));
                     }
-                    Err(e) => {
-                        tracing::warn!("supertable: inline entries decode failed ({e}); ignoring");
-                        None
-                    }
+                    Some(entries)
                 }
-            })
+            }
         };
         let hydrated: Option<Vec<Arc<SuperfileEntry>>> = match (reused, inline_entries) {
             (Some(entries), _) => Some(entries),
@@ -551,27 +554,16 @@ impl Manifest {
                 list.slow_vector_state_content_hash,
             ) {
                 (Some(uri), Some(hash)) => {
-                    match slow_vector_state::load_state(storage.as_ref(), uri, &hash).await {
-                        Ok(entries) if entries.len() as u64 == expected_n_superfiles => {
-                            Some(entries)
-                        }
-                        Ok(entries) => {
-                            tracing::warn!(
-                                "supertable: slow vector-state blob entry count {} != list total {}; \
-                                 falling back to manifest parts",
-                                entries.len(),
-                                expected_n_superfiles
-                            );
-                            None
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "supertable: slow vector-state hydration failed ({e}); \
-                                 falling back to manifest parts"
-                            );
-                            None
-                        }
+                    let entries = slow_vector_state::load_state(storage.as_ref(), uri, &hash)
+                        .await
+                        .map_err(|e| ManifestLoadError::SlowStateHydration(e.to_string()))?;
+                    if entries.len() as u64 != expected_n_superfiles {
+                        return Err(ManifestLoadError::SlowStateHydration(format!(
+                            "blob entry count {} != list total {expected_n_superfiles}",
+                            entries.len()
+                        )));
                     }
+                    Some(entries)
                 }
                 _ => None,
             },
@@ -745,21 +737,26 @@ impl Manifest {
             part_result.map_err(translate_contention)?;
         }
 
-        // Step 3: build the pointer — the table's ONE metadata object.
-        // It carries the full list payload plus the flat entries inline
-        // (when the in-memory view is complete), so an open reads the
-        // table's entire metadata in ONE GET — no list, part, or blob
-        // fetches. The user table's pointer is the fast-CAS blob (churns
-        // per commit); the hidden table's pointer is the slow-CAS blob
-        // (only drain / hidden compaction rewrite its bulk) — the linked
-        // pair opens in exactly two GETs. The separate list/part objects
-        // remain only as the content-addressed audit trail.
+        // Step 3: build the pointer — the table's hot-CAS object. It always
+        // carries the list payload inline (small: membership bookkeeping,
+        // refs, grid). The flat entries ride inline ONLY while the list has
+        // no slow-state ref: once the drainer stamps the ref, the entry
+        // payload lives in the content-addressed slow blob and the pointer
+        // stays thin — so per-commit pointer churn (deleted-id stamps, OCC
+        // retries) neither re-uploads nor re-downloads the entry bytes, and
+        // readers whose ref is unchanged keep their resident entries with
+        // zero I/O. A membership commit clears the ref (`update`), so its
+        // pointer temporarily inlines the entries again — full availability
+        // during the maintenance window — until the post-settle re-stamp
+        // thins it. The separate list/part objects remain the
+        // content-addressed audit trail.
         let expected_n: u64 = list_to_write
             .parts
             .iter()
             .map(|e| e.n_superfiles)
             .sum();
-        let entries_inline = (self.superfile_list.superfiles.len() as u64 == expected_n)
+        let entries_inline = (list_to_write.slow_vector_state_uri.is_none()
+            && self.superfile_list.superfiles.len() as u64 == expected_n)
             .then(|| Bytes::from(encode_entries(&self.superfile_list.superfiles)));
         let pointer = PointerFile {
             manifest_id: self.get_manifest_id(),
@@ -1607,6 +1604,14 @@ pub enum ManifestLoadError {
     /// Avro / zstd / version-incompat parse failure.
     #[error("part parse failed")]
     Parse(#[from] part::PartParseError),
+    /// Slow-state blob hydration failed while the list carries a ref —
+    /// missing object, hash mismatch, decode failure, or an entry count
+    /// that disagrees with the list. Corruption, not a race: surfaced as
+    /// a load failure rather than silently degrading to the part fan (a
+    /// quiet fallback here concealed real defects across whole bench
+    /// cycles).
+    #[error("slow vector-state hydration failed: {0}")]
+    SlowStateHydration(String),
 }
 
 /// One superfile's metadata + skip-pruning summaries. The bytes that
@@ -2141,7 +2146,8 @@ pub struct VectorSummary {
     /// Cluster centroid; length matches the vector column's `dim`
     /// declared in `SupertableOptions::vector_columns`.
     pub centroid: Vec<f32>,
-    /// Per-cluster IVF centroids (Sq8+ε, same codec as rerank rows) for
+    /// Per-cluster IVF centroids (fp32, cluster-major — scored zero-copy by
+    /// [`ClusterCentroids::score_clusters_into`], no dequant) for
     /// cross-superfile global cluster selection. Empty when the superfile
     /// has no vector index for this column.
     pub clusters: ClusterCentroids,
@@ -3485,10 +3491,13 @@ mod tests {
         );
     }
 
-    /// A corrupt slow-state ref (hash mismatch) must fall back to the
-    /// existing eager part-loading path — never fail the open.
+    /// A list that carries a slow-state ref whose blob is missing or
+    /// corrupt is a CORRUPT manifest: the load must raise
+    /// [`ManifestLoadError::SlowStateHydration`] — never silently degrade
+    /// to the part fan. (The old quiet fallback concealed hydration
+    /// defects behind normal-looking, slower opens.)
     #[tokio::test]
-    async fn load_with_corrupt_slow_ref_falls_back_to_parts() {
+    async fn load_with_corrupt_slow_ref_raises_hydration_error() {
         let opts = make_opts();
         let (_dir, storage) = local_storage();
         let bogus = (
@@ -3497,18 +3506,12 @@ mod tests {
         );
         persist_two_entry_table(&storage, Some(bogus)).await;
 
-        let loaded = Manifest::load(None, Arc::clone(&storage), Some(opts))
+        let err = Manifest::load(None, Arc::clone(&storage), Some(opts))
             .await
-            .expect("load must fall back, not fail");
-        assert_eq!(
-            loaded.superfiles.len(),
-            2,
-            "fallback must serve the full membership from parts"
-        );
-        assert_eq!(
-            n_parts_initialized(&loaded),
-            1,
-            "fallback eager-loads the part"
+            .expect_err("corrupt slow-state ref must fail the load loudly");
+        assert!(
+            matches!(err, ManifestLoadError::SlowStateHydration(_)),
+            "expected SlowStateHydration, got: {err:?}"
         );
     }
 
