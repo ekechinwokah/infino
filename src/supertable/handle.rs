@@ -19,18 +19,18 @@ use std::{
     fmt,
     future::Future,
     sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
-    thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
 use arrow_schema::SchemaRef;
 use chrono::Utc;
 use datafusion::execution::context::SessionContext;
-use tokio::runtime::{self, Runtime};
+use tokio::runtime::Runtime;
 
 use super::{
     error::{BuildError, OpenError},
+    hidden_deleted::{self, HiddenDeletedError},
     manifest::Manifest,
     options::SupertableOptions,
 };
@@ -53,7 +53,6 @@ use crate::{
             lease::DEFAULT_LEASE_DURATION,
             recovery::{RecoveryError, RecoveryReport, scan_and_recover},
         },
-        writer::refresh_inner_state_async,
     },
 };
 
@@ -145,6 +144,20 @@ pub(super) struct SupertableInner {
     /// Hidden sibling supertable storing vectors only, partitioned by
     /// global centroids so unfiltered search can route by nearest cell.
     pub(super) vector_index_table: Option<Arc<Supertable>>,
+    /// Last time the read path checked the storage manifest pointer
+    /// for freshness, under [`Consistency::BoundedStaleness`]. `None`
+    /// until the first check (so the first query always refreshes).
+    /// Unused for [`Consistency::Strong`] (always checks) and
+    /// [`Consistency::Snapshot`] (never checks).
+    pub(super) last_pointer_check: Mutex<Option<std::time::Instant>>,
+    /// Decoded hidden deleted-`_id` set, cached per hidden manifest version.
+    /// The set is a deliberate duplicate of the user-table tombstones, carried
+    /// INLINE in the hidden manifest so hidden vector search drops deleted rows
+    /// from resident bytes instead of GETting the user table's tombstones on
+    /// every query. Caching only adds the `SidecarCache`-style discipline on
+    /// top: decode the inline bytes once per manifest version, not once per
+    /// query. Keyed by `manifest_id`, which bumps on every deleted-id stamp.
+    pub(super) hidden_deleted_cache: Mutex<Option<(u64, Arc<Vec<i128>>)>>,
 }
 
 impl Drop for SupertableInner {
@@ -432,12 +445,6 @@ impl Supertable {
     /// [`Consistency::Snapshot`](crate::supertable::options::Consistency::Snapshot).
     /// Best-effort: a failed pointer read leaves the current snapshot
     /// in place rather than failing the query.
-    /// Under [`Consistency::BoundedStaleness`] this issues NO storage
-    /// I/O: the background poller (see `spawn_freshness_poller`)
-    /// re-reads the pointer on its own thread every window and swaps
-    /// the snapshot, so the read path only ever loads the in-memory
-    /// `ArcSwap`. Only `Strong` — an explicit per-query
-    /// read-your-writes opt-in — touches storage here.
     pub(crate) fn ensure_fresh(&self) {
         if self.inner.options.storage.is_none() {
             return;
@@ -447,7 +454,27 @@ impl Supertable {
             Consistency::Strong => {
                 let _ = bridge_sync_to_async(self.refresh());
             }
-            Consistency::BoundedStaleness(_) => {}
+            Consistency::BoundedStaleness(window) => {
+                // Decide whether a check is due under the lock, stamp
+                // "now" optimistically so concurrent queries don't all
+                // stampede the pointer, then release the lock *before*
+                // the (blocking) pointer read.
+                let due = {
+                    let mut last = self
+                        .inner
+                        .last_pointer_check
+                        .lock()
+                        .expect("last_pointer_check mutex poisoned");
+                    let due = last.map(|t| t.elapsed() >= window).unwrap_or(true);
+                    if due {
+                        *last = Some(Instant::now());
+                    }
+                    due
+                };
+                if due {
+                    let _ = bridge_sync_to_async(self.refresh());
+                }
+            }
         }
     }
 
@@ -1113,52 +1140,16 @@ async fn build_handle(
         tombstone_cache,
         handle_id,
         vector_index_table,
+        last_pointer_check: Mutex::new(None),
+        hidden_deleted_cache: Mutex::new(None),
     });
     install_disk_cache_pinning(&inner);
-    spawn_freshness_poller(&inner);
     let st = Supertable { inner };
     if st.inner.options.storage.is_some() {
         let _ = st.run_recovery_sweep_once().await;
         let _ = st.run_gc_sweep_once().await;
     }
     Ok(st)
-}
-
-/// Background freshness poller — the ONLY place the read path's
-/// consistency policy touches storage. Under
-/// [`Consistency::BoundedStaleness`] a dedicated thread re-reads the
-/// manifest pointer every window and swaps the in-memory snapshot;
-/// [`Supertable::ensure_fresh`] on the query path then never issues a
-/// GET. The thread holds a `Weak` on the inner state and exits within
-/// one window of the last handle dropping. `Strong` (explicit per-query
-/// read-your-writes) and `Snapshot` spawn nothing.
-fn spawn_freshness_poller(inner: &Arc<SupertableInner>) {
-    let Some(storage) = inner.options.storage.clone() else {
-        return;
-    };
-    let Consistency::BoundedStaleness(window) = inner.options.read_consistency else {
-        return;
-    };
-    let weak = Arc::downgrade(inner);
-    let builder = thread::Builder::new().name("supertable-freshness".into());
-    let spawned = builder.spawn(move || {
-        // One long-lived current-thread runtime for the poller (not a
-        // per-call throwaway): the poll is a single pointer GET + swap,
-        // with no CPU wave to keep off the shared query runtime.
-        let Ok(rt) = runtime::Builder::new_current_thread().enable_all().build() else {
-            return;
-        };
-        loop {
-            thread::sleep(window);
-            let Some(inner) = weak.upgrade() else {
-                return;
-            };
-            let _ = rt.block_on(refresh_inner_state_async(&inner, &storage));
-        }
-    });
-    if let Err(e) = spawned {
-        tracing::warn!("supertable: freshness poller failed to spawn: {e}");
-    }
 }
 
 /// Create one supertable handle (empty manifest). Leaf — never creates a sibling.
@@ -1358,6 +1349,37 @@ impl SupertableReader {
 
     pub(crate) fn vector_index_table(&self) -> Option<&Arc<Supertable>> {
         self.inner.vector_index_table.as_ref()
+    }
+
+    /// Decoded hidden deleted-`_id` set for this reader's pinned manifest,
+    /// cached per manifest version so the inline bytes are decoded once per
+    /// version rather than once per query (the `SidecarCache` discipline).
+    ///
+    /// The set itself is a deliberate duplicate of the user-table tombstones,
+    /// carried inline in the hidden manifest: hidden vector search drops
+    /// deleted rows from these resident bytes instead of GETting the user
+    /// table's per-superfile tombstones on every query.
+    pub(crate) fn hidden_deleted_ids(&self) -> Result<Arc<Vec<i128>>, HiddenDeletedError> {
+        let version = self.manifest.get_manifest_id();
+        {
+            let guard = self
+                .inner
+                .hidden_deleted_cache
+                .lock()
+                .expect("hidden deleted-set cache mutex poisoned");
+            if let Some((cached_version, ids)) = guard.as_ref()
+                && *cached_version == version
+            {
+                return Ok(Arc::clone(ids));
+            }
+        }
+        let ids = hidden_deleted::deleted_user_ids(&self.manifest)?;
+        *self
+            .inner
+            .hidden_deleted_cache
+            .lock()
+            .expect("hidden deleted-set cache mutex poisoned") = Some((version, Arc::clone(&ids)));
+        Ok(ids)
     }
 }
 
@@ -2496,6 +2518,125 @@ mod tests {
         assert_ne!(uri_c, uri_a, "new membership ⇒ new content-addressed blob");
     }
 
+    /// The hidden deleted-`_id` set is decoded from the resident inline
+    /// manifest bytes ONCE per manifest version and cached on the handle:
+    /// repeated reads on the same version return the same `Arc` (no
+    /// re-decode), and a user delete that bumps the hidden manifest
+    /// re-decodes the updated set. This is the only discipline the
+    /// GET-free inline set needs.
+    #[test]
+    fn hidden_deleted_ids_decoded_once_per_manifest_version() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::prelude::{col, lit};
+
+        use crate::superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        let append_one = |title: &str| {
+            let titles = LargeStringArray::from(vec![title.to_owned()]);
+            let flat = Float32Array::from(vec![1.0f32; dim]);
+            let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(titles) as Arc<dyn Array>,
+                    Arc::new(fsl) as Arc<dyn Array>,
+                ],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        };
+        append_one("alpha");
+        append_one("beta");
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden vector index")
+            .clone();
+
+        // No deletes yet: the resident set is empty, and two reads on the
+        // same manifest version return the SAME cached `Arc` (decoded once).
+        let empty_a = hidden.reader().hidden_deleted_ids().expect("decode");
+        let empty_b = hidden.reader().hidden_deleted_ids().expect("cached");
+        assert!(empty_a.is_empty(), "no deletes ⇒ empty resident set");
+        assert!(
+            Arc::ptr_eq(&empty_a, &empty_b),
+            "same manifest version must reuse the decoded set (no per-query decode)"
+        );
+
+        // A user delete bumps the hidden manifest and stamps the id inline.
+        let stats = st.delete(col("title").eq(lit("alpha"))).expect("delete");
+        assert_eq!(stats.n_tombstoned(), 1, "delete tombstones one row");
+
+        // New manifest version ⇒ re-decode the updated set; then cached again.
+        let ids_a = hidden
+            .reader()
+            .hidden_deleted_ids()
+            .expect("decode after delete");
+        let ids_b = hidden
+            .reader()
+            .hidden_deleted_ids()
+            .expect("cached after delete");
+        assert_eq!(ids_a.len(), 1, "one deleted id resident after delete");
+        assert!(
+            Arc::ptr_eq(&ids_a, &ids_b),
+            "post-delete version must also reuse its decoded set"
+        );
+        assert!(
+            !Arc::ptr_eq(&empty_a, &ids_a),
+            "a manifest bump must re-decode the updated set, not serve the stale one"
+        );
+    }
+
     /// Every drain-built hidden cell superfile must carry a usable
     /// `vector_summary` (summary centroid + non-empty per-cluster centroids,
     /// correct dim). An entry without one would silently degrade cluster
@@ -2598,10 +2739,13 @@ mod tests {
         }
     }
 
+    /// Raw pointer object ceiling for the thin-pointer assertions: three
+    /// short text lines (id, list URI, hash) — generously bounded.
+    const MAX_POINTER_OBJECT_BYTES: usize = 512;
+
     /// Storage contract of the fast/slow split, end to end:
     /// (1) once the drainer stamps the slow-CAS ref, the pointer object is
-    ///     THIN — no inline entries, so per-commit pointer churn neither
-    ///     uploads nor downloads the entry payload;
+    ///     TINY — no payload rides the hot-CAS write;
     /// (2) `optimize` (whose membership `update`s clear the ref) ends
     ///     re-stamped with a durable, non-empty blob — the state a
     ///     post-maintenance footprint reads;
@@ -2622,7 +2766,7 @@ mod tests {
                 reader::VectorSearchOptions,
                 vector::{distance::Metric, rerank_codec::RerankCodec},
             },
-            supertable::manifest::commit::{MANIFEST_PARTS_DIR, read_pointer},
+            supertable::manifest::commit::{MANIFEST_PARTS_DIR, POINTER_PATH},
         };
 
         let dim = 16usize;
@@ -2700,21 +2844,22 @@ mod tests {
             .clone()
             .expect("hidden storage");
 
-        // (1) Ref stamped ⇒ pointer thin, blob durable and non-empty.
+        // (1) Ref stamped ⇒ pointer tiny (raw object bytes bounded — no
+        // payload of any kind rides the hot-CAS write), blob durable and
+        // non-empty.
         let (uri_a, _) = hidden
             .reader()
             .manifest()
             .slow_vector_state_blob()
             .map(|(u, h)| (u.to_owned(), h))
             .expect("drain must stamp the slow-CAS ref");
-        let (ptr, _) = hidden
-            .block_on_query(read_pointer(hidden_storage.as_ref()))
-            .expect("read pointer")
-            .expect("pointer exists");
-        assert!(ptr.list_inline.is_some(), "pointer carries the (small) list");
+        let (ptr_bytes, _) = hidden
+            .block_on_query(hidden_storage.get(POINTER_PATH))
+            .expect("read pointer object");
         assert!(
-            ptr.entries_inline.is_none(),
-            "ref present ⇒ pointer must NOT inline the entry payload"
+            ptr_bytes.len() <= MAX_POINTER_OBJECT_BYTES,
+            "pointer object must stay tiny (id + list uri + hash); got {} bytes",
+            ptr_bytes.len()
         );
         let (blob, _) = hidden
             .block_on_query(hidden_storage.get(&uri_a))
@@ -2733,13 +2878,13 @@ mod tests {
             .block_on_query(hidden_storage.get(&uri_b))
             .expect("slow blob durable after optimize");
         assert!(!blob_b.is_empty());
-        let (ptr_b, _) = hidden
-            .block_on_query(read_pointer(hidden_storage.as_ref()))
-            .expect("read pointer")
-            .expect("pointer exists");
+        let (ptr_bytes_b, _) = hidden
+            .block_on_query(hidden_storage.get(POINTER_PATH))
+            .expect("read pointer object");
         assert!(
-            ptr_b.entries_inline.is_none(),
-            "post-optimize pointer must stay thin"
+            ptr_bytes_b.len() <= MAX_POINTER_OBJECT_BYTES,
+            "post-optimize pointer must stay tiny; got {} bytes",
+            ptr_bytes_b.len()
         );
         let n_entries = manifest_after.superfiles.len();
         assert!(n_entries > 0, "hidden flat view populated");

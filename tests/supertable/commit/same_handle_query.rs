@@ -250,20 +250,23 @@ fn open_is_one_pointer_get_and_reads_touch_no_metadata() {
     )
     .expect("open");
 
+    // Open cost is fixed and small: one pointer GET, one list GET, and the
+    // eager part fetch.
     assert_eq!(
         counter.pointer_gets(),
         1,
         "open must read the pointer object exactly once"
     );
-    assert_eq!(counter.list_gets(), 0, "the list rides inside the pointer");
+    assert_eq!(counter.list_gets(), 1, "open fetches the list by URI once");
     assert_eq!(
         counter.part_gets(),
-        0,
-        "entries ride inside the pointer; no part fan on open"
+        1,
+        "single-bucket table: open eager-loads exactly one part"
     );
 
-    // Reads: repeated readers + queries issue zero metadata GETs of
-    // any kind — no pointer freshness check, no list, no parts.
+    // Reads: repeated readers + queries issue zero FURTHER metadata GETs
+    // of any kind within the staleness window — no pointer freshness
+    // check, no list, no parts. The resident flat view serves them all.
     for _ in 0..3 {
         let hits = st
             .reader()
@@ -274,10 +277,10 @@ fn open_is_one_pointer_get_and_reads_touch_no_metadata() {
     assert_eq!(
         counter.pointer_gets(),
         1,
-        "the read path must never re-read the pointer (freshness is a background poll)"
+        "the read path must not re-read the pointer within the staleness window"
     );
-    assert_eq!(counter.list_gets(), 0, "reads must never fetch a list");
-    assert_eq!(counter.part_gets(), 0, "reads must never fetch a part");
+    assert_eq!(counter.list_gets(), 1, "reads must never fetch a list");
+    assert_eq!(counter.part_gets(), 1, "reads must never fetch a part");
 }
 
 /// Storage proxy that counts `get`s into the manifest metadata

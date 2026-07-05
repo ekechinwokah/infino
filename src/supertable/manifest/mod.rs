@@ -45,7 +45,6 @@ use std::{
 use arrow::compute::kernels::aggregate as agg;
 use arrow_array::*;
 use arrow_schema::DataType;
-use bytes::Bytes;
 use dashmap::DashMap;
 use futures::future;
 /// Re-export the per-column skip aggregates so callers can refer to them as
@@ -80,7 +79,7 @@ use crate::{
             partition::{PartitionKey, assign_partition, encode_partition_key},
         },
         query::{hierarchical_iter, prune::PruneLeaf},
-        slow_vector_state::{self, decode_entries, encode_entries},
+        slow_vector_state,
     },
 };
 
@@ -440,28 +439,12 @@ impl Manifest {
             return Err(ManifestLoadError::AlreadyLoaded);
         }
 
-        // 2. The list rides inline in the pointer (the table's one
-        // metadata object) — hash-verified against the pointer's own
-        // content hash, zero additional GETs. Legacy pointers without
-        // the payload fall back to the standalone list object.
-        let list = match &pointer.list_inline {
-            Some(inline) if ContentHash::of(inline) == pointer.content_hash => {
-                list::decode(inline).map_err(ManifestLoadError::ListParse)?
-            }
-            Some(_) => {
-                return Err(ManifestLoadError::ContentHashMismatch {
-                    expected: pointer.content_hash.to_hex(),
-                    actual: "inline list payload hash mismatch".into(),
-                });
-            }
-            None => {
-                let (list_bytes, _) = storage
-                    .get(&pointer.manifest_list_uri)
-                    .await
-                    .map_err(ManifestLoadError::Storage)?;
-                list::decode(&list_bytes).map_err(ManifestLoadError::ListParse)?
-            }
-        };
+        // 2. Load + parse the manifest list.
+        let (list_bytes, _) = storage
+            .get(&pointer.manifest_list_uri)
+            .await
+            .map_err(ManifestLoadError::Storage)?;
+        let list = list::decode(&list_bytes).map_err(ManifestLoadError::ListParse)?;
 
         let options = if let Some(options) = options {
             options
@@ -506,8 +489,9 @@ impl Manifest {
         // membership unchanged by construction since every membership
         // `update` clears the ref — this keeps centroid state resident
         // across manifest churn until the drainer republishes);
-        // (2) pointer-inline entries (the open is that single GET);
-        // (3) slow-state blob fetch; (4) legacy part fan.
+        // (2) slow-state blob fetch (ref present, one GET);
+        // (3) part loading (no ref — the user table always, and the
+        //     hidden table mid-maintenance).
         let reused: Option<Vec<Arc<SuperfileEntry>>> = match (
             list.slow_vector_state_uri.as_deref(),
             list.slow_vector_state_content_hash,
@@ -522,34 +506,14 @@ impl Manifest {
             }),
             _ => None,
         };
-        // No silent degradation: a pointer that carries inline entries, or a
-        // list that carries a slow-state ref, IS the entry payload — if it
-        // fails to decode or disagrees with the list, that is corruption and
-        // the load fails loudly. The part fan below serves only manifests
-        // that carry neither (legacy / mid-maintenance windows).
-        let inline_entries: Option<Vec<Arc<SuperfileEntry>>> = if reused.is_some() {
-            None
-        } else {
-            match pointer.entries_inline.as_ref() {
-                None => None,
-                Some(bytes) => {
-                    let entries = decode_entries(bytes).map_err(|e| {
-                        ManifestLoadError::PointerParse(format!("inline entries decode: {e}"))
-                    })?;
-                    if entries.len() as u64 != expected_n_superfiles {
-                        return Err(ManifestLoadError::PointerParse(format!(
-                            "inline entries count {} != list total {expected_n_superfiles}",
-                            entries.len()
-                        )));
-                    }
-                    Some(entries)
-                }
-            }
-        };
-        let hydrated: Option<Vec<Arc<SuperfileEntry>>> = match (reused, inline_entries) {
-            (Some(entries), _) => Some(entries),
-            (None, Some(entries)) => Some(entries),
-            (None, None) => match (
+        // No silent degradation: a list that carries a slow-state ref IS
+        // the entry payload's address — if the blob fails to load, verify,
+        // or agree with the list, that is corruption and the load fails
+        // loudly. The part fan below serves only manifests without a ref
+        // (the user table always; the hidden table mid-maintenance).
+        let hydrated: Option<Vec<Arc<SuperfileEntry>>> = match reused {
+            Some(entries) => Some(entries),
+            None => match (
                 list.slow_vector_state_uri.as_deref(),
                 list.slow_vector_state_content_hash,
             ) {
@@ -737,33 +701,11 @@ impl Manifest {
             part_result.map_err(translate_contention)?;
         }
 
-        // Step 3: build the pointer — the table's hot-CAS object. It always
-        // carries the list payload inline (small: membership bookkeeping,
-        // refs, grid). The flat entries ride inline ONLY while the list has
-        // no slow-state ref: once the drainer stamps the ref, the entry
-        // payload lives in the content-addressed slow blob and the pointer
-        // stays thin — so per-commit pointer churn (deleted-id stamps, OCC
-        // retries) neither re-uploads nor re-downloads the entry bytes, and
-        // readers whose ref is unchanged keep their resident entries with
-        // zero I/O. A membership commit clears the ref (`update`), so its
-        // pointer temporarily inlines the entries again — full availability
-        // during the maintenance window — until the post-settle re-stamp
-        // thins it. The separate list/part objects remain the
-        // content-addressed audit trail.
-        let expected_n: u64 = list_to_write
-            .parts
-            .iter()
-            .map(|e| e.n_superfiles)
-            .sum();
-        let entries_inline = (list_to_write.slow_vector_state_uri.is_none()
-            && self.superfile_list.superfiles.len() as u64 == expected_n)
-            .then(|| Bytes::from(encode_entries(&self.superfile_list.superfiles)));
+        // Step 3: build pointer.
         let pointer = PointerFile {
             manifest_id: self.get_manifest_id(),
             manifest_list_uri: list_res.uri,
             content_hash: list_res.content_hash,
-            list_inline: Some(list_res.encoded),
-            entries_inline,
         };
 
         // Step 4: conditional pointer write — the visibility
@@ -3384,11 +3326,6 @@ mod tests {
                 manifest_id: 1,
                 manifest_list_uri: lw.uri,
                 content_hash: lw.content_hash,
-                list_inline: Some(lw.encoded),
-                // Deliberately no inline entries: these fixtures exercise
-                // the slow-blob and part-fan hydration paths, which only
-                // engage when the pointer payload doesn't carry entries.
-                entries_inline: None,
             },
             None,
         )

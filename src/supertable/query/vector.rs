@@ -91,7 +91,6 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader, is_hidden_vector_index_table},
-        hidden_deleted,
         manifest::{
             Manifest, SuperfileEntry, SuperfileUri,
             list::{CellRoutingParams, PartitionStrategy},
@@ -458,7 +457,8 @@ async fn hidden_hits_id_score_batch(
     let id_column = user_reader.options().id_column.as_str();
 
     let ids = hidden_hits_user_ids(hidden_manifest, hidden_hits, id_column).await?;
-    let deleted = hidden_deleted::deleted_user_ids(hidden_manifest)
+    let deleted = vit_reader
+        .hidden_deleted_ids()
         .map_err(|e| QueryError::Execute(e.to_string()))?;
     let (ids, scores): (Vec<i128>, Vec<f32>) = ids
         .into_iter()
@@ -487,7 +487,8 @@ async fn remap_hidden_hits_to_user_hits(
 
     // Step 1: hidden hit → stable user `_id` (deduped, resident).
     let user_ids = hidden_hits_user_ids(hidden_manifest, hidden_hits, id_column).await?;
-    let deleted = hidden_deleted::deleted_user_ids(hidden_manifest)
+    let deleted = vit_reader
+        .hidden_deleted_ids()
         .map_err(|e| QueryError::Execute(e.to_string()))?;
 
     // Step 2: user `_id` → (user superfile, local row). Resolve the owning
