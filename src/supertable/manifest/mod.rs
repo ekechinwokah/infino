@@ -2263,11 +2263,11 @@ impl ClusterCentroids {
         let n = scored.len();
         let floor = nprobe_min.min(n);
         let mut order: Vec<usize> = (0..floor).collect();
-        for i in floor..n {
+        for (i, &(_, d)) in scored.iter().enumerate().skip(floor) {
             if order.len() >= nprobe_max {
                 break;
             }
-            if scored[i].1 <= tau {
+            if d <= tau {
                 order.push(i);
             }
         }

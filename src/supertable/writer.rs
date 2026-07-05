@@ -1111,14 +1111,14 @@ impl SupertableWriter {
                 } => (n_tombstoned, n_not_found),
             };
             let _ = wal_store.delete_state(wal_id).await;
-            if let Some(hi) = hidden_inner {
-                if let Err(e) = record_hidden_deleted_ids(&hi, &deleted_ids).await {
-                    tracing::warn!(
-                        "supertable: hidden vector-index deleted-set record failed: {e} \
-                         (user-table delete is durable; vector search may transiently \
-                         return deleted rows until the next successful record)"
-                    );
-                }
+            if let Some(hi) = hidden_inner
+                && let Err(e) = record_hidden_deleted_ids(&hi, &deleted_ids).await
+            {
+                tracing::warn!(
+                    "supertable: hidden vector-index deleted-set record failed: {e} \
+                     (user-table delete is durable; vector search may transiently \
+                     return deleted rows until the next successful record)"
+                );
             }
             Ok::<_, MutationError>((n_t, n_nf))
         };
@@ -1159,22 +1159,20 @@ impl SupertableWriter {
                 .get_global_vector_index()
                 .is_none()
             && !buffer.is_empty()
+            && let Some(vc) = self.inner.options.vector_columns.first()
+            && let Some(grid) = bootstrap_centroids_from_batch(
+                &buffer,
+                vc.dim,
+                super::handle::GLOBAL_VECTOR_CELL_COUNT,
+            )
         {
-            if let Some(vc) = self.inner.options.vector_columns.first() {
-                if let Some(grid) = bootstrap_centroids_from_batch(
-                    &buffer,
-                    vc.dim,
-                    super::handle::GLOBAL_VECTOR_CELL_COUNT,
-                ) {
-                    let index = super::manifest::GlobalVectorIndex {
-                        column: vc.column.clone(),
-                        grid,
-                    };
-                    self.inner.manifest.store(Arc::new(
-                        self.inner.manifest.load().with_global_vector_index(index),
-                    ));
-                }
-            }
+            let index = super::manifest::GlobalVectorIndex {
+                column: vc.column.clone(),
+                grid,
+            };
+            self.inner.manifest.store(Arc::new(
+                self.inner.manifest.load().with_global_vector_index(index),
+            ));
         }
 
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
@@ -2904,11 +2902,12 @@ pub(in crate::supertable) async fn refresh_slow_vector_state(
         let (uri, hash) = slow_vector_state::write_state(storage.as_ref(), entries)
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
-        if let Some((cur_uri, cur_hash)) = old.slow_vector_state_blob() {
-            if cur_uri == uri && cur_hash == hash {
-                // Same membership already stamped — republish is a no-op.
-                return Ok(());
-            }
+        if let Some((cur_uri, cur_hash)) = old.slow_vector_state_blob()
+            && cur_uri == uri
+            && cur_hash == hash
+        {
+            // Same membership already stamped — republish is a no-op.
+            return Ok(());
         }
         let new_manifest = old.with_slow_vector_state(uri, hash);
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))

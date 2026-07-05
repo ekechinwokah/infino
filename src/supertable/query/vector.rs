@@ -340,14 +340,13 @@ async fn read_ids_for_locals(
             return Ok(ids);
         }
         // Cold path: fetch the inline region async when present but not resident.
-        if let Some(v) = reader.vec() {
-            if let Some(ids) = v
+        if let Some(v) = reader.vec()
+            && let Some(ids) = v
                 .inline_stable_ids_for_locals_async(local_ids)
                 .await
                 .map_err(|e| QueryError::Execute(e.to_string()))?
-            {
-                return Ok(ids);
-            }
+        {
+            return Ok(ids);
         }
     }
     if reader.parquet_bytes().is_some() {
@@ -830,7 +829,7 @@ impl SupertableReader {
             terms: tokens.clone(),
             mode: filter.mode,
         }];
-        let surviving: HashSet<u128> = select_superfiles(&manifest, &prune_leaves)
+        let surviving: HashSet<u128> = select_superfiles(manifest, &prune_leaves)
             .await?
             .iter()
             .map(|e| e.superfile_id.as_u128())
@@ -839,7 +838,7 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let superfiles = self
-            .vector_pruned_superfiles_intersect(&manifest, &surviving)
+            .vector_pruned_superfiles_intersect(manifest, &surviving)
             .await?;
         if superfiles.is_empty() {
             return Ok(Vec::new());
@@ -935,14 +934,14 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
-        let superfiles = match plan.surviving_superfile_ids(&manifest).await? {
+        let superfiles = match plan.surviving_superfile_ids(manifest).await? {
             None => manifest
                 .get_all_superfiles_loaded()
                 .await
                 .map_err(QueryError::ManifestLoad)?,
             Some(surviving) if surviving.is_empty() => return Ok(Vec::new()),
             Some(surviving) => {
-                self.vector_pruned_superfiles_intersect(&manifest, &surviving)
+                self.vector_pruned_superfiles_intersect(manifest, &surviving)
                     .await?
             }
         };
