@@ -369,6 +369,28 @@ fn on_storage_bytes(table: &Supertable) -> u64 {
     total
 }
 
+/// Storage prefix of the drain-published slow-CAS entry blob, relative to the
+/// table's own provider. Mirrors
+/// `src/supertable/slow_vector_state.rs::STORAGE_PREFIX` (crate-private), the
+/// same way `UriClass` mirrors engine URI tokens.
+const SLOW_VECTOR_STATE_PREFIX: &str = "slow-vector-state/";
+
+/// Total bytes under the table's slow-CAS prefix — the drain-published entry
+/// blob(s). Listed directly from storage so the stored-capacity readout
+/// reflects what is actually durable (a superseded blob not yet GC'd counts,
+/// deliberately). `None` when the table has no storage attached.
+fn slow_state_stored_bytes(table: &Supertable) -> Option<u64> {
+    let storage = Arc::clone(table.reader().manifest().options.storage.as_ref()?);
+    let total = tiers::block_on(async move {
+        storage
+            .list_with_prefix_metadata(SLOW_VECTOR_STATE_PREFIX)
+            .await
+            .map(|objs| objs.iter().map(|(_, meta)| meta.size).sum::<u64>())
+            .unwrap_or(0)
+    });
+    Some(total)
+}
+
 /// Cap on printed first-cold-query trace lines; the tail is summarized so a
 /// pre-drain fan (hundreds of GETs) can't flood the log.
 const COLD_TRACE_PRINT_MAX: usize = 200;
@@ -1606,12 +1628,20 @@ pub mod vector {
                     })
                     .unwrap_or(0);
                 let post_drain_stored = user_stored + hidden_stored;
+                // Slow-CAS entry blob (drain-published routing state) is a
+                // storage object outside the superfile sums above; list its
+                // prefix so the stored-capacity readout can't hide it.
+                let slow_state_stored = consumer
+                    .vector_index_table()
+                    .and_then(|h| slow_state_stored_bytes(h))
+                    .unwrap_or(0);
                 eprintln!(
-                    "[supertable_vector] on-storage footprint (steady state): user {} + hidden index {} = {} (ingest-time user-only was {})",
+                    "[supertable_vector] on-storage footprint (steady state): user {} + hidden index {} = {} (ingest-time user-only was {}); slow vector-state blob {}",
                     rss::fmt_bytes(user_stored),
                     rss::fmt_bytes(hidden_stored),
                     rss::fmt_bytes(post_drain_stored),
                     rss::fmt_bytes(built.total_index_bytes),
+                    rss::fmt_bytes(slow_state_stored),
                 );
                 let warm_vec = cost::warm_from_vector(&recall_rows);
                 let cold_vec = cost::cold_from_vector(&recall_rows);

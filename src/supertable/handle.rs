@@ -2355,6 +2355,137 @@ mod tests {
         );
     }
 
+    /// Residency under churn — the manifest-split invariant, end to end.
+    /// Drain publishes the slow-CAS entry blob and stamps its ref; a USER
+    /// DELETE (which records hidden deleted-ids and bumps the HIDDEN
+    /// pointer — the linked-manifest churn path) must preserve the ref and
+    /// the resident entries (same `Arc`s). Only the next drain (membership
+    /// change) replaces the blob and swaps the entries.
+    #[test]
+    fn hidden_slow_state_survives_user_delete_churn() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::prelude::{col, lit};
+
+        use crate::superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        let append_one = |title: &str| {
+            let titles = LargeStringArray::from(vec![title.to_owned()]);
+            let flat = Float32Array::from(vec![1.0f32; dim]);
+            let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(titles) as Arc<dyn Array>,
+                    Arc::new(fsl) as Arc<dyn Array>,
+                ],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        };
+        append_one("alpha");
+        append_one("beta");
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden vector index")
+            .clone();
+        let manifest_a = Arc::clone(hidden.reader().manifest());
+        let (uri_a, _) = manifest_a
+            .slow_vector_state_blob()
+            .expect("drain must publish + stamp the slow-CAS ref");
+        let uri_a = uri_a.to_owned();
+        assert!(!manifest_a.superfiles.is_empty());
+
+        // Churn: a USER delete records hidden deleted-ids — list-only churn
+        // on the HIDDEN manifest (linked manifests). Ref + entries survive.
+        let stats = st.delete(col("title").eq(lit("alpha"))).expect("delete");
+        assert_eq!(stats.n_tombstoned(), 1, "delete must tombstone one row");
+        let manifest_b = Arc::clone(hidden.reader().manifest());
+        assert!(
+            manifest_b.get_manifest_id() > manifest_a.get_manifest_id(),
+            "user delete must bump the hidden manifest (deleted-ids stamp)"
+        );
+        assert!(
+            manifest_b.deleted_user_ids_blob().is_some(),
+            "delete must stamp the hidden deleted-ids blob"
+        );
+        let (uri_b, _) = manifest_b
+            .slow_vector_state_blob()
+            .expect("delete churn must PRESERVE the slow-CAS ref");
+        assert_eq!(uri_b, uri_a, "ref unchanged by list-only churn");
+        assert_eq!(manifest_b.superfiles.len(), manifest_a.superfiles.len());
+        for (b, a) in manifest_b
+            .superfiles
+            .iter()
+            .zip(manifest_a.superfiles.iter())
+        {
+            assert!(
+                Arc::ptr_eq(b, a),
+                "residency: the entries must be the SAME Arcs across delete churn"
+            );
+        }
+
+        // Membership change: another commit + drain republishes the blob —
+        // the ONLY invalidation the slow state accepts.
+        append_one("gamma");
+        st.drain_vectors_to_cells_sync().expect("second drain");
+        let manifest_c = Arc::clone(hidden.reader().manifest());
+        let (uri_c, _) = manifest_c
+            .slow_vector_state_blob()
+            .expect("drain must restamp the ref");
+        assert_ne!(uri_c, uri_a, "new membership ⇒ new content-addressed blob");
+    }
+
     /// Incremental drain: each drain consumes only user commits not already in
     /// the hidden manifest's `drained_ranges`, and a drain with no new commits
     /// is a no-op (no re-drive, no duplicate cells). The distinguishing signal

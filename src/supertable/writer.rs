@@ -138,6 +138,7 @@ use crate::{
         },
         query::{dispatch::open_reader, vector::stable_ids_by_local_for_routing},
         reader_cache::DiskCacheStore,
+        slow_vector_state,
     },
 };
 
@@ -2521,6 +2522,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .map(|v| format!("{v:.0}"))
             .unwrap_or_else(|| "?".into()),
     );
+    // Membership has settled: publish the slow-CAS entry blob and stamp its
+    // ref (the per-batch `update`s cleared it). Warn-only: the drain itself
+    // is durable, and an unstamped ref just leaves consumers on the
+    // part-loading fallback until the next maintenance pass.
+    if let Err(e) = refresh_slow_vector_state(&hidden_inner).await {
+        tracing::warn!("supertable: slow vector-state refresh after drain failed: {e}");
+    }
     schedule_background_storage_reclaim(Arc::clone(&hidden_inner));
     Ok(())
 }
@@ -2866,6 +2874,68 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 /// superfiles go into one `ManifestPart` with a fresh `PartId`.
 /// With a real `PartitionStrategy`, `try_commit_attempt` runs
 /// the per-partition part-reuse path described on that fn.
+/// Publish the slow-CAS vector-state blob for `inner`'s CURRENT membership
+/// and stamp its ref on the manifest list. Called after a maintenance
+/// sequence settles hidden vector membership (end of drain; end of the
+/// hidden compaction pass, after merges + finalize + any cell splits) —
+/// scoped by call site, never by a table-kind test. `Manifest::update`
+/// cleared the ref when membership changed; this restamps it so consumers'
+/// resident centroid state is invalidated exactly once, by maintenance.
+///
+/// Mirrors [`record_hidden_deleted_ids`]: content-addressed idempotent PUT
+/// (`PreconditionFailed` = already durable), then a list+pointer etag-CAS
+/// stamp with refresh-and-retry on contention — so a lost race rebuilds the
+/// blob from the WINNING membership, never stamping stale state.
+pub(in crate::supertable) async fn refresh_slow_vector_state(
+    inner: &SupertableInner,
+) -> Result<(), BuildError> {
+    let Some(storage) = inner.options.storage.clone() else {
+        return Ok(());
+    };
+    let max_retries = inner.options.max_commit_retries.max(1);
+    for attempt in 0..max_retries {
+        let old = inner.manifest.load_full();
+        let entries = old.get_all_superfiles();
+        if entries.is_empty() {
+            // Nothing to describe (pre-drain / empty table); the ref is
+            // already absent because `update` never carries it forward.
+            return Ok(());
+        }
+        let (uri, hash) = slow_vector_state::write_state(storage.as_ref(), entries)
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        if let Some((cur_uri, cur_hash)) = old.slow_vector_state_blob() {
+            if cur_uri == uri && cur_hash == hash {
+                // Same membership already stamped — republish is a no-op.
+                return Ok(());
+            }
+        }
+        let new_manifest = old.with_slow_vector_state(uri, hash);
+        let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        match new_manifest
+            .write(storage.as_ref(), prev_etag.as_deref(), &[])
+            .await
+        {
+            Ok(()) => {
+                inner.manifest.store(Arc::new(new_manifest));
+                return Ok(());
+            }
+            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                refresh_inner_state_async(inner, &storage)
+                    .await
+                    .map_err(|e| BuildError::Store(e.to_string()))?;
+                sleep(backoff_delay(attempt)).await;
+            }
+            Err(e) => return Err(BuildError::Store(e.to_string())),
+        }
+    }
+    Err(BuildError::Store(
+        "slow vector-state refresh: write contention exhausted".into(),
+    ))
+}
+
 async fn record_hidden_deleted_ids(
     inner: &SupertableInner,
     new_deleted: &[i128],

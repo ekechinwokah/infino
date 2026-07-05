@@ -683,6 +683,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: Vec::new(),
         };
         let res = write_manifest_list(storage.as_ref(), &list)

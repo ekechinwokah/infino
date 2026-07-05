@@ -117,6 +117,17 @@ pub struct ManifestList {
     /// search on the hidden index (zero per-cell tombstone GETs).
     pub deleted_user_ids_uri: Option<String>,
     pub deleted_user_ids_content_hash: Option<ContentHash>,
+    /// Slow-CAS section: content-addressed blob holding this table's
+    /// superfile entries verbatim (the drain-owned routing/centroid state).
+    /// Present only on the hidden vector-index table, stamped exclusively by
+    /// drain / hidden compaction; the user table's slow section stays `None`
+    /// (the inverse of the hidden manifest — same format, no special paths).
+    /// `Manifest::update` deliberately does NOT carry these into its
+    /// successor list: any membership change invalidates the blob, and only
+    /// maintenance republishes it. Every consumer keys on ref presence,
+    /// never on table kind.
+    pub slow_vector_state_uri: Option<String>,
+    pub slow_vector_state_content_hash: Option<ContentHash>,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
@@ -771,6 +782,10 @@ struct ManifestListDto {
     deleted_user_ids_uri: Option<String>,
     #[serde(default)]
     deleted_user_ids_content_hash: Option<String>, // "blake3:<64hex>"
+    #[serde(default)]
+    slow_vector_state_uri: Option<String>,
+    #[serde(default)]
+    slow_vector_state_content_hash: Option<String>, // "blake3:<64hex>"
     partition_strategy: PartitionStrategyDto,
     #[serde(default)]
     global_vector_index: Option<GlobalVectorIndexDto>,
@@ -1235,6 +1250,11 @@ fn list_to_dto(l: &ManifestList) -> Result<ManifestListDto, ListEncodeError> {
         drained_ranges: l.drained_ranges.intervals().to_vec(),
         deleted_user_ids_uri: l.deleted_user_ids_uri.clone(),
         deleted_user_ids_content_hash: l.deleted_user_ids_content_hash.as_ref().map(encode_hash),
+        slow_vector_state_uri: l.slow_vector_state_uri.clone(),
+        slow_vector_state_content_hash: l
+            .slow_vector_state_content_hash
+            .as_ref()
+            .map(encode_hash),
         parts,
     })
 }
@@ -1284,6 +1304,12 @@ fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
         deleted_user_ids_uri: d.deleted_user_ids_uri,
         deleted_user_ids_content_hash: d
             .deleted_user_ids_content_hash
+            .as_deref()
+            .map(decode_hash)
+            .transpose()?,
+        slow_vector_state_uri: d.slow_vector_state_uri,
+        slow_vector_state_content_hash: d
+            .slow_vector_state_content_hash
             .as_deref()
             .map(decode_hash)
             .transpose()?,
@@ -1776,6 +1802,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: vec![],
         }
     }
@@ -1990,6 +2018,45 @@ mod tests {
         assert_eq!(decoded.global_vector_index, list.global_vector_index);
         // Absent by default (back-compat: old manifests without the field).
         assert!(empty_list().global_vector_index.is_none());
+    }
+
+    #[test]
+    fn slow_vector_state_ref_roundtrip() {
+        let mut list = empty_list();
+        list.slow_vector_state_uri = Some("slow-vector-state/state-abc.bin".into());
+        list.slow_vector_state_content_hash = Some(ContentHash([7u8; 32]));
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.slow_vector_state_uri, list.slow_vector_state_uri);
+        assert_eq!(
+            decoded.slow_vector_state_content_hash,
+            list.slow_vector_state_content_hash
+        );
+        // Absent by default (user tables and old manifests without the field).
+        let plain = empty_list();
+        let bytes = encode(&plain).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert!(decoded.slow_vector_state_uri.is_none());
+        assert!(decoded.slow_vector_state_content_hash.is_none());
+    }
+
+    /// A slow-state hash that isn't `blake3:<64hex>` is rejected with
+    /// `BadContentHash` (same `decode_hash` used by every other hash field).
+    #[test]
+    fn slow_vector_state_bad_hash_rejected() {
+        let mut list = empty_list();
+        list.slow_vector_state_uri = Some("slow-vector-state/state-abc.bin".into());
+        list.slow_vector_state_content_hash = Some(ContentHash([9u8; 32]));
+        let bytes = encode(&list).expect("encode");
+        let s = from_utf8(&bytes).expect("utf8");
+        let full = "09".repeat(BLAKE3_DIGEST_BYTES);
+        let tampered = s.replacen(&format!("blake3:{full}"), "blake3:xyz", 1);
+        assert_ne!(tampered, s, "tamper must change the bytes");
+        let err = decode(tampered.as_bytes()).expect_err("bad slow-state hash");
+        assert!(
+            matches!(err, ListParseError::BadContentHash(_)),
+            "expected BadContentHash, got {err:?}"
+        );
     }
 
     #[test]

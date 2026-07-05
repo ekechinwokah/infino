@@ -18,6 +18,7 @@ use crate::{
             SUPERFILE_DATA_DIR,
             commit::{MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, list_uri},
         },
+        slow_vector_state::STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX,
     },
 };
 
@@ -47,6 +48,12 @@ fn build_live_set(manifest: &Manifest) -> HashSet<String> {
         live.insert(sf.uri.storage_path());
     }
     if let Some((uri, _)) = manifest.deleted_user_ids_blob() {
+        live.insert(uri.to_owned());
+    }
+    // Slow-CAS entry blob: the URI is read straight off the manifest-list
+    // ref — sync, no fetch. Superseded blobs (older drains) are absent from
+    // the current list and get swept once past the safety gap.
+    if let Some((uri, _)) = manifest.slow_vector_state_blob() {
         live.insert(uri.to_owned());
     }
     live
@@ -83,6 +90,7 @@ pub(super) async fn gc_storage_sweep_for_inner(
         MANIFEST_PARTS_DIR,
         SUPERFILE_DATA_DIR,
         HIDDEN_DELETED_STORAGE_PREFIX,
+        SLOW_VECTOR_STATE_STORAGE_PREFIX,
     ] {
         let entries = storage.list_with_prefix_metadata(prefix).await?;
         for (key, meta) in entries {
@@ -126,6 +134,7 @@ mod tests {
                 list::{FORMAT_VERSION, ManifestList, PartitionStrategy},
                 part::ContentHash,
             },
+            slow_vector_state,
         },
         test_helpers::default_supertable_options,
     };
@@ -184,6 +193,55 @@ mod tests {
         assert!(!live.contains(&list_uri(2)));
     }
 
+    /// The slow-CAS entry blob referenced from the list is live; anything
+    /// else under its prefix (superseded drains, orphans from a crash
+    /// between PUT and stamp) is sweepable, and a ref-less manifest keeps
+    /// nothing there.
+    #[test]
+    fn build_live_set_contains_slow_vector_state_blob() {
+        let dir = tempdir().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let hash = ContentHash::of(b"slow state");
+        let uri = slow_vector_state::storage_path(&hash);
+        let orphan = slow_vector_state::storage_path(&ContentHash::of(b"orphan"));
+        let manifest = Manifest::new(
+            TEST_MANIFEST_ID,
+            opts(),
+            Vec::new(),
+            Some(storage),
+            Some(ManifestList {
+                format_version: FORMAT_VERSION.into(),
+                manifest_id: TEST_MANIFEST_ID,
+                options_hash: ContentHash::of(b"options"),
+                schema: Vec::new(),
+                id_column: "_id".into(),
+                fts_columns: Vec::new(),
+                vector_columns: Vec::new(),
+                partition_strategy: PartitionStrategy::Hash {
+                    column: "_id".into(),
+                    n_buckets: TEST_HASH_BUCKETS,
+                },
+                vector_index_storage_prefix: None,
+                global_vector_index: None,
+                drained_ranges: Default::default(),
+                deleted_user_ids_uri: None,
+                deleted_user_ids_content_hash: None,
+                slow_vector_state_uri: Some(uri.clone()),
+                slow_vector_state_content_hash: Some(hash),
+                parts: Vec::new(),
+            }),
+        );
+        let live = build_live_set(&manifest);
+        assert!(live.contains(&uri), "referenced blob must be live");
+        assert!(!live.contains(&orphan), "unreferenced blob must be sweepable");
+
+        // A manifest without a ref keeps nothing under the prefix live.
+        let bare = Manifest::empty(opts());
+        let live = build_live_set(&bare);
+        assert!(!live.contains(&uri));
+    }
+
     #[test]
     fn build_live_set_contains_deleted_user_ids_blob() {
         let dir = tempdir().expect("tempdir");
@@ -213,6 +271,8 @@ mod tests {
                 drained_ranges: Default::default(),
                 deleted_user_ids_uri: Some(uri.clone()),
                 deleted_user_ids_content_hash: Some(hash),
+                slow_vector_state_uri: None,
+                slow_vector_state_content_hash: None,
                 parts: Vec::new(),
             }),
         );

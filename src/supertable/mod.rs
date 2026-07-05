@@ -36,6 +36,7 @@ pub(crate) mod optimize;
 pub mod options;
 pub mod query;
 pub mod reader_cache;
+pub(crate) mod slow_vector_state;
 pub(crate) mod spfresh;
 pub mod stats;
 pub mod tombstones;

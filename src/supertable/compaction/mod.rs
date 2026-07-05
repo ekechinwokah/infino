@@ -44,7 +44,8 @@ use crate::{
         },
         writer::{
             PreparedSuperfile, ShardOutput, backoff_delay, finalize_compaction_commit,
-            prepare_superfile, split_overflow_cell_after_compaction, try_commit_attempt,
+            prepare_superfile, refresh_slow_vector_state, split_overflow_cell_after_compaction,
+            try_commit_attempt,
         },
     },
 };
@@ -195,6 +196,16 @@ impl Supertable {
         Self::compact_one_table(self, cfg).await?;
         if let Some(hidden) = self.inner().vector_index_table.as_ref() {
             Self::compact_one_table(hidden, &hidden_vector_index_compaction_settings()).await?;
+            // The hidden pass settled vector membership (merges + finalize +
+            // any cell splits); its `update`s cleared the slow-CAS ref, so
+            // republish the entry blob and restamp. Warn-only: compaction is
+            // durable, and an unstamped ref just leaves consumers on the
+            // part-loading fallback until the next maintenance pass.
+            if let Err(e) = refresh_slow_vector_state(hidden.inner()).await {
+                tracing::warn!(
+                    "supertable: slow vector-state refresh after hidden compaction failed: {e}"
+                );
+            }
         }
         Ok(())
     }

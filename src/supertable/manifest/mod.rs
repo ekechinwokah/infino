@@ -79,6 +79,7 @@ use crate::{
             partition::{PartitionKey, assign_partition, encode_partition_key},
         },
         query::{hierarchical_iter, prune::PruneLeaf},
+        slow_vector_state,
     },
 };
 
@@ -472,7 +473,75 @@ impl Manifest {
         let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
         let parts: DashMap<_, _> = DashMap::new();
         let mut all_superfiles: Vec<Arc<SuperfileEntry>> = Vec::new();
-        if let Some(current_manifest) = &current_manifest {
+
+        // Slow-CAS hydration. When the list carries a slow-state ref (keyed
+        // on presence, never table kind — the user table's slow section is
+        // always `None`), the flat view comes from one content-addressed
+        // blob instead of the part fan; parts stay lazily loadable for
+        // maintenance. The ref survives list-only churn (deleted-id stamps)
+        // and is cleared by every membership `update`, so ref-equality with
+        // the current manifest proves membership is unchanged — reuse the
+        // already-decoded entries with zero I/O. That reuse is what keeps
+        // the centroid state memory-resident across manifest versions until
+        // the drainer republishes.
+        let expected_n_superfiles: u64 = list.parts.iter().map(|e| e.n_superfiles as u64).sum();
+        let hydrated: Option<Vec<Arc<SuperfileEntry>>> = match (
+            list.slow_vector_state_uri.as_deref(),
+            list.slow_vector_state_content_hash,
+        ) {
+            (Some(uri), Some(hash)) => {
+                let reused = current_manifest.as_ref().and_then(|cur| {
+                    let same_ref = cur.list.as_ref().is_some_and(|cl| {
+                        cl.slow_vector_state_uri.as_deref() == Some(uri)
+                            && cl.slow_vector_state_content_hash == Some(hash)
+                    });
+                    let complete =
+                        cur.superfile_list.superfiles.len() as u64 == expected_n_superfiles;
+                    (same_ref && complete).then(|| cur.superfile_list.superfiles.clone())
+                });
+                match reused {
+                    Some(entries) => Some(entries),
+                    None => match slow_vector_state::load_state(storage.as_ref(), uri, &hash)
+                        .await
+                    {
+                        Ok(entries) if entries.len() as u64 == expected_n_superfiles => {
+                            Some(entries)
+                        }
+                        Ok(entries) => {
+                            tracing::warn!(
+                                "supertable: slow vector-state blob entry count {} != list total {}; \
+                                 falling back to manifest parts",
+                                entries.len(),
+                                expected_n_superfiles
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "supertable: slow vector-state hydration failed ({e}); \
+                                 falling back to manifest parts"
+                            );
+                            None
+                        }
+                    },
+                }
+            }
+            _ => None,
+        };
+        if let Some(entries) = hydrated {
+            // Inherit any already-loaded part cells (maintenance reuse);
+            // everything else stays an empty OnceCell for on-demand loads.
+            for entry in &list.parts {
+                let inherited = current_manifest
+                    .as_ref()
+                    .and_then(|cur| cur.parts.get(&entry.part_id).map(|kv| kv.value().clone()));
+                parts.insert(
+                    entry.part_id,
+                    inherited.unwrap_or_else(|| Arc::new(OnceCell::new())),
+                );
+            }
+            all_superfiles = entries;
+        } else if let Some(current_manifest) = &current_manifest {
             // If we have an existing manifest, populate `parts` with
             // existing entries and track missing part IDs for lazy-load.
             let mut missing_part_ids = Vec::new();
@@ -689,6 +758,17 @@ impl Manifest {
     ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
         match &self.list {
             Some(list) => {
+                // Flat-view fast path: when the resident view is COMPLETE
+                // (eager-loaded, blob-hydrated, or update-derived from a
+                // complete predecessor) it is exactly the parts' content, so
+                // no part loads are needed. Completeness is checked against
+                // the list's per-part counts because a LAZY manifest's
+                // post-commit flat view is non-empty but incomplete (the new
+                // entries only) — returning it would silently drop data.
+                let expected: u64 = list.parts.iter().map(|e| e.n_superfiles as u64).sum();
+                if self.superfile_list.superfiles.len() as u64 == expected {
+                    return Ok(self.superfile_list.superfiles.clone());
+                }
                 let all: Vec<PartId> = list.parts.iter().map(|p| p.part_id).collect();
                 hierarchical_iter::load_and_flatten(self, &all).await
             }
@@ -729,6 +809,18 @@ impl Manifest {
         ))
     }
 
+    /// Slow-CAS section accessor: the content-addressed blob holding this
+    /// table's superfile entries (drain-owned routing/centroid state), or
+    /// `None` when no maintenance has published one — always `None` on the
+    /// user table. Consumers key on presence, never on table kind.
+    pub(crate) fn slow_vector_state_blob(&self) -> Option<(&str, part::ContentHash)> {
+        let list = self.list.as_ref()?;
+        Some((
+            list.slow_vector_state_uri.as_deref()?,
+            list.slow_vector_state_content_hash?,
+        ))
+    }
+
     /// Stamp (or replace) the hidden index's consolidated deleted-user-`_id`
     /// blob reference. Bumps `manifest_id` like a normal commit without
     /// touching superfiles or parts.
@@ -739,6 +831,41 @@ impl Manifest {
             list.manifest_id = next_id;
             list.deleted_user_ids_uri = Some(uri);
             list.deleted_user_ids_content_hash = Some(hash);
+            list
+        });
+        Self {
+            superfile_list: SuperfileList {
+                manifest_id: next_id,
+                options: Arc::clone(&self.superfile_list.options),
+                superfiles: self.superfile_list.superfiles.clone(),
+                vector_index_storage_prefix: self
+                    .superfile_list
+                    .vector_index_storage_prefix
+                    .clone(),
+            },
+            list: new_list,
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+        }
+    }
+
+    /// Stamp (or replace) the slow-CAS vector-state blob reference — the
+    /// content-addressed object holding this table's superfile entries
+    /// (drain-owned routing/centroid state). Bumps `manifest_id` like a
+    /// normal commit without touching superfiles or parts, mirroring
+    /// [`Manifest::with_deleted_user_ids`]. Called only from drain / hidden
+    /// compaction publication; ordinary commits instead CLEAR the ref via
+    /// [`Manifest::update`] (membership change invalidates the blob).
+    pub fn with_slow_vector_state(&self, uri: String, hash: part::ContentHash) -> Self {
+        let next_id = self.get_next_manifest_id();
+        let new_list = self.list.as_ref().map(|list| {
+            let mut list = list.clone();
+            list.manifest_id = next_id;
+            list.slow_vector_state_uri = Some(uri);
+            list.slow_vector_state_content_hash = Some(hash);
             list
         });
         Self {
@@ -1203,6 +1330,14 @@ impl Manifest {
                 .list
                 .as_ref()
                 .and_then(|l| l.deleted_user_ids_content_hash),
+            // Slow-CAS section is deliberately NOT carried into the
+            // successor: `update` is the membership-change path (its only
+            // production caller is the commit attempt), and a membership
+            // change invalidates the drain-published entry blob. Only
+            // drain / hidden compaction restamp it, via
+            // `with_slow_vector_state`, after the new membership settles.
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: out_list_entries_after_removal,
         };
 
@@ -2592,6 +2727,8 @@ mod tests {
                 vector_index_storage_prefix: None,
                 deleted_user_ids_uri: None,
                 deleted_user_ids_content_hash: None,
+                slow_vector_state_uri: None,
+                slow_vector_state_content_hash: None,
                 parts: entries,
             }
         }
@@ -2827,6 +2964,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: vec![list::ManifestPartEntry {
                 part_id: entry,
                 uri: "manifests/part-x".into(),
@@ -2982,6 +3121,8 @@ mod tests {
                 vector_index_storage_prefix: None,
                 deleted_user_ids_uri: None,
                 deleted_user_ids_content_hash: None,
+                slow_vector_state_uri: None,
+                slow_vector_state_content_hash: None,
                 parts: vec![],
             }),
             parts: DashMap::new(),
@@ -2990,6 +3131,52 @@ mod tests {
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
         })
+    }
+
+    /// Slow-CAS section semantics: `with_slow_vector_state` stamps the ref
+    /// (bumping manifest_id, preserving membership); `update` — the
+    /// membership-change path — CLEARS it in the successor list; the
+    /// deleted-ids stamper preserves it (list-only churn keeps residency).
+    #[tokio::test]
+    async fn slow_vector_state_ref_stamp_clear_and_preserve() {
+        let opts = make_opts();
+        let manifest = empty_manifest(&opts);
+        assert!(manifest.slow_vector_state_blob().is_none());
+
+        let hash = ContentHash([3u8; 32]);
+        let stamped =
+            manifest.with_slow_vector_state("slow-vector-state/state-x.bin".into(), hash);
+        let (uri, got_hash) = stamped.slow_vector_state_blob().expect("ref stamped");
+        assert_eq!(uri, "slow-vector-state/state-x.bin");
+        assert_eq!(got_hash, hash);
+        assert_eq!(stamped.get_manifest_id(), manifest.get_next_manifest_id());
+        assert_eq!(
+            stamped.get_all_superfiles().len(),
+            manifest.get_all_superfiles().len(),
+            "stamp must not change membership"
+        );
+
+        // A deleted-ids stamp (list-only churn: the user-delete path) must
+        // NOT disturb the slow-state ref — this is the residency invariant.
+        let deleted_stamped =
+            stamped.with_deleted_user_ids("hidden-deleted-ids/deleted-y.bin".into(), hash);
+        assert!(
+            deleted_stamped.slow_vector_state_blob().is_some(),
+            "deleted-ids stamp must preserve the slow-state ref"
+        );
+
+        // A membership change (update) must CLEAR the ref: the blob no
+        // longer describes the new membership; only maintenance restamps.
+        let pk = hash_bucket_0_pk();
+        let new_entry = make_superfile_entry(100, pk);
+        let (updated, _parts) = stamped
+            .update(from_ref(&new_entry), &[])
+            .await
+            .expect("update");
+        assert!(
+            updated.slow_vector_state_blob().is_none(),
+            "membership change must clear the slow-state ref"
+        );
     }
 
     #[tokio::test]
@@ -3048,6 +3235,213 @@ mod tests {
         (dir, store)
     }
 
+    /// Number of parts whose `OnceCell` actually holds decoded bytes —
+    /// distinct from `get_num_parts_loaded()`, which counts map slots (the
+    /// lazy and hydrated branches pre-insert empty cells for every part).
+    fn n_parts_initialized(m: &Manifest) -> usize {
+        m.parts
+            .iter()
+            .filter(|kv| kv.value().get().is_some())
+            .count()
+    }
+
+    /// Persist one part (two entries) + a list referencing it + the pointer.
+    /// `slow_ref` optionally stamps the list's slow-CAS section, letting the
+    /// hydration tests choose a valid ref, a corrupt one, or none.
+    async fn persist_two_entry_table(
+        storage: &Arc<dyn StorageProvider>,
+        slow_ref: Option<(String, ContentHash)>,
+    ) -> Vec<Arc<SuperfileEntry>> {
+        let pk = hash_bucket_0_pk();
+        let entries = vec![
+            make_superfile_entry(100, pk.clone()),
+            make_superfile_entry(50, pk.clone()),
+        ];
+        let part = ManifestPart {
+            format_version: part::FORMAT_VERSION.into(),
+            part_id: PartId::new_v4(),
+            superfiles: entries.clone(),
+        };
+        let pw = write_manifest_part(storage.as_ref(), &part, MANIFEST_ZSTD_LEVEL)
+            .await
+            .expect("write part");
+        let (slow_uri, slow_hash) = match slow_ref {
+            Some((u, h)) => (Some(u), Some(h)),
+            None => (None, None),
+        };
+        let list = ManifestList {
+            drained_ranges: Default::default(),
+            global_vector_index: None,
+            format_version: list::FORMAT_VERSION.into(),
+            manifest_id: 1,
+            options_hash: ContentHash([0u8; 32]),
+            schema: vec![],
+            id_column: "_id".into(),
+            fts_columns: vec![],
+            vector_columns: vec![],
+            partition_strategy: PartitionStrategy::Hash {
+                column: "_id".into(),
+                n_buckets: 1,
+            },
+            vector_index_storage_prefix: None,
+            deleted_user_ids_uri: None,
+            deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: slow_uri,
+            slow_vector_state_content_hash: slow_hash,
+            parts: vec![ManifestPartEntry {
+                part_id: pw.part_id,
+                uri: pw.uri,
+                content_hash: pw.content_hash,
+                size_bytes_compressed: pw.size_bytes_compressed,
+                size_bytes_uncompressed: pw.size_bytes_uncompressed,
+                n_superfiles: 2,
+                partition_key: pk,
+                id_range: (0, 99),
+                scalar_stats_agg: Default::default(),
+                fts_summary_agg: Default::default(),
+            }],
+        };
+        let lw = write_manifest_list(storage.as_ref(), &list)
+            .await
+            .expect("write list");
+        write_pointer(
+            storage.as_ref(),
+            &PointerFile {
+                manifest_id: 1,
+                manifest_list_uri: lw.uri,
+                content_hash: lw.content_hash,
+            },
+            None,
+        )
+        .await
+        .expect("write pointer");
+        entries
+    }
+
+    /// Hydration: a list carrying a verified slow-state ref builds the flat
+    /// view from the blob with ZERO part loads; the parts stay lazily
+    /// loadable for maintenance.
+    #[tokio::test]
+    async fn load_hydrates_flat_view_from_slow_state_blob() {
+        let opts = make_opts();
+        let (_dir, storage) = local_storage();
+        let pk = hash_bucket_0_pk();
+        let entries = vec![
+            make_superfile_entry(100, pk.clone()),
+            make_superfile_entry(50, pk),
+        ];
+        let (blob_uri, blob_hash) = slow_vector_state::write_state(storage.as_ref(), &entries)
+            .await
+            .expect("write blob");
+        // Rebuild the same membership durably with the ref stamped.
+        let (_dir2, storage2) = local_storage();
+        let _ = _dir2;
+        drop(storage2); // single-storage test; helper writes to `storage`.
+        let persisted = persist_two_entry_table(&storage, Some((blob_uri, blob_hash))).await;
+
+        let loaded = Manifest::load(None, Arc::clone(&storage), Some(opts))
+            .await
+            .expect("load");
+        assert_eq!(loaded.superfiles.len(), 2);
+        let want: HashSet<Uuid> = persisted.iter().map(|e| e.superfile_id).collect();
+        let got: HashSet<Uuid> = loaded.superfiles.iter().map(|e| e.superfile_id).collect();
+        assert_eq!(
+            got.len(),
+            2,
+            "blob-hydrated flat view must carry both entries"
+        );
+        assert_eq!(want.len(), 2);
+        assert_eq!(
+            n_parts_initialized(&loaded),
+            0,
+            "hydration must not fetch any manifest part"
+        );
+        assert!(loaded.slow_vector_state_blob().is_some());
+    }
+
+    /// Residency invariant: a refresh whose slow-state ref is unchanged
+    /// (list-only churn — here a deleted-ids stamp) reuses the decoded
+    /// entries — same `Arc`s, zero part loads, zero blob refetch.
+    #[tokio::test]
+    async fn refresh_with_unchanged_slow_ref_reuses_entries() {
+        let opts = make_opts();
+        let (_dir, storage) = local_storage();
+        let pk = hash_bucket_0_pk();
+        let entries = vec![
+            make_superfile_entry(100, pk.clone()),
+            make_superfile_entry(50, pk),
+        ];
+        let (blob_uri, blob_hash) = slow_vector_state::write_state(storage.as_ref(), &entries)
+            .await
+            .expect("write blob");
+        persist_two_entry_table(&storage, Some((blob_uri, blob_hash))).await;
+
+        let a = Manifest::load(None, Arc::clone(&storage), Some(Arc::clone(&opts)))
+            .await
+            .expect("load A");
+        // List-only churn: stamp deleted-ids (preserves the slow ref) and
+        // publish it so the pointer advances past A.
+        let (_, meta) = read_pointer(storage.as_ref())
+            .await
+            .expect("read pointer")
+            .expect("pointer present");
+        let etag = meta.etag.expect("localfs pointer etag");
+        let stamped = a.with_deleted_user_ids(
+            "hidden-deleted-ids/deleted-z.bin".into(),
+            ContentHash([4u8; 32]),
+        );
+        stamped
+            .write(storage.as_ref(), Some(etag.as_str()), &[])
+            .await
+            .expect("stamp publish");
+
+        let b = Manifest::load(Some(Arc::clone(&a)), Arc::clone(&storage), None)
+            .await
+            .expect("refresh");
+        assert_eq!(b.get_manifest_id(), a.get_manifest_id() + 1);
+        assert!(b.slow_vector_state_blob().is_some(), "ref preserved");
+        assert_eq!(b.superfiles.len(), a.superfiles.len());
+        for (be, ae) in b.superfiles.iter().zip(a.superfiles.iter()) {
+            assert!(
+                Arc::ptr_eq(be, ae),
+                "unchanged ref must reuse the SAME decoded entries — \
+                 the centroid state never leaves memory on list-only churn"
+            );
+        }
+        assert_eq!(
+            n_parts_initialized(&b),
+            0,
+            "refresh with unchanged ref must not fetch parts"
+        );
+    }
+
+    /// A corrupt slow-state ref (hash mismatch) must fall back to the
+    /// existing eager part-loading path — never fail the open.
+    #[tokio::test]
+    async fn load_with_corrupt_slow_ref_falls_back_to_parts() {
+        let opts = make_opts();
+        let (_dir, storage) = local_storage();
+        let bogus = (
+            "slow-vector-state/state-missing.bin".to_string(),
+            ContentHash([9u8; 32]),
+        );
+        persist_two_entry_table(&storage, Some(bogus)).await;
+
+        let loaded = Manifest::load(None, Arc::clone(&storage), Some(opts))
+            .await
+            .expect("load must fall back, not fail");
+        assert_eq!(
+            loaded.superfiles.len(),
+            2,
+            "fallback must serve the full membership from parts"
+        );
+        assert_eq!(
+            n_parts_initialized(&loaded),
+            1,
+            "fallback eager-loads the part"
+        );
+    }
+
     #[tokio::test]
     async fn update_add_to_existing_partition_rewrites_part() {
         // Adding a new entry to an existing single-part partition rewrites that part.
@@ -3083,6 +3477,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -3234,6 +3630,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: vec![
                 entry_for(&pw_a_old, &pk_a),
                 entry_for(&pw_a_latest, &pk_a),
@@ -3449,6 +3847,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -3549,6 +3949,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -3688,6 +4090,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_old.part_id,
@@ -3821,6 +4225,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
@@ -3956,6 +4362,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
@@ -4112,6 +4520,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
@@ -4270,6 +4680,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -4366,6 +4778,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -4478,6 +4892,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
@@ -4620,6 +5036,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
@@ -4752,6 +5170,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -4839,6 +5259,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -4947,6 +5369,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
@@ -5074,6 +5498,8 @@ mod tests {
             vector_index_storage_prefix: None,
             deleted_user_ids_uri: None,
             deleted_user_ids_content_hash: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
             parts,
         }
     }
