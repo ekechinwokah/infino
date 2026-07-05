@@ -12,7 +12,7 @@
 //! per-modality trait here, so the measured + reported surface can never
 //! drift between the two tiers again.
 
-use std::time::{Duration, Instant};
+use std::{sync::Arc, time::{Duration, Instant}};
 
 /// p50 of a sample set (lower-median; matches the historical bench
 /// definition shared by every runner).
@@ -667,10 +667,7 @@ pub mod fts {
 pub mod vector {
     use std::{collections::HashMap, hint::black_box};
 
-    use infino::{
-        superfile::{SuperfileReader, reader::VectorSearchOptions},
-        supertable::Supertable,
-    };
+    use infino::superfile::{SuperfileReader, reader::VectorSearchOptions};
 
     use super::*;
     use crate::{
@@ -716,9 +713,8 @@ pub mod vector {
             .with_rerank_mult(rerank_mult)
     }
 
-    /// A reader the vector executor runs kNN against, returning **global**
-    /// `(doc_id, score)` hits so recall can be graded against brute-force
-    /// ground truth regardless of how many superfiles back the reader.
+    /// A reader the vector executor runs kNN against, returning global
+    /// dense `(doc_id, score)` hits for recall vs brute-force ground truth.
     pub trait VectorRead {
         fn topk_global(
             &self,
@@ -756,7 +752,7 @@ pub mod vector {
             nprobe: usize,
             rerank: usize,
         ) -> Vec<(u32, f32)> {
-            // Single superfile: local_doc_id == global id.
+            // Single superfile: local_doc_id == dense oracle id.
             crate::tiers::block_on(self.vector_hits_async(
                 column,
                 query,
@@ -767,7 +763,16 @@ pub mod vector {
         }
     }
 
-    impl VectorRead for Supertable {
+    /// Supertable recall through the public `vector_search` surface: hits come
+    /// back as stable `_id` + score; `id_to_dense` (one ordered `SELECT _id`
+    /// scan) translates them to the dense oracle rows the brute-force ground
+    /// truth speaks.
+    pub struct SupertableVectorRead<'a> {
+        pub table: &'a infino::supertable::Supertable,
+        pub id_to_dense: Arc<HashMap<i128, u32>>,
+    }
+
+    impl VectorRead for SupertableVectorRead<'_> {
         fn topk_global(
             &self,
             column: &str,
@@ -776,69 +781,21 @@ pub mod vector {
             nprobe: usize,
             rerank: usize,
         ) -> Vec<(u32, f32)> {
-            let reader = self.reader();
-            let hits = reader
-                .vector_hits(column, query, k, search_opts(nprobe, rerank), None)
-                .expect("supertable vector_hits");
-            let manifest = reader.manifest();
-            // Per-superfile doc offsets in manifest order. Unfiltered
-            // vector search may route through the hidden index, whose
-            // superfiles live in a sibling manifest — fall back there
-            // until source_ref maps hidden hits back to user rows.
-            let mut seg_uris: Vec<_> = manifest.superfiles.iter().map(|e| e.uri).collect();
-            let mut offsets: Vec<u32> = Vec::with_capacity(seg_uris.len());
-            let mut acc: u32 = 0;
-            for entry in manifest.superfiles.iter() {
-                offsets.push(acc);
-                acc = acc.saturating_add(entry.n_docs as u32);
-            }
-            if let Some(hidden) = self.vector_index_table() {
-                let hidden_reader = hidden.reader();
-                let hidden_manifest = hidden_reader.manifest();
-                for entry in hidden_manifest.superfiles.iter() {
-                    seg_uris.push(entry.uri);
-                    offsets.push(acc);
-                    acc = acc.saturating_add(entry.n_docs as u32);
-                }
-            }
-            hits.into_iter()
-                .map(|h| {
-                    let seg_idx = seg_uris
-                        .iter()
-                        .position(|u| *u == h.superfile)
-                        .expect("hit superfile present in user or hidden manifest");
-                    (offsets[seg_idx] + h.local_doc_id, h.score)
-                })
-                .collect()
-        }
-
-        fn full_search_p50_ns(
-            &self,
-            column: &str,
-            query: &[f32],
-            k: usize,
-            nprobe: usize,
-            rerank: usize,
-        ) -> Option<f64> {
-            // The public `vector_search` a real caller uses: routing + rerank
-            // + stable `_id` resolution + Arrow materialization (projection =
-            // None → `_id` + score). `topk_global` stops at (superfile,
-            // local_doc_id); this measures the id-resolution cost that path
-            // excludes, so the reported warm p50 can be stated honestly.
-            let reader = self.reader();
-            let _ = reader
+            let batches = self
+                .table
+                .reader()
                 .vector_search(column, query, k, search_opts(nprobe, rerank), None, None)
                 .expect("supertable vector_search");
-            let mut samples = Vec::with_capacity(CALIBRATION_P50_ITERS);
-            for _ in 0..CALIBRATION_P50_ITERS {
-                let t0 = Instant::now();
-                let batches = reader
-                    .vector_search(column, query, k, search_opts(nprobe, rerank), None, None)
-                    .expect("supertable vector_search");
-                samples.push(t0.elapsed());
-                black_box(batches);
-            }
-            Some(p50(&mut samples).as_secs_f64() * NS_PER_SEC)
+            corpus::id_scores_from_vector_search(&batches)
+                .into_iter()
+                .map(|(id, score)| {
+                    let dense = *self
+                        .id_to_dense
+                        .get(&id)
+                        .unwrap_or_else(|| panic!("vector_search returned unknown _id {id}"));
+                    (dense, score)
+                })
+                .collect()
         }
     }
 
@@ -1401,15 +1358,13 @@ pub mod vector {
             }),
         });
 
-        // Quantify the `_id`-resolution cost the `topk_global` (`vector_hits`)
-        // p50 excludes: time the public `vector_search` path once at the
-        // default config and log the delta vs the just-measured `vector_hits`
-        // warm p50. `None` for tiers that only expose `topk_global`.
+        // `topk_global` times the public `vector_search` path for supertable.
         if include_warm
             && let (Some(full_p50), Some(hits_p50)) = (
                 warm_reader.full_search_p50_ns(column, q0, k, default_nprobe, default_rerank),
                 rows.last().and_then(|r| r.warm.as_ref()).map(|w| w.p50_ns),
             )
+            && (full_p50 - hits_p50).abs() > 1.0
         {
             eprintln!(
                 "[{log_prefix}] public vector_search (_id-resolved) p50 = {} vs vector_hits p50 = {} (id-resolve delta = {})",

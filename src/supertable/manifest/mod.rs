@@ -35,7 +35,6 @@ pub mod partition;
 pub mod term_range;
 
 use std::{
-    cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
     ops::Deref,
@@ -76,7 +75,7 @@ use crate::{
                 PartitionStrategy,
             },
             part::{ContentHash, ManifestPart, PartId},
-            partition::{PartitionKey, assign_partition, encode_partition_key},
+            partition::{assign_partition, encode_partition_key},
         },
         query::{hierarchical_iter, prune::PruneLeaf},
         slow_vector_state,
@@ -1014,58 +1013,10 @@ impl Manifest {
         Ok(Arc::clone(loaded))
     }
 
-    /// All superfiles under list parts for `partition_key`.
-    ///
-    /// The flat [`SuperfileList::superfiles`] view is only populated when
-    /// `parts.len() <= eager_load_threshold_parts`; writers that replace
-    /// per-partition superfiles must use this helper instead.
-    pub(crate) async fn superfiles_for_partition_key(
-        &self,
-        partition_key: &[u8],
-    ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
-        let Some(list) = &self.list else {
-            return Ok(self
-                .superfiles
-                .iter()
-                .filter(|e| e.partition_key == partition_key)
-                .cloned()
-                .collect());
-        };
-        let mut out = Vec::new();
-        for entry in &list.parts {
-            if entry.partition_key != partition_key {
-                continue;
-            }
-            let part = self.get_part_by_id(entry.part_id).await?;
-            out.extend(part.superfiles.iter().cloned());
-        }
-        Ok(out)
-    }
-
-    /// Load superfiles for routed VectorCell ids from list parts (works when
-    /// the flat `superfiles` view is empty under lazy manifest loading).
-    pub(crate) async fn superfiles_for_routed_cells(
-        &self,
-        routed_cells: &[u32],
-    ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
-        let mut out = Vec::new();
-        let mut seen = HashSet::new();
-        for cell in routed_cells {
-            let pk = encode_partition_key(&PartitionKey::VectorCell(*cell));
-            for sf in self.superfiles_for_partition_key(&pk).await? {
-                if seen.insert(sf.superfile_id) {
-                    out.push(sf);
-                }
-            }
-        }
-        Ok(out)
-    }
-
     /// Resolve one superfile by storage URI. Checks the flat
     /// [`SuperfileList::superfiles`] view first; when the entry is absent
     /// there (lazy list/parts layout), walks manifest parts until a match
-    /// is found — the same source [`superfiles_for_routed_cells`] uses for
-    /// hidden-index search.
+    /// is found.
     pub(crate) async fn lookup_superfile_entry(
         &self,
         uri: SuperfileUri,
@@ -2175,47 +2126,6 @@ impl ClusterCentroids {
         distance(metric, query, self.centroid(c))
     }
 
-    /// Adaptive cell selection for hidden-index routing: score every populated
-    /// cell by centroid distance and return the probe set — the `nprobe_min`
-    /// nearest cells, extended (up to `nprobe_max`) with every cell whose
-    /// centroid distance is within `(1 + slack)` of the nearest.
-    pub fn select_cells_adaptive(
-        &self,
-        metric: Metric,
-        query: &[f32],
-        nprobe_floor: usize,
-        routing: list::CellRoutingParams,
-    ) -> Vec<u32> {
-        let dim = self.dim as usize;
-        if self.n_cent == 0 || dim == 0 || query.len() != dim {
-            return (0..self.n_cent).collect();
-        }
-        let mut scored: Vec<(u32, f32)> = Vec::with_capacity(self.n_cent as usize);
-        self.score_clusters_into(metric, query, |c, score| {
-            scored.push((c, score));
-        });
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-        if scored.is_empty() {
-            return Vec::new();
-        }
-        let d_star = scored[0].1;
-        let tau = d_star * (1.0 + routing.slack);
-        let nprobe_min = nprobe_floor.max(routing.nprobe_min).max(1);
-        let nprobe_max = routing.nprobe_max.max(nprobe_min);
-        let n = scored.len();
-        let floor = nprobe_min.min(n);
-        let mut order: Vec<usize> = (0..floor).collect();
-        for (i, &(_, d)) in scored.iter().enumerate().skip(floor) {
-            if order.len() >= nprobe_max {
-                break;
-            }
-            if d <= tau {
-                order.push(i);
-            }
-        }
-        order.into_iter().map(|i| scored[i].0).collect()
-    }
-
     /// Score every populated cluster: [`distance`] on each fp32 centroid
     /// slice against `query` (zero-copy, no dequant). Calls
     /// `emit(cluster_id, score)` for each cluster with a nonzero indexed count.
@@ -2305,34 +2215,6 @@ mod tests {
         let counts: Vec<u32> = (0..nc).map(|c| if c == nc / 2 { 0 } else { 10 }).collect();
         let cc = ClusterCentroids::from_fp32(n_cent, dim, &centroids, counts);
         (cc, centroids)
-    }
-
-    /// `select_cells_adaptive` honors the nprobe floor and cap and returns
-    /// the nearest cell first. Wire roundtrip of the centroid block is
-    /// covered separately in `encoding::tests`.
-    #[test]
-    fn select_cells_adaptive_floor_cap_and_nearest_first() {
-        use crate::supertable::manifest::list::CellRoutingParams;
-
-        let clusters = ClusterCentroids::from_fp32(
-            4,
-            4,
-            &[
-                0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0, 10.0, 0.0,
-            ],
-            vec![1, 1, 1, 1],
-        );
-
-        let query = [0.1, 0.0, 0.0, 0.0];
-        let routing = CellRoutingParams {
-            nprobe_min: 2,
-            nprobe_max: 4,
-            slack: 0.0,
-        };
-        let routed = clusters.select_cells_adaptive(Metric::L2Sq, &query, 1, routing);
-        assert!(routed.len() >= 2);
-        assert!(routed.len() <= 4);
-        assert_eq!(routed[0], clusters.nearest_cell(Metric::L2Sq, &query));
     }
 
     /// `score_clusters_into` must match [`distance`] on the fp32 centroid slice.

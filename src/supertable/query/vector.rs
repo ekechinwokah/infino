@@ -80,21 +80,17 @@ use super::{
     SuperfileHit,
     candidate::CandidatePlan,
     dispatch,
-    exec::common::{id_score_batch, resolve_hits_named, take_rows_object_store},
-    hierarchical_iter,
+    exec::common::{SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_object_store},
     prune::{PruneLeaf, select_superfiles},
 };
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::{
     storage::StorageProvider,
-    superfile::{SuperfileReader, fts::reader::BoolMode, vector::distance::Metric},
+    superfile::{SuperfileReader, fts::reader::BoolMode},
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader, is_hidden_vector_index_table},
-        manifest::{
-            Manifest, SuperfileEntry, SuperfileUri,
-            list::{CellRoutingParams, PartitionStrategy},
-        },
+        manifest::{Manifest, SuperfileEntry, SuperfileUri},
         tombstones::SidecarCache,
     },
 };
@@ -110,100 +106,6 @@ pub struct VectorFilter<'a> {
     pub query: &'a str,
     /// Token matching mode (AND / OR).
     pub mode: BoolMode,
-}
-
-/// Apply query-time diagnostic overrides to the persisted cell-routing params.
-/// `INFINO_CELL_NPROBE_MAX` caps (or sets) the adaptive probe ceiling without
-/// rebuilding the index — set it equal to the nprobe floor to disable adaptive
-/// expansion ("use the hint"), or sweep it to trade fan-out against recall.
-/// Read once and cached.
-fn routing_with_env_overrides(mut routing: CellRoutingParams) -> CellRoutingParams {
-    use std::sync::OnceLock;
-    static NPROBE_MAX: OnceLock<Option<usize>> = OnceLock::new();
-    let override_max = *NPROBE_MAX.get_or_init(|| {
-        std::env::var("INFINO_CELL_NPROBE_MAX")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-    });
-    if let Some(n) = override_max {
-        routing.nprobe_max = n.max(routing.nprobe_min);
-    }
-    routing
-}
-
-fn filter_superfiles_by_cells(
-    superfiles: &[Arc<SuperfileEntry>],
-    routed_cells: &[u32],
-) -> Vec<Arc<SuperfileEntry>> {
-    if routed_cells.is_empty() {
-        return superfiles.to_vec();
-    }
-    let routed_keys: HashSet<[u8; 4]> = routed_cells.iter().map(|c| c.to_le_bytes()).collect();
-    superfiles
-        .iter()
-        .filter(|sf| {
-            if sf.partition_key.len() == 4 {
-                let mut key = [0u8; 4];
-                key.copy_from_slice(&sf.partition_key);
-                routed_keys.contains(&key)
-            } else if let Some(cell) = sf.partition_hint {
-                routed_keys.contains(&cell.to_le_bytes())
-            } else {
-                false
-            }
-        })
-        .cloned()
-        .collect()
-}
-
-/// Split hits into those already on the user table vs hidden-index hits
-/// that still need remap. Mixed fan-out (user-table fallback alongside
-/// hidden-index probes) is classified per hit instead of all-or-nothing.
-async fn partition_hits_by_table(
-    user_reader: &SupertableReader,
-    hits: &[SuperfileHit],
-) -> Result<(Vec<SuperfileHit>, Vec<SuperfileHit>), QueryError> {
-    if hits.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
-    }
-    let user_manifest = user_reader.manifest();
-    let hidden_manifest = user_reader
-        .vector_index_table()
-        .map(|vit| Arc::clone(vit.reader().manifest()));
-    let hidden_has_data = hidden_manifest
-        .as_ref()
-        .is_some_and(|m| !m.superfiles.is_empty() || m.get_num_parts() > 0);
-    let mut on_user = Vec::new();
-    let mut on_hidden = Vec::new();
-    for hit in hits {
-        if user_manifest
-            .lookup_superfile_entry(hit.superfile)
-            .await
-            .map_err(QueryError::ManifestLoad)?
-            .is_some()
-        {
-            on_user.push(*hit);
-            continue;
-        }
-        if hidden_has_data {
-            let hidden_manifest = hidden_manifest.as_ref().expect("checked above");
-            if hidden_manifest
-                .lookup_superfile_entry(hit.superfile)
-                .await
-                .map_err(QueryError::ManifestLoad)?
-                .is_some()
-            {
-                on_hidden.push(*hit);
-                continue;
-            }
-        }
-        return Err(QueryError::Execute(format!(
-            "hit superfile {:?} missing from user and hidden manifests",
-            hit.superfile
-        )));
-    }
-    Ok((on_user, on_hidden))
 }
 
 /// Resolve the user-table superfile that owns `user_row_id` (flat view
@@ -440,86 +342,132 @@ async fn hidden_hits_user_ids(
     Ok(ids)
 }
 
-/// `_id`-only hidden-index fast path. The caller wants only `_id` + `score`,
-/// which remap step 1 already yields — so resolve the stable `_id` per hidden
-/// hit and synthesize the batch directly, skipping remap steps 2/3 and the
-/// user-superfile column resolve entirely (no user-table data-page read). Hits
-/// are already in global rank order; the batch preserves it.
-async fn hidden_hits_id_score_batch(
-    user_reader: &SupertableReader,
-    hidden_hits: &[SuperfileHit],
-) -> Result<RecordBatch, QueryError> {
-    let vit = user_reader
-        .vector_index_table()
-        .ok_or_else(|| QueryError::Execute("hidden vector index missing".into()))?;
-    let vit_reader = vit.reader();
-    let hidden_manifest: &Manifest = vit_reader.manifest();
-    let id_column = user_reader.options().id_column.as_str();
+fn projection_is_id_score_only(projection: Option<&[&str]>, id_column: &str) -> bool {
+    match projection {
+        None => true,
+        Some(names) => names == [id_column, SCORE_COLUMN] || names == [SCORE_COLUMN, id_column],
+    }
+}
 
-    let ids = hidden_hits_user_ids(hidden_manifest, hidden_hits, id_column).await?;
-    let deleted = vit_reader
-        .hidden_deleted_ids()
-        .map_err(|e| QueryError::Execute(e.to_string()))?;
-    let (ids, scores): (Vec<i128>, Vec<f32>) = ids
-        .into_iter()
-        .zip(hidden_hits.iter().map(|h| h.score))
-        .filter(|(id, _)| deleted.binary_search(id).is_err())
-        .unzip();
+/// `_id` + `score` batch from hits. Fan-out stamps the user `_id` on
+/// `stable_id` for hidden-index hits; pre-drain user-table hits resolve
+/// from manifest span arithmetic.
+async fn hits_id_score_batch(
+    user_reader: &SupertableReader,
+    hits: &[SuperfileHit],
+) -> Result<RecordBatch, QueryError> {
+    let user_manifest = user_reader.manifest();
+    let id_column = user_reader.options().id_column.as_str();
+    let hidden_manifest = user_reader
+        .vector_index_table()
+        .map(|vit| Arc::clone(vit.reader().manifest()));
+    let deleted = user_reader
+        .vector_index_table()
+        .and_then(|vit| vit.reader().hidden_deleted_ids().ok());
+    let mut ids = Vec::with_capacity(hits.len());
+    let mut scores = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let user_row_id = if let Some(id) = hit.stable_id {
+            id
+        } else if let Some(entry) = user_manifest
+            .lookup_superfile_entry(hit.superfile)
+            .await
+            .map_err(QueryError::ManifestLoad)?
+        {
+            if let Some(id) = row_id_from_manifest_entry(&entry, hit.local_doc_id) {
+                id
+            } else {
+                read_ids_for_locals(
+                    user_manifest,
+                    entry.as_ref(),
+                    std::slice::from_ref(&hit.local_doc_id),
+                    id_column,
+                    false,
+                )
+                .await?[0]
+            }
+        } else if let Some(ref hm) = hidden_manifest {
+            hidden_hits_user_ids(hm, std::slice::from_ref(hit), id_column).await?[0]
+        } else {
+            return Err(QueryError::Execute(format!(
+                "hit superfile {:?} missing from manifests",
+                hit.superfile
+            )));
+        };
+        if deleted
+            .as_ref()
+            .is_some_and(|d| d.binary_search(&user_row_id).is_ok())
+        {
+            continue;
+        }
+        ids.push(user_row_id);
+        scores.push(hit.score);
+    }
     id_score_batch(user_reader, &ids, &scores).map_err(|e| QueryError::Execute(e.to_string()))
 }
 
-/// Map hidden-index `(superfile, local_doc_id)` hits to user-table hits
-/// using aligned `_id` values stamped during dual-write.
-async fn remap_hidden_hits_to_user_hits(
+/// Locate each hit's user-table `(superfile, local_doc_id)` for scalar
+/// column decode. Hidden-index hits already carry the user `_id` on
+/// `stable_id`; user-table hits pass through unchanged.
+async fn user_placement_for_scalar_resolve(
     user_reader: &SupertableReader,
-    hidden_hits: &[SuperfileHit],
+    hits: &[SuperfileHit],
 ) -> Result<Vec<SuperfileHit>, QueryError> {
-    if hidden_hits.is_empty() {
+    if hits.is_empty() {
         return Ok(Vec::new());
     }
-    let vit = user_reader
-        .vector_index_table()
-        .ok_or_else(|| QueryError::Execute("hidden vector index missing".into()))?;
-    let vit_reader = vit.reader();
-    let hidden_manifest = vit_reader.manifest();
     let user_manifest = user_reader.manifest();
     let id_column = user_reader.options().id_column.as_str();
-
-    // Step 1: hidden hit → stable user `_id` (deduped, resident).
-    let user_ids = hidden_hits_user_ids(hidden_manifest, hidden_hits, id_column).await?;
-    let deleted = vit_reader
-        .hidden_deleted_ids()
-        .map_err(|e| QueryError::Execute(e.to_string()))?;
-
-    // Step 2: user `_id` → (user superfile, local row). Resolve the owning
-    // superfile by id range; arithmetic when its span is contiguous, else
-    // binary-search the superfile's `_id` column — read once per superfile
-    // (resident via the disk cache), grouped so a gapped superfile is never
-    // re-read per hit. A future per-superfile id-run index would make the
-    // gapped case O(1) and drop the column read entirely.
-    let mut remapped: Vec<Option<SuperfileHit>> = vec![None; hidden_hits.len()];
-    let mut gapped: HashMap<SuperfileUri, Vec<usize>> = HashMap::new();
-    for (i, &user_row_id) in user_ids.iter().enumerate() {
-        if deleted.binary_search(&user_row_id).is_ok() {
+    let hidden_manifest = user_reader
+        .vector_index_table()
+        .map(|vit| Arc::clone(vit.reader().manifest()));
+    let deleted = user_reader
+        .vector_index_table()
+        .and_then(|vit| vit.reader().hidden_deleted_ids().ok());
+    let mut out: Vec<Option<SuperfileHit>> = vec![None; hits.len()];
+    let mut gapped: HashMap<SuperfileUri, Vec<(usize, i128)>> = HashMap::new();
+    for (i, hit) in hits.iter().enumerate() {
+        if user_manifest
+            .lookup_superfile_entry(hit.superfile)
+            .await
+            .map_err(QueryError::ManifestLoad)?
+            .is_some()
+        {
+            out[i] = Some(*hit);
+            continue;
+        }
+        let user_row_id = if let Some(id) = hit.stable_id {
+            id
+        } else if let Some(ref hm) = hidden_manifest {
+            hidden_hits_user_ids(hm, std::slice::from_ref(hit), id_column).await?[0]
+        } else {
+            return Err(QueryError::Execute(format!(
+                "hit superfile {:?} missing from manifests",
+                hit.superfile
+            )));
+        };
+        if deleted
+            .as_ref()
+            .is_some_and(|d| d.binary_search(&user_row_id).is_ok())
+        {
             continue;
         }
         let user_entry = lookup_user_superfile_by_id(user_manifest, user_row_id).await?;
         if row_id_from_manifest_entry(&user_entry, 0).is_some() {
-            // Contiguous span (single-append): invert `id_min + local`.
             let local = u32::try_from(user_row_id - user_entry.id_min).map_err(|_| {
                 QueryError::Execute(format!("local_doc_id out of range for id {user_row_id}"))
             })?;
-            remapped[i] = Some(SuperfileHit {
+            out[i] = Some(SuperfileHit {
                 superfile: user_entry.uri,
                 local_doc_id: local,
-                score: hidden_hits[i].score,
-                stable_id: None,
+                score: hit.score,
+                stable_id: Some(user_row_id),
             });
         } else {
-            gapped.entry(user_entry.uri).or_default().push(i);
+            gapped.entry(user_entry.uri).or_default().push((i, user_row_id));
         }
     }
-    for (uri, idxs) in gapped {
+    for (uri, entries) in gapped {
         let user_entry = user_manifest
             .lookup_superfile_entry(uri)
             .await
@@ -529,23 +477,21 @@ async fn remap_hidden_hits_to_user_hits(
             })?;
         let n = user_entry.n_docs as usize;
         let all_locals: Vec<u32> = (0..n as u32).collect();
-        // Column is monotonic (ids minted in row order) → binary-searchable.
         let id_col =
             read_ids_for_locals(user_manifest, &user_entry, &all_locals, id_column, false).await?;
-        for &i in &idxs {
-            let user_row_id = user_ids[i];
+        for &(i, user_row_id) in &entries {
             let pos = id_col.binary_search(&user_row_id).map_err(|_| {
                 QueryError::Execute(format!("no row with id {user_row_id} in user superfile"))
             })?;
-            remapped[i] = Some(SuperfileHit {
+            out[i] = Some(SuperfileHit {
                 superfile: uri,
                 local_doc_id: pos as u32,
-                score: hidden_hits[i].score,
-                stable_id: None,
+                score: hits[i].score,
+                stable_id: Some(user_row_id),
             });
         }
     }
-    Ok(remapped.into_iter().flatten().collect())
+    Ok(out.into_iter().flatten().collect())
 }
 
 impl SupertableReader {
@@ -665,16 +611,13 @@ impl SupertableReader {
             segs.dedup();
             segs.len()
         };
-        // Inner fragment budget. On the hidden cell index `nprobe` means
-        // CLUSTERS, absolutely: cells are global partitions, so the
-        // closest `nprobe` clusters across all cell superfiles are the
-        // whole fetch — exactly `nprobe` cluster-block GETs per query.
-        // On the user table (the pre-drain fallback) every superfile is
-        // an independent local IVF shard whose clusters only cover its
-        // own rows, so the budget stays per-file (`nprobe × eligible`) —
-        // a global cap there starves most shards and collapses recall.
-        // `INFINO_INNER_BUDGET` OVERRIDES with an absolute cluster count
-        // for recall sweeps on splice indexes (many fragments per cell).
+        // `nprobe` = probe the globally closest `nprobe` fine IVF centroids.
+        // Score every resident centroid, keep the top `nprobe`, fan out to
+        // those lists only. Coarse cell routing (limiting to a handful of
+        // storage cells before centroid ranking) was the recall bug — not this.
+        // User table (pre-drain): each superfile is its own IVF shard, so the
+        // budget is `nprobe × eligible_superfiles` centroids ranked globally.
+        // `INFINO_INNER_BUDGET` overrides with an absolute centroid count.
         let default_budget = if is_hidden_vector_index_table(&manifest.options) {
             nprobe.max(1)
         } else {
@@ -1106,9 +1049,9 @@ impl SupertableReader {
             .await
     }
 
-    /// Global-index vector kNN: hidden manifest + cell filter + fan-out at
-    /// the hidden storage prefix. Falls back to the user table when the
-    /// hidden index is absent or empty.
+    /// Global-index vector kNN over the hidden index. Pre-drain (no cell
+    /// superfiles yet) searches the user table; post-drain ranks every
+    /// resident fine-cluster centroid globally — no coarse cell filter.
     pub(crate) async fn vector_search_global_index_async(
         &self,
         column: &str,
@@ -1121,62 +1064,15 @@ impl SupertableReader {
         }
         if let Some(vit) = self.vector_index_table() {
             let vit_reader = vit.reader();
-            let vit_manifest = vit_reader.manifest();
-            let has_data = !vit_manifest.superfiles.is_empty() || vit_manifest.get_num_parts() > 0;
-            if has_data {
-                let vit_metric = vit_manifest
-                    .options
-                    .vector_columns
-                    .iter()
-                    .find(|vc| vc.column == column)
-                    .map(|vc| vc.metric)
-                    .unwrap_or(Metric::L2Sq);
-                let selected = match vit_manifest.get_partition_strategy() {
-                    PartitionStrategy::VectorCell {
-                        clusters, routing, ..
-                    } => {
-                        let routed = clusters.select_cells_adaptive(
-                            vit_metric,
-                            query,
-                            options.resolve(false).0,
-                            routing_with_env_overrides(routing),
-                        );
-                        // No-staging model: the hidden index is built by draining
-                        // the user superfiles into cells, so there is no separate
-                        // "incoming" staging region to scan. Pre-drain the hidden
-                        // index is empty (0 results) — accepted for now; the
-                        // watermark/incremental path comes post-1M.
-                        if vit_manifest.superfiles.is_empty() {
-                            vit_manifest
-                                .superfiles_for_routed_cells(&routed)
-                                .await
-                                .map_err(|e| QueryError::Execute(e.to_string()))?
-                        } else {
-                            filter_superfiles_by_cells(&vit_manifest.superfiles, &routed)
-                        }
-                    }
-                    _ => {
-                        if vit_manifest.superfiles.is_empty() {
-                            let part_ids: Vec<_> = vit_manifest
-                                .get_all_list_entries()
-                                .iter()
-                                .map(|e| e.part_id)
-                                .collect();
-                            hierarchical_iter::load_and_flatten(vit_manifest, &part_ids)
-                                .await
-                                .map_err(|e| QueryError::Execute(e.to_string()))?
-                        } else {
-                            vit_manifest.superfiles.to_vec()
-                        }
-                    }
-                };
-                if !selected.is_empty() {
-                    // Already top-k ascending (same as the user-table path
-                    // below) — no second `top_k_ascending` pass needed.
-                    return vit_reader
-                        .fanout_vector_clusters(&selected, column, query, k, options)
-                        .await;
-                }
+            let selected = vit_reader
+                .manifest()
+                .get_all_superfiles_loaded()
+                .await
+                .map_err(QueryError::ManifestLoad)?;
+            if !selected.is_empty() {
+                return vit_reader
+                    .fanout_vector_clusters(&selected, column, query, k, options)
+                    .await;
             }
         }
         self.vector_search_user_table_async(column, query, k, options)
@@ -1213,26 +1109,20 @@ impl SupertableReader {
         self.block_on(async {
             let hits = match filter {
                 None => {
-                    let hits = self
-                        .vector_search_global_index_async(column, query, k, options)
-                        .await?;
-                    let (on_user, on_hidden) = partition_hits_by_table(self, &hits).await?;
-                    if projection.is_none() && on_user.is_empty() && !on_hidden.is_empty() {
-                        let batch = hidden_hits_id_score_batch(self, &on_hidden).await?;
-                        return Ok(vec![batch]);
-                    }
-                    if on_hidden.is_empty() {
-                        on_user
-                    } else {
-                        let remapped = remap_hidden_hits_to_user_hits(self, &on_hidden).await?;
-                        top_k_ascending(vec![on_user, remapped], k)
-                    }
+                    self.vector_search_global_index_async(column, query, k, options)
+                        .await?
                 }
                 Some(f) => {
                     self.vector_hits_filtered_async(column, query, k, options, f)
                         .await?
                 }
             };
+            let id_column = self.options().id_column.as_str();
+            if projection_is_id_score_only(projection, id_column) {
+                let batch = hits_id_score_batch(self, &hits).await?;
+                return Ok(vec![batch]);
+            }
+            let hits = user_placement_for_scalar_resolve(self, &hits).await?;
             let batch = resolve_hits_named(self, &hits, projection, "vector_search")
                 .await
                 .map_err(|e| QueryError::Execute(e.to_string()))?;
@@ -1252,18 +1142,7 @@ impl SupertableReader {
         // S3 bandwidth to it; released when this query returns.
         let _fg = crate::supertable::reader_cache::disk::ForegroundQueryGuard::enter();
         match filter {
-            None => self.block_on(async {
-                let hits = self
-                    .vector_search_global_index_async(column, query, k, options)
-                    .await?;
-                let (on_user, on_hidden) = partition_hits_by_table(self, &hits).await?;
-                if on_hidden.is_empty() {
-                    Ok(on_user)
-                } else {
-                    let remapped = remap_hidden_hits_to_user_hits(self, &on_hidden).await?;
-                    Ok(top_k_ascending(vec![on_user, remapped], k))
-                }
-            }),
+            None => self.block_on(self.vector_search_global_index_async(column, query, k, options)),
             Some(f) => self.block_on(self.vector_hits_filtered_async(column, query, k, options, f)),
         }
     }

@@ -26,7 +26,7 @@
 
 use std::{fs::File, io::Write, os::unix::fs::FileExt, sync::Arc, time::Instant};
 
-use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
+use arrow_array::{Decimal128Array, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
@@ -900,6 +900,104 @@ pub fn recall_at_k(predicted: &[Hit], truth: &[u32]) -> f32 {
         .filter(|(id, _)| truth_set.contains(id))
         .count();
     hits as f32 / truth.len() as f32
+}
+
+/// Stable `_id` + score pairs from public [`SupertableReader::vector_search`]
+/// batches (`projection = None` → `_id` + `score`).
+pub fn id_scores_from_vector_search(batches: &[RecordBatch]) -> Vec<(i128, f32)> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let id_idx = batch
+            .schema()
+            .index_of("_id")
+            .unwrap_or(0);
+        let score_idx = batch
+            .schema()
+            .index_of("score")
+            .unwrap_or(1);
+        let ids = batch
+            .column(id_idx)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("_id column is Decimal128");
+        let scores = batch
+            .column(score_idx)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("score column is Float32");
+        for i in 0..batch.num_rows() {
+            out.push((ids.value(i), scores.value(i)));
+        }
+    }
+    out
+}
+
+/// Recall@k on stable table `_id`s (minted `i128` values).
+pub fn recall_at_k_stable(predicted: &[(i128, f32)], truth: &[i128]) -> f32 {
+    if truth.is_empty() {
+        return EMPTY_TRUTH_RECALL;
+    }
+    let truth_set: std::collections::HashSet<i128> = truth.iter().copied().collect();
+    let hits = predicted
+        .iter()
+        .filter(|(id, _)| truth_set.contains(id))
+        .count();
+    hits as f32 / truth.len() as f32
+}
+
+/// Map `vector_search` `_id` values to dense oracle row indices.
+///
+/// `_id`s are minted sequentially at `append()` (one snowflake generator per
+/// handle, buffer order), so ascending `_id` order IS ingest order: the row at
+/// position `d` of `ORDER BY _id` is corpus row `d`. The ORDER BY is load-
+/// bearing — an unordered scan returns DataFusion partitions interleaved.
+pub fn engine_id_to_dense(
+    table: &infino::supertable::Supertable,
+    n_docs: usize,
+) -> std::collections::HashMap<i128, u32> {
+    use arrow_array::Decimal128Array;
+
+    let batches = table
+        .reader()
+        .query_sql("SELECT _id FROM supertable ORDER BY _id")
+        .expect("SELECT _id FROM supertable ORDER BY _id");
+    let mut ids = Vec::with_capacity(n_docs);
+    for batch in batches {
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("_id column is Decimal128");
+        ids.extend(col.values().iter().copied());
+    }
+    assert_eq!(
+        ids.len(),
+        n_docs,
+        "SELECT _id row count must match ingest doc count"
+    );
+    ids.into_iter()
+        .enumerate()
+        .map(|(d, id)| (id, d as u32))
+        .collect()
+}
+
+/// Brute-force oracle rows are corpus row indices; translate to engine `_id`s.
+/// `row_ids[d]` is the engine `_id` for corpus row `d`.
+pub fn oracle_to_engine_ids(gt: &[Vec<u32>], row_ids: &[i128]) -> Vec<Vec<i128>> {
+    gt.iter()
+        .map(|row| {
+            row.iter()
+                .map(|&d| row_ids[d as usize])
+                .collect()
+        })
+        .collect()
+}
+
+/// Superfile oracle rows are already engine-local ids (`0..n-1`).
+pub fn oracle_to_i128(gt: &[Vec<u32>]) -> Vec<Vec<i128>> {
+    gt.iter()
+        .map(|row| row.iter().map(|&d| i128::from(d)).collect())
+        .collect()
 }
 
 /// Mean recall for one (engine, config) point across a query batch.

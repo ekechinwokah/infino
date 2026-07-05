@@ -40,7 +40,6 @@
 #[allow(unused_imports)] // `Instant` is consumed by the child mods via `use super::*`
 use std::time::Instant;
 use std::{
-    collections::HashMap,
     process::{Command, Stdio},
     sync::Arc,
 };
@@ -977,7 +976,7 @@ pub mod vector {
     use super::*;
     use crate::{
         corpus,
-        executors::{vector as exec_vec, vector::VectorRead},
+        executors::{vector as exec_vec, vector::{SupertableVectorRead, VectorRead}},
     };
 
     // Correctness gate, recall targets, calibration grid, and p50 iters
@@ -1031,6 +1030,76 @@ pub mod vector {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_RERANK_MULT)
+    }
+
+    struct SupertableVecColdGuard {
+        _cache_dir: TempDir,
+        consumer: Supertable,
+        id_to_dense: Arc<std::collections::HashMap<i128, u32>>,
+    }
+
+    impl SupertableVecColdGuard {
+        fn open(
+            built: &supertable::IngestResult,
+            id_to_dense: Arc<std::collections::HashMap<i128, u32>>,
+        ) -> Self {
+            let (cache_dir, consumer) = open_consumer(Modality::Vector, built);
+            Self {
+                _cache_dir: cache_dir,
+                consumer,
+                id_to_dense,
+            }
+        }
+    }
+
+    impl VectorRead for SupertableVecColdGuard {
+        fn topk_global(
+            &self,
+            column: &str,
+            query: &[f32],
+            k: usize,
+            nprobe: usize,
+            rerank: usize,
+        ) -> Vec<(u32, f32)> {
+            SupertableVectorRead {
+                table: &self.consumer,
+                id_to_dense: Arc::clone(&self.id_to_dense),
+            }
+            .topk_global(column, query, k, nprobe, rerank)
+        }
+    }
+
+    fn hits_to_dense_u32(
+        st: &Supertable,
+        hits: &[infino::supertable::query::SuperfileHit],
+    ) -> Vec<(u32, f32)> {
+        let reader = st.reader();
+        let manifest = reader.manifest();
+        let mut seg_uris: Vec<_> = manifest.superfiles.iter().map(|e| e.uri).collect();
+        let mut offsets: Vec<u32> = Vec::with_capacity(seg_uris.len());
+        let mut acc = 0u32;
+        for entry in manifest.superfiles.iter() {
+            offsets.push(acc);
+            acc = acc.saturating_add(entry.n_docs as u32);
+        }
+        if let Some(hidden) = st.vector_index_table() {
+            let hidden_reader = hidden.reader();
+            let hidden_manifest = hidden_reader.manifest();
+            for entry in hidden_manifest.superfiles.iter() {
+                seg_uris.push(entry.uri);
+                offsets.push(acc);
+                acc = acc.saturating_add(entry.n_docs as u32);
+            }
+        }
+        hits.iter()
+            .map(|h| {
+                let seg_idx = seg_uris
+                    .iter()
+                    .position(|u| *u == h.superfile)
+                    .expect("hit superfile present in user or hidden manifest");
+                (offsets[seg_idx] + h.local_doc_id, h.score)
+            })
+            .collect()
     }
 
     fn log_hidden_stats(consumer: &Supertable, label: &str) {
@@ -1324,6 +1393,11 @@ pub mod vector {
                 consumer_meter.provider(),
                 cache,
             ));
+            let id_to_dense = Arc::new(corpus::engine_id_to_dense(&consumer, n_docs));
+            let warm_reader = SupertableVectorRead {
+                table: &consumer,
+                id_to_dense: Arc::clone(&id_to_dense),
+            };
             let mut drain_stats: Option<(f64, storage_meter::ObjectStoreMeter, u64)> = None;
             let mut filtered_stats: Option<(storage_meter::ObjectStoreMeter, u64)> = None;
             let mut cold_split_pre: Option<storage_meter::ColdStoreSplit> = None;
@@ -1336,8 +1410,8 @@ pub mod vector {
                 eprintln!("[supertable_vector] === pre-drain search (incoming staging) ===");
                 pre_search_rows = Some(exec_vec::run_search(
                     &mut report,
-                    &consumer,
-                    || SupertableVecColdGuard::open(&built),
+                    &warm_reader,
+                    || SupertableVecColdGuard::open(&built, Arc::clone(&id_to_dense)),
                     supertable::VEC_COLUMN,
                     n_docs,
                     TOP_K,
@@ -1394,8 +1468,8 @@ pub mod vector {
                 eprintln!("[supertable_vector] === post-drain search (routed cells) ===");
                 exec_vec::run_search(
                     &mut report,
-                    &consumer,
-                    || SupertableVecColdGuard::open(&built),
+                    &warm_reader,
+                    || SupertableVecColdGuard::open(&built, Arc::clone(&id_to_dense)),
                     supertable::VEC_COLUMN,
                     n_docs,
                     TOP_K,
@@ -1420,8 +1494,8 @@ pub mod vector {
                 }
                 exec_vec::run_search(
                     &mut report,
-                    &consumer,
-                    || SupertableVecColdGuard::open(&built),
+                    &warm_reader,
+                    || SupertableVecColdGuard::open(&built, Arc::clone(&id_to_dense)),
                     supertable::VEC_COLUMN,
                     n_docs,
                     TOP_K,
@@ -1454,13 +1528,6 @@ pub mod vector {
                 let allow = Arc::new(allow);
 
                 let consumer_reader = consumer.reader();
-                let manifest = consumer_reader.manifest();
-                let mut offsets: HashMap<_, u32> = HashMap::new();
-                let mut base = 0u32;
-                for entry in manifest.superfiles.iter() {
-                    offsets.insert(entry.uri, base);
-                    base = base.saturating_add(entry.n_docs as u32);
-                }
                 let mut recalls = Vec::new();
                 let mut latencies = Vec::new();
                 let filtered_before = consumer_meter.snapshot();
@@ -1478,16 +1545,8 @@ pub mod vector {
                     ))
                     .expect("filtered recall query");
                     latencies.push(t0.elapsed());
-                    let global_hits: Vec<(u32, f32)> = hits
-                        .iter()
-                        .map(|h| {
-                            let base = offsets.get(&h.superfile).unwrap_or_else(|| {
-                                panic!("missing manifest offset for superfile {:?}", h.superfile,)
-                            });
-                            (base.saturating_add(h.local_doc_id), h.score)
-                        })
-                        .collect();
-                    recalls.push(corpus::recall_at_k(&global_hits, gt));
+                    let dense_hits = hits_to_dense_u32(&consumer, &hits);
+                    recalls.push(corpus::recall_at_k(&dense_hits, gt));
                 }
                 let filtered_io = consumer_meter.snapshot().since(&filtered_before);
                 if !q_correct.is_empty() {
@@ -1705,40 +1764,6 @@ pub mod vector {
         if let Some(cleanup) = &built.cleanup {
             eprintln!("[supertable_vector] cleaning up object-store prefix...");
             tiers::cleanup_prefix(cleanup);
-        }
-    }
-
-    struct SupertableVecColdGuard {
-        _cache_dir: TempDir,
-        consumer: Supertable,
-    }
-
-    impl SupertableVecColdGuard {
-        fn open(built: &supertable::IngestResult) -> Self {
-            // Open-on-demand: do NOT force-open every superfile. A vector
-            // query routes to ~nprobe cells and opens only those (lazily, via
-            // the disk cache) — that's the realistic cold path. Force-opening
-            // all user+hidden superfiles spawned a background fill per cell
-            // (an S3-throttling storm) and an open cost unrelated to the
-            // query's working set.
-            let (cache_dir, consumer) = open_consumer(Modality::Vector, built);
-            Self {
-                _cache_dir: cache_dir,
-                consumer,
-            }
-        }
-    }
-
-    impl VectorRead for SupertableVecColdGuard {
-        fn topk_global(
-            &self,
-            column: &str,
-            query: &[f32],
-            k: usize,
-            nprobe: usize,
-            rerank: usize,
-        ) -> Vec<(u32, f32)> {
-            self.consumer.topk_global(column, query, k, nprobe, rerank)
         }
     }
 }
