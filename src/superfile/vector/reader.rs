@@ -41,7 +41,7 @@ use crate::superfile::{
     vector::{
         cell_posting::{EncodedCellRow, MaterializedIvfRow, sq8_residual_norm_sq},
         distance::{
-            Metric, SQ8_RESIDUAL_DIVISOR, Sq8Kernel, Sq8ResidualEpsilonKernel, decode_f32_le_into,
+            Metric, SQ8_RESIDUAL_DIVISOR, Sq8Kernel, Sq8ResidualKernel, decode_f32_le_into,
             distance_bytes, distance_bytes_codec, sum_f32,
         },
         ivf_merge::Sq8IvfMergeInput,
@@ -55,7 +55,7 @@ const OUTER_HEADER_SIZE: usize = format::vec::OUTER_HEADER_SIZE;
 const DIR_ENTRY_SIZE: usize = format::vec::DIR_ENTRY_SIZE;
 const SUB_HEADER_SIZE: usize = format::vec::SUB_HEADER_SIZE;
 
-/// Shortlist multiplier for the Sq8ResidualEpsilon refine pass. After the
+/// Shortlist multiplier for the Sq8Residual refine pass. After the
 /// first-pass Sq8 scan, only the top `SQ8_RESIDUAL_REFINE_MULT × k`
 /// survivors are re-scored with the more expensive residual leg.
 const SQ8_RESIDUAL_REFINE_MULT: usize = 2;
@@ -1062,7 +1062,7 @@ impl VectorReader {
                 ))));
             }
 
-            let sq8_meta = if matches!(rerank_codec, RerankCodec::Sq8ResidualEpsilon) {
+            let sq8_meta = if matches!(rerank_codec, RerankCodec::Sq8Residual) {
                 let meta_abs_start = subsection_off + codec_meta_off;
                 let meta_abs_end = meta_abs_start + actual_codec_meta_size;
                 let so_block_bytes = (n_cent as usize) * dim * 4;
@@ -1328,7 +1328,7 @@ impl VectorReader {
             .get(column)
             .ok_or_else(|| BuildError::VectorSchemaMismatch(format!("unknown column {column}")))?;
         let col = &self.columns[cid as usize];
-        if col.rerank_codec != RerankCodec::Sq8ResidualEpsilon {
+        if col.rerank_codec != RerankCodec::Sq8Residual {
             return Err(BuildError::VectorRerankCodecUnimplemented {
                 column: column.to_string(),
                 codec: col.rerank_codec.name(),
@@ -1399,7 +1399,7 @@ impl VectorReader {
     /// Read Sq8+ε rerank rows plus preserved 1-bit RaBitQ codes for maintenance
     /// rebuilds through the normal IVF writer (no fp32 reconstruction).
     ///
-    /// Async because this is the SPFresh drain/maintenance read-back: the hidden
+    /// Async because this is the OPANN drain/maintenance read-back: the hidden
     /// incoming superfile it reads is routinely evicted from the disk cache by
     /// the pre-drain search, so it must fetch-on-miss — and the drain's source
     /// (`StorageRangeSource`) has no sync-resident tier, so a resident-only read
@@ -1414,7 +1414,7 @@ impl VectorReader {
     ) -> Option<Vec<MaterializedIvfRow>> {
         let cid = *self.column_id_by_name.get(index_name)?;
         let col = &self.columns[cid as usize];
-        if col.rerank_codec != RerankCodec::Sq8ResidualEpsilon {
+        if col.rerank_codec != RerankCodec::Sq8Residual {
             return None;
         }
         let dim = col.dim;
@@ -2041,7 +2041,7 @@ impl VectorReader {
     /// = empty-result short circuit, caller returns `Ok(Vec::new())`.
     #[inline]
     /// Retrieve original vectors in their insertion order for fp32-encoded columns.
-    /// Returns an error if the column uses a different encoding (Sq8ResidualEpsilon or RabitqOnly).
+    /// Returns an error if the column uses a different encoding (Sq8Residual or RabitqOnly).
     pub fn get_vectors_fp32(&self, column: &str) -> Result<Vec<Vec<f32>>, VectorError> {
         let cid = *self
             .column_id_by_name
@@ -2174,9 +2174,9 @@ impl VectorReader {
         }
         match col.rerank_codec {
             RerankCodec::Fp32 => self.get_vectors_fp32(column),
-            RerankCodec::Sq8ResidualEpsilon => {
+            RerankCodec::Sq8Residual => {
                 Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                    "column '{}' uses Sq8ResidualEpsilon — merge via build_from_sq8_ivf_readers",
+                    "column '{}' uses Sq8Residual — merge via build_from_sq8_ivf_readers",
                     col.name
                 ))))
             }
@@ -2796,13 +2796,13 @@ async fn rerank_candidates_from_blocks(
                     .collect()
             }
         }
-        RerankCodec::Sq8ResidualEpsilon => {
+        RerankCodec::Sq8Residual => {
             let meta = col
                 .sq8_meta
                 .as_ref()
-                .expect("Sq8ResidualEpsilon column must carry sq8_meta (built in open_with)");
+                .expect("Sq8Residual column must carry sq8_meta (built in open_with)");
             let dim = col.dim;
-            // `Sq8ResidualEpsilon` stores `[code dim u8 ‖ residual dim i8]`
+            // `Sq8Residual` stores `[code dim u8 ‖ residual dim i8]`
             // per vector (`stride == 2·dim`); the first `dim` bytes
             // are the Sq8 code leg the shortlist scoring reads.
             match meta {
@@ -2955,7 +2955,7 @@ async fn rerank_candidates_from_blocks(
                         .max(k)
                         .min(scored.len());
                     scored.truncate(final_refine);
-                    let mut rk: HashMap<u32, Sq8ResidualEpsilonKernel> = HashMap::new();
+                    let mut rk: HashMap<u32, Sq8ResidualKernel> = HashMap::new();
                     scored
                         .into_iter()
                         .map(|(did, _, i, pos, cluster_id)| {
@@ -2971,7 +2971,7 @@ async fn rerank_candidates_from_blocks(
                                 let (scale, offset) = scale_offset_by_cluster
                                     .get(&cluster_id)
                                     .expect("cluster metadata fetched");
-                                Sq8ResidualEpsilonKernel::new(
+                                Sq8ResidualKernel::new(
                                     col.metric,
                                     query,
                                     scale.as_slice(),
@@ -3090,7 +3090,7 @@ async fn sq8_score_and_refine(
         k,
         |cluster_id| {
             let c = cluster_id as usize;
-            Sq8ResidualEpsilonKernel::new(
+            Sq8ResidualKernel::new(
                 col.metric,
                 query,
                 &scale[c * dim..(c + 1) * dim],
@@ -3102,10 +3102,10 @@ async fn sq8_score_and_refine(
     )
 }
 
-/// `Sq8ResidualEpsilon` final-refine pass. Takes the Sq8-scored shortlist
+/// `Sq8Residual` final-refine pass. Takes the Sq8-scored shortlist
 /// (`(did, sq8_dist, candidate_idx, pos, cluster_id)`), keeps the lowest
 /// `2·k` by Sq8 distance, then re-scores just that set with the
-/// residual-corrected [`Sq8ResidualEpsilonKernel`] (built per cluster via
+/// residual-corrected [`Sq8ResidualKernel`] (built per cluster via
 /// `make_kernel`). The candidate index points into `candidates`,
 /// whose row bytes are read directly from `cluster_blocks`.
 fn residual_refine_from_blocks<'a>(
@@ -3116,7 +3116,7 @@ fn residual_refine_from_blocks<'a>(
     stride: usize,
     dim: usize,
     k: usize,
-    make_kernel: impl Fn(u32) -> Sq8ResidualEpsilonKernel<'a>,
+    make_kernel: impl Fn(u32) -> Sq8ResidualKernel<'a>,
 ) -> Vec<(u32, f32)> {
     scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
     let final_refine = k
@@ -3124,7 +3124,7 @@ fn residual_refine_from_blocks<'a>(
         .max(k)
         .min(scored.len());
     scored.truncate(final_refine);
-    let mut rk: HashMap<u32, Sq8ResidualEpsilonKernel> = HashMap::new();
+    let mut rk: HashMap<u32, Sq8ResidualKernel> = HashMap::new();
     scored
         .into_iter()
         .map(|(did, _, i, pos, cluster_id)| {
@@ -3491,7 +3491,7 @@ mod tests {
             n_cent: 4,
             rot_seed: 7,
             metric: Metric::L2Sq,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         })
         .expect("register Sq8 column");
@@ -3615,7 +3615,7 @@ mod tests {
         // orders.)
         use std::collections::HashSet;
         let (blob, json, all) =
-            build_small_superfile(32, 4, 64, RerankCodec::Sq8ResidualEpsilon, Metric::L2Sq);
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
         let q = &all[0];
         let (k, rerank, n_cent) = (5usize, 5usize, 4u32);
@@ -3797,8 +3797,8 @@ mod tests {
     fn register_column_accepts_every_codec() {
         for codec in [
             RerankCodec::Fp32,
-            RerankCodec::Sq8ResidualEpsilon,
-            RerankCodec::Sq8ResidualEpsilon,
+            RerankCodec::Sq8Residual,
+            RerankCodec::Sq8Residual,
             RerankCodec::RabitqOnly,
         ] {
             let mut b = VectorBuilder::new();
@@ -3815,12 +3815,12 @@ mod tests {
         }
     }
 
-    /// building a column with `RerankCodec::Sq8ResidualEpsilon`
+    /// building a column with `RerankCodec::Sq8Residual`
     /// round-trips through the reader. The codec discriminator
     /// surfaces on `ColumnReader.rerank_codec`; the codec_meta
     /// region carries `scale[dim] + offset[dim]` (always) plus
     /// per-doc norms (L2Sq only). The on-disk `full[]` region is
-    /// `n_docs × 2·dim` bytes for `Sq8ResidualEpsilon`: one u8 code plus
+    /// `n_docs × 2·dim` bytes for `Sq8Residual`: one u8 code plus
     /// one i8 residual per dimension.
     #[test]
     fn open_round_trips_sq8_codec_discriminator_l2sq() {
@@ -3834,7 +3834,7 @@ mod tests {
             n_cent,
             rot_seed: 7,
             metric: Metric::L2Sq,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         })
         .expect("register column");
@@ -3849,7 +3849,7 @@ mod tests {
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         assert_eq!(r.columns.len(), 1);
         let col = &r.columns[0];
-        assert_eq!(col.rerank_codec, RerankCodec::Sq8ResidualEpsilon);
+        assert_eq!(col.rerank_codec, RerankCodec::Sq8Residual);
 
         // codec_meta_off must be non-zero for Sq8 — codec_meta
         // sits inside the open-time region between cluster_idx
@@ -3886,7 +3886,7 @@ mod tests {
         assert_eq!(norms.len(), col.n_docs as usize);
     }
 
-    /// `Sq8ResidualEpsilon` (the default codec) round-trips through the
+    /// `Sq8Residual` (the default codec) round-trips through the
     /// reader. The on-disk `full[]` body is `n_docs × 2·dim` bytes
     /// (`[code dim u8 ‖ residual dim i8]`); codec_meta matches Sq8
     /// (per-cluster scale/offset + per-doc norms). The residual leg
@@ -3898,7 +3898,7 @@ mod tests {
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         // Register via the struct default for rerank_codec to pin
-        // that the build default is Sq8ResidualEpsilon.
+        // that the build default is Sq8Residual.
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
@@ -3919,10 +3919,10 @@ mod tests {
             r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#.to_string();
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         let col = &r.columns[0];
-        assert_eq!(col.rerank_codec, RerankCodec::Sq8ResidualEpsilon);
+        assert_eq!(col.rerank_codec, RerankCodec::Sq8Residual);
         assert_ne!(
             col.codec_meta_off, 0,
-            "Sq8ResidualEpsilon must declare codec_meta_off > 0"
+            "Sq8Residual must declare codec_meta_off > 0"
         );
 
         // full[] is n_docs × 2·dim (code + residual sidecar).
@@ -3933,7 +3933,7 @@ mod tests {
         assert!(col.sq8_meta.is_some());
     }
 
-    /// End-to-end: a `Sq8ResidualEpsilon` cosine self-query returns the
+    /// End-to-end: a `Sq8Residual` cosine self-query returns the
     /// planted doc as top-1. Exercises the residual refine pass in
     /// the eager rerank path.
     #[tokio::test]
@@ -3948,7 +3948,7 @@ mod tests {
             n_cent,
             rot_seed: 29,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         })
         .expect("register column");
@@ -3974,14 +3974,14 @@ mod tests {
             r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":29,"metric":"cosine"}]"#.to_string();
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         let col = &r.columns[0];
-        assert_eq!(col.rerank_codec, RerankCodec::Sq8ResidualEpsilon);
+        assert_eq!(col.rerank_codec, RerankCodec::Sq8Residual);
         let hits = r
             .search("v", &all[42], 5, n_cent, 20)
             .await
-            .expect("search must succeed on Sq8ResidualEpsilon cosine column");
+            .expect("search must succeed on Sq8Residual cosine column");
         assert_eq!(
             hits[0].0, 42,
-            "Sq8ResidualEpsilon cosine self-query must recover self"
+            "Sq8Residual cosine self-query must recover self"
         );
     }
 
@@ -4003,7 +4003,7 @@ mod tests {
             n_cent,
             rot_seed: 11,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         })
         .expect("register column");
@@ -4094,7 +4094,7 @@ mod tests {
             n_cent,
             rot_seed: 23,
             metric: Metric::L2Sq,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         })
         .expect("register column");
@@ -4197,7 +4197,7 @@ mod tests {
             n_cent,
             rot_seed: 13,
             metric: Metric::L2Sq,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         })
         .expect("register column");
@@ -4264,7 +4264,7 @@ mod tests {
             n_cent,
             rot_seed: 19,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         })
         .expect("register column");
@@ -4721,7 +4721,7 @@ mod tests {
             Bytes::from(b.finish().expect("finish"))
         };
         let fp32_blob = build(RerankCodec::Fp32);
-        let sq8_blob = build(RerankCodec::Sq8ResidualEpsilon);
+        let sq8_blob = build(RerankCodec::Sq8Residual);
         eprintln!(
             "--- superfile sizes ---\n\
              fp32: {:.2} MiB (1.00x)\n\
@@ -5830,7 +5830,7 @@ mod tests {
     #[tokio::test]
     async fn open_lazy_small_sq8_superfile_fetches_exact_metadata_ranges() {
         let (blob, json, _) =
-            build_small_superfile(32, 4, 64, RerankCodec::Sq8ResidualEpsilon, Metric::L2Sq);
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         let async_counter = counting.async_counter();
 
@@ -5885,7 +5885,7 @@ mod tests {
     async fn open_lazy_search_matches_eager_open_per_codec() {
         for codec in [
             RerankCodec::Fp32,
-            RerankCodec::Sq8ResidualEpsilon,
+            RerankCodec::Sq8Residual,
             RerankCodec::RabitqOnly,
         ] {
             let (blob, json, all) = build_small_superfile(32, 4, 64, codec, Metric::L2Sq);
@@ -5936,7 +5936,7 @@ mod tests {
     #[tokio::test]
     async fn cold_first_search_after_open_lazy_within_nprobe_plus_one_ranges() {
         let (blob, json, all) =
-            build_small_superfile(32, 8, 128, RerankCodec::Sq8ResidualEpsilon, Metric::L2Sq);
+            build_small_superfile(32, 8, 128, RerankCodec::Sq8Residual, Metric::L2Sq);
 
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         let async_counter = counting.async_counter();
@@ -6005,7 +6005,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cold_first_search_dispatches_cluster_gets_concurrently() {
         let (blob, json, all) =
-            build_small_superfile(32, 8, 256, RerankCodec::Sq8ResidualEpsilon, Metric::L2Sq);
+            build_small_superfile(32, 8, 256, RerankCodec::Sq8Residual, Metric::L2Sq);
 
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         let async_counter = counting.async_counter();
@@ -6067,7 +6067,7 @@ mod tests {
     async fn m3_combined_cluster_fetch_matches_eager_open_per_codec() {
         for codec in [
             RerankCodec::Fp32,
-            RerankCodec::Sq8ResidualEpsilon,
+            RerankCodec::Sq8Residual,
             RerankCodec::RabitqOnly,
         ] {
             let (blob, json, all) = build_small_superfile(32, 4, 64, codec, Metric::L2Sq);
@@ -6111,7 +6111,7 @@ mod tests {
     #[test]
     fn cluster_block_range_matches_v1_layout_invariant() {
         let (blob, json, _) =
-            build_small_superfile(32, 4, 64, RerankCodec::Sq8ResidualEpsilon, Metric::L2Sq);
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
         let col = &r.columns[0];
         let cb = col.quant.code_bytes();
@@ -6182,7 +6182,7 @@ mod tests {
     #[tokio::test]
     async fn open_lazy_column_metadata_matches_eager_open() {
         let (blob, json, _) =
-            build_small_superfile(32, 4, 64, RerankCodec::Sq8ResidualEpsilon, Metric::L2Sq);
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
         let r_eager = VectorReader::open(blob.clone(), &json).expect("eager open");
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         // Simulate the object-store path: with no zero-copy sync read
@@ -6281,7 +6281,7 @@ mod tests {
 
     #[test]
     fn get_vectors_fp32_rejects_non_fp32_codec() {
-        // blob was built with Sq8ResidualEpsilon by default, not Fp32
+        // blob was built with Sq8Residual by default, not Fp32
         let mut builder = VectorBuilder::new();
         builder
             .register_column(VectorConfig {
@@ -6290,7 +6290,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::L2Sq,
-                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             })
             .expect("register column");
@@ -6306,7 +6306,7 @@ mod tests {
                 .to_string();
         let reader = VectorReader::open(Bytes::from(sq8_bytes), &sq8_json).expect("open");
 
-        // Should error because codec is Sq8ResidualEpsilon, not Fp32
+        // Should error because codec is Sq8Residual, not Fp32
         let result = reader.get_vectors_fp32("embedding");
         assert!(result.is_err());
         if let Err(VectorError::Read(ReadError::MalformedVersion(msg))) = result {
@@ -6539,7 +6539,7 @@ mod tests {
             16,
             n_cent,
             n_docs,
-            RerankCodec::Sq8ResidualEpsilon,
+            RerankCodec::Sq8Residual,
             Metric::L2Sq,
         );
         let r = VectorReader::open(blob, &json).expect("open");
@@ -6675,7 +6675,7 @@ mod tests {
         // `Sq8ColumnMeta::Lazy` and the first search resolves the
         // scale/offset (and L2Sq norms) through the deferred-fetch arm.
         let (blob, json, all) =
-            build_small_superfile(32, 4, 64, RerankCodec::Sq8ResidualEpsilon, Metric::L2Sq);
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
         let r_eager = VectorReader::open(blob.clone(), &json).expect("eager open");
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         // Disable sync BEFORE open so the deferred codec_meta probe inside
@@ -6730,7 +6730,7 @@ mod tests {
         // so the lazy arm takes the `norms_abs_off = None` branch — no
         // norm span fetch, `norm_by_pos = None`.
         let (blob, json, all) =
-            build_small_superfile(32, 4, 64, RerankCodec::Sq8ResidualEpsilon, Metric::NegDot);
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::NegDot);
         let r_eager = VectorReader::open(blob.clone(), &json).expect("eager open");
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         counting.disable_sync();
@@ -6762,7 +6762,7 @@ mod tests {
         // on a cold lazy Sq8 source drives the async coalesced
         // codes/doc_ids + Sq8-meta fetch and the async survivor-row fetch.
         let (blob, json, all) =
-            build_small_superfile(32, 4, 64, RerankCodec::Sq8ResidualEpsilon, Metric::L2Sq);
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::L2Sq);
         let r_eager = VectorReader::open(blob.clone(), &json).expect("eager open");
         let counting = StdArc::new(CountingLazyByteSource::new(blob));
         counting.disable_sync();

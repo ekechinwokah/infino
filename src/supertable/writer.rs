@@ -85,7 +85,7 @@ use super::{
         PendingDelete, PendingUpdate,
     },
     options::{DECIMAL128_PRECISION, DECIMAL128_SCALE, SupertableOptions},
-    spfresh,
+    opann,
     utils::vector_split::split_vectors,
     wal::{
         WalStore,
@@ -118,7 +118,7 @@ use crate::{
         reader::vector_layout_from_kv,
         vector::{
             cell_posting::{EncodedCellRow, MaterializedIvfRow},
-            distance::Metric,
+            distance::{Metric, transpose_centroids_cluster_major},
             ivf_merge::{MergedIvfSubsection, route_clusters_into_cells},
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
@@ -314,7 +314,7 @@ async fn materialized_ivf_rows_in_doc_order(
         .await
         .ok_or_else(|| {
             BuildError::Store(format!(
-                "IVF maintenance: column '{column}' missing Sq8ResidualEpsilon index"
+                "IVF maintenance: column '{column}' missing Sq8Residual index"
             ))
         })?;
     let n_rows = stable_ids_by_local.len();
@@ -2011,6 +2011,29 @@ fn drain_batch_superfiles(opts: &SupertableOptions) -> i64 {
         .unwrap_or(opts.drain_batch_superfiles)
 }
 
+/// Default drain replica factor: `1.0` means no boundary replicas.
+const DEFAULT_DRAIN_REPLICA_TARGET_FACTOR: f32 = 1.0;
+
+/// Target storage amplification for boundary-only drain replication. For
+/// example, `1.2` means the drain may add at most `0.2 * rows` extra row copies,
+/// selected from rows closest to a Voronoi boundary. Values `<= 1.0` disable
+/// replication; the knob is explicit so the default drain path is unchanged.
+fn drain_replica_target_factor() -> f32 {
+    std::env::var("INFINO_DRAIN_REPLICA_TARGET_FACTOR")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > DEFAULT_DRAIN_REPLICA_TARGET_FACTOR)
+        .unwrap_or(DEFAULT_DRAIN_REPLICA_TARGET_FACTOR)
+}
+
+fn drain_replica_extra_budget(n_rows: usize, target_factor: f32) -> usize {
+    if n_rows == 0 || target_factor <= DEFAULT_DRAIN_REPLICA_TARGET_FACTOR {
+        return 0;
+    }
+    let target_rows = (n_rows as f64 * target_factor as f64).ceil() as usize;
+    target_rows.saturating_sub(n_rows).min(n_rows)
+}
+
 pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     user_inner: Arc<SupertableInner>,
     hidden_inner: Arc<SupertableInner>,
@@ -2334,22 +2357,54 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
 
             let all_rows: Vec<MaterializedIvfRow> = row_sets.into_iter().flatten().collect();
             let mut by_cell: HashMap<u32, Vec<MaterializedIvfRow>> = HashMap::new();
-            if assign_skip {
+            let replica_target = drain_replica_target_factor();
+            let replica_extra_budget =
+                drain_replica_extra_budget(all_rows.len(), replica_target);
+            if replica_extra_budget == 0 && assign_skip {
                 for row in all_rows {
                     by_cell.entry(row.cluster).or_default().push(row);
                 }
             } else {
                 let clusters_ref = &running_clusters;
-                let assignments: Vec<u32> = hidden_inner.options.writer_pool.install(|| {
-                    all_rows
-                        .par_iter()
-                        .map(|row| {
-                            spfresh::nearest_cell_encoded(clusters_ref, metric, &row.encoded)
-                        })
-                        .collect()
-                });
-                for (row, cell) in all_rows.into_iter().zip(assignments) {
-                    by_cell.entry(cell).or_default().push(row);
+                let transposed_centroids = transpose_centroids_cluster_major(
+                    &clusters_ref.centroids,
+                    clusters_ref.n_cent as usize,
+                    clusters_ref.dim as usize,
+                );
+                let assignments: Vec<opann::BoundaryAssignment> =
+                    hidden_inner.options.writer_pool.install(|| {
+                        all_rows
+                            .par_iter()
+                            .map(|row| {
+                                opann::boundary_assignment_encoded_with_transposed(
+                                    clusters_ref,
+                                    &transposed_centroids,
+                                    metric,
+                                    &row.encoded,
+                                )
+                            })
+                            .collect()
+                    });
+                let mut replica_candidates: Vec<(usize, u32, f32)> = assignments
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row_idx, assignment)| {
+                        assignment
+                            .neighbor
+                            .map(|(neighbor, margin)| (row_idx, neighbor, margin))
+                    })
+                    .collect();
+                replica_candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
+                let replicas: Vec<(usize, u32)> = replica_candidates
+                    .into_iter()
+                    .take(replica_extra_budget)
+                    .map(|(row_idx, neighbor, _)| (row_idx, neighbor))
+                    .collect();
+                for &(row_idx, cell) in &replicas {
+                    by_cell.entry(cell).or_default().push(all_rows[row_idx].clone());
+                }
+                for (row, assignment) in all_rows.into_iter().zip(assignments) {
+                    by_cell.entry(assignment.primary).or_default().push(row);
                 }
             }
             let t_assign = batch_t0.elapsed().as_secs_f64() * 1e3;
@@ -2438,7 +2493,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // exclude committed work). Re-read drained_ranges so sequential batches
         // (and a prior drainer's progress) compose.
         let publish_batch = collect_prepared_superfiles(&hidden_inner, prepared)?;
-        running_clusters = spfresh::apply_cell_updates(&running_clusters, &cell_updates);
+        running_clusters = opann::apply_cell_updates(&running_clusters, &cell_updates);
         let mut new_drained = hidden_inner.manifest.load_full().get_drained_ranges();
         // Advance as a CONTIGUOUS range up to this batch's max version, starting
         // from just past the existing genesis-anchored prefix. This absorbs
@@ -2687,14 +2742,14 @@ fn build_one_shard_from_materialized(
 /// needs at least one row per side, so fewer than this is a no-op.
 const MIN_ROWS_TO_SPLIT_CELL: usize = 2;
 
-/// SPFresh steps 7–9: Sq8-native split, centroid extension, neighborhood
+/// OPANN steps 7–9: Sq8-native split, centroid extension, neighborhood
 /// reassign, then redrive rows through incoming staging (not direct cell publish).
 pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
     inner: Arc<SupertableInner>,
     merged_entry: &Arc<SuperfileEntry>,
     split_cell: u32,
 ) -> Result<(), BuildError> {
-    if !spfresh::split_overflow_needed(merged_entry.n_docs) {
+    if !opann::split_overflow_needed(merged_entry.n_docs) {
         return Ok(());
     }
 
@@ -2734,14 +2789,14 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
         .collect();
 
     let (sub0, sub1) = maint_pool()
-        .install(|| spfresh::plan_sq8_split(&overflow_encoded, &clusters, split_cell, metric));
+        .install(|| opann::plan_sq8_split(&overflow_encoded, &clusters, split_cell, metric));
     let mut sub_centroids = sub0;
     sub_centroids.extend_from_slice(&sub1);
 
     let old_n_cent = clusters.n_cent;
     let (mut updated_clusters, new_cell_id) =
-        spfresh::insert_split_centroid(&clusters, split_cell, &sub_centroids);
-    let neighborhood = spfresh::reassign_neighborhood(split_cell, old_n_cent, new_cell_id);
+        opann::insert_split_centroid(&clusters, split_cell, &sub_centroids);
+    let neighborhood = opann::reassign_neighborhood(split_cell, old_n_cent, new_cell_id);
 
     let mut to_remove: Vec<Arc<SuperfileEntry>> = Vec::new();
     for entry in manifest.superfiles.iter() {
@@ -2764,7 +2819,7 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
     }
 
     // Rows leave the neighborhood cells; counts reset until routing lands them.
-    spfresh::zero_cell_counts(&mut updated_clusters, &neighborhood);
+    opann::zero_cell_counts(&mut updated_clusters, &neighborhood);
 
     let incoming_prepared = maint_pool().install(|| -> Result<PreparedSuperfile, BuildError> {
         let mut rows = all_materialized;
@@ -3143,7 +3198,7 @@ pub async fn write_superfile_list(
     // commit can stage one hidden delta per touched cell plus user shards;
     // driving all PUTs at once opens dozens of sockets and can stall the commit
     // path. Crucially, bulk ingest commits overlap background hidden-index
-    // SPFresh maintenance (its own compaction PUT/GET waves), so a full-width
+    // OPANN maintenance (its own compaction PUT/GET waves), so a full-width
     // fanout from each stacks and starves the connection pool until requests
     // hit the per-request timeout. Capping each operation at ~50% of cores
     // leaves headroom for a concurrent maintenance pass without saturation.

@@ -22,7 +22,7 @@ use crate::superfile::vector::rerank_codec::RerankCodec;
 #[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
 
-/// Residual quantization step divisor for [`RerankCodec::Sq8ResidualEpsilon`].
+/// Residual quantization step divisor for [`RerankCodec::Sq8Residual`].
 /// The signed 8-bit residual code at dim `d` carries
 /// `scale_c[d] / SQ8_RESIDUAL_DIVISOR`-sized steps around the Sq8
 /// dequant base. `16` hit the recall target with the best
@@ -39,6 +39,11 @@ const F32X8_LANES: usize = 8;
 // Referenced only by the x86-gated AVX-512 kernels; dead on other targets.
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const AVX512_F32_LANES: usize = 16;
+
+/// Centroid batch width for the transposed routing cache. Chosen to match the
+/// AVX-512 f32 lane count; the portable fallback consumes each 16-lane block as
+/// two 8-lane halves.
+pub(crate) const CENTROID_BATCH_LANES: usize = AVX512_F32_LANES;
 
 /// Byte width of one little-endian `f32`. A byte-backed vector of
 /// dimension `d` occupies `d * F32_BYTES` bytes.
@@ -103,6 +108,241 @@ pub(crate) fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
         return unsafe { l2_sq_avx512(a, b) };
     }
     l2_sq_wide(a, b)
+}
+
+/// Build the block-transposed centroid cache used by
+/// [`nearest_two_centroids_transposed`].
+///
+/// Canonical centroid storage is cluster-major (`centroid -> dim`). This derived
+/// cache is block-transposed in 16-centroid groups:
+/// `block -> dim -> centroid_lane`. That gives the AVX-512 hot loop contiguous
+/// loads for 16 centroid lanes at one query dimension.
+pub(crate) fn transpose_centroids_cluster_major(
+    centroids: &[f32],
+    n_cent: usize,
+    dim: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(centroids.len(), n_cent * dim);
+    let n_blocks = n_cent.div_ceil(CENTROID_BATCH_LANES);
+    let mut transposed = vec![0f32; n_blocks * dim * CENTROID_BATCH_LANES];
+    for block in 0..n_blocks {
+        let centroid_base = block * CENTROID_BATCH_LANES;
+        let block_base = block * dim * CENTROID_BATCH_LANES;
+        for d in 0..dim {
+            let dst = block_base + d * CENTROID_BATCH_LANES;
+            for lane in 0..CENTROID_BATCH_LANES {
+                let centroid = centroid_base + lane;
+                if centroid < n_cent {
+                    transposed[dst + lane] = centroids[centroid * dim + d];
+                }
+            }
+        }
+    }
+    transposed
+}
+
+/// Return the closest two centroids in a block-transposed fp32 centroid cache.
+/// Full blocks score multiple centroids per SIMD register: AVX-512 scores 16
+/// centroids from contiguous loads, and the portable fallback scores each block
+/// as two contiguous `wide::f32x8` halves. `counts = Some(..)` skips zero-count
+/// centroids; `None` keeps every centroid eligible.
+pub(crate) fn nearest_two_centroids_transposed(
+    metric: Metric,
+    query: &[f32],
+    transposed: &[f32],
+    n_cent: usize,
+    dim: usize,
+    counts: Option<&[u32]>,
+) -> Option<((u32, f32), Option<(u32, f32)>)> {
+    debug_assert_eq!(query.len(), dim);
+    debug_assert_eq!(
+        transposed.len(),
+        n_cent.div_ceil(CENTROID_BATCH_LANES) * dim * CENTROID_BATCH_LANES
+    );
+    debug_assert!(counts.is_none_or(|counts| counts.len() >= n_cent));
+    let mut best: Option<(u32, f32)> = None;
+    let mut second: Option<(u32, f32)> = None;
+
+    let n_blocks = n_cent.div_ceil(CENTROID_BATCH_LANES);
+    #[cfg(target_arch = "x86_64")]
+    if avx512_enabled() {
+        for block in 0..n_blocks {
+            // SAFETY: gated by runtime CPUID detection in `avx512_enabled()`.
+            let scores = unsafe {
+                score_centroid_block16_transposed_avx512(metric, query, transposed, dim, block)
+            };
+            update_centroid_block_top_two(
+                counts,
+                block * CENTROID_BATCH_LANES,
+                n_cent,
+                &scores,
+                &mut best,
+                &mut second,
+            );
+        }
+        return best.map(|best| (best, second));
+    }
+
+    for block in 0..n_blocks {
+        let base_centroid = block * CENTROID_BATCH_LANES;
+        for half in 0..CENTROID_BATCH_LANES / F32X8_LANES {
+            let lane_offset = half * F32X8_LANES;
+            let scores = score_centroid_block8_transposed_wide(
+                metric,
+                query,
+                transposed,
+                dim,
+                block,
+                lane_offset,
+            );
+            update_centroid_block_top_two(
+                counts,
+                base_centroid + lane_offset,
+                n_cent,
+                &scores,
+                &mut best,
+                &mut second,
+            );
+        }
+    }
+
+    best.map(|best| (best, second))
+}
+
+#[inline]
+fn centroid_included(counts: Option<&[u32]>, centroid: usize) -> bool {
+    counts.is_none_or(|counts| counts[centroid] != 0)
+}
+
+#[inline]
+fn update_centroid_block_top_two(
+    counts: Option<&[u32]>,
+    base_centroid: usize,
+    n_cent: usize,
+    scores: &[f32],
+    best: &mut Option<(u32, f32)>,
+    second: &mut Option<(u32, f32)>,
+) {
+    for (lane, &score) in scores.iter().enumerate() {
+        let centroid = base_centroid + lane;
+        if centroid < n_cent && centroid_included(counts, centroid) {
+            update_top_two(centroid as u32, score, best, second);
+        }
+    }
+}
+
+#[inline]
+fn update_top_two(
+    centroid: u32,
+    score: f32,
+    best: &mut Option<(u32, f32)>,
+    second: &mut Option<(u32, f32)>,
+) {
+    match *best {
+        None => *best = Some((centroid, score)),
+        Some((_, best_score)) if score < best_score => {
+            *second = *best;
+            *best = Some((centroid, score));
+        }
+        _ => {
+            if second.is_none_or(|(_, second_score)| score < second_score) {
+                *second = Some((centroid, score));
+            }
+        }
+    }
+}
+
+#[inline]
+fn score_centroid_block8_transposed_wide(
+    metric: Metric,
+    query: &[f32],
+    transposed: &[f32],
+    dim: usize,
+    block: usize,
+    lane_offset: usize,
+) -> [f32; F32X8_LANES] {
+    let mut acc = f32x8::ZERO;
+    let block_base = block * dim * CENTROID_BATCH_LANES;
+    for d in 0..dim {
+        let q = f32x8::splat(query[d]);
+        let row = block_base + d * CENTROID_BATCH_LANES + lane_offset;
+        let c = f32x8::from(
+            <[f32; F32X8_LANES]>::try_from(&transposed[row..row + F32X8_LANES])
+                .expect("transposed centroid row has 8-lane half"),
+        );
+        match metric {
+            Metric::L2Sq => {
+                let diff = q - c;
+                acc += diff * diff;
+            }
+            Metric::Cosine | Metric::NegDot => {
+                acc += q * c;
+            }
+        }
+    }
+    let mut scores = acc.to_array();
+    match metric {
+        Metric::Cosine => {
+            for score in &mut scores {
+                *score = COSINE_DISTANCE_BASE - *score;
+            }
+        }
+        Metric::NegDot => {
+            for score in &mut scores {
+                *score = -*score;
+            }
+        }
+        Metric::L2Sq => {}
+    }
+    scores
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn score_centroid_block16_transposed_avx512(
+    metric: Metric,
+    query: &[f32],
+    transposed: &[f32],
+    dim: usize,
+    block: usize,
+) -> [f32; AVX512_F32_LANES] {
+    // SAFETY: called only after `avx512_enabled()`. Each load reads one full
+    // 16-f32 transposed row. The transposed cache is allocated as
+    // `n_blocks * dim * 16`, and callers pass `block < n_blocks`.
+    unsafe {
+        let mut acc = _mm512_setzero_ps();
+        let block_base = block * dim * CENTROID_BATCH_LANES;
+        for d in 0..dim {
+            let q = _mm512_set1_ps(query[d]);
+            let row = block_base + d * CENTROID_BATCH_LANES;
+            let c = _mm512_loadu_ps(transposed.as_ptr().add(row));
+            match metric {
+                Metric::L2Sq => {
+                    let diff = _mm512_sub_ps(q, c);
+                    acc = _mm512_fmadd_ps(diff, diff, acc);
+                }
+                Metric::Cosine | Metric::NegDot => {
+                    acc = _mm512_fmadd_ps(q, c, acc);
+                }
+            }
+        }
+        let mut scores = [0f32; AVX512_F32_LANES];
+        _mm512_storeu_ps(scores.as_mut_ptr(), acc);
+        match metric {
+            Metric::Cosine => {
+                for score in &mut scores {
+                    *score = COSINE_DISTANCE_BASE - *score;
+                }
+            }
+            Metric::NegDot => {
+                for score in &mut scores {
+                    *score = -*score;
+                }
+            }
+            Metric::L2Sq => {}
+        }
+        scores
+    }
 }
 
 /// Horizontal sum `Σ a[d]`. Dispatches AVX-512 → `wide::f32x8` like
@@ -412,9 +652,9 @@ pub(crate) fn distance_bytes_codec(
 ) -> f32 {
     match codec {
         RerankCodec::Fp32 => distance_bytes(metric, query, bytes),
-        RerankCodec::Sq8ResidualEpsilon => {
+        RerankCodec::Sq8Residual => {
             unreachable!(
-                "distance_bytes_codec called with Sq8ResidualEpsilon — Sq8ResidualEpsilon rerank goes \
+                "distance_bytes_codec called with Sq8Residual — Sq8Residual rerank goes \
                  through dedicated kernels (need per-column scale/offset + per-doc \
                  norm context)"
             )
@@ -563,7 +803,7 @@ impl Sq8Kernel {
     }
 }
 
-/// `Sq8ResidualEpsilon` rerank context — the residual-corrected sibling of
+/// `Sq8Residual` rerank context — the residual-corrected sibling of
 /// [`Sq8Kernel`]. Captures the per-cluster quantizer (`scale[dim]`,
 /// `offset[dim]`) plus the query-side precomputes for both the Sq8
 /// code leg and the i8 residual leg, so the per-candidate inner loop
@@ -572,7 +812,7 @@ impl Sq8Kernel {
 /// Applied only to the small final-refine set the Sq8 score selects,
 /// so it never runs over the full shortlist. One kernel per query +
 /// cluster, reused across that cluster's refine candidates.
-pub(crate) struct Sq8ResidualEpsilonKernel<'a> {
+pub(crate) struct Sq8ResidualKernel<'a> {
     metric: Metric,
     dim: usize,
     /// `q_code[d] = query[d] * scale[d]`. Per-doc step is
@@ -590,7 +830,7 @@ pub(crate) struct Sq8ResidualEpsilonKernel<'a> {
     per_doc_norms: Option<&'a [f32]>,
 }
 
-impl<'a> Sq8ResidualEpsilonKernel<'a> {
+impl<'a> Sq8ResidualKernel<'a> {
     /// Build the per-query residual kernel. `scale` + `offset` are
     /// the per-cluster quantizer arrays; `residual_divisor` is
     /// [`SQ8_RESIDUAL_DIVISOR`]. `per_doc_norms` is `Some` for L2Sq
@@ -702,7 +942,7 @@ impl<'a> Sq8ResidualEpsilonKernel<'a> {
         match self.metric {
             Metric::Cosine => {
                 let x_norm = norm
-                    .expect("Sq8ResidualEpsilonKernel + Cosine requires per_doc_norms")
+                    .expect("Sq8ResidualKernel + Cosine requires per_doc_norms")
                     .sqrt();
                 if x_norm > 0.0 {
                     COSINE_DISTANCE_BASE - dot / x_norm
@@ -713,7 +953,7 @@ impl<'a> Sq8ResidualEpsilonKernel<'a> {
             Metric::NegDot => -dot,
             Metric::L2Sq => {
                 let x_norm_sq =
-                    norm.expect("Sq8ResidualEpsilonKernel + L2Sq requires per_doc_norms");
+                    norm.expect("Sq8ResidualKernel + L2Sq requires per_doc_norms");
                 self.q_norm_sq - L2_CROSS_TERM_COEFF * dot + x_norm_sq
             }
         }
@@ -1510,6 +1750,118 @@ mod tests {
         (a - b).abs() < eps
     }
 
+    fn scalar_nearest_two_centroids(
+        metric: Metric,
+        query: &[f32],
+        centroids: &[f32],
+        n_cent: usize,
+        dim: usize,
+        counts: Option<&[u32]>,
+    ) -> Option<((u32, f32), Option<(u32, f32)>)> {
+        let mut best: Option<(u32, f32)> = None;
+        let mut second: Option<(u32, f32)> = None;
+        for c in 0..n_cent {
+            if counts.is_some_and(|counts| counts[c] == 0) {
+                continue;
+            }
+            let score = distance(metric, query, &centroids[c * dim..(c + 1) * dim]);
+            match best {
+                None => best = Some((c as u32, score)),
+                Some((_, best_score)) if score < best_score => {
+                    second = best;
+                    best = Some((c as u32, score));
+                }
+                _ => {
+                    if second.is_none_or(|(_, second_score)| score < second_score) {
+                        second = Some((c as u32, score));
+                    }
+                }
+            }
+        }
+        best.map(|best| (best, second))
+    }
+
+    fn assert_nearest_two_matches(
+        got: Option<((u32, f32), Option<(u32, f32)>)>,
+        expected: Option<((u32, f32), Option<(u32, f32)>)>,
+    ) {
+        let (got_best, got_second) = got.expect("nearest result");
+        let (expected_best, expected_second) = expected.expect("scalar nearest result");
+        assert_eq!(got_best.0, expected_best.0);
+        assert!(
+            approx(got_best.1, expected_best.1, 1e-3),
+            "best score got {} expected {}",
+            got_best.1,
+            expected_best.1
+        );
+        let got_second = got_second.expect("second result");
+        let expected_second = expected_second.expect("scalar second result");
+        assert_eq!(got_second.0, expected_second.0);
+        assert!(
+            approx(got_second.1, expected_second.1, 1e-3),
+            "second score got {} expected {}",
+            got_second.1,
+            expected_second.1
+        );
+    }
+
+    #[test]
+    fn nearest_two_centroids_transposed_matches_scalar_reference() {
+        let dim = 17;
+        let n_cent = 19;
+        let query: Vec<f32> = (0..dim)
+            .map(|d| ((d * 37 % 23) as f32 - 11.0) * 0.031)
+            .collect();
+        let mut centroids = Vec::with_capacity(n_cent * dim);
+        for c in 0..n_cent {
+            for d in 0..dim {
+                centroids.push(((c * 13 + d * 7) % 31) as f32 * 0.02 - 0.3 + c as f32 * 0.001);
+            }
+        }
+        let transposed = transpose_centroids_cluster_major(&centroids, n_cent, dim);
+        for metric in [Metric::L2Sq, Metric::Cosine, Metric::NegDot] {
+            let got =
+                nearest_two_centroids_transposed(metric, &query, &transposed, n_cent, dim, None);
+            let expected =
+                scalar_nearest_two_centroids(metric, &query, &centroids, n_cent, dim, None);
+            assert_nearest_two_matches(got, expected);
+        }
+    }
+
+    #[test]
+    fn nearest_two_centroids_transposed_honors_zero_counts() {
+        let dim = 17;
+        let n_cent = 19;
+        let query: Vec<f32> = (0..dim).map(|d| d as f32 * 0.01).collect();
+        let mut centroids = Vec::with_capacity(n_cent * dim);
+        for c in 0..n_cent {
+            for d in 0..dim {
+                centroids.push(c as f32 + d as f32 * 0.001);
+            }
+        }
+        let mut counts = vec![1u32; n_cent];
+        counts[0] = 0;
+        let transposed = transpose_centroids_cluster_major(&centroids, n_cent, dim);
+        let got = nearest_two_centroids_transposed(
+            Metric::L2Sq,
+            &query,
+            &transposed,
+            n_cent,
+            dim,
+            Some(&counts),
+        );
+        let expected = scalar_nearest_two_centroids(
+            Metric::L2Sq,
+            &query,
+            &centroids,
+            n_cent,
+            dim,
+            Some(&counts),
+        );
+        assert_nearest_two_matches(got, expected);
+        assert_ne!(got.expect("nearest result").0.0, 0);
+    }
+
     // --- dot ------------------------------------------------------------
 
     #[test]
@@ -1718,7 +2070,7 @@ mod tests {
             .collect()
     }
 
-    /// Decode `Sq8ResidualEpsilon` codes (`code * scale + offset + residual
+    /// Decode `Sq8Residual` codes (`code * scale + offset + residual
     /// * scale / divisor`) — the reference the residual kernel must
     /// agree with.
     fn decode_sq8_residual(
@@ -1762,7 +2114,7 @@ mod tests {
                 Metric::Cosine | Metric::L2Sq => Some(&norms[..]),
                 Metric::NegDot => None,
             };
-            let kernel = Sq8ResidualEpsilonKernel::new(
+            let kernel = Sq8ResidualKernel::new(
                 metric,
                 &query,
                 &scale,
@@ -1795,7 +2147,7 @@ mod tests {
             .collect();
         let corrected =
             decode_sq8_residual(&codes, &residuals, dim, &scale, &offset, residual_divisor);
-        let kernel = Sq8ResidualEpsilonKernel::new(
+        let kernel = Sq8ResidualKernel::new(
             Metric::NegDot,
             &query,
             &scale,

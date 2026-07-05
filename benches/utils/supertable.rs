@@ -1146,7 +1146,7 @@ pub mod vector {
     }
 
     /// Drain hidden incoming IVF into per-cell superfiles via the existing
-    /// SPFresh maintenance hook (same call integration tests use).
+    /// OPANN maintenance hook (same call integration tests use).
     fn drain_hidden_incoming(consumer: &Supertable) {
         let hidden = consumer
             .vector_index_table()
@@ -1357,7 +1357,7 @@ pub mod vector {
             drop(corpus);
 
             const PRE_DRAIN_NOTE: &str = "Pre-drain (incoming staging): hidden IVF commit shards still in INCOMING; every query includes INCOMING plus nprobe-routed cells. Warm = query-driven cache fill; cold = fresh cache per iteration. Δ vs previous run.";
-            const POST_DRAIN_NOTE: &str = "Post-drain (routed cells): incoming empty after SPFresh route; queries hit ~nprobe cell-local IVF superfiles only. Warm = query-driven cache fill; cold = fresh cache per iteration. Δ vs previous run.";
+            const POST_DRAIN_NOTE: &str = "Post-drain (routed cells): incoming empty after OPANN route; queries hit ~nprobe cell-local IVF superfiles only. Warm = query-driven cache fill; cold = fresh cache per iteration. Δ vs previous run.";
             const LEGACY_NOTE: &str = "Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = shared disk cache; each row runs one untimed query then timed iterations (only probed superfiles are cached). Cold = fresh disk cache + consumer per iteration. Δ is vs the previous run.";
 
             // Fresh ingest leaves hidden IVF in INCOMING; dataset / existing-prefix

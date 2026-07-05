@@ -16,7 +16,7 @@ use crate::superfile::{
     format::vec::{METRIC_ID_COSINE, METRIC_ID_L2SQ, METRIC_ID_NEGDOT},
     vector::{
         builder::derive_sq8_quantizer_from_min_max,
-        distance::{Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualEpsilonKernel},
+        distance::{Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualKernel},
     },
 };
 
@@ -298,7 +298,7 @@ pub fn search_blob(bytes: &[u8], query: &[f32], k: usize) -> Result<Vec<(u32, f3
                     .ok_or_else(|| "cell posting missing per_doc_norms".to_string())?,
             ),
         };
-        let kernel = Sq8ResidualEpsilonKernel::new(
+        let kernel = Sq8ResidualKernel::new(
             posting.metric,
             query,
             &posting.scale,
@@ -593,7 +593,7 @@ fn metric_from_id(id: u8) -> Result<Metric, String> {
     }
 }
 
-/// One Sq8+ε row carried through SPFresh maintenance without fp32 reconstruction.
+/// One Sq8+ε row carried through OPANN maintenance without fp32 reconstruction.
 ///
 /// `scale`/`offset` are the per-cluster dequant params (length `dim`), identical
 /// for every row in a cluster, so they are stored as a shared `Arc<[f32]>`: all
@@ -716,7 +716,7 @@ const MEDOID_SAMPLE_CAP: usize = 512;
 
 /// Index of the medoid row — the one minimizing the summed pairwise distance to
 /// all others — under an arbitrary row↔row distance `dist`. Used as a centroid
-/// seed by the split's discrete k-means in `supertable::spfresh`.
+/// seed by the split's discrete k-means in `supertable::opann`.
 ///
 /// Bounded to O(cap²): on a shard larger than [`MEDOID_SAMPLE_CAP`] it evaluates
 /// a strided sample of candidate rows against a strided sample of reference rows

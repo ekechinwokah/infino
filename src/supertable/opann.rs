@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! MVCC SPFresh maintenance for the hidden global vector cell index.
+//! MVCC OPANN maintenance for the hidden global vector cell index.
 //!
 //! The user table stays time-ordered and immutable. The hidden index is a
-//! derived, cell-ordered acceleration layer maintained with SPFresh/LIRE-style
+//! derived, cell-ordered acceleration layer maintained with OPANN-style
 //! logical updates expressed as append/MVCC physical swaps:
 //!
 //!   1. Assign incoming vectors to nearest manifest centroids with zero GETs.
@@ -29,12 +29,12 @@ use crate::{
             EncodedCellRow, dequantize_sq8_residual_into, manifest_centroid_components_from_row,
             medoid_index_by,
         },
-        distance::{Metric, distance},
+        distance::{Metric, distance, nearest_two_centroids_transposed},
     },
     supertable::manifest::ClusterCentroids,
 };
 
-/// Doc count above which a merged cell superfile is split (SPFresh step 7).
+/// Doc count above which a merged cell superfile is split (OPANN step 7).
 const CELL_SPLIT_DOC_CAP_DEFAULT: u64 = 50_000;
 
 /// Lloyd iterations for 2-way Sq8+ε k-means at split time.
@@ -78,6 +78,16 @@ pub(crate) fn apply_cell_updates(
     apply_cell_count_updates(base, count_updates)
 }
 
+/// Primary cell assignment plus the nearest neighboring Voronoi cell.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct BoundaryAssignment {
+    pub primary: u32,
+    /// Second-nearest cell and the row's distance to the primary/neighbor
+    /// boundary. Smaller margin means closer to the boundary and therefore a
+    /// better replication candidate.
+    pub neighbor: Option<(u32, f32)>,
+}
+
 fn score_row_against_cell(
     clusters: &ClusterCentroids,
     metric: Metric,
@@ -94,6 +104,104 @@ fn score_row_against_cell(
         &mut row_fp,
     );
     distance(metric, &row_fp, clusters.centroid(cell))
+}
+
+fn boundary_margin(
+    clusters: &ClusterCentroids,
+    metric: Metric,
+    primary: u32,
+    neighbor: u32,
+    primary_score: f32,
+    neighbor_score: f32,
+) -> f32 {
+    let gap = (neighbor_score - primary_score).max(0.0);
+    let c1 = clusters.centroid(primary as usize);
+    let c2 = clusters.centroid(neighbor as usize);
+    match metric {
+        Metric::L2Sq => {
+            let separation = distance(metric, c1, c2).sqrt();
+            if separation > 0.0 {
+                gap / (2.0 * separation)
+            } else {
+                f32::INFINITY
+            }
+        }
+        Metric::Cosine | Metric::NegDot => {
+            let separation = distance(metric, c1, c2).abs();
+            if separation > 0.0 {
+                gap / separation
+            } else {
+                f32::INFINITY
+            }
+        }
+    }
+}
+
+/// Drain-only boundary assignment: decode each row once, then rank centroids
+/// with a prebuilt transposed centroid cache.
+///
+/// Same assignment semantics as `nearest-two by score then Voronoi margin`,
+/// but without changing ingest/manifest structs.
+///
+/// Centroid ranking uses a prebuilt
+/// transposed centroid cache. The cache is derived from manifest centroids by
+/// the drain caller and is not stored on ingest/manifest structs.
+pub(crate) fn boundary_assignment_encoded_with_transposed(
+    clusters: &ClusterCentroids,
+    transposed_centroids: &[f32],
+    metric: Metric,
+    row: &EncodedCellRow,
+) -> BoundaryAssignment {
+    let dim = clusters.dim as usize;
+    let mut row_fp = vec![0f32; dim];
+    dequantize_sq8_residual_into(
+        &row.scale,
+        &row.offset,
+        &row.codes,
+        &row.residuals,
+        &mut row_fp,
+    );
+    boundary_assignment_decoded(clusters, Some(transposed_centroids), metric, &row_fp)
+}
+
+fn boundary_assignment_decoded(
+    clusters: &ClusterCentroids,
+    transposed_centroids: Option<&[f32]>,
+    metric: Metric,
+    row_fp: &[f32],
+) -> BoundaryAssignment {
+    let nearest = transposed_centroids
+        .and_then(|transposed| {
+            nearest_two_centroids_transposed(
+                metric,
+                row_fp,
+                transposed,
+                clusters.n_cent as usize,
+                clusters.dim as usize,
+                None,
+            )
+        })
+        .or_else(|| clusters.nearest_two_cells(metric, row_fp));
+    let Some(((primary, primary_score), second)) = nearest else {
+        return BoundaryAssignment {
+            primary: 0,
+            neighbor: None,
+        };
+    };
+    let neighbor = second.map(|(neighbor, neighbor_score)| {
+        (
+            neighbor,
+            boundary_margin(
+                clusters,
+                metric,
+                primary,
+                neighbor,
+                primary_score,
+                neighbor_score,
+            ),
+        )
+    });
+    BoundaryAssignment { primary, neighbor }
 }
 
 /// One-cluster [`ClusterCentroids`] prototype from a Sq8+ε row (split k-means seeds).
@@ -213,24 +321,6 @@ pub(crate) fn plan_sq8_split(
         manifest_centroid_components_from_row(&shard0[m0], dim),
         manifest_centroid_components_from_row(&shard1[m1], dim),
     )
-}
-
-/// Assign an encoded row to its nearest manifest cell.
-pub(crate) fn nearest_cell_encoded(
-    clusters: &ClusterCentroids,
-    metric: Metric,
-    row: &EncodedCellRow,
-) -> u32 {
-    let mut best = 0u32;
-    let mut best_score = f32::INFINITY;
-    for c in 0..clusters.n_cent as usize {
-        let score = score_row_against_cell(clusters, metric, c, row);
-        if score < best_score {
-            best_score = score;
-            best = c as u32;
-        }
-    }
-    best
 }
 
 /// Replace cell `cell_id`'s centroid and append a second sub-cell at `n_cent`.

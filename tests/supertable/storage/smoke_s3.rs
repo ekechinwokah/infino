@@ -193,7 +193,7 @@ fn real_s3_options(dim: usize) -> infino::supertable::SupertableOptions {
             n_cent: VECTOR_N_CENT,
             rot_seed: VECTOR_ROT_SEED,
             metric: infino::superfile::vector::distance::Metric::Cosine,
-            rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: infino::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
             provided_centroids: None,
         }],
         Some(infino::test_helpers::default_tokenizer()),
@@ -381,7 +381,7 @@ async fn supertable_smoke_via_s3_wire_protocol() {
 /// the EC2 `supertable_vector` ingest hang. Commits run on a `spawn_blocking`
 /// thread (no ambient runtime → `block_on_writer_future` takes the `Err` branch
 /// onto `query_runtime`, exactly as the EC2 ingest harness drives it), across
-/// enough commits to trigger the background SPFresh drain (the multi-commit
+/// enough commits to trigger the background OPANN drain (the multi-commit
 /// path that hangs on EC2). A `timeout` converts a deadlock into a fast test
 /// failure instead of wedging the runner.
 ///

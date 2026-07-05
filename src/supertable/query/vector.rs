@@ -1187,8 +1187,29 @@ fn top_k_ascending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<Super
         }
     }
 
-    let mut heap = BinaryHeap::with_capacity(k + 1);
+    // Boundary replicas are stored in different hidden cell superfiles but carry
+    // the same user `_id` in `stable_id`. Collapse them before the top-k heap so
+    // one logical row cannot occupy multiple result slots. User-table hits
+    // without `stable_id` pass through unchanged.
+    let mut best_by_id: HashMap<i128, SuperfileHit> = HashMap::new();
+    let mut passthrough = Vec::new();
     for hit in per_superfile.into_iter().flatten() {
+        if let Some(id) = hit.stable_id {
+            best_by_id
+                .entry(id)
+                .and_modify(|existing| {
+                    if hit.score < existing.score {
+                        *existing = hit;
+                    }
+                })
+                .or_insert(hit);
+        } else {
+            passthrough.push(hit);
+        }
+    }
+
+    let mut heap = BinaryHeap::with_capacity(k + 1);
+    for hit in best_by_id.into_values().chain(passthrough) {
         if heap.len() < k {
             heap.push(MaxByScore(hit));
         } else if let Some(worst) = heap.peek()

@@ -58,10 +58,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use super::options::SupertableOptions;
 use crate::{
     storage::{StorageError, StorageProvider},
-    superfile::vector::{
-        distance::{Metric, distance},
-        layout::VectorLayout,
-    },
+    superfile::vector::{distance::{Metric, distance}, layout::VectorLayout},
     supertable::{
         CommitError,
         error::ManifestError,
@@ -2046,12 +2043,12 @@ pub struct VectorSummary {
     pub clusters: ClusterCentroids,
 }
 
-/// Per-cluster IVF centroids for one vector column, stored as fp32
-/// (cluster-major, `n_cent * dim`). Carried in the manifest so a query
-/// can rank every superfile's clusters globally — without opening the
-/// superfile — and probe only the globally-closest clusters. The 1-bit
-/// shortlist + rerank still run on the superfile's on-disk compressed
-/// vectors; these drive cluster *selection* only.
+/// Per-cluster IVF centroids for one vector column, stored canonically as fp32
+/// cluster-major (`n_cent * dim`) plus a derived block-transposed cache for hot
+/// routing. Carried in the manifest so a query can rank every superfile's
+/// clusters globally — without opening the superfile — and probe only the
+/// globally-closest clusters. The 1-bit shortlist + rerank still run on the
+/// superfile's on-disk compressed vectors; these drive cluster *selection* only.
 ///
 /// Centroids are `n_cent * dim` (~1% of index bytes), so they are kept
 /// fp32 — routing reads a centroid as a zero-copy `&[f32]` slice and
@@ -2155,6 +2152,35 @@ impl ClusterCentroids {
             }
         });
         best_cell
+    }
+
+    /// Return the closest two cells to `query`, keeping empty cells eligible.
+    /// Drain routing uses this because an empty cell can be the right
+    /// destination for incoming rows.
+    pub(crate) fn nearest_two_cells(
+        &self,
+        metric: Metric,
+        query: &[f32],
+    ) -> Option<((u32, f32), Option<(u32, f32)>)> {
+        debug_assert_eq!(query.len(), self.dim as usize);
+        let mut best: Option<(u32, f32)> = None;
+        let mut second: Option<(u32, f32)> = None;
+        for cell in 0..self.n_cent {
+            let score = self.score_one(metric, cell as usize, query);
+            match best {
+                None => best = Some((cell, score)),
+                Some((_, best_score)) if score < best_score => {
+                    second = best;
+                    best = Some((cell, score));
+                }
+                _ => {
+                    if second.is_none_or(|(_, second_score)| score < second_score) {
+                        second = Some((cell, score));
+                    }
+                }
+            }
+        }
+        best.map(|best| (best, second))
     }
 
     /// Assign each row in `vectors` to its nearest cell. Parallel over rows;

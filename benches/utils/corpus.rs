@@ -1213,7 +1213,7 @@ pub fn build_vector_index(
         n_cent,
         rot_seed: ROT_SEED,
         metric,
-        rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+        rerank_codec: RerankCodec::Sq8Residual,
     })
     .expect("register column");
     for i in 0..n_docs {
@@ -1266,7 +1266,7 @@ pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u
             n_cent,
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: RerankCodec::Sq8Residual,
         }],
         Some(default_tokenizer()),
     );
@@ -1313,7 +1313,7 @@ pub fn build_superfile_with_metric(
             n_cent,
             rot_seed: ROT_SEED,
             metric,
-            rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: RerankCodec::Sq8Residual,
         }],
         Some(default_tokenizer()),
     );

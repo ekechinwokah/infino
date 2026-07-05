@@ -922,7 +922,7 @@ pub(crate) const GLOBAL_VECTOR_CELL_COUNT: usize = 64;
 /// region. Each hidden commit writes one IVF superfile under this sentinel
 /// partition holding that whole batch (all cells mixed, unsorted). Queries
 /// always scan the incoming superfiles in addition to the nprobe-routed cell
-/// superfiles; background SPFresh maintenance later routes incoming into the
+/// superfiles; background OPANN maintenance later routes incoming into the
 /// per-cell IVF superfiles and deletes it. `u32::MAX` is out of the
 /// valid cell range `0..n_cent`, so it never collides with a real cell.
 pub(crate) const INCOMING_VECTOR_CELL: u32 = u32::MAX;
@@ -983,7 +983,7 @@ pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::Compac
 
 /// Open-time bootstrap only: derive initial global centroids from an
 /// existing user-table IVF summary. Hidden commits use
-/// [`super::spfresh`] MVCC maintenance — never call this per commit.
+/// [`super::opann`] MVCC maintenance — never call this per commit.
 pub(crate) fn train_global_centroids(
     user_opts: &SupertableOptions,
     manifest: &super::manifest::Manifest,
@@ -1087,7 +1087,7 @@ fn build_vector_index_options(
         .vector_columns
         .iter()
         .map(|vc| crate::superfile::builder::VectorConfig {
-            rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Sq8ResidualEpsilon,
+            rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
             ..vc.clone()
         })
         .collect();
@@ -1757,7 +1757,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
             Some(crate::test_helpers::default_tokenizer()),
@@ -1878,7 +1878,7 @@ mod tests {
                     n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
-                    rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                    rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
                 }],
                 None,
@@ -2029,7 +2029,7 @@ mod tests {
                     n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
-                    rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                    rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
                 }],
                 Some(crate::test_helpers::default_tokenizer()),
@@ -2213,7 +2213,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
             Some(crate::test_helpers::default_tokenizer()),
@@ -2310,7 +2310,7 @@ mod tests {
                     n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
-                    rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                    rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
                 }],
                 Some(crate::test_helpers::default_tokenizer()),
@@ -2436,7 +2436,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
             Some(crate::test_helpers::default_tokenizer()),
@@ -2567,7 +2567,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
             Some(crate::test_helpers::default_tokenizer()),
@@ -2684,7 +2684,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
             Some(crate::test_helpers::default_tokenizer()),
@@ -2800,7 +2800,7 @@ mod tests {
                     n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
-                    rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                    rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
                 }],
                 Some(crate::test_helpers::default_tokenizer()),
@@ -2970,7 +2970,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
             Some(crate::test_helpers::default_tokenizer()),
@@ -3100,7 +3100,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Sq8ResidualEpsilon,
+                rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
             }],
             Some(crate::test_helpers::default_tokenizer()),
