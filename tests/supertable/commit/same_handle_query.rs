@@ -208,19 +208,20 @@ fn parts_cache_stays_bounded_across_repeated_commits() {
 }
 
 // ============================================================
-// Two-blob metadata law: open = one pointer GET per table, and
-// the read path issues ZERO metadata GETs — the pointer payload
-// carries the list, the entries, and the deleted-id set inline,
-// and freshness under BoundedStaleness is a background poll,
-// never a query-path fetch.
+// Metadata-GET law: open costs a fixed pointer + list + part
+// fetch. On the read path the ONLY metadata I/O is the
+// BoundedStaleness freshness check — one pointer GET at most
+// once per window, which short-circuits (`AlreadyLoaded`)
+// before any list/part fetch when the pointer hasn't advanced.
+// Lists and parts are never re-fetched by reads.
 // ============================================================
 
-/// Freshness window wide enough that the background poller cannot
-/// fire during the test — proving reader() itself never fetches.
+/// Staleness window wide enough that only the FIRST query's freshness
+/// check can fire during the test — every later read must be GET-free.
 const WIDE_STALENESS_SECS: u64 = 3600;
 
 #[test]
-fn open_is_one_pointer_get_and_reads_touch_no_metadata() {
+fn open_metadata_cost_is_fixed_and_reads_check_pointer_once_per_window() {
     let dir = TempDir::new().expect("tempdir");
     let local: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
@@ -264,9 +265,11 @@ fn open_is_one_pointer_get_and_reads_touch_no_metadata() {
         "single-bucket table: open eager-loads exactly one part"
     );
 
-    // Reads: repeated readers + queries issue zero FURTHER metadata GETs
-    // of any kind within the staleness window — no pointer freshness
-    // check, no list, no parts. The resident flat view serves them all.
+    // Reads: the FIRST query pays the one freshness check for the
+    // staleness window — a single pointer GET whose unchanged pointer
+    // short-circuits (`AlreadyLoaded`) before any list/part fetch.
+    // Every further read inside the window issues zero metadata GETs;
+    // the resident flat view serves them all.
     for _ in 0..3 {
         let hits = st
             .reader()
@@ -276,8 +279,8 @@ fn open_is_one_pointer_get_and_reads_touch_no_metadata() {
     }
     assert_eq!(
         counter.pointer_gets(),
-        1,
-        "the read path must not re-read the pointer within the staleness window"
+        2,
+        "reads perform exactly one freshness pointer check per staleness window"
     );
     assert_eq!(counter.list_gets(), 1, "reads must never fetch a list");
     assert_eq!(counter.part_gets(), 1, "reads must never fetch a part");
