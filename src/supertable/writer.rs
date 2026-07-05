@@ -128,12 +128,12 @@ use crate::{
     supertable::{
         CommitError as SupertableCommitError, ManifestLoadError,
         error::ManifestError,
-        hidden_deleted::{self, encode_deleted_ids, storage_path},
+        hidden_deleted::{self, encode_deleted_ids},
         manifest::{
             ClusterCentroids, Manifest,
             commit::get_current_manifest_etag,
             list::PartitionStrategy,
-            part::{self as part_mod, ContentHash, PartId},
+            part::{self as part_mod, PartId},
             partition::{assign_partition, encode_partition_key},
         },
         query::{dispatch::open_reader, vector::stable_ids_by_local_for_routing},
@@ -2882,10 +2882,10 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 /// cleared the ref when membership changed; this restamps it so consumers'
 /// resident centroid state is invalidated exactly once, by maintenance.
 ///
-/// Mirrors [`record_hidden_deleted_ids`]: content-addressed idempotent PUT
-/// (`PreconditionFailed` = already durable), then a list+pointer etag-CAS
-/// stamp with refresh-and-retry on contention — so a lost race rebuilds the
-/// blob from the WINNING membership, never stamping stale state.
+/// Writes the content-addressed blob idempotently (`PreconditionFailed` =
+/// already durable), then a list+pointer etag-CAS stamp with refresh-and-retry
+/// on contention — so a lost race rebuilds the blob from the winning
+/// membership, never stamping stale state.
 pub(in crate::supertable) async fn refresh_slow_vector_state(
     inner: &SupertableInner,
 ) -> Result<(), BuildError> {
@@ -2953,9 +2953,10 @@ async fn record_hidden_deleted_ids(
         if !has_data {
             return Ok(());
         }
-        let mut ids = hidden_deleted::load_deleted_user_ids(&old, storage.as_ref())
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
+        let mut ids = hidden_deleted::deleted_user_ids(&old)
+            .map_err(|e| BuildError::Store(e.to_string()))?
+            .as_ref()
+            .clone();
         let before = ids.len();
         ids.extend_from_slice(new_deleted);
         ids.sort_unstable();
@@ -2964,13 +2965,7 @@ async fn record_hidden_deleted_ids(
             return Ok(());
         }
         let bytes = encode_deleted_ids(&ids);
-        let hash = ContentHash::of(&bytes);
-        let uri = storage_path(&hash);
-        match storage.put_atomic(&uri, Bytes::from(bytes)).await {
-            Ok(_) | Err(StorageError::PreconditionFailed { .. }) => {}
-            Err(e) => return Err(BuildError::Store(e.to_string())),
-        }
-        let new_manifest = old.with_deleted_user_ids(uri, hash);
+        let new_manifest = old.with_deleted_user_ids(bytes);
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -3320,7 +3315,7 @@ pub(crate) async fn try_commit_attempt(
 /// Mirrors the logic in [`Supertable::refresh`] but operates
 /// on `&SupertableInner` so it can be called from inside the
 /// writer's commit path without holding a `Supertable` handle.
-async fn refresh_inner_state_async(
+pub(in crate::supertable) async fn refresh_inner_state_async(
     inner: &SupertableInner,
     storage: &Arc<dyn StorageProvider>,
 ) -> Result<(), SupertableCommitError> {

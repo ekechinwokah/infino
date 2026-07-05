@@ -45,6 +45,7 @@ use std::{
 use arrow::compute::kernels::aggregate as agg;
 use arrow_array::*;
 use arrow_schema::DataType;
+use bytes::Bytes;
 use dashmap::DashMap;
 use futures::future;
 /// Re-export the per-column skip aggregates so callers can refer to them as
@@ -79,7 +80,7 @@ use crate::{
             partition::{PartitionKey, assign_partition, encode_partition_key},
         },
         query::{hierarchical_iter, prune::PruneLeaf},
-        slow_vector_state,
+        slow_vector_state::{self, decode_entries, encode_entries},
     },
 };
 
@@ -439,12 +440,28 @@ impl Manifest {
             return Err(ManifestLoadError::AlreadyLoaded);
         }
 
-        // 2. Load + parse the manifest list.
-        let (list_bytes, _) = storage
-            .get(&pointer.manifest_list_uri)
-            .await
-            .map_err(ManifestLoadError::Storage)?;
-        let list = list::decode(&list_bytes).map_err(ManifestLoadError::ListParse)?;
+        // 2. The list rides inline in the pointer (the table's one
+        // metadata object) — hash-verified against the pointer's own
+        // content hash, zero additional GETs. Legacy pointers without
+        // the payload fall back to the standalone list object.
+        let list = match &pointer.list_inline {
+            Some(inline) if ContentHash::of(inline) == pointer.content_hash => {
+                list::decode(inline).map_err(ManifestLoadError::ListParse)?
+            }
+            Some(_) => {
+                return Err(ManifestLoadError::ContentHashMismatch {
+                    expected: pointer.content_hash.to_hex(),
+                    actual: "inline list payload hash mismatch".into(),
+                });
+            }
+            None => {
+                let (list_bytes, _) = storage
+                    .get(&pointer.manifest_list_uri)
+                    .await
+                    .map_err(ManifestLoadError::Storage)?;
+                list::decode(&list_bytes).map_err(ManifestLoadError::ListParse)?
+            }
+        };
 
         let options = if let Some(options) = options {
             options
@@ -484,26 +501,57 @@ impl Manifest {
         // already-decoded entries with zero I/O. That reuse is what keeps
         // the centroid state memory-resident across manifest versions until
         // the drainer republishes.
-        let expected_n_superfiles: u64 = list.parts.iter().map(|e| e.n_superfiles as u64).sum();
-        let hydrated: Option<Vec<Arc<SuperfileEntry>>> = match (
+        let expected_n_superfiles: u64 = list.parts.iter().map(|e| e.n_superfiles).sum();
+        // Hydration precedence: (1) slow-ref reuse (zero I/O, zero decode;
+        // membership unchanged by construction since every membership
+        // `update` clears the ref — this keeps centroid state resident
+        // across manifest churn until the drainer republishes);
+        // (2) pointer-inline entries (the open is that single GET);
+        // (3) slow-state blob fetch; (4) legacy part fan.
+        let reused: Option<Vec<Arc<SuperfileEntry>>> = match (
             list.slow_vector_state_uri.as_deref(),
             list.slow_vector_state_content_hash,
         ) {
-            (Some(uri), Some(hash)) => {
-                let reused = current_manifest.as_ref().and_then(|cur| {
-                    let same_ref = cur.list.as_ref().is_some_and(|cl| {
-                        cl.slow_vector_state_uri.as_deref() == Some(uri)
-                            && cl.slow_vector_state_content_hash == Some(hash)
-                    });
-                    let complete =
-                        cur.superfile_list.superfiles.len() as u64 == expected_n_superfiles;
-                    (same_ref && complete).then(|| cur.superfile_list.superfiles.clone())
+            (Some(uri), Some(hash)) => current_manifest.as_ref().and_then(|cur| {
+                let same_ref = cur.list.as_ref().is_some_and(|cl| {
+                    cl.slow_vector_state_uri.as_deref() == Some(uri)
+                        && cl.slow_vector_state_content_hash == Some(hash)
                 });
-                match reused {
-                    Some(entries) => Some(entries),
-                    None => match slow_vector_state::load_state(storage.as_ref(), uri, &hash)
-                        .await
-                    {
+                let complete = cur.superfile_list.superfiles.len() as u64 == expected_n_superfiles;
+                (same_ref && complete).then(|| cur.superfile_list.superfiles.clone())
+            }),
+            _ => None,
+        };
+        let inline_entries: Option<Vec<Arc<SuperfileEntry>>> = if reused.is_some() {
+            None
+        } else {
+            pointer.entries_inline.as_ref().and_then(|bytes| {
+                match decode_entries(bytes) {
+                    Ok(entries) if entries.len() as u64 == expected_n_superfiles => Some(entries),
+                    Ok(entries) => {
+                        tracing::warn!(
+                            "supertable: inline entries count {} != list total {}; ignoring",
+                            entries.len(),
+                            expected_n_superfiles
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!("supertable: inline entries decode failed ({e}); ignoring");
+                        None
+                    }
+                }
+            })
+        };
+        let hydrated: Option<Vec<Arc<SuperfileEntry>>> = match (reused, inline_entries) {
+            (Some(entries), _) => Some(entries),
+            (None, Some(entries)) => Some(entries),
+            (None, None) => match (
+                list.slow_vector_state_uri.as_deref(),
+                list.slow_vector_state_content_hash,
+            ) {
+                (Some(uri), Some(hash)) => {
+                    match slow_vector_state::load_state(storage.as_ref(), uri, &hash).await {
                         Ok(entries) if entries.len() as u64 == expected_n_superfiles => {
                             Some(entries)
                         }
@@ -523,10 +571,10 @@ impl Manifest {
                             );
                             None
                         }
-                    },
+                    }
                 }
-            }
-            _ => None,
+                _ => None,
+            },
         };
         if let Some(entries) = hydrated {
             // Inherit any already-loaded part cells (maintenance reuse);
@@ -697,11 +745,28 @@ impl Manifest {
             part_result.map_err(translate_contention)?;
         }
 
-        // Step 3: build pointer.
+        // Step 3: build the pointer — the table's ONE metadata object.
+        // It carries the full list payload plus the flat entries inline
+        // (when the in-memory view is complete), so an open reads the
+        // table's entire metadata in ONE GET — no list, part, or blob
+        // fetches. The user table's pointer is the fast-CAS blob (churns
+        // per commit); the hidden table's pointer is the slow-CAS blob
+        // (only drain / hidden compaction rewrite its bulk) — the linked
+        // pair opens in exactly two GETs. The separate list/part objects
+        // remain only as the content-addressed audit trail.
+        let expected_n: u64 = list_to_write
+            .parts
+            .iter()
+            .map(|e| e.n_superfiles)
+            .sum();
+        let entries_inline = (self.superfile_list.superfiles.len() as u64 == expected_n)
+            .then(|| Bytes::from(encode_entries(&self.superfile_list.superfiles)));
         let pointer = PointerFile {
             manifest_id: self.get_manifest_id(),
             manifest_list_uri: list_res.uri,
             content_hash: list_res.content_hash,
+            list_inline: Some(list_res.encoded),
+            entries_inline,
         };
 
         // Step 4: conditional pointer write — the visibility
@@ -721,6 +786,19 @@ impl Manifest {
     ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
         match &self.list {
             Some(list) => {
+                // Residency fast path: when the flat view is COMPLETE, the
+                // read path must issue zero metadata GETs — serve the
+                // resident entries and let the per-entry skips downstream
+                // (term ranges, Blooms, min/max on each `SuperfileEntry`)
+                // bound the data fetches. Part-level pruning only ever
+                // paid off by *avoiding part loads*; with the entries
+                // already resident there is nothing to avoid.
+                let expected: u64 = list.parts.iter().map(|e| e.n_superfiles).sum();
+                if self.superfile_list.superfiles.len() as u64 == expected {
+                    return Ok(self.superfile_list.superfiles.clone());
+                }
+                // Incomplete view (legacy lazy manifests): prune at part
+                // granularity and load only the survivors.
                 // Intersect each constraining leaf's kept-part set. A leaf
                 // with no part pruner (`None`) imposes no constraint.
                 let mut kept: Option<HashSet<PartId>> = None;
@@ -765,7 +843,7 @@ impl Manifest {
                 // the list's per-part counts because a LAZY manifest's
                 // post-commit flat view is non-empty but incomplete (the new
                 // entries only) — returning it would silently drop data.
-                let expected: u64 = list.parts.iter().map(|e| e.n_superfiles as u64).sum();
+                let expected: u64 = list.parts.iter().map(|e| e.n_superfiles).sum();
                 if self.superfile_list.superfiles.len() as u64 == expected {
                     return Ok(self.superfile_list.superfiles.clone());
                 }
@@ -801,12 +879,11 @@ impl Manifest {
         }
     }
 
-    pub(crate) fn deleted_user_ids_blob(&self) -> Option<(&str, part::ContentHash)> {
-        let list = self.list.as_ref()?;
-        Some((
-            list.deleted_user_ids_uri.as_deref()?,
-            list.deleted_user_ids_content_hash?,
-        ))
+    /// The deleted-`_id` set's encoded bytes carried inline in the list
+    /// (zero-GET read path); `None` on manifests stamped before the
+    /// inline bytes existed.
+    pub(crate) fn deleted_user_ids_inline(&self) -> Option<&[u8]> {
+        self.list.as_ref()?.deleted_user_ids_inline.as_deref()
     }
 
     /// Slow-CAS section accessor: the content-addressed blob holding this
@@ -822,15 +899,14 @@ impl Manifest {
     }
 
     /// Stamp (or replace) the hidden index's consolidated deleted-user-`_id`
-    /// blob reference. Bumps `manifest_id` like a normal commit without
-    /// touching superfiles or parts.
-    pub fn with_deleted_user_ids(&self, uri: String, hash: part::ContentHash) -> Self {
+    /// bytes in the manifest list. Bumps `manifest_id` like a normal commit
+    /// without touching superfiles or parts.
+    pub fn with_deleted_user_ids(&self, encoded: Vec<u8>) -> Self {
         let next_id = self.get_next_manifest_id();
         let new_list = self.list.as_ref().map(|list| {
             let mut list = list.clone();
             list.manifest_id = next_id;
-            list.deleted_user_ids_uri = Some(uri);
-            list.deleted_user_ids_content_hash = Some(hash);
+            list.deleted_user_ids_inline = Some(encoded.clone());
             list
         });
         Self {
@@ -1322,14 +1398,10 @@ impl Manifest {
             partition_strategy: strategy,
             vector_index_storage_prefix: self.stamp_vector_index_storage_prefix(&vector_columns),
             global_vector_index: self.get_global_vector_index(),
-            deleted_user_ids_uri: self
+            deleted_user_ids_inline: self
                 .list
                 .as_ref()
-                .and_then(|l| l.deleted_user_ids_uri.clone()),
-            deleted_user_ids_content_hash: self
-                .list
-                .as_ref()
-                .and_then(|l| l.deleted_user_ids_content_hash),
+                .and_then(|l| l.deleted_user_ids_inline.clone()),
             // Slow-CAS section is deliberately NOT carried into the
             // successor: `update` is the membership-change path (its only
             // production caller is the commit attempt), and a membership
@@ -2725,8 +2797,7 @@ mod tests {
                     n_buckets: 64,
                 },
                 vector_index_storage_prefix: None,
-                deleted_user_ids_uri: None,
-                deleted_user_ids_content_hash: None,
+                deleted_user_ids_inline: None,
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
                 parts: entries,
@@ -2962,8 +3033,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: vec![list::ManifestPartEntry {
@@ -3119,8 +3189,7 @@ mod tests {
                     n_buckets: 1,
                 },
                 vector_index_storage_prefix: None,
-                deleted_user_ids_uri: None,
-                deleted_user_ids_content_hash: None,
+                deleted_user_ids_inline: None,
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
                 parts: vec![],
@@ -3159,7 +3228,7 @@ mod tests {
         // A deleted-ids stamp (list-only churn: the user-delete path) must
         // NOT disturb the slow-state ref — this is the residency invariant.
         let deleted_stamped =
-            stamped.with_deleted_user_ids("hidden-deleted-ids/deleted-y.bin".into(), hash);
+            stamped.with_deleted_user_ids(Vec::new());
         assert!(
             deleted_stamped.slow_vector_state_blob().is_some(),
             "deleted-ids stamp must preserve the slow-state ref"
@@ -3284,8 +3353,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: slow_uri,
             slow_vector_state_content_hash: slow_hash,
             parts: vec![ManifestPartEntry {
@@ -3310,6 +3378,11 @@ mod tests {
                 manifest_id: 1,
                 manifest_list_uri: lw.uri,
                 content_hash: lw.content_hash,
+                list_inline: Some(lw.encoded),
+                // Deliberately no inline entries: these fixtures exercise
+                // the slow-blob and part-fan hydration paths, which only
+                // engage when the pointer payload doesn't carry entries.
+                entries_inline: None,
             },
             None,
         )
@@ -3386,10 +3459,7 @@ mod tests {
             .expect("read pointer")
             .expect("pointer present");
         let etag = meta.etag.expect("localfs pointer etag");
-        let stamped = a.with_deleted_user_ids(
-            "hidden-deleted-ids/deleted-z.bin".into(),
-            ContentHash([4u8; 32]),
-        );
+        let stamped = a.with_deleted_user_ids(Vec::new());
         stamped
             .write(storage.as_ref(), Some(etag.as_str()), &[])
             .await
@@ -3475,8 +3545,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: vec![ManifestPartEntry {
@@ -3628,8 +3697,7 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: vec![
@@ -3845,8 +3913,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: vec![ManifestPartEntry {
@@ -3947,8 +4014,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: vec![ManifestPartEntry {
@@ -4088,8 +4154,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: vec![
@@ -4223,8 +4288,7 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: vec![
@@ -4360,8 +4424,7 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: vec![
@@ -4518,8 +4581,7 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: vec![
@@ -4678,8 +4740,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: vec![ManifestPartEntry {
@@ -4776,8 +4837,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: vec![ManifestPartEntry {
@@ -4890,8 +4950,7 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: vec![
@@ -5034,8 +5093,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: vec![
@@ -5168,8 +5226,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: vec![ManifestPartEntry {
@@ -5257,8 +5314,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: vec![ManifestPartEntry {
@@ -5367,8 +5423,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: vec![
@@ -5496,8 +5551,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts,

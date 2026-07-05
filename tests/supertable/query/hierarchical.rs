@@ -144,10 +144,10 @@ fn bm25_exact_term_loads_only_the_matching_part() {
         assert_eq!(loaded, 0, "lazy-open should not have eager-fetched");
     }
 
-    // Search a term that exists only in commit #2's batch
-    // ("echo"). The list-level bloom-union should prune
-    // four parts; we expect exactly one part loaded post-
-    // query.
+    // Search a term that exists only in commit #2's batch ("echo").
+    // Entries ride the pointer payload, so the query serves routing
+    // from the resident flat view — correct hits, and NO part object
+    // is ever fetched (per-entry skips bound the data reads instead).
     let hits = consumer
         .reader()
         .bm25_search("title", "echo", BM25_TOP_K, BoolMode::Or, None)
@@ -157,7 +157,8 @@ fn bm25_exact_term_loads_only_the_matching_part() {
         "bm25 search should find 'echo' in one of the parts"
     );
 
-    // Post-condition: exactly one OnceCell populated.
+    // Post-condition: zero part OnceCells populated — the read path
+    // issues no metadata fetches of any kind.
     let r = consumer.reader();
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();
@@ -166,8 +167,8 @@ fn bm25_exact_term_loads_only_the_matching_part() {
         .filter(|e| m.get_cached_part_by_id(&e.part_id).is_some())
         .count();
     assert_eq!(
-        n_loaded, 1,
-        "high-selectivity bm25 must load exactly 1 of 5 parts; got {n_loaded}"
+        n_loaded, 0,
+        "queries must not load part objects (entries are resident); got {n_loaded}"
     );
 }
 
@@ -255,25 +256,20 @@ fn bm25_prefix_with_narrow_prefix_loads_one_part() {
         .iter()
         .filter(|e| m.get_cached_part_by_id(&e.part_id).is_some())
         .count();
-    // Term-range prune is range-based — a part survives
-    // iff [prefix, prefix_upper_bound) overlaps the
-    // part's [min_term, max_term]. With 5 disjoint
-    // vocabularies the prefix "ech" lands in exactly one
-    // part's range.
+    // Entries are resident from the pointer payload; the prefix is
+    // routed on the in-memory term ranges and no part object is
+    // fetched.
     assert_eq!(
-        n_loaded, 1,
-        "prefix-prune should load exactly 1 of 5 parts; got {n_loaded}"
+        n_loaded, 0,
+        "prefix query must not load part objects; got {n_loaded}"
     );
 }
 
 #[test]
 fn sql_loads_all_parts_returns_correct_count() {
-    // SQL list-prune is deferred (DataFusion pushdown
-    // through MemTable requires a custom TableProvider).
-    // The SQL path loads all parts and returns correct
-    // aggregate results. The "loads all parts" property
-    // is documented; the correctness property is asserted
-    // here.
+    // SQL serves from the resident flat view (entries ride the
+    // pointer payload) and returns correct aggregate results with
+    // zero part fetches.
     let dir = TempDir::new().expect("tempdir");
     build_5_parts_with_distinct_terms(dir.path());
 
@@ -303,7 +299,7 @@ fn sql_loads_all_parts_returns_correct_count() {
         .expect("Int64");
     assert_eq!(arr.value(0), HIERARCHICAL_PART_COUNT as i64 * ROWS_PER_PART);
 
-    // Post: all 5 parts loaded (SQL doesn't list-prune).
+    // Post: zero parts loaded — SQL reads the resident entries.
     let r = consumer.reader();
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();
@@ -312,8 +308,8 @@ fn sql_loads_all_parts_returns_correct_count() {
         .filter(|e| m.get_cached_part_by_id(&e.part_id).is_some())
         .count();
     assert_eq!(
-        n_loaded, HIERARCHICAL_PART_COUNT,
-        "SQL loads all parts (list-pushdown deferred); got {n_loaded}/5"
+        n_loaded, 0,
+        "SQL must not load part objects (entries are resident); got {n_loaded}/5"
     );
 }
 
@@ -345,14 +341,20 @@ fn eager_mode_query_paths_observationally_unchanged() {
     )
     .expect("open");
 
-    // Eager: 1 part loaded at open.
+    // Open hydrates the flat view from the pointer's inline entries;
+    // no part object is fetched.
     let r = consumer.reader();
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();
     assert_eq!(list_entries.len(), 1);
     assert!(
-        m.get_cached_part_by_id(&list_entries[0].part_id).is_some(),
-        "eager mode pre-loads the part at open"
+        m.get_cached_part_by_id(&list_entries[0].part_id).is_none(),
+        "open must not fetch part objects; entries ride the pointer"
+    );
+    assert_eq!(
+        m.get_all_superfiles().len(),
+        1,
+        "flat view hydrated from the pointer payload"
     );
     drop(r);
 

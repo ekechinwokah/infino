@@ -93,82 +93,137 @@ pub fn part_uri(content_hash: &ContentHash) -> String {
 
 /// In-memory pointer file. Lives at [`POINTER_PATH`]; its
 /// atomic rename is the visibility barrier for a commit.
+///
+/// The pointer IS the table's one metadata object: it carries the full
+/// manifest-list payload (`list_inline`) and the flat superfile entries
+/// (`entries_inline`) inline, so an open reads the table's entire
+/// metadata in ONE GET. The user table's pointer is the fast-CAS blob
+/// (churns per commit); the hidden vector-index table's pointer is the
+/// slow-CAS blob (only drain / hidden compaction rewrite its bulk) —
+/// the linked pair opens in exactly two GETs, and the read path never
+/// fetches metadata at all. The `manifest_list_uri` indirection remains
+/// only for wire compatibility with pointers written before the inline
+/// payloads existed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PointerFile {
     pub manifest_id: u64,
     pub manifest_list_uri: String,
     pub content_hash: ContentHash,
+    /// Full manifest-list JSON carried in the pointer payload. `None`
+    /// only when parsing a legacy pointer written without it.
+    pub list_inline: Option<Bytes>,
+    /// The table's superfile entries (part-codec bytes, same encoding
+    /// as the slow-state blob) carried in the pointer payload, so
+    /// opening needs no list, part, or blob fetches.
+    pub entries_inline: Option<Bytes>,
 }
 
 impl PointerFile {
-    /// Serialize to the on-disk text format.
+    /// Serialize to the on-disk format.
     ///
     /// ```text
     /// manifest_id=42
     /// manifest_list_uri=manifest-lists/list-000042.json
     /// content_hash=blake3:def...
+    /// list_inline_len=31337
+    /// <raw list JSON bytes>
+    /// entries_inline_len=90210
+    /// <raw part-codec bytes>
     /// ```
+    ///
+    /// Line-oriented `key=value` headers; each `*_len` line is followed
+    /// by exactly that many raw payload bytes, then parsing resumes
+    /// line-oriented. The parser walks positionally, so payload bytes
+    /// are never scanned for line breaks.
     pub fn to_bytes(&self) -> Vec<u8> {
-        format!(
+        let header = format!(
             "manifest_id={}\nmanifest_list_uri={}\ncontent_hash=blake3:{}\n",
             self.manifest_id,
             self.manifest_list_uri,
             self.content_hash.to_hex(),
-        )
-        .into_bytes()
+        );
+        let mut out = Vec::with_capacity(
+            header.len()
+                + self.list_inline.as_ref().map_or(0, |b| b.len() + 32)
+                + self.entries_inline.as_ref().map_or(0, |b| b.len() + 32),
+        );
+        out.extend_from_slice(header.as_bytes());
+        if let Some(list) = &self.list_inline {
+            out.extend_from_slice(format!("{LIST_INLINE_KEY}={}\n", list.len()).as_bytes());
+            out.extend_from_slice(list);
+        }
+        if let Some(entries) = &self.entries_inline {
+            out.extend_from_slice(format!("{ENTRIES_INLINE_KEY}={}\n", entries.len()).as_bytes());
+            out.extend_from_slice(entries);
+        }
+        out
     }
 
-    /// Parse the on-disk text format.
+    /// Parse the on-disk format (legacy pointers without inline
+    /// payloads parse to `list_inline: None, entries_inline: None`).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ManifestLoadError> {
-        let s = from_utf8(bytes)
-            .map_err(|e| ManifestLoadError::PointerParse(format!("not utf-8: {e}")))?;
-
         let mut manifest_id: Option<u64> = None;
         let mut manifest_list_uri: Option<String> = None;
         let mut content_hash: Option<ContentHash> = None;
+        let mut list_inline: Option<Bytes> = None;
+        let mut entries_inline: Option<Bytes> = None;
 
-        for line in s.lines() {
+        // Positional walk: consume one `key=value\n` line at a time;
+        // a `*_len` key consumes its declared payload bytes immediately
+        // after the newline, then the walk resumes on the next line.
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            let rest = &bytes[pos..];
+            let nl = match rest.iter().position(|&b| b == b'\n') {
+                Some(nl) => nl,
+                None => {
+                    // Truncated tail: diagnose invalid bytes as utf-8
+                    // garbage (torn write), otherwise as truncation.
+                    from_utf8(rest).map_err(|e| {
+                        ManifestLoadError::PointerParse(format!("not utf-8: {e}"))
+                    })?;
+                    return Err(ManifestLoadError::PointerParse(
+                        "unterminated header line".into(),
+                    ));
+                }
+            };
+            let line = from_utf8(&rest[..nl])
+                .map_err(|e| ManifestLoadError::PointerParse(format!("not utf-8: {e}")))?;
+            pos += nl + 1;
             if line.is_empty() {
                 continue;
             }
             let (key, value) = line.split_once('=').ok_or_else(|| {
                 ManifestLoadError::PointerParse(format!("no '=' in line: {line:?}"))
             })?;
-            match key {
-                "manifest_id" => {
-                    manifest_id = Some(value.parse::<u64>().map_err(|e| {
-                        ManifestLoadError::PointerParse(format!("manifest_id: {e}"))
-                    })?);
-                }
-                "manifest_list_uri" => {
-                    manifest_list_uri = Some(value.to_string());
-                }
-                "content_hash" => {
-                    let hex = value.strip_prefix("blake3:").ok_or_else(|| {
+            if key == LIST_INLINE_KEY || key == ENTRIES_INLINE_KEY {
+                let len: usize = value.trim().parse().map_err(|e| {
+                    ManifestLoadError::PointerParse(format!("{key}: {e}"))
+                })?;
+                let end = pos.checked_add(len).filter(|&e| e <= bytes.len()).ok_or_else(
+                    || {
                         ManifestLoadError::PointerParse(format!(
-                            "content_hash missing 'blake3:' prefix: {value}"
+                            "{key}={len} but only {} payload bytes present",
+                            bytes.len() - pos
                         ))
-                    })?;
-                    if hex.len() != BLAKE3_HEX_LEN {
-                        return Err(ManifestLoadError::PointerParse(format!(
-                            "content_hash hex must be {BLAKE3_HEX_LEN} chars; got {}",
-                            hex.len()
-                        )));
-                    }
-                    let mut bytes = [0u8; BLAKE3_DIGEST_BYTES];
-                    for i in 0..BLAKE3_DIGEST_BYTES {
-                        bytes[i] =
-                            u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| {
-                                ManifestLoadError::PointerParse(format!("content_hash hex: {hex}"))
-                            })?;
-                    }
-                    content_hash = Some(ContentHash(bytes));
+                    },
+                )?;
+                let payload = Bytes::copy_from_slice(&bytes[pos..end]);
+                if key == LIST_INLINE_KEY {
+                    list_inline = Some(payload);
+                } else {
+                    entries_inline = Some(payload);
                 }
-                _ => {
-                    // Unknown key — tolerate for forward compat (a
-                    // future plan can add fields; old readers ignore).
-                }
+                pos = end;
+                continue;
             }
+            Self::parse_header_line(
+                key,
+                value,
+                &mut manifest_id,
+                &mut manifest_list_uri,
+                &mut content_hash,
+            )?;
         }
 
         Ok(Self {
@@ -179,13 +234,67 @@ impl PointerFile {
             })?,
             content_hash: content_hash
                 .ok_or_else(|| ManifestLoadError::PointerParse("missing content_hash".into()))?,
+            list_inline,
+            entries_inline,
         })
+    }
+
+    /// Interpret one line-oriented `key=value` header pair. Unknown keys
+    /// are tolerated for forward compatibility (a future plan can add
+    /// fields; old readers ignore them).
+    fn parse_header_line(
+        key: &str,
+        value: &str,
+        manifest_id: &mut Option<u64>,
+        manifest_list_uri: &mut Option<String>,
+        content_hash: &mut Option<ContentHash>,
+    ) -> Result<(), ManifestLoadError> {
+        match key {
+            "manifest_id" => {
+                *manifest_id = Some(value.parse::<u64>().map_err(|e| {
+                    ManifestLoadError::PointerParse(format!("manifest_id: {e}"))
+                })?);
+            }
+            "manifest_list_uri" => {
+                *manifest_list_uri = Some(value.to_string());
+            }
+            "content_hash" => {
+                let hex = value.strip_prefix("blake3:").ok_or_else(|| {
+                    ManifestLoadError::PointerParse(format!(
+                        "content_hash missing 'blake3:' prefix: {value}"
+                    ))
+                })?;
+                if hex.len() != BLAKE3_HEX_LEN {
+                    return Err(ManifestLoadError::PointerParse(format!(
+                        "content_hash hex must be {BLAKE3_HEX_LEN} chars; got {}",
+                        hex.len()
+                    )));
+                }
+                let mut bytes = [0u8; BLAKE3_DIGEST_BYTES];
+                for i in 0..BLAKE3_DIGEST_BYTES {
+                    bytes[i] = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| {
+                        ManifestLoadError::PointerParse(format!("content_hash hex: {hex}"))
+                    })?;
+                }
+                *content_hash = Some(ContentHash(bytes));
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     pub fn get_manifest_id(&self) -> u64 {
         self.manifest_id
     }
 }
+
+/// Header key whose line is followed by the raw inline manifest-list
+/// payload (exactly the declared byte length).
+const LIST_INLINE_KEY: &str = "list_inline_len";
+
+/// Header key whose line is followed by the raw inline superfile-entries
+/// payload (part-codec bytes, exactly the declared byte length).
+const ENTRIES_INLINE_KEY: &str = "entries_inline_len";
 
 /// Read the pointer file from storage.
 ///
@@ -224,6 +333,10 @@ pub struct ListWriteResult {
     pub uri: String,
     pub content_hash: ContentHash,
     pub size_bytes: u64,
+    /// The encoded list bytes, returned so the commit can inline them
+    /// into the pointer payload (the table's one metadata object)
+    /// without a second encode pass.
+    pub encoded: Bytes,
 }
 
 /// Encode + write one manifest part. Content-addressed:
@@ -294,15 +407,16 @@ pub async fn write_manifest_list(
     storage: &dyn StorageProvider,
     list: &ManifestList,
 ) -> Result<ListWriteResult, CommitError> {
-    let json = list_mod::encode(list).map_err(|e| CommitError::Encode(e.to_string()))?;
+    let json = Bytes::from(list_mod::encode(list).map_err(|e| CommitError::Encode(e.to_string()))?);
     let content_hash = ContentHash::of(&json);
     let uri = list_uri(list.manifest_id);
     let size = json.len() as u64;
-    storage.put_atomic(&uri, Bytes::from(json)).await?;
+    storage.put_atomic(&uri, json.clone()).await?;
     Ok(ListWriteResult {
         uri,
         content_hash,
         size_bytes: size,
+        encoded: json,
     })
 }
 
@@ -440,6 +554,8 @@ mod tests {
             manifest_id: 7,
             manifest_list_uri: "manifest-lists/list-000007.json".into(),
             content_hash: ContentHash(bytes),
+            list_inline: None,
+            entries_inline: None,
         }
     }
 
@@ -681,8 +797,7 @@ mod tests {
                 granularity_secs: 86_400,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: Vec::new(),

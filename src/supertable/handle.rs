@@ -19,18 +19,18 @@ use std::{
     fmt,
     future::Future,
     sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
-    time::{Duration, Instant},
+    thread,
+    time::Duration,
 };
 
 use arc_swap::ArcSwap;
 use arrow_schema::SchemaRef;
 use chrono::Utc;
 use datafusion::execution::context::SessionContext;
-use tokio::runtime::Runtime;
+use tokio::runtime::{self, Runtime};
 
 use super::{
     error::{BuildError, OpenError},
-    hidden_deleted::DeletedSetCache,
     manifest::Manifest,
     options::SupertableOptions,
 };
@@ -53,6 +53,7 @@ use crate::{
             lease::DEFAULT_LEASE_DURATION,
             recovery::{RecoveryError, RecoveryReport, scan_and_recover},
         },
+        writer::refresh_inner_state_async,
     },
 };
 
@@ -125,9 +126,6 @@ pub(super) struct SupertableInner {
     /// `query_sql` the `Arc::ptr_eq` check fails and the cache
     /// is rebuilt against the fresh snapshot.
     pub(super) sql_session_cache: Mutex<Option<(Arc<Manifest>, SessionContext)>>,
-    /// Per-handle decoded hidden deleted-set cache, keyed by the manifest's
-    /// `(uri, content_hash)` blob reference.
-    pub(super) hidden_deleted_cache: DeletedSetCache,
     /// Per-process reader-side cache of per-superfile tombstone
     /// bitmaps. `Some` when storage is attached (the cache
     /// fetches sidecars from `superfiles/<id>.tombstones`);
@@ -147,12 +145,6 @@ pub(super) struct SupertableInner {
     /// Hidden sibling supertable storing vectors only, partitioned by
     /// global centroids so unfiltered search can route by nearest cell.
     pub(super) vector_index_table: Option<Arc<Supertable>>,
-    /// Last time the read path checked the storage manifest pointer
-    /// for freshness, under [`Consistency::BoundedStaleness`]. `None`
-    /// until the first check (so the first query always refreshes).
-    /// Unused for [`Consistency::Strong`] (always checks) and
-    /// [`Consistency::Snapshot`] (never checks).
-    pub(super) last_pointer_check: Mutex<Option<std::time::Instant>>,
 }
 
 impl Drop for SupertableInner {
@@ -440,6 +432,12 @@ impl Supertable {
     /// [`Consistency::Snapshot`](crate::supertable::options::Consistency::Snapshot).
     /// Best-effort: a failed pointer read leaves the current snapshot
     /// in place rather than failing the query.
+    /// Under [`Consistency::BoundedStaleness`] this issues NO storage
+    /// I/O: the background poller (see `spawn_freshness_poller`)
+    /// re-reads the pointer on its own thread every window and swaps
+    /// the snapshot, so the read path only ever loads the in-memory
+    /// `ArcSwap`. Only `Strong` — an explicit per-query
+    /// read-your-writes opt-in — touches storage here.
     pub(crate) fn ensure_fresh(&self) {
         if self.inner.options.storage.is_none() {
             return;
@@ -449,27 +447,7 @@ impl Supertable {
             Consistency::Strong => {
                 let _ = bridge_sync_to_async(self.refresh());
             }
-            Consistency::BoundedStaleness(window) => {
-                // Decide whether a check is due under the lock, stamp
-                // "now" optimistically so concurrent queries don't all
-                // stampede the pointer, then release the lock *before*
-                // the (blocking) pointer read.
-                let due = {
-                    let mut last = self
-                        .inner
-                        .last_pointer_check
-                        .lock()
-                        .expect("last_pointer_check mutex poisoned");
-                    let due = last.map(|t| t.elapsed() >= window).unwrap_or(true);
-                    if due {
-                        *last = Some(Instant::now());
-                    }
-                    due
-                };
-                if due {
-                    let _ = bridge_sync_to_async(self.refresh());
-                }
-            }
+            Consistency::BoundedStaleness(_) => {}
         }
     }
 
@@ -1132,19 +1110,55 @@ async fn build_handle(
         id_generator: Mutex::new(id_generator),
         query_runtime: OnceLock::new(),
         sql_session_cache: Mutex::new(None),
-        hidden_deleted_cache: DeletedSetCache::default(),
         tombstone_cache,
         handle_id,
         vector_index_table,
-        last_pointer_check: Mutex::new(None),
     });
     install_disk_cache_pinning(&inner);
+    spawn_freshness_poller(&inner);
     let st = Supertable { inner };
     if st.inner.options.storage.is_some() {
         let _ = st.run_recovery_sweep_once().await;
         let _ = st.run_gc_sweep_once().await;
     }
     Ok(st)
+}
+
+/// Background freshness poller — the ONLY place the read path's
+/// consistency policy touches storage. Under
+/// [`Consistency::BoundedStaleness`] a dedicated thread re-reads the
+/// manifest pointer every window and swaps the in-memory snapshot;
+/// [`Supertable::ensure_fresh`] on the query path then never issues a
+/// GET. The thread holds a `Weak` on the inner state and exits within
+/// one window of the last handle dropping. `Strong` (explicit per-query
+/// read-your-writes) and `Snapshot` spawn nothing.
+fn spawn_freshness_poller(inner: &Arc<SupertableInner>) {
+    let Some(storage) = inner.options.storage.clone() else {
+        return;
+    };
+    let Consistency::BoundedStaleness(window) = inner.options.read_consistency else {
+        return;
+    };
+    let weak = Arc::downgrade(inner);
+    let builder = thread::Builder::new().name("supertable-freshness".into());
+    let spawned = builder.spawn(move || {
+        // One long-lived current-thread runtime for the poller (not a
+        // per-call throwaway): the poll is a single pointer GET + swap,
+        // with no CPU wave to keep off the shared query runtime.
+        let Ok(rt) = runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        loop {
+            thread::sleep(window);
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let _ = rt.block_on(refresh_inner_state_async(&inner, &storage));
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::warn!("supertable: freshness poller failed to spawn: {e}");
+    }
 }
 
 /// Create one supertable handle (empty manifest). Leaf — never creates a sibling.
@@ -1340,10 +1354,6 @@ impl SupertableReader {
     /// [`SupertableReader::query_sql`] across queries on this snapshot.
     pub(crate) fn sql_session_cache(&self) -> &Mutex<Option<(Arc<Manifest>, SessionContext)>> {
         &self.inner.sql_session_cache
-    }
-
-    pub(crate) fn hidden_deleted_cache(&self) -> &DeletedSetCache {
-        &self.inner.hidden_deleted_cache
     }
 
     pub(crate) fn vector_index_table(&self) -> Option<&Arc<Supertable>> {
@@ -2456,8 +2466,8 @@ mod tests {
             "user delete must bump the hidden manifest (deleted-ids stamp)"
         );
         assert!(
-            manifest_b.deleted_user_ids_blob().is_some(),
-            "delete must stamp the hidden deleted-ids blob"
+            manifest_b.deleted_user_ids_inline().is_some(),
+            "delete must stamp hidden deleted ids inline"
         );
         let (uri_b, _) = manifest_b
             .slow_vector_state_blob()

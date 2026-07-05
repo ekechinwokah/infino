@@ -1317,52 +1317,6 @@ impl VectorReader {
         Ok(Some(out))
     }
 
-    /// Build the per-cell deny-set of LOCAL doc-ids whose stable `_id` is in
-    /// `deleted` (a sorted-ascending set of tombstoned user `_id`s), straight
-    /// from the inline stable-`_id` region — one contiguous region read
-    /// (resident after the cell's data wave) and one pass. The hidden read
-    /// path passes this to the coarse-scan kernel so tombstoned rows are
-    /// excluded *before* the per-cell top-k heap, preserving recall@k under
-    /// deletes.
-    ///
-    /// `Ok(None)` when the cell has no inline region (e.g. INCOMING staging
-    /// superfiles — the caller's post-merge filter covers those) or no local is
-    /// deleted.
-    pub(crate) async fn inline_deleted_locals(
-        &self,
-        deleted: &[i128],
-    ) -> Result<Option<RoaringBitmap>, VectorError> {
-        if deleted.is_empty() {
-            return Ok(None);
-        }
-        let Some(col) = self.columns.iter().find(|c| c.has_inline_stable_ids()) else {
-            return Ok(None);
-        };
-        let Some(range) = col.stable_ids_region_range() else {
-            return Ok(None);
-        };
-        let region = self
-            .source
-            .range_async(range)
-            .await
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
-        let stride = format::vec::STABLE_ID_BYTES;
-        let mut deny = RoaringBitmap::new();
-        for local in 0..(region.len() / stride) {
-            let p = local * stride;
-            let arr: [u8; format::vec::STABLE_ID_BYTES] =
-                region[p..p + stride].try_into().map_err(|_| {
-                    VectorError::Read(ReadError::MalformedVersion(
-                        "inline stable_id region slice".into(),
-                    ))
-                })?;
-            if deleted.binary_search(&i128::from_le_bytes(arr)).is_ok() {
-                deny.insert(local as u32);
-            }
-        }
-        Ok(if deny.is_empty() { None } else { Some(deny) })
-    }
-
     /// Load one column's subsection and Sq8 meta for byte-splice compaction merge.
     pub(crate) fn sq8_ivf_merge_input(
         &self,

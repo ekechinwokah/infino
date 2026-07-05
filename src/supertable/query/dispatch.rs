@@ -223,15 +223,10 @@ where
     .await
 }
 
-/// Fan-out for the hidden vector-index path. Identical to [`fanout`] — runs
-/// the kernel, tags hits, and piggybacks the hidden→user `_id` resolve — but
-/// does NOT prefetch or apply per-cell tombstone sidecars. The hidden cells'
-/// sidecars are never populated (user deletes are recorded in the resident
-/// deleted-set instead), so the prefetch wave fetched only empty objects on
-/// the cold critical path and the post-score filter was a no-op. Deletes are
-/// dropped by the caller against the resident deleted-set, keyed by the
-/// `stable_id` resolved here.
-pub(crate) async fn fanout_untombstoned<P, K, Fut>(
+/// Same fan-out as [`fanout`], but without ordinary per-superfile tombstone
+/// sidecars. Hidden vector cells use the deleted `_id` set carried inline in
+/// the hidden manifest and apply it after remapping hits to user `_id`s.
+pub(crate) async fn fanout_without_tombstones<P, K, Fut>(
     reader: &SupertableReader,
     units: Vec<(Arc<SuperfileEntry>, P)>,
     kernel: K,

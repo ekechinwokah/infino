@@ -112,11 +112,10 @@ pub struct ManifestList {
     /// user manifest). The hidden-index drain advances this as it consumes user
     /// commits into cells; see [`DrainedVersionRanges`].
     pub drained_ranges: DrainedVersionRanges,
-    /// Content-addressed blob of tombstoned user `_id`s not yet physically
-    /// removed from hidden cell superfiles. Consulted in memory by vector
-    /// search on the hidden index (zero per-cell tombstone GETs).
-    pub deleted_user_ids_uri: Option<String>,
-    pub deleted_user_ids_content_hash: Option<ContentHash>,
+    /// The deleted-`_id` set's encoded bytes carried INLINE in the list —
+    /// so the set rides the pointer payload and consulting it never costs
+    /// a GET.
+    pub deleted_user_ids_inline: Option<Vec<u8>>,
     /// Slow-CAS section: content-addressed blob holding this table's
     /// superfile entries verbatim (the drain-owned routing/centroid state).
     /// Present only on the hidden vector-index table, stamped exclusively by
@@ -779,9 +778,7 @@ struct ManifestListDto {
     #[serde(default)]
     vector_index_storage_prefix: Option<String>,
     #[serde(default)]
-    deleted_user_ids_uri: Option<String>,
-    #[serde(default)]
-    deleted_user_ids_content_hash: Option<String>, // "blake3:<64hex>"
+    deleted_user_ids_inline_b64: Option<String>, // base64 of encoded id set
     #[serde(default)]
     slow_vector_state_uri: Option<String>,
     #[serde(default)]
@@ -1248,8 +1245,7 @@ fn list_to_dto(l: &ManifestList) -> Result<ManifestListDto, ListEncodeError> {
                 grid_b64: encode_b64(&encode_cluster_centroids(&g.grid)),
             }),
         drained_ranges: l.drained_ranges.intervals().to_vec(),
-        deleted_user_ids_uri: l.deleted_user_ids_uri.clone(),
-        deleted_user_ids_content_hash: l.deleted_user_ids_content_hash.as_ref().map(encode_hash),
+        deleted_user_ids_inline_b64: l.deleted_user_ids_inline.as_deref().map(encode_b64),
         slow_vector_state_uri: l.slow_vector_state_uri.clone(),
         slow_vector_state_content_hash: l
             .slow_vector_state_content_hash
@@ -1301,11 +1297,10 @@ fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
             })
             .transpose()?,
         drained_ranges: DrainedVersionRanges::from_intervals(d.drained_ranges),
-        deleted_user_ids_uri: d.deleted_user_ids_uri,
-        deleted_user_ids_content_hash: d
-            .deleted_user_ids_content_hash
+        deleted_user_ids_inline: d
+            .deleted_user_ids_inline_b64
             .as_deref()
-            .map(decode_hash)
+            .map(|b64| decode_b64(b64, "deleted_user_ids_inline"))
             .transpose()?,
         slow_vector_state_uri: d.slow_vector_state_uri,
         slow_vector_state_content_hash: d
@@ -1800,8 +1795,7 @@ mod tests {
                 n_buckets: 64,
             },
             vector_index_storage_prefix: None,
-            deleted_user_ids_uri: None,
-            deleted_user_ids_content_hash: None,
+            deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: vec![],

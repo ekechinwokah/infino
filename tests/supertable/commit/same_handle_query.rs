@@ -207,12 +207,88 @@ fn parts_cache_stays_bounded_across_repeated_commits() {
     }
 }
 
-/// Storage proxy that counts `get`s into the manifest-parts
-/// namespace, delegating everything else to the inner provider.
+// ============================================================
+// Two-blob metadata law: open = one pointer GET per table, and
+// the read path issues ZERO metadata GETs — the pointer payload
+// carries the list, the entries, and the deleted-id set inline,
+// and freshness under BoundedStaleness is a background poll,
+// never a query-path fetch.
+// ============================================================
+
+/// Freshness window wide enough that the background poller cannot
+/// fire during the test — proving reader() itself never fetches.
+const WIDE_STALENESS_SECS: u64 = 3600;
+
+#[test]
+fn open_is_one_pointer_get_and_reads_touch_no_metadata() {
+    let dir = TempDir::new().expect("tempdir");
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+
+    // Producer: two commits so multiple parts/entries exist.
+    {
+        let st = Supertable::create(
+            default_supertable_options().with_storage(Arc::clone(&local)),
+        )
+        .expect("create");
+        for text in ["alpha bravo", "charlie delta"] {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_title_batch(&[text])).expect("append");
+            w.commit().expect("commit");
+        }
+    }
+
+    // Consumer behind the counting proxy.
+    let counter = Arc::new(PartGetCounter::new(local));
+    let storage: Arc<dyn StorageProvider> = Arc::clone(&counter) as Arc<dyn StorageProvider>;
+    let st = Supertable::open(
+        default_supertable_options()
+            .with_storage(storage)
+            .with_read_consistency(Consistency::BoundedStaleness(
+                std::time::Duration::from_secs(WIDE_STALENESS_SECS),
+            )),
+    )
+    .expect("open");
+
+    assert_eq!(
+        counter.pointer_gets(),
+        1,
+        "open must read the pointer object exactly once"
+    );
+    assert_eq!(counter.list_gets(), 0, "the list rides inside the pointer");
+    assert_eq!(
+        counter.part_gets(),
+        0,
+        "entries ride inside the pointer; no part fan on open"
+    );
+
+    // Reads: repeated readers + queries issue zero metadata GETs of
+    // any kind — no pointer freshness check, no list, no parts.
+    for _ in 0..3 {
+        let hits = st
+            .reader()
+            .bm25_hits("title", "alpha", BM25_TOP_K, BoolMode::Or)
+            .expect("query");
+        assert_eq!(hits.len(), 1);
+    }
+    assert_eq!(
+        counter.pointer_gets(),
+        1,
+        "the read path must never re-read the pointer (freshness is a background poll)"
+    );
+    assert_eq!(counter.list_gets(), 0, "reads must never fetch a list");
+    assert_eq!(counter.part_gets(), 0, "reads must never fetch a part");
+}
+
+/// Storage proxy that counts `get`s into the manifest metadata
+/// namespaces (pointer / lists / parts), delegating everything else
+/// to the inner provider.
 #[derive(Debug)]
 struct PartGetCounter {
     inner: Arc<dyn StorageProvider>,
     part_gets: AtomicUsize,
+    list_gets: AtomicUsize,
+    pointer_gets: AtomicUsize,
 }
 
 impl PartGetCounter {
@@ -220,11 +296,21 @@ impl PartGetCounter {
         Self {
             inner,
             part_gets: AtomicUsize::new(0),
+            list_gets: AtomicUsize::new(0),
+            pointer_gets: AtomicUsize::new(0),
         }
     }
 
     fn part_gets(&self) -> usize {
         self.part_gets.load(Ordering::Acquire)
+    }
+
+    fn list_gets(&self) -> usize {
+        self.list_gets.load(Ordering::Acquire)
+    }
+
+    fn pointer_gets(&self) -> usize {
+        self.pointer_gets.load(Ordering::Acquire)
     }
 }
 
@@ -235,8 +321,14 @@ impl StorageProvider for PartGetCounter {
     }
 
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
-        if uri.starts_with(MANIFEST_PARTS_PREFIX) {
+        if uri.starts_with(MANIFEST_PARTS_PREFIX) || uri.starts_with("manifest-parts/") {
             self.part_gets.fetch_add(1, Ordering::AcqRel);
+        }
+        if uri.starts_with("manifest-lists/") {
+            self.list_gets.fetch_add(1, Ordering::AcqRel);
+        }
+        if uri == "_supertable/current" {
+            self.pointer_gets.fetch_add(1, Ordering::AcqRel);
         }
         self.inner.get(uri).await
     }

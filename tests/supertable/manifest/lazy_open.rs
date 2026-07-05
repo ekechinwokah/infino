@@ -60,8 +60,8 @@ fn one_part_eager_fetches_under_default_threshold() {
         w.commit().expect("commit");
     }
 
-    // Consumer with default threshold (4) opens a 1-part
-    // manifest → eager-fetch.
+    // Consumer hydrates the flat view from the pointer's inline
+    // entries — the open is one GET, and no part object is fetched.
     let consumer =
         Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
             .expect("open");
@@ -73,13 +73,14 @@ fn one_part_eager_fetches_under_default_threshold() {
     assert_eq!(
         m.get_all_superfiles().len(),
         1,
-        "eager mode must populate superfile_list.superfiles"
+        "open must populate superfile_list.superfiles from the pointer"
     );
-    // Eager-mode populates the OnceCell.
+    // Parts stay lazily loadable for maintenance but are NOT fetched
+    // on the open path — the pointer already carried the entries.
     let part = m.get_cached_part_by_list_idx(0);
     assert!(
-        part.is_some(),
-        "eager-fetched OnceCell should be initialized"
+        part.is_none(),
+        "open must not fetch part objects; entries ride the pointer"
     );
 }
 
@@ -113,21 +114,22 @@ fn many_parts_skip_eager_fetch() {
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();
     assert_eq!(list_entries.len(), 5);
-    assert!(
-        m.get_all_superfiles().is_empty(),
-        "lazy mode leaves superfile_list.superfiles empty pending \
-         the hierarchical query path; got {} superfiles",
-        m.get_all_superfiles().len()
+    assert_eq!(
+        m.get_all_superfiles().len(),
+        LAZY_MODE_PART_COUNT,
+        "flat view hydrates from the pointer's inline entries even \
+         above the eager-load threshold — no part fan on open"
     );
 
-    // Every part has an empty OnceCell.
+    // Every part still has an empty OnceCell: hydration came from the
+    // pointer payload, not from part fetches.
     let n_loaded = list_entries
         .iter()
         .filter(|entry| m.get_cached_part_by_id(&entry.part_id).is_some())
         .count();
     assert_eq!(
         n_loaded, 0,
-        "lazy mode must not have eager-fetched any parts; got {n_loaded} loaded"
+        "open must not fetch any part objects; got {n_loaded} loaded"
     );
 }
 
@@ -232,10 +234,15 @@ fn with_eager_load_threshold_zero_forces_lazy_on_tiny_manifest() {
     let m = r.manifest();
     let list_entries = m.get_all_list_entries();
     assert_eq!(list_entries.len(), 1);
-    assert!(
-        m.get_all_superfiles().is_empty(),
-        "threshold=0 forces lazy even on 1-part manifest"
+    assert_eq!(
+        m.get_all_superfiles().len(),
+        1,
+        "pointer-inline hydration is threshold-independent; the flat \
+         view fills without any part fetch"
     );
     let part = m.get_cached_part_by_id(&list_entries[0].part_id);
-    assert!(part.is_none(), "threshold=0 must not eager-fetch");
+    assert!(
+        part.is_none(),
+        "no part object may be fetched on open regardless of threshold"
+    );
 }

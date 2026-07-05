@@ -121,6 +121,8 @@ fn pointer_file_text_format_roundtrip() {
         manifest_id: POINTER_ROUNDTRIP_MANIFEST_ID,
         manifest_list_uri: "manifest-lists/list-000042.json".into(),
         content_hash: ContentHash([FIXTURE_CONTENT_HASH_BYTE; 32]),
+        list_inline: None,
+        entries_inline: None,
     };
     let bytes = p.to_bytes();
     let s = std::str::from_utf8(&bytes).expect("utf-8");
@@ -179,8 +181,7 @@ fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> ManifestList {
             n_buckets: DEFAULT_HASH_N_BUCKETS,
         },
         vector_index_storage_prefix: None,
-        deleted_user_ids_uri: None,
-        deleted_user_ids_content_hash: None,
+        deleted_user_ids_inline: None,
         slow_vector_state_uri: None,
         slow_vector_state_content_hash: None,
         parts,
@@ -599,6 +600,8 @@ async fn write_pointer_initial_then_update() {
         manifest_id: 0,
         manifest_list_uri: list_uri(0),
         content_hash: ContentHash([FIXTURE_CONTENT_HASH_BYTE; 32]),
+        list_inline: None,
+        entries_inline: None,
     };
     write_pointer(&storage, &p0, None).await.expect("initial");
 
@@ -613,6 +616,8 @@ async fn write_pointer_initial_then_update() {
         manifest_id: 1,
         manifest_list_uri: list_uri(1),
         content_hash: ContentHash([0xcd; 32]),
+        list_inline: None,
+        entries_inline: None,
     };
     write_pointer(&storage, &p1, Some(&etag))
         .await
@@ -630,6 +635,8 @@ async fn write_pointer_initial_rejects_existing() {
         manifest_id: 0,
         manifest_list_uri: list_uri(0),
         content_hash: ContentHash([0u8; 32]),
+        list_inline: None,
+        entries_inline: None,
     };
     write_pointer(&storage, &p0, None).await.expect("first");
     let err = write_pointer(&storage, &p0, None)

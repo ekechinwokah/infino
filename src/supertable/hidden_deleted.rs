@@ -4,21 +4,16 @@
 //! Consolidated deleted-user-`_id` set for the hidden vector-index table.
 //!
 //! User deletes tombstone only the user table; hidden cell superfiles keep
-//! deleted rows physically present until drain/compaction removes them. Vector
-//! search consults this content-addressed blob (loaded from object storage)
-//! instead of per-cell tombstone sidecars — which are never populated on the
-//! hidden index and would cost a wasted GET wave.
+//! deleted rows physically present until drain/compaction removes them. The
+//! hidden manifest fast payload carries this encoded set inline, so vector
+//! search consults resident manifest bytes and never performs a deleted-set
+//! GET.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use bytes::Bytes;
+use crate::supertable::manifest::Manifest;
 
-use crate::{
-    storage::StorageProvider,
-    supertable::manifest::{Manifest, part::ContentHash},
-};
-
-/// Magic prefix on a packed deleted-user-`_id` blob.
+/// Magic prefix on a packed deleted-user-`_id` set.
 const DELETED_IDS_MAGIC: &[u8; 4] = b"HDEL";
 
 /// Wire-format version for [`DELETED_IDS_MAGIC`] blobs.
@@ -29,14 +24,6 @@ const DELETED_IDS_HEADER_LEN: usize = 4 + 1 + 4;
 
 /// Bytes per serialized `_id` (a little-endian `i128`).
 const DELETED_ID_LEN: usize = 16;
-
-/// Object-storage prefix for content-addressed deleted-`_id` blobs.
-pub(crate) const STORAGE_PREFIX: &str = "hidden-deleted-ids/";
-
-/// Object-storage path for a content-addressed deleted-`_id` blob.
-pub(crate) fn storage_path(hash: &ContentHash) -> String {
-    format!("{STORAGE_PREFIX}deleted-{}.bin", hash.to_hex())
-}
 
 /// Serialize the consolidated deleted user-`_id` set. The caller passes a
 /// sorted, deduplicated slice so the on-disk order is canonical.
@@ -53,19 +40,15 @@ pub(crate) fn encode_deleted_ids(sorted_ids: &[i128]) -> Vec<u8> {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum HiddenDeletedError {
-    #[error("deleted-id blob truncated")]
+    #[error("deleted-id set truncated")]
     Truncated,
-    #[error("deleted-id blob bad magic")]
+    #[error("deleted-id set bad magic")]
     BadMagic,
-    #[error("deleted-id blob unsupported version {0}")]
+    #[error("deleted-id set unsupported version {0}")]
     UnsupportedVersion(u8),
-    #[error("storage: {0}")]
-    Storage(String),
-    #[error("content hash mismatch")]
-    HashMismatch,
 }
 
-/// Parse a deleted-`_id` blob written by [`encode_deleted_ids`].
+/// Parse a deleted-`_id` set written by [`encode_deleted_ids`].
 pub(crate) fn decode_deleted_ids(bytes: &[u8]) -> Result<Vec<i128>, HiddenDeletedError> {
     if bytes.len() < DELETED_IDS_HEADER_LEN {
         return Err(HiddenDeletedError::Truncated);
@@ -91,84 +74,15 @@ pub(crate) fn decode_deleted_ids(bytes: &[u8]) -> Result<Vec<i128>, HiddenDelete
     Ok(ids)
 }
 
-/// Load the hidden index's consolidated deleted user-`_id` set from the
-/// manifest. Returns an empty vec when no blob is stamped (legacy manifests
-/// or no deletes pending).
-pub(crate) async fn load_deleted_user_ids(
-    manifest: &Manifest,
-    storage: &dyn StorageProvider,
-) -> Result<Vec<i128>, HiddenDeletedError> {
-    let Some((path, expected)) = manifest.deleted_user_ids_blob() else {
-        return Ok(Vec::new());
+/// Decode the hidden index's resident deleted user-`_id` set from the
+/// manifest. Returns an empty set when none is stamped. There is deliberately
+/// no storage fallback here: the two-blob contract requires this state to ride
+/// in the hidden manifest fast payload.
+pub(crate) fn deleted_user_ids(manifest: &Manifest) -> Result<Arc<Vec<i128>>, HiddenDeletedError> {
+    let Some(bytes) = manifest.deleted_user_ids_inline() else {
+        return Ok(Arc::new(Vec::new()));
     };
-    let bytes = fetch_and_verify(storage, path, &expected).await?;
-    decode_deleted_ids(&bytes)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DeletedSetKey {
-    uri: String,
-    content_hash: ContentHash,
-}
-
-#[derive(Debug, Clone)]
-struct CachedDeletedSet {
-    key: Option<DeletedSetKey>,
-    ids: Arc<Vec<i128>>,
-}
-
-/// Per-handle cache of the hidden index's decoded deleted user-`_id` set.
-#[derive(Debug, Default)]
-pub(crate) struct DeletedSetCache {
-    inner: Mutex<Option<CachedDeletedSet>>,
-}
-
-impl DeletedSetCache {
-    pub(crate) async fn load(
-        &self,
-        manifest: &Manifest,
-        storage: &dyn StorageProvider,
-    ) -> Result<Arc<Vec<i128>>, HiddenDeletedError> {
-        let key = manifest
-            .deleted_user_ids_blob()
-            .map(|(uri, content_hash)| DeletedSetKey {
-                uri: uri.to_owned(),
-                content_hash,
-            });
-        if let Some(cached) = self
-            .inner
-            .lock()
-            .expect("hidden deleted-set cache mutex poisoned")
-            .as_ref()
-            .filter(|cached| cached.key == key)
-        {
-            return Ok(Arc::clone(&cached.ids));
-        }
-        let ids = Arc::new(load_deleted_user_ids(manifest, storage).await?);
-        *self
-            .inner
-            .lock()
-            .expect("hidden deleted-set cache mutex poisoned") = Some(CachedDeletedSet {
-            key,
-            ids: Arc::clone(&ids),
-        });
-        Ok(ids)
-    }
-}
-
-async fn fetch_and_verify(
-    storage: &dyn StorageProvider,
-    path: &str,
-    expected: &ContentHash,
-) -> Result<Bytes, HiddenDeletedError> {
-    let (bytes, _) = storage
-        .get(path)
-        .await
-        .map_err(|e| HiddenDeletedError::Storage(e.to_string()))?;
-    if ContentHash::of(bytes.as_ref()) != *expected {
-        return Err(HiddenDeletedError::HashMismatch);
-    }
-    Ok(bytes)
+    Ok(Arc::new(decode_deleted_ids(bytes)?))
 }
 
 #[cfg(test)]
