@@ -35,6 +35,7 @@
 //! `DiskCacheStore` is built on top of it.
 
 pub mod config;
+pub mod block_source;
 pub mod disk;
 pub mod in_memory;
 
