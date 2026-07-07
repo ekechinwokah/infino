@@ -1135,7 +1135,7 @@ pub mod vector {
             let p_eff = p.min(n_cent).max(1);
             for &r in &reranks {
                 let unfiltered =
-                    exec_vec::mean_recall(reader, VEC_COLUMN, q_corr, &gt_stable, TOP_K, p_eff, r);
+                    exec_vec::mean_recall(reader, VEC_COLUMN, q_corr, gt_stable, TOP_K, p_eff, r);
                 let filtered = mean_filtered_recall(reader, &allow, &filtered_gt, p_eff, r);
                 let pass = unfiltered >= floor && filtered >= floor;
                 eprintln!(

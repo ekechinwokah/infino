@@ -2449,7 +2449,7 @@ mod tests {
             .vector_index_table()
             .expect("hidden index")
             .clone();
-        let n_after = hidden.reader().manifest().superfiles.iter().count();
+        let n_after = hidden.reader().manifest().superfiles.len();
         assert_eq!(
             n_after,
             per_cell.len(),

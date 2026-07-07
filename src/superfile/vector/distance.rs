@@ -263,8 +263,8 @@ fn score_centroid_block8_transposed_wide(
 ) -> [f32; F32X8_LANES] {
     let mut acc = f32x8::ZERO;
     let block_base = block * dim * CENTROID_BATCH_LANES;
-    for d in 0..dim {
-        let q = f32x8::splat(query[d]);
+    for (d, &q_scalar) in query[..dim].iter().enumerate() {
+        let q = f32x8::splat(q_scalar);
         let row = block_base + d * CENTROID_BATCH_LANES + lane_offset;
         let c = f32x8::from(
             <[f32; F32X8_LANES]>::try_from(&transposed[row..row + F32X8_LANES])
@@ -312,8 +312,8 @@ unsafe fn score_centroid_block16_transposed_avx512(
     unsafe {
         let mut acc = _mm512_setzero_ps();
         let block_base = block * dim * CENTROID_BATCH_LANES;
-        for d in 0..dim {
-            let q = _mm512_set1_ps(query[d]);
+        for (d, &q_scalar) in query[..dim].iter().enumerate() {
+            let q = _mm512_set1_ps(q_scalar);
             let row = block_base + d * CENTROID_BATCH_LANES;
             let c = _mm512_loadu_ps(transposed.as_ptr().add(row));
             match metric {
