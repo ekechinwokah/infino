@@ -1007,12 +1007,16 @@ pub mod vector {
     /// search — used only to report the *effective* `(nprobe, rerank)`.
     const FILTER_MAX_MULT: usize = 64;
 
-    /// `INFINO_BENCH_SKIP_CALIBRATION=1` measures only the fixed
-    /// `(nprobe, rerank)` config — no correctness gate, no recall-target
-    /// grid, no brute-force ground truth. Gives a fast, prod-shaped
-    /// cold-only run without the 54-config calibration sweep.
-    fn skip_calibration() -> bool {
+    /// Calibration policy for supertable vector benches:
+    /// - force off when `INFINO_BENCH_SKIP_CALIBRATION=1`
+    /// - otherwise auto-off above 1M docs
+    /// - on for 1M docs or less
+    ///
+    /// Even when calibration is off we still compute default recall (and
+    /// filtered recall), we just skip the recall-target sweep.
+    fn skip_calibration(n_docs: usize) -> bool {
         std::env::var_os("INFINO_BENCH_SKIP_CALIBRATION").is_some()
+            || n_docs > exec_vec::FULL_CALIBRATION_MAX_DOCS
     }
 
     /// Fixed probe count for the `default` row, overridable with
@@ -1270,9 +1274,9 @@ pub mod vector {
         }
 
         if phases.warm || phases.cold {
-            // No corpus (existing-prefix) ⇒ no ground truth possible ⇒ force
+            // No corpus (existing-prefix) => no ground truth possible => force
             // skip-calibration: this path measures latency + memory only.
-            let skip_cal = skip_calibration() || corpus.is_none();
+            let skip_cal = skip_calibration(n_docs) || corpus.is_none();
             let nprobe = fixed_nprobe();
             let rerank = fixed_rerank_mult();
 
@@ -1286,11 +1290,9 @@ pub mod vector {
             ) = if let Some(corpus) = &corpus {
                 // The ingested vectors are still mmapped from the prepared
                 // corpus — queries and ground truth come from them instead
-                // of a regeneration. Skip-calibration needs no ground truth
-                // (no recall gate / grid), so the brute-force pass is elided
-                // there; otherwise both query batches share ONE streamed
-                // oracle pass: the pass is I/O-bound over a corpus several
-                // times RAM, so its cost is corpus bytes, not query count.
+                // of a regeneration. Skip-calibration still computes
+                // correctness/default recall (and filtered recall); it only
+                // skips the recall-target calibration sweep.
                 let vslice = corpus
                     .vectors()
                     .expect("vector modality prepared a vector corpus")
@@ -1316,7 +1318,18 @@ pub mod vector {
                     Vec<Vec<u32>>,
                     Option<Vec<Vec<u32>>>,
                 ) = if skip_cal {
-                    (Vec::new(), Vec::new(), None)
+                    eprintln!(
+                        "[supertable_vector] brute-force ground truth: correctness/default only ({} queries)...",
+                        q_correct.len(),
+                    );
+                    let gt_correct = corpus::ground_truth(vslice, n_docs, &q_correct, TOP_K);
+                    let mut allow = RoaringBitmap::new();
+                    for i in (0..n_docs as u32).step_by(FILTER_KEEP_EVERY) {
+                        allow.insert(i);
+                    }
+                    let filtered_gt =
+                        corpus::filtered_ground_truth(vslice, &allow, &q_correct, TOP_K);
+                    (gt_correct, Vec::new(), Some(filtered_gt))
                 } else {
                     eprintln!(
                         "[supertable_vector] brute-force ground truth: one streamed pass, {} queries...",
