@@ -820,7 +820,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         };
         vec![
             text(format!("{label}{binding}")),
-            text(format!("{} wall · measured CPU", fmt_wall_seconds(wall_s))),
+            text(format!("{} · measured CPU", fmt_wall_seconds(wall_s))),
             text(fmt_vcpu_seconds(vcpu)),
             metric(usd_v, usd(usd_v), Better::Lower),
         ]
@@ -875,7 +875,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 let open_usd = inst.per_query_cpu_usd(cpu);
                 vec![
                     text(open_label),
-                    text(format!("{} wall · measured CPU", fmt_wall_seconds(q.open_s))),
+                    text(format!("{} · measured CPU", fmt_wall_seconds(q.open_s))),
                     text(fmt_vcpu_seconds(cpu)),
                     metric(open_usd, usd(open_usd), Better::Lower),
                 ]
