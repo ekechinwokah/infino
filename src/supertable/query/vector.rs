@@ -617,16 +617,24 @@ impl SupertableReader {
         // Inner-cluster budget: probe the globally-closest N fine IVF centroids
         // across all eligible superfiles. The user/pre-drain path uses
         // N = nprobe × eligible_superfiles. The hidden vector index defaults to a
-        // flat N = nprobe (fewer clusters → faster, lower recall);
-        // `INFINO_HIDDEN_INNER_BUDGET` overrides it (e.g. to nprobe × eligible for
-        // higher recall at higher cost). `vector.inner_budget` (or legacy
-        // `INFINO_INNER_BUDGET`) overrides both with an absolute count.
+        // flat N = nprobe when UNFILTERED (fewer clusters → faster) — but a
+        // FILTERED hidden query drops ~(1 − selectivity) of candidates per
+        // cluster, so a flat budget starves recall (measured 0.68 vs 0.98 at
+        // 100K, ~10% selectivity). Filtered hidden search therefore scales to
+        // nprobe × eligible like the user path. `INFINO_HIDDEN_INNER_BUDGET`
+        // overrides the hidden default; `vector.inner_budget` (or legacy
+        // `INFINO_INNER_BUDGET`) overrides everything with an absolute count.
         let default_budget = if is_hidden_vector_index_table(&manifest.options) {
+            let hidden_default = if filtered {
+                nprobe.saturating_mul(n_eligible.max(1)).max(nprobe)
+            } else {
+                nprobe.max(1)
+            };
             std::env::var("INFINO_HIDDEN_INNER_BUDGET")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .map(|b| b.max(1))
-                .unwrap_or(nprobe.max(1))
+                .unwrap_or(hidden_default)
         } else {
             nprobe.saturating_mul(n_eligible.max(1)).max(nprobe)
         };
@@ -1103,7 +1111,7 @@ impl SupertableReader {
             });
         }
         let allow_for_user = Arc::clone(&allow_set);
-        let manifest_for_ids = Arc::clone(&manifest);
+        let manifest_for_ids = Arc::clone(manifest);
         let allow_by_uri = self
             .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
                 let allow_for_user = Arc::clone(&allow_for_user);
