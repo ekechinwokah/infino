@@ -624,19 +624,20 @@ impl SupertableReader {
         // nprobe × eligible like the user path. `INFINO_HIDDEN_INNER_BUDGET`
         // overrides the hidden default; `vector.inner_budget` (or legacy
         // `INFINO_INNER_BUDGET`) overrides everything with an absolute count.
+        // Probe budget scaled by the eligible-superfile count. The
+        // user/pre-drain path always uses it; the hidden index uses it only
+        // for filtered search (a flat nprobe there starves filtered recall)
+        // and a flat nprobe when unfiltered.
+        let scaled_budget = nprobe.saturating_mul(n_eligible.max(1)).max(nprobe);
         let default_budget = if is_hidden_vector_index_table(&manifest.options) {
-            let hidden_default = if filtered {
-                nprobe.saturating_mul(n_eligible.max(1)).max(nprobe)
-            } else {
-                nprobe.max(1)
-            };
+            let hidden_default = if filtered { scaled_budget } else { nprobe.max(1) };
             std::env::var("INFINO_HIDDEN_INNER_BUDGET")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .map(|b| b.max(1))
                 .unwrap_or(hidden_default)
         } else {
-            nprobe.saturating_mul(n_eligible.max(1)).max(nprobe)
+            scaled_budget
         };
         let budget = config::global()
             .vector

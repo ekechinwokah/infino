@@ -25,15 +25,57 @@ pub fn p50(samples: &mut [Duration]) -> Duration {
 }
 
 /// Mean of per-iteration on-CPU seconds, or `None` when nothing was
-/// sampled (e.g. `/proc/self/task` unavailable). Shared by every tier's
-/// cold measurement so the cost ledger prices cold-query compute from
-/// measured on-CPU time — a cold query is almost all object-store I/O
-/// wait, so its wall latency wildly overstates its CPU.
-pub fn mean_opt(samples: &[f64]) -> Option<f64> {
+/// sampled (e.g. `/proc/self/task` unavailable).
+fn mean_opt(samples: &[f64]) -> Option<f64> {
     if samples.is_empty() {
         return None;
     }
     Some(samples.iter().sum::<f64>() / samples.len() as f64)
+}
+
+/// Per-iteration open/search wall + on-CPU samples for one cold measurement.
+///
+/// Shared by every tier's `measure_cold` (FTS / vector / SQL) so the p50 +
+/// mean reduction and the [`ColdTiming`] shape live in exactly one place. A
+/// cold query is mostly object-store I/O wait, so the cost ledger prices its
+/// compute from the measured on-CPU means, not the wall p50s.
+pub struct ColdSamples {
+    open_wall: Vec<Duration>,
+    search_wall: Vec<Duration>,
+    open_cpu: Vec<f64>,
+    search_cpu: Vec<f64>,
+}
+
+impl ColdSamples {
+    pub fn with_capacity(iters: usize) -> Self {
+        Self {
+            open_wall: Vec::with_capacity(iters),
+            search_wall: Vec::with_capacity(iters),
+            open_cpu: Vec::with_capacity(iters),
+            search_cpu: Vec::with_capacity(iters),
+        }
+    }
+
+    /// Record one open's wall duration and (optional) measured on-CPU seconds.
+    pub fn push_open(&mut self, wall: Duration, cpu: Option<f64>) {
+        self.open_wall.push(wall);
+        self.open_cpu.extend(cpu);
+    }
+
+    /// Record one first-search's wall duration and measured on-CPU seconds.
+    pub fn push_search(&mut self, wall: Duration, cpu: Option<f64>) {
+        self.search_wall.push(wall);
+        self.search_cpu.extend(cpu);
+    }
+
+    pub fn finish(mut self) -> ColdTiming {
+        ColdTiming {
+            open: p50(&mut self.open_wall),
+            search: p50(&mut self.search_wall),
+            open_cpu_s: mean_opt(&self.open_cpu),
+            search_cpu_s: mean_opt(&self.search_cpu),
+        }
+    }
 }
 
 /// Cold timings for one query, split at the open/search boundary:
@@ -443,36 +485,19 @@ pub mod fts {
             );
             let query = q.terms.join(" ");
             let mode = to_infino_mode(q.mode);
-            let mut open_samples = Vec::with_capacity(iters);
-            let mut search_samples = Vec::with_capacity(iters);
-            let mut open_cpu = Vec::with_capacity(iters);
-            let mut search_cpu = Vec::with_capacity(iters);
+            let mut cold = ColdSamples::with_capacity(iters);
             for _ in 0..iters {
-                let oc0 = cpu::process_cpu_ns();
-                let t_open = Instant::now();
-                let guard = open_fresh();
-                open_samples.push(t_open.elapsed());
-                if let Some(c) = cpu::cpu_seconds_since(oc0) {
-                    open_cpu.push(c);
-                }
-                let sc0 = cpu::process_cpu_ns();
-                let t = Instant::now();
-                let rows = guard.bm25_rows(column, &query, k, mode);
-                search_samples.push(t.elapsed());
-                if let Some(c) = cpu::cpu_seconds_since(sc0) {
-                    search_cpu.push(c);
-                }
+                let (guard, open_wall, open_cpu) = cpu::timed(&open_fresh);
+                cold.push_open(open_wall, open_cpu);
+                let (rows, search_wall, search_cpu) =
+                    cpu::timed(|| guard.bm25_rows(column, &query, k, mode));
+                cold.push_search(search_wall, search_cpu);
                 std::hint::black_box(rows);
                 drop(guard);
             }
             out.insert(
                 q.name,
-                ColdTiming {
-                    open: p50(&mut open_samples),
-                    search: p50(&mut search_samples),
-                    open_cpu_s: mean_opt(&open_cpu),
-                    search_cpu_s: mean_opt(&search_cpu),
-                },
+                cold.finish(),
             );
         }
         out
@@ -1103,34 +1128,17 @@ pub mod vector {
         rerank: usize,
         iters: usize,
     ) -> ColdTiming {
-        let mut open_samples = Vec::with_capacity(iters);
-        let mut search_samples = Vec::with_capacity(iters);
-        let mut open_cpu = Vec::with_capacity(iters);
-        let mut search_cpu = Vec::with_capacity(iters);
+        let mut cold = ColdSamples::with_capacity(iters);
         for _ in 0..iters {
-            let oc0 = cpu::process_cpu_ns();
-            let t_open = Instant::now();
-            let guard = open_fresh();
-            open_samples.push(t_open.elapsed());
-            if let Some(c) = cpu::cpu_seconds_since(oc0) {
-                open_cpu.push(c);
-            }
-            let sc0 = cpu::process_cpu_ns();
-            let t0 = Instant::now();
-            let hits = guard.topk_global(column, query, k, nprobe, rerank);
-            search_samples.push(t0.elapsed());
-            if let Some(c) = cpu::cpu_seconds_since(sc0) {
-                search_cpu.push(c);
-            }
+            let (guard, open_wall, open_cpu) = cpu::timed(open_fresh);
+            cold.push_open(open_wall, open_cpu);
+            let (hits, search_wall, search_cpu) =
+                cpu::timed(|| guard.topk_global(column, query, k, nprobe, rerank));
+            cold.push_search(search_wall, search_cpu);
             black_box(hits);
             drop(guard);
         }
-        ColdTiming {
-            open: p50(&mut open_samples),
-            search: p50(&mut search_samples),
-            open_cpu_s: mean_opt(&open_cpu),
-            search_cpu_s: mean_opt(&search_cpu),
-        }
+        cold.finish()
     }
 
     /// One rendered recall-table row.
@@ -1806,36 +1814,18 @@ pub mod sql {
                 "[{log_prefix}] cold: query {} — {iters} fresh-cache iters...",
                 q.name
             );
-            let mut open_samples = Vec::with_capacity(iters);
-            let mut search_samples = Vec::with_capacity(iters);
-            let mut open_cpu = Vec::with_capacity(iters);
-            let mut search_cpu = Vec::with_capacity(iters);
+            let mut cold = ColdSamples::with_capacity(iters);
             for _ in 0..iters {
-                let oc0 = cpu::process_cpu_ns();
-                let t_open = Instant::now();
-                let guard = open_fresh();
-                open_samples.push(t_open.elapsed());
-                if let Some(c) = cpu::cpu_seconds_since(oc0) {
-                    open_cpu.push(c);
-                }
-                let sc0 = cpu::process_cpu_ns();
-                let t0 = Instant::now();
-                let rows = guard.query_rows(q.sql);
-                search_samples.push(t0.elapsed());
-                if let Some(c) = cpu::cpu_seconds_since(sc0) {
-                    search_cpu.push(c);
-                }
+                let (guard, open_wall, open_cpu) = cpu::timed(&open_fresh);
+                cold.push_open(open_wall, open_cpu);
+                let (rows, search_wall, search_cpu) = cpu::timed(|| guard.query_rows(q.sql));
+                cold.push_search(search_wall, search_cpu);
                 black_box(rows);
                 drop(guard);
             }
             out.insert(
                 q.name,
-                ColdTiming {
-                    open: p50(&mut open_samples),
-                    search: p50(&mut search_samples),
-                    open_cpu_s: mean_opt(&open_cpu),
-                    search_cpu_s: mean_opt(&search_cpu),
-                },
+                cold.finish(),
             );
         }
         out

@@ -118,39 +118,24 @@ impl Instance {
         resident_bytes as f64 / BYTES_PER_GIB / self.ram_gib
     }
 
-    fn parallel_vcpu_seconds(&self, wall_s: f64, writers: u32) -> f64 {
-        let cpu_share = f64::from(writers.min(self.vcpu)) / f64::from(self.vcpu.max(1));
-        wall_s * cpu_share
+    /// RAM-hold leg for a one-time phase: `wall × peak-RSS share`. RAM is
+    /// allocated at phase start and dropped at the end, so a RAM-bound phase
+    /// bills its RSS share for the full wall duration.
+    fn ram_leg(&self, wall_s: f64, peak_rss_bytes: Option<u64>) -> f64 {
+        wall_s * peak_rss_bytes.map(|b| self.ram_share(b)).unwrap_or(0.0)
     }
 
-    /// Binding vCPU·s for a one-time parallel phase, preferring measured
-    /// on-CPU time. The CPU leg is the measured `cpu_s` when present
-    /// (schedstat excludes I/O wait — the correct compute basis), else the
-    /// modeled `wall × pool-share`. The RAM leg is `wall × peak-RSS share`
-    /// (RAM is held for the whole wall). The phase bills on whichever binds.
-    fn phase_vcpu_seconds(
-        &self,
-        wall_s: f64,
-        writers: u32,
-        peak_rss_bytes: Option<u64>,
-        cpu_s: Option<f64>,
-    ) -> f64 {
-        let cpu_leg = cpu_s.unwrap_or_else(|| self.parallel_vcpu_seconds(wall_s, writers));
-        let ram_leg = wall_s * peak_rss_bytes.map(|b| self.ram_share(b)).unwrap_or(0.0);
-        cpu_leg.max(ram_leg)
+    /// Binding vCPU·s for a one-time phase from MEASURED on-CPU seconds:
+    /// `max(measured CPU, RAM-hold leg)`. CPU is never approximated from wall
+    /// time — schedstat is the only compute basis, and a phase without a
+    /// measurement is reported NOT METERED by the caller (never a wall guess).
+    fn phase_vcpu_seconds(&self, cpu_s: f64, wall_s: f64, peak_rss_bytes: Option<u64>) -> f64 {
+        cpu_s.max(self.ram_leg(wall_s, peak_rss_bytes))
     }
 
-    /// Whether the measured/modeled CPU leg (not RAM) binds a one-time phase.
-    fn phase_cpu_binds(
-        &self,
-        wall_s: f64,
-        writers: u32,
-        peak_rss_bytes: Option<u64>,
-        cpu_s: Option<f64>,
-    ) -> bool {
-        let cpu_leg = cpu_s.unwrap_or_else(|| self.parallel_vcpu_seconds(wall_s, writers));
-        let ram_leg = wall_s * peak_rss_bytes.map(|b| self.ram_share(b)).unwrap_or(0.0);
-        cpu_leg >= ram_leg
+    /// Whether measured CPU (not the RAM-hold leg) binds a one-time phase.
+    fn phase_cpu_binds(&self, cpu_s: f64, wall_s: f64, peak_rss_bytes: Option<u64>) -> bool {
+        cpu_s >= self.ram_leg(wall_s, peak_rss_bytes)
     }
 
     fn per_query_usd(&self, p50_s: f64, resident_anon_bytes: u64) -> f64 {
@@ -163,25 +148,12 @@ impl Instance {
         p50_s * cpu_share.max(ram_share)
     }
 
-    /// vCPU·s for a CPU-labeled per-query row. Prefers measured on-CPU
-    /// seconds (`cpu_s`); a cold query's wall latency is almost all
-    /// object-store I/O wait, so pricing it as `latency × share` overstates
-    /// its compute by orders of magnitude. Falls back to the wall model only
-    /// when no measurement exists (e.g. `/proc` unavailable).
-    fn per_query_cpu_vcpu_seconds(
-        &self,
-        latency_s: f64,
-        cpu_s: Option<f64>,
-        resident_anon_bytes: u64,
-    ) -> f64 {
-        match cpu_s {
-            Some(c) => c,
-            None => self.per_query_vcpu_seconds(latency_s, resident_anon_bytes),
-        }
-    }
-
-    fn per_query_cpu_usd(&self, latency_s: f64, cpu_s: Option<f64>, resident_anon_bytes: u64) -> f64 {
-        self.per_query_cpu_vcpu_seconds(latency_s, cpu_s, resident_anon_bytes) * self.usd_per_sec()
+    /// Dollars for a per-query CPU-labeled row from MEASURED on-CPU seconds.
+    /// A cold query is mostly object-store I/O wait, so its wall latency
+    /// overstates compute by orders of magnitude; only measured on-CPU time
+    /// is billed, and the caller reports NOT METERED when it's absent.
+    fn per_query_cpu_usd(&self, cpu_s: f64) -> f64 {
+        cpu_s * self.usd_per_sec()
     }
 
     fn ram_binds(&self, resident_anon_bytes: u64) -> bool {
@@ -409,34 +381,27 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     // ---- Write path: ingest + drain + compaction (compute and requests).
     // Each phase is billed at its binding share — pool CPU or peak-RSS
     // share of RAM, whichever is larger — for its full wall duration.
-    // Compute is priced from measured on-CPU seconds when the harness
-    // captured them (schedstat, I/O wait excluded); otherwise it falls back
-    // to the `wall × pool-share` model. vCPU·s and $ share one basis so the
-    // ledger's two columns can't disagree.
-    let ingest_vcpu_s = inst.phase_vcpu_seconds(
-        c.ingest_wall_s,
-        c.writers,
-        c.ingest_peak_rss_bytes,
-        c.ingest_cpu_s,
-    );
-    let ingest_compute = ingest_vcpu_s * inst.usd_per_sec();
+    // Compute is priced ONLY from measured on-CPU seconds (schedstat, I/O
+    // wait excluded). A phase that ran but whose CPU wasn't sampled is
+    // reported NOT METERED — never back-filled with a wall-clock guess.
+    let ingest_compute = c
+        .ingest_cpu_s
+        .map(|cpu| inst.phase_vcpu_seconds(cpu, c.ingest_wall_s, c.ingest_peak_rss_bytes))
+        .map(|vcpu| vcpu * inst.usd_per_sec());
     let drain_wall_s = c.store.drain_wall_s.unwrap_or(0.0);
-    let drain_vcpu_s = inst.phase_vcpu_seconds(
-        drain_wall_s,
-        c.writers,
-        c.store.drain_peak_rss_bytes,
-        c.store.drain_cpu_s,
-    );
-    let drain_compute = drain_vcpu_s * inst.usd_per_sec();
-
+    let drain_compute = c
+        .store
+        .drain_cpu_s
+        .map(|cpu| inst.phase_vcpu_seconds(cpu, drain_wall_s, c.store.drain_peak_rss_bytes))
+        .map(|vcpu| vcpu * inst.usd_per_sec());
     let compaction_wall_s = c.store.compaction_wall_s.unwrap_or(0.0);
-    let compaction_vcpu_s = inst.phase_vcpu_seconds(
-        compaction_wall_s,
-        c.writers,
-        c.store.compaction_peak_rss_bytes,
-        c.store.compaction_cpu_s,
-    );
-    let compaction_compute = compaction_vcpu_s * inst.usd_per_sec();
+    let compaction_compute = c
+        .store
+        .compaction_cpu_s
+        .map(|cpu| {
+            inst.phase_vcpu_seconds(cpu, compaction_wall_s, c.store.compaction_peak_rss_bytes)
+        })
+        .map(|vcpu| vcpu * inst.usd_per_sec());
 
     let ingest_req_usd = match (c.store.ingest, c.unmetered_put_count) {
         (Some(io), _) => request_usd(&io),
@@ -446,7 +411,8 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     let drain_req_usd = c.store.drain.map(|io| request_usd(&io)).unwrap_or(0.0);
     let compaction_req_usd = c.store.compaction.map(|io| request_usd(&io)).unwrap_or(0.0);
 
-    let write_compute = ingest_compute + drain_compute + compaction_compute;
+    let write_compute =
+        ingest_compute.unwrap_or(0.0) + drain_compute.unwrap_or(0.0) + compaction_compute.unwrap_or(0.0);
     let write_requests = ingest_req_usd + drain_req_usd + compaction_req_usd;
     let write_total = write_compute + write_requests;
     let write_per_million_docs = if c.n_docs > 0 {
@@ -505,7 +471,9 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     // object-store requests for the first-query fetch window.
     let cold_query_req_usd = c.store.cold_query.map(|io| request_usd(&io));
     let cold_query_usd = anchor_cold.map(|q| {
-        inst.per_query_cpu_usd(q.search_s, q.search_cpu_s, c.resident_anon_bytes)
+        q.search_cpu_s
+            .map(|cpu| inst.per_query_cpu_usd(cpu))
+            .unwrap_or(0.0)
             + cold_query_req_usd.unwrap_or(0.0)
     });
 
@@ -833,121 +801,108 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     });
 
     // ---- Block 3: compute ledger ----
-    let writers_used = c.writers.min(inst.vcpu);
-    let vcpu_share = format!("{writers_used}/{}/vCPU share", inst.vcpu);
-    // A parallel phase's label carries its binding resource: peak RSS when
-    // the phase's RAM share exceeds the (measured or modeled) CPU leg, else
-    // CPU.
-    let phase_binding_tag = |wall_s: f64, peak_rss: Option<u64>, cpu_s: Option<f64>| -> String {
-        match peak_rss {
-            Some(rss) if !inst.phase_cpu_binds(wall_s, c.writers, Some(rss), cpu_s) => {
+    // One-time-phase row from MEASURED on-CPU seconds. `None` cpu ⇒ NOT
+    // METERED (the phase ran but schedstat was unavailable) — never a
+    // wall-clock substitute. Shared by ingest / drain / compaction so the
+    // Some/None handling and cell layout live in one place.
+    let phase_row = |label: String, wall_s: f64, peak_rss: Option<u64>, cpu_s: Option<f64>| -> Vec<Cell> {
+        let Some(cpu) = cpu_s else {
+            return vec![text(label), text("NOT METERED"), text("—"), text("—")];
+        };
+        let vcpu = inst.phase_vcpu_seconds(cpu, wall_s, peak_rss);
+        let usd_v = vcpu * inst.usd_per_sec();
+        let binding = match peak_rss {
+            Some(rss) if !inst.phase_cpu_binds(cpu, wall_s, peak_rss) => {
                 format!(" — RAM-bound: {} peak held for the window", fmt_bytes(rss))
             }
             Some(rss) => format!(" — {} peak, CPU binds", fmt_bytes(rss)),
             None => String::new(),
-        }
+        };
+        vec![
+            text(format!("{label}{binding}")),
+            text(format!("{} wall · measured CPU", fmt_wall_seconds(wall_s))),
+            text(fmt_vcpu_seconds(vcpu)),
+            metric(usd_v, usd(usd_v), Better::Lower),
+        ]
     };
-    // Wall/basis cell: measured on-CPU time when captured, else the
-    // `wall × pool-share` model.
-    let phase_wall_cell = |wall_s: f64, cpu_s: Option<f64>| -> String {
-        if cpu_s.is_some() {
-            format!("{} · measured CPU", fmt_wall_seconds(wall_s))
-        } else {
-            format!("{} × {vcpu_share}", fmt_wall_seconds(wall_s))
-        }
-    };
-    let mut compute_rows = vec![vec![
-        text(format!(
-            "Ingest ({}w on {} vCPU{})",
-            c.writers,
-            inst.vcpu,
-            phase_binding_tag(c.ingest_wall_s, c.ingest_peak_rss_bytes, c.ingest_cpu_s),
-        )),
-        text(phase_wall_cell(c.ingest_wall_s, c.ingest_cpu_s)),
-        text(fmt_vcpu_seconds(ingest_vcpu_s)),
-        metric(ingest_compute, usd(ingest_compute), Better::Lower),
-    ]];
+    let mut compute_rows = vec![phase_row(
+        format!("Ingest ({}w on {} vCPU)", c.writers, inst.vcpu),
+        c.ingest_wall_s,
+        c.ingest_peak_rss_bytes,
+        c.ingest_cpu_s,
+    )];
     if c.store.drain_wall_s.is_some() {
-        compute_rows.push(vec![
-            text(format!(
-                "Drain (hidden index, one-time{})",
-                phase_binding_tag(drain_wall_s, c.store.drain_peak_rss_bytes, c.store.drain_cpu_s),
-            )),
-            text(phase_wall_cell(drain_wall_s, c.store.drain_cpu_s)),
-            text(fmt_vcpu_seconds(drain_vcpu_s)),
-            metric(drain_compute, usd(drain_compute), Better::Lower),
-        ]);
+        compute_rows.push(phase_row(
+            "Drain (hidden index, one-time)".to_string(),
+            drain_wall_s,
+            c.store.drain_peak_rss_bytes,
+            c.store.drain_cpu_s,
+        ));
     } else if c.vector_cell {
-        compute_rows.push(vec![
-            text("Drain (hidden index, one-time)"),
-            text("NOT METERED"),
-            text("—"),
-            text("—"),
-        ]);
+        compute_rows.push(phase_row(
+            "Drain (hidden index, one-time)".to_string(),
+            0.0,
+            None,
+            None,
+        ));
     }
     if c.store.compaction_wall_s.is_some() {
-        compute_rows.push(vec![
-            text(format!(
-                "Compaction (optimize, one-time{})",
-                phase_binding_tag(
-                    compaction_wall_s,
-                    c.store.compaction_peak_rss_bytes,
-                    c.store.compaction_cpu_s,
-                ),
-            )),
-            text(phase_wall_cell(compaction_wall_s, c.store.compaction_cpu_s)),
-            text(fmt_vcpu_seconds(compaction_vcpu_s)),
-            metric(compaction_compute, usd(compaction_compute), Better::Lower),
-        ]);
+        compute_rows.push(phase_row(
+            "Compaction (optimize, one-time)".to_string(),
+            compaction_wall_s,
+            c.store.compaction_peak_rss_bytes,
+            c.store.compaction_cpu_s,
+        ));
     } else if c.vector_cell {
-        compute_rows.push(vec![
-            text("Compaction (optimize, one-time)"),
-            text("NOT METERED"),
-            text("—"),
-            text("—"),
-        ]);
+        compute_rows.push(phase_row(
+            "Compaction (optimize, one-time)".to_string(),
+            0.0,
+            None,
+            None,
+        ));
     }
     if let Some(q) = anchor_cold {
-        let open_vcpu = inst.per_query_cpu_vcpu_seconds(q.open_s, q.open_cpu_s, c.resident_anon_bytes);
-        let open_usd = open_vcpu * inst.usd_per_sec();
         let open_label = if c.cold_open_amortized {
             format!("Table open CPU (one-time, {})", q.name)
         } else {
             format!("Cold open CPU ({})", q.name)
         };
-        // The wall/basis cell notes measured CPU so a reader can see the
-        // vCPU·s is on-CPU time, not the (I/O-dominated) wall latency.
-        let open_basis = if q.open_cpu_s.is_some() {
-            format!("{} wall · measured CPU", fmt_wall_seconds(q.open_s))
-        } else {
-            fmt_wall_seconds(q.open_s)
-        };
-        compute_rows.push(vec![
-            text(open_label),
-            text(open_basis),
-            text(fmt_vcpu_seconds(open_vcpu)),
-            metric(open_usd, usd(open_usd), Better::Lower),
-        ]);
-        let search_per_q = inst.per_query_cpu_usd(q.search_s, q.search_cpu_s, c.resident_anon_bytes);
-        let search_basis = if q.search_cpu_s.is_some() {
-            format!("{} p50 · measured CPU", fmt_time(q.search_s * 1e9))
-        } else {
-            format!("{} p50", fmt_time(q.search_s * 1e9))
-        };
-        compute_rows.push(vec![
-            text(format!("Cold query CPU ({})", q.name)),
-            text(search_basis),
-            text(fmt_vcpu_seconds(inst.per_query_cpu_vcpu_seconds(
-                q.search_s,
-                q.search_cpu_s,
-                c.resident_anon_bytes,
-            ))),
-            metric(
-                search_per_q * PER_MILLION,
-                format!("{} queries", usd_per_million(search_per_q)),
-                Better::Lower,
-            ),
-        ]);
+        // Cold open / query CPU are priced from MEASURED on-CPU seconds — a
+        // cold path is mostly object-store I/O wait, so its wall latency is
+        // not its compute. NOT METERED (never latency × share) when unsampled.
+        compute_rows.push(match q.open_cpu_s {
+            Some(cpu) => {
+                let open_usd = inst.per_query_cpu_usd(cpu);
+                vec![
+                    text(open_label),
+                    text(format!("{} wall · measured CPU", fmt_wall_seconds(q.open_s))),
+                    text(fmt_vcpu_seconds(cpu)),
+                    metric(open_usd, usd(open_usd), Better::Lower),
+                ]
+            }
+            None => vec![text(open_label), text("NOT METERED"), text("—"), text("—")],
+        });
+        compute_rows.push(match q.search_cpu_s {
+            Some(cpu) => {
+                let per_q = inst.per_query_cpu_usd(cpu);
+                vec![
+                    text(format!("Cold query CPU ({})", q.name)),
+                    text(format!("{} p50 · measured CPU", fmt_time(q.search_s * 1e9))),
+                    text(fmt_vcpu_seconds(cpu)),
+                    metric(
+                        per_q * PER_MILLION,
+                        format!("{} queries", usd_per_million(per_q)),
+                        Better::Lower,
+                    ),
+                ]
+            }
+            None => vec![
+                text(format!("Cold query CPU ({})", q.name)),
+                text("NOT METERED"),
+                text("—"),
+                text("—"),
+            ],
+        });
     }
     if let Some((name, p50_s)) = c
         .warm
@@ -1046,7 +1001,10 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         ]);
     }
     if let Some(q) = c.cold_pre.and_then(|rows| rows.first()) {
-        let per_q = inst.per_query_cpu_usd(q.search_s, q.search_cpu_s, c.resident_anon_bytes)
+        let per_q = q
+            .search_cpu_s
+            .map(|cpu| inst.per_query_cpu_usd(cpu))
+            .unwrap_or(0.0)
             + c.store
                 .cold_query_pre
                 .map(|io| request_usd(&io))
@@ -1206,39 +1164,25 @@ mod tests {
     }
 
     #[test]
-    fn parallel_ingest_costs_more_per_second_than_single_writer() {
+    fn phase_bills_measured_cpu_when_it_exceeds_ram() {
         let inst = test_instance();
-        let single = inst.phase_vcpu_seconds(10.0, 1, None, None) * inst.usd_per_sec();
-        let full = inst.phase_vcpu_seconds(10.0, 8, None, None) * inst.usd_per_sec();
-        assert!((full / single - 8.0).abs() < 1e-9);
+        // Measured on-CPU is billed verbatim (I/O wait already excluded) when
+        // it exceeds the RAM-hold leg — no wall-clock substitution.
+        assert!((inst.phase_vcpu_seconds(5.0, 10.0, None) - 5.0).abs() < 1e-9);
+        assert!(inst.phase_cpu_binds(5.0, 10.0, None));
     }
 
     #[test]
     fn ram_bound_phase_bills_rss_share_for_full_wall() {
         let inst = test_instance();
-        // 1 writer on 8 vCPU = 12.5% CPU share; 8 GiB peak on 16 GiB = 50%
-        // RAM share → RAM binds and the phase bills 4× the CPU-only price.
+        // 8 GiB peak on 16 GiB = 50% RAM share over a 10s wall = 5 vCPU·s RAM
+        // leg; a smaller measured CPU is dominated by it → phase is RAM-bound.
         let eight_gib = 8u64 << 30;
-        let cpu_only = inst.phase_vcpu_seconds(10.0, 1, None, None) * inst.usd_per_sec();
-        let ram_bound = inst.phase_vcpu_seconds(10.0, 1, Some(eight_gib), None) * inst.usd_per_sec();
-        assert!(!inst.phase_cpu_binds(10.0, 1, Some(eight_gib), None));
-        assert!((ram_bound / cpu_only - 4.0).abs() < 1e-9);
-        // Full-pool CPU (100%) dominates the same 50% RAM share.
-        assert!(inst.phase_cpu_binds(10.0, 8, Some(eight_gib), None));
-    }
-
-    #[test]
-    fn measured_cpu_overrides_wall_model_for_phase() {
-        let inst = test_instance();
-        // No measurement → wall model: 10s × (8/8 pool share) = 10 vCPU·s.
-        assert!((inst.phase_vcpu_seconds(10.0, 8, None, None) - 10.0).abs() < 1e-9);
-        // Measured on-CPU 3.5s (I/O wait excluded) is billed verbatim when it
-        // exceeds the RAM leg — the whole point of measuring instead of wall.
-        assert!((inst.phase_vcpu_seconds(10.0, 8, None, Some(3.5)) - 3.5).abs() < 1e-9);
-        // RAM leg (50% of 16 GiB over a 10s wall = 5 vCPU·s) still binds when
-        // it exceeds the measured CPU.
-        let eight_gib = 8u64 << 30;
-        assert!((inst.phase_vcpu_seconds(10.0, 8, Some(eight_gib), Some(3.5)) - 5.0).abs() < 1e-9);
+        assert!((inst.phase_vcpu_seconds(1.0, 10.0, Some(eight_gib)) - 5.0).abs() < 1e-9);
+        assert!(!inst.phase_cpu_binds(1.0, 10.0, Some(eight_gib)));
+        // Measured CPU above the RAM leg binds on CPU and is billed as-is.
+        assert!(inst.phase_cpu_binds(6.0, 10.0, Some(eight_gib)));
+        assert!((inst.phase_vcpu_seconds(6.0, 10.0, Some(eight_gib)) - 6.0).abs() < 1e-9);
     }
 
     #[test]

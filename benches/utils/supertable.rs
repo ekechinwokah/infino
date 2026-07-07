@@ -66,6 +66,9 @@ use crate::{
 const SHAPE_ENV: &str = "INFINO_BENCH_SUPERTABLE_SHAPE";
 /// Line prefix a child writes to stdout carrying its measured metrics.
 const RESULT_PREFIX: &str = "__SUPERTABLE_SHAPE_RESULT__ ";
+/// `ingest_cpu_ns` value meaning "not measured" — a `key=value` result line
+/// can't carry `Option<f64>`, so a negative sentinel encodes `None`.
+const INGEST_CPU_NOT_MEASURED_NS: i128 = -1;
 
 /// The three measured shapes: (display label, child-env key, modality).
 const SHAPES: [(&str, &str, Modality); 4] = [
@@ -115,8 +118,9 @@ impl ShapeMetrics {
             self.p90_rss_bytes,
             self.index_bytes,
             self.corpus_bytes,
-            // -1 sentinel = not measured (Option<f64> can't cross the line).
-            self.ingest_cpu_s.map(|s| (s * 1e9) as i128).unwrap_or(-1),
+            self.ingest_cpu_s
+                .map(|s| (s * 1e9) as i128)
+                .unwrap_or(INGEST_CPU_NOT_MEASURED_NS),
         )
     }
 
@@ -147,7 +151,7 @@ impl ShapeMetrics {
                     ingest_cpu_s = v
                         .parse::<i128>()
                         .ok()
-                        .filter(|ns| *ns >= 0)
+                        .filter(|ns| *ns != INGEST_CPU_NOT_MEASURED_NS)
                         .map(|ns| ns as f64 / 1e9);
                 }
                 _ => {}
@@ -194,11 +198,7 @@ fn run_child_shape(key: &str) {
     // measured window covers the engine only.
     let corpus = supertable::prepare_corpus(modality);
     let sampler = PeakSampler::start_default();
-    let cpu0 = cpu::process_cpu_ns();
-    let t0 = Instant::now();
-    let built = supertable::build_on_storage(modality, &corpus);
-    let wall = t0.elapsed();
-    let ingest_cpu_s = cpu::cpu_seconds_since(cpu0);
+    let (built, wall, ingest_cpu_s) = cpu::timed(|| supertable::build_on_storage(modality, &corpus));
     let rss = sampler.stop_stats();
 
     // This child wrote its own unique prefix; delete it before exiting so the
@@ -646,11 +646,7 @@ fn build_measured(
     phases: Phases,
 ) -> (supertable::IngestResult, Option<ShapeMetrics>) {
     let sampler = PeakSampler::start_default();
-    let cpu0 = cpu::process_cpu_ns();
-    let t0 = Instant::now();
-    let built = supertable::build_on_storage(modality, corpus);
-    let wall = t0.elapsed();
-    let ingest_cpu_s = cpu::cpu_seconds_since(cpu0);
+    let (built, wall, ingest_cpu_s) = cpu::timed(|| supertable::build_on_storage(modality, corpus));
     let rss = sampler.stop_stats();
     let metrics = phases.build.then_some(ShapeMetrics {
         wall_ns: wall.as_secs_f64() * 1e9,
@@ -1484,11 +1480,8 @@ pub mod vector {
 
                 let before_drain = consumer_meter.snapshot();
                 let drain_sampler = PeakSampler::start_default();
-                let drain_cpu0 = cpu::process_cpu_ns();
-                let drain_t0 = Instant::now();
-                drain_hidden_incoming(&consumer);
-                let drain_wall_s = drain_t0.elapsed().as_secs_f64();
-                let drain_cpu_s = cpu::cpu_seconds_since(drain_cpu0);
+                let ((), drain_wall, drain_cpu_s) = cpu::timed(|| drain_hidden_incoming(&consumer));
+                let drain_wall_s = drain_wall.as_secs_f64();
                 let drain_peak_rss = drain_sampler.stop_stats().peak_rss_bytes;
                 let drain_io = consumer_meter.snapshot().since(&before_drain);
                 eprintln!(
@@ -1736,13 +1729,10 @@ pub mod vector {
                     eprintln!("[supertable_vector] compacting (optimize: user + hidden)...");
                     let before = consumer_meter.snapshot();
                     let sampler = PeakSampler::start_default();
-                    let cpu0 = cpu::process_cpu_ns();
-                    let t0 = Instant::now();
-                    consumer
-                        .optimize(&OptimizeOptions::default())
-                        .expect("optimize (compaction)");
-                    let wall_s = t0.elapsed().as_secs_f64();
-                    let cpu_s = cpu::cpu_seconds_since(cpu0);
+                    let (result, wall, cpu_s) =
+                        cpu::timed(|| consumer.optimize(&OptimizeOptions::default()));
+                    result.expect("optimize (compaction)");
+                    let wall_s = wall.as_secs_f64();
                     let peak_rss = sampler.stop_stats().peak_rss_bytes;
                     let io = consumer_meter.snapshot().since(&before);
                     eprintln!(

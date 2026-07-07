@@ -67,31 +67,19 @@ pub fn cpu_seconds_since(start_ns: Option<u128>) -> Option<f64> {
     Some(end.saturating_sub(start) as f64 / NS_PER_SEC)
 }
 
-/// Amortized per-iteration CPU seconds for a sub-microsecond op.
+/// Run `f`, returning `(result, wall_duration, measured_on_cpu_seconds)`.
 ///
-/// Runs `f` in a tight loop until at least `min_wall` has elapsed (or
-/// `max_iters` is hit), bracketing process CPU once around the whole loop and
-/// dividing by the iteration count. This is the only correct way to measure
-/// warm CPU at hundreds of ns/op: the boundary reads amortize to ~0 and
-/// accuracy rises with the iteration count. Returns `None` if CPU sampling is
-/// unavailable.
-pub fn amortized_cpu_per_iter(
-    mut f: impl FnMut(),
-    min_wall: Duration,
-    max_iters: usize,
-) -> Option<f64> {
-    let cpu0 = process_cpu_ns()?;
+/// The single primitive every phase / cold-query measurement uses, so wall
+/// and on-CPU time are always bracketed identically around the same work.
+/// `cpu` is `None` only when `/proc/self/task` sampling is unavailable
+/// (never on the Linux bench hosts); callers treat that as "not measured",
+/// never as an excuse to substitute a wall-clock approximation.
+pub fn timed<T>(f: impl FnOnce() -> T) -> (T, Duration, Option<f64>) {
+    let cpu0 = process_cpu_ns();
     let t0 = Instant::now();
-    let mut iters: usize = 0;
-    loop {
-        f();
-        iters += 1;
-        if iters >= max_iters || t0.elapsed() >= min_wall {
-            break;
-        }
-    }
-    let cpu = cpu_seconds_since(Some(cpu0))?;
-    Some(cpu / iters as f64)
+    let out = f();
+    let wall = t0.elapsed();
+    (out, wall, cpu_seconds_since(cpu0))
 }
 
 #[cfg(test)]
@@ -138,24 +126,21 @@ mod tests {
         );
     }
 
-    /// The process-wide aggregate is available and the amortized helper
-    /// returns a per-iter figure for a sub-microsecond op.
+    /// `timed` returns the closure's value, its wall duration, and — on a
+    /// procfs host — a measured on-CPU figure. (The "on-CPU excludes I/O
+    /// wait" property is asserted by [`on_cpu_time_excludes_sleep`] using a
+    /// thread-local read; `timed`'s process-wide aggregate can't assert it
+    /// under the parallel test harness, where sibling test threads run.)
     #[test]
-    fn process_cpu_available_and_amortizes() {
-        if process_cpu_ns().is_none() {
-            return;
+    fn timed_returns_value_wall_and_cpu() {
+        let (value, wall, cpu) = timed(|| {
+            std::thread::sleep(Duration::from_millis(20));
+            42u64
+        });
+        assert_eq!(value, 42);
+        assert!(wall >= Duration::from_millis(20));
+        if process_cpu_ns().is_some() {
+            assert!(cpu.expect("procfs host measures cpu") >= 0.0);
         }
-        let per = amortized_cpu_per_iter(
-            || {
-                let mut a = 0u64;
-                for i in 0..1000u64 {
-                    a = a.wrapping_add(i);
-                }
-                std::hint::black_box(a);
-            },
-            Duration::from_millis(30),
-            10_000_000,
-        );
-        assert!(per.is_some(), "amortized CPU should be measurable");
     }
 }
