@@ -1218,7 +1218,7 @@ impl SuperfileReader {
 /// Each field is an optional override. `None` means “use the engine default”,
 /// which depends on whether the query is filtered:
 ///
-/// - unfiltered: `nprobe=6`, `rerank_mult=256`
+/// - unfiltered: `nprobe=4`, `rerank_mult=256`
 /// - filtered (`filter: Some(...)` or an internal allow-set): `nprobe=8`, `rerank_mult=256`
 ///
 /// Set a field with [`Self::with_nprobe`] / [`Self::with_rerank_mult`].
@@ -1231,7 +1231,7 @@ pub struct VectorSearchOptions {
 
 impl VectorSearchOptions {
     /// Unfiltered default `nprobe` (used when [`Self::nprobe`] is `None`).
-    pub const DEFAULT_NPROBE: usize = 6;
+    pub const DEFAULT_NPROBE: usize = 4;
 
     /// Default `rerank_mult` for both paths (used when unset).
     pub const RERANK_MULT: usize = 256;
@@ -1653,7 +1653,7 @@ mod tests {
         let opts = VectorSearchOptions::default();
         assert_eq!(opts.nprobe, None);
         assert_eq!(opts.rerank_mult(), None);
-        assert_eq!(opts.resolve(false), (6, 256));
+        assert_eq!(opts.resolve(false), (4, 256));
         assert_eq!(opts.resolve(true), (8, 256));
     }
 

@@ -1550,6 +1550,23 @@ pub mod vector {
                 .expect("prepare stable-id allow bitmaps");
                 let mut recalls = Vec::new();
                 let mut latencies = Vec::new();
+                // Untimed prewarm: fault the filtered path's routed cells into
+                // the resident cache first, so the metered window below reflects
+                // steady-state warm I/O (not the one-time cache fill).
+                for q in q_correct.iter() {
+                    let _ =
+                        tiers::block_on(consumer_reader.vector_hits_prepared_global_allow_async(
+                            supertable::VEC_COLUMN,
+                            q,
+                            TOP_K,
+                            exec_vec::search_opts(
+                                FILTERED_DEFAULT_NPROBE,
+                                FILTERED_DEFAULT_RERANK_MULT,
+                            ),
+                            &prepared_allow,
+                        ))
+                        .expect("filtered prewarm query");
+                }
                 let filtered_before = consumer_meter.snapshot();
                 for (q, gt) in q_correct.iter().zip(filtered_gt) {
                     let t0 = Instant::now();
@@ -1643,8 +1660,25 @@ pub mod vector {
                 // warm latency battery timed — so the ledger's warm GET/query
                 // and the compute ledger's warm CPU describe one path.
                 let warm_io = (phases.warm && !q_correct.is_empty()).then(|| {
-                    let before = consumer_meter.snapshot();
                     let reader = consumer.reader();
+                    // Untimed prewarm: fault each query's routed cells into the
+                    // resident cache first, so the metered pass below reflects
+                    // steady-state warm I/O (0 GET when the working set fits the
+                    // budget), not the one-time cache fill. Mirrors the FTS warm
+                    // path's untimed-prewarm-then-measure discipline.
+                    for q in &q_correct {
+                        let _ = reader
+                            .vector_search(
+                                supertable::VEC_COLUMN,
+                                q,
+                                TOP_K,
+                                exec_vec::search_opts(nprobe, rerank),
+                                None,
+                                None,
+                            )
+                            .expect("warm-window prewarm vector_search");
+                    }
+                    let before = consumer_meter.snapshot();
                     for q in &q_correct {
                         let _ = reader
                             .vector_search(
