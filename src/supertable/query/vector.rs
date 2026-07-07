@@ -109,6 +109,14 @@ pub struct VectorFilter<'a> {
     pub mode: BoolMode,
 }
 
+/// Prepared per-superfile allow-set for bench/test global-id filtering.
+#[cfg(feature = "test-helpers")]
+#[derive(Clone)]
+pub struct PreparedGlobalAllow {
+    use_hidden_index: bool,
+    allow_by_uri: HashMap<SuperfileUri, Arc<RoaringBitmap>>,
+}
+
 /// Resolve the user-table superfile that owns `user_row_id` (flat view
 /// first, then list parts — same source as query fan-out).
 async fn lookup_user_superfile_by_id(
@@ -925,22 +933,75 @@ impl SupertableReader {
         options: VectorSearchOptions,
         allow_global: Arc<RoaringBitmap>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        if k == 0 || allow_global.is_empty() {
-            return Ok(Vec::new());
+        let prepared = self.prepare_vector_global_allow_async(allow_global).await?;
+        self.vector_hits_prepared_global_allow_async(column, query, k, options, &prepared)
+            .await
+    }
+
+    /// Build the per-superfile allow-set once from corpus-global ids.
+    ///
+    /// User-table path maps by contiguous ingest order. Post-drain path maps
+    /// against hidden-cell stable ids and returns a hidden-index allow-set.
+    #[cfg(feature = "test-helpers")]
+    pub async fn prepare_vector_global_allow_async(
+        &self,
+        allow_global: Arc<RoaringBitmap>,
+    ) -> Result<PreparedGlobalAllow, QueryError> {
+        if allow_global.is_empty() {
+            return Ok(PreparedGlobalAllow {
+                use_hidden_index: self.vector_index_table().is_some(),
+                allow_by_uri: HashMap::new(),
+            });
         }
+        if let Some(vit) = self.vector_index_table() {
+            let hidden_reader = vit.reader();
+            let hidden_manifest = Arc::clone(hidden_reader.manifest());
+            let superfiles = hidden_manifest
+                .get_all_superfiles_loaded()
+                .await
+                .map_err(QueryError::ManifestLoad)?;
+            if superfiles.is_empty() {
+                return Ok(PreparedGlobalAllow {
+                    use_hidden_index: true,
+                    allow_by_uri: HashMap::new(),
+                });
+            }
+            let allow_for_cell = Arc::clone(&allow_global);
+            let manifest_for_ids = Arc::clone(&hidden_manifest);
+            let allow_by_uri = hidden_reader
+                .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
+                    let allow_for_cell = Arc::clone(&allow_for_cell);
+                    let manifest_for_ids = Arc::clone(&manifest_for_ids);
+                    async move {
+                        let stable_ids =
+                            stable_ids_by_local_for_routing(&manifest_for_ids, &entry, &r).await?;
+                        let mut local = RoaringBitmap::new();
+                        for (local_doc_id, stable_id) in stable_ids.into_iter().enumerate() {
+                            if let Ok(global_id) = u32::try_from(stable_id)
+                                && allow_for_cell.contains(global_id)
+                            {
+                                local.insert(local_doc_id as u32);
+                            }
+                        }
+                        Ok(local)
+                    }
+                })
+                .await?;
+            return Ok(PreparedGlobalAllow {
+                use_hidden_index: true,
+                allow_by_uri,
+            });
+        }
+
         let manifest = self.manifest();
         let superfiles = manifest
             .get_all_superfiles_loaded()
             .await
             .map_err(QueryError::ManifestLoad)?;
-        if superfiles.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let mut allow_by_uri: HashMap<SuperfileUri, RoaringBitmap> = HashMap::new();
         let mut allowed = allow_global.iter().peekable();
         let mut base = 0u64;
-        for entry in manifest.superfiles.iter() {
+        for entry in &superfiles {
             let end = base.saturating_add(entry.n_docs);
             while allowed.peek().is_some_and(|&id| (id as u64) < base) {
                 allowed.next();
@@ -959,16 +1020,69 @@ impl SupertableReader {
             }
             base = end;
         }
+        Ok(PreparedGlobalAllow {
+            use_hidden_index: false,
+            allow_by_uri: allow_by_uri
+                .into_iter()
+                .map(|(uri, bm)| (uri, Arc::new(bm)))
+                .collect(),
+        })
+    }
 
-        if allow_by_uri.is_empty() {
+    /// Run filtered vector fan-out from a precomputed global-id allow-set.
+    #[cfg(feature = "test-helpers")]
+    pub async fn vector_hits_prepared_global_allow_async(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+        prepared: &PreparedGlobalAllow,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        if k == 0 || prepared.allow_by_uri.is_empty() {
             return Ok(Vec::new());
         }
-        let allow = allow_by_uri
-            .into_iter()
-            .map(|(uri, bm)| (uri, Arc::new(bm)))
-            .collect();
-        self.vector_fanout_over_superfiles(superfiles, column, query, k, options, Some(allow))
+        if prepared.use_hidden_index {
+            let vit = self.vector_index_table().ok_or_else(|| {
+                QueryError::Execute("prepared hidden allow-set but no hidden index table".into())
+            })?;
+            let hidden_reader = vit.reader();
+            let superfiles = hidden_reader
+                .manifest()
+                .get_all_superfiles_loaded()
+                .await
+                .map_err(QueryError::ManifestLoad)?;
+            if superfiles.is_empty() {
+                return Ok(Vec::new());
+            }
+            return hidden_reader
+                .vector_fanout_over_superfiles(
+                    superfiles,
+                    column,
+                    query,
+                    k,
+                    options,
+                    Some(prepared.allow_by_uri.clone()),
+                )
+                .await;
+        }
+        let superfiles = self
+            .manifest()
+            .get_all_superfiles_loaded()
             .await
+            .map_err(QueryError::ManifestLoad)?;
+        if superfiles.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.vector_fanout_over_superfiles(
+            superfiles,
+            column,
+            query,
+            k,
+            options,
+            Some(prepared.allow_by_uri.clone()),
+        )
+        .await
     }
 
     /// Resolve a [`CandidatePlan`] to a per-superfile allow-set of matching

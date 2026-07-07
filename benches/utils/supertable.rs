@@ -971,6 +971,8 @@ pub mod fts {
 }
 
 pub mod vector {
+    use std::collections::HashMap;
+
     use infino::roaring::RoaringBitmap;
 
     use super::*;
@@ -1075,33 +1077,42 @@ pub mod vector {
 
     fn hits_to_dense_u32(
         st: &Supertable,
+        id_to_dense: &HashMap<i128, u32>,
         hits: &[infino::supertable::query::SuperfileHit],
     ) -> Vec<(u32, f32)> {
         let reader = st.reader();
         let manifest = reader.manifest();
-        let mut seg_uris: Vec<_> = manifest.superfiles.iter().map(|e| e.uri).collect();
-        let mut offsets: Vec<u32> = Vec::with_capacity(seg_uris.len());
-        let mut acc = 0u32;
-        for entry in manifest.superfiles.iter() {
-            offsets.push(acc);
-            acc = acc.saturating_add(entry.n_docs as u32);
+        let mut contiguous_min_by_uri: HashMap<_, i128> = HashMap::new();
+        for entry in manifest.get_all_superfiles() {
+            let span = entry.id_max.saturating_sub(entry.id_min).saturating_add(1);
+            if span == entry.n_docs as i128 {
+                contiguous_min_by_uri.insert(entry.uri, entry.id_min);
+            }
         }
         if let Some(hidden) = st.vector_index_table() {
             let hidden_reader = hidden.reader();
             let hidden_manifest = hidden_reader.manifest();
-            for entry in hidden_manifest.superfiles.iter() {
-                seg_uris.push(entry.uri);
-                offsets.push(acc);
-                acc = acc.saturating_add(entry.n_docs as u32);
+            for entry in hidden_manifest.get_all_superfiles() {
+                let span = entry.id_max.saturating_sub(entry.id_min).saturating_add(1);
+                if span == entry.n_docs as i128 {
+                    contiguous_min_by_uri.insert(entry.uri, entry.id_min);
+                }
             }
         }
         hits.iter()
-            .map(|h| {
-                let seg_idx = seg_uris
-                    .iter()
-                    .position(|u| *u == h.superfile)
-                    .expect("hit superfile present in user or hidden manifest");
-                (offsets[seg_idx] + h.local_doc_id, h.score)
+            .filter_map(|h| {
+                let stable_id = h.stable_id.or_else(|| {
+                    contiguous_min_by_uri
+                        .get(&h.superfile)
+                        .copied()
+                        .map(|id_min| id_min + i128::from(h.local_doc_id))
+                })?;
+                let dense = id_to_dense.get(&stable_id).copied().or_else(|| {
+                    u32::try_from(stable_id)
+                        .ok()
+                        .filter(|id| *id < supertable::n_docs() as u32)
+                })?;
+                Some((dense, h.score))
             })
             .collect()
     }
@@ -1541,24 +1552,30 @@ pub mod vector {
                 let allow = Arc::new(allow);
 
                 let consumer_reader = consumer.reader();
+                let prepared_allow = tiers::block_on(
+                    consumer_reader.prepare_vector_global_allow_async(Arc::clone(&allow)),
+                )
+                .expect("prepare global allow bitmaps");
                 let mut recalls = Vec::new();
                 let mut latencies = Vec::new();
                 let filtered_before = consumer_meter.snapshot();
                 for (q, gt) in q_correct.iter().zip(filtered_gt) {
                     let t0 = Instant::now();
-                    let hits = tiers::block_on(consumer_reader.vector_hits_global_allow_async(
-                        supertable::VEC_COLUMN,
-                        q,
-                        TOP_K,
-                        exec_vec::search_opts(
-                            FILTERED_DEFAULT_NPROBE,
-                            FILTERED_DEFAULT_RERANK_MULT,
+                    let hits = tiers::block_on(
+                        consumer_reader.vector_hits_prepared_global_allow_async(
+                            supertable::VEC_COLUMN,
+                            q,
+                            TOP_K,
+                            exec_vec::search_opts(
+                                FILTERED_DEFAULT_NPROBE,
+                                FILTERED_DEFAULT_RERANK_MULT,
+                            ),
+                            &prepared_allow,
                         ),
-                        Arc::clone(&allow),
-                    ))
+                    )
                     .expect("filtered recall query");
                     latencies.push(t0.elapsed());
-                    let dense_hits = hits_to_dense_u32(&consumer, &hits);
+                    let dense_hits = hits_to_dense_u32(&consumer, &id_to_dense, &hits);
                     recalls.push(corpus::recall_at_k(&dense_hits, gt));
                 }
                 let filtered_io = consumer_meter.snapshot().since(&filtered_before);
