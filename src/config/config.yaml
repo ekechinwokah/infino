@@ -112,3 +112,82 @@ compaction:
 
   # Maximum memory budget for materializing inputs during a single merge, in MiB.
   max_memory_mb: 3072
+
+# Vector-index build / search / drain tuning. Every value below
+# defaults to the engine's built-in behavior — a fresh install never
+# needs to touch this section. These are the levers that used to be
+# one-off INFINO_* env vars.
+#
+# Env overrides (note the double underscore for nesting):
+#   INFINO_VECTOR__CELL_SPLIT_DOC_CAP=100000
+#   INFINO_VECTOR__DRAIN_BATCH_SUPERFILES=32
+#   INFINO_VECTOR__USER_CENTROIDS=global
+vector:
+  # Absolute cap on fine IVF centroids probed per vector search.
+  # Empty (~) derives the budget from nprobe × eligible superfiles at
+  # query time; set an integer to force exactly that many.
+  inner_budget: ~
+
+  # K-means training points per centroid for the drain's per-cell
+  # sub-builds.
+  kmeans_pts_per_centroid: 64
+
+  # Doc count above which a merged cell superfile is split into two
+  # sub-cells during hidden-index maintenance.
+  cell_split_doc_cap: 50000
+
+  # How user-superfile clusters align to the global cell grid:
+  #   local  — per-superfile k-means (default).
+  #   global — cluster c == cell c, so the drain routes cluster → cell
+  #            without re-scoring.
+  user_centroids: local
+
+  # User superfiles the hidden-index drain materializes per batch
+  # before publishing that batch's cell superfiles (bounds drain RAM
+  # to O(batch)). -1 = unbounded (one merge, O(corpus) RAM);
+  # 0 = skip the drain entirely.
+  drain_batch_superfiles: 64
+
+  # Target storage amplification for boundary-only drain replication.
+  # 1.2 lets the drain add at most 0.2 × rows extra copies of rows near
+  # a Voronoi boundary; <= 1.0 disables replication.
+  drain_replica_target_factor: 1.0
+
+  # Per-cell consolidation op the drain applies:
+  #   kmeans — re-cluster each cell's rows (default).
+  #   splice — keep each superfile's local clusters verbatim.
+  drain_consolidate: kmeans
+
+  # Read fan-out for the drain's superfile opens. `auto` resolves to
+  # one in-flight read per hardware thread, floored at the
+  # background-fill default and capped at 64; or set a positive
+  # integer.
+  drain_read_concurrency: auto
+
+# Diagnostic and hardware-capability toggles. Each gates
+# instrumentation or forces a slower code path for A/B measurement;
+# none of them change query results. Leave everything off unless you
+# are profiling or benchmarking.
+#
+# Env overrides:
+#   INFINO_DIAGNOSTICS__IO_TIMELINE=true
+#   INFINO_DIAGNOSTICS__DISABLE_AVX512=true
+diagnostics:
+  # Accumulate per-phase timers during the vector drain build.
+  drain_build_timers: false
+
+  # Emit the FTS builder's finish-phase profile.
+  fts_profile: false
+
+  # Capture the object-store I/O timeline.
+  io_timeline: false
+
+  # Skip the lazy_foreground_with_background_fill full-superfile
+  # background promotion, serving cold queries over range GETs only.
+  disable_bg_fill: false
+
+  # Force the AVX2 vector-distance path even where AVX-512 is available.
+  disable_avx512: false
+
+  # Force the scalar vector-distance path even where AVX2 is available.
+  disable_avx2: false

@@ -219,6 +219,7 @@ fn real_s3_config(bucket: &str, prefix: &str, cache_root: &std::path::Path) -> C
             ..StorageSettings::default()
         },
         compaction: CompactionSettings::default(),
+        ..Config::default()
     }
 }
 

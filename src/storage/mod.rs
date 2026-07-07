@@ -187,13 +187,9 @@ pub mod io_counters {
     static EPOCH: Mutex<Option<Instant>> = Mutex::new(None);
     static SPANS: Mutex<Vec<FetchSpan>> = Mutex::new(Vec::new());
 
-    /// Whether timeline capture is active (`INFINO_IO_TIMELINE` set & truthy).
+    /// Whether timeline capture is active (`diagnostics.io_timeline`).
     pub fn timeline_enabled() -> bool {
-        *TIMELINE_ON.get_or_init(|| {
-            std::env::var("INFINO_IO_TIMELINE")
-                .map(|v| v != "0" && !v.is_empty())
-                .unwrap_or(false)
-        })
+        *TIMELINE_ON.get_or_init(|| crate::config::global().diagnostics.io_timeline)
     }
 
     /// Capture an op-start `Instant` *iff* the timeline is active; `None`

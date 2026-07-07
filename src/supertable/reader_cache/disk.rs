@@ -7,7 +7,7 @@
 
 use std::{
     collections::HashSet,
-    env, fmt, fs, io,
+    fmt, fs, io,
     io::SeekFrom,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
@@ -1990,19 +1990,14 @@ fn rollback_lazy_background_fill(store: &Arc<DiskCacheStore>, uri: &SuperfileUri
 /// `reader(uri)` calls hit the promoted entry — every query
 /// resolves from mmap (zero S3 GETs).
 /// Diagnostic gate for the `LazyForegroundWithBackgroundFill`
-/// full-superfile promotion. When `INFINO_DISABLE_BG_FILL=1` (or
-/// `true`), the cold-fetch path installs the open-blob overlay
-/// and serves the foreground query over range GETs, but never
-/// spawns the full-superfile background download. Lets us measure
-/// the cold fan-out cost in isolation from the competing
-/// full-superfile fills.
+/// full-superfile promotion. When `diagnostics.disable_bg_fill` is
+/// set, the cold-fetch path installs the open-blob overlay and serves
+/// the foreground query over range GETs, but never spawns the
+/// full-superfile background download. Lets us measure the cold
+/// fan-out cost in isolation from the competing full-superfile fills.
 pub(crate) fn skip_background_fill() -> bool {
     static SKIP: OnceLock<bool> = OnceLock::new();
-    *SKIP.get_or_init(|| {
-        env::var("INFINO_DISABLE_BG_FILL")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    *SKIP.get_or_init(|| crate::config::global().diagnostics.disable_bg_fill)
 }
 
 async fn lazy_background_fill(

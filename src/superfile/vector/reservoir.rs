@@ -49,6 +49,8 @@
 
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 
+use crate::config;
+
 /// Multiplier on a column's IVF centroid count to size its k-means
 /// training sample. Slightly above the FAISS-empirical 30–60× sweet
 /// spot for IVF training, picked for recall headroom.
@@ -90,17 +92,16 @@ pub fn default_kmeans_sample_size(n_cent: usize) -> usize {
 /// Unlike [`default_kmeans_sample_size`] there is no absolute representativeness
 /// floor — that floor suits the global build over the whole corpus, whereas a
 /// per-cell sub-build trains a few sub-centroids over one cell, so the sample
-/// need only scale with the sub-cluster count. `mult` is overridable via
-/// `INFINO_KMEANS_PTS_PER_CENTROID`.
+/// need only scale with the sub-cluster count. `mult` is sourced from
+/// `vector.kmeans_pts_per_centroid` (falling back to the built-in default when
+/// it is set to zero).
 pub fn partition_kmeans_sample_size(n_cent: usize) -> usize {
-    static PTS_PER_CENTROID: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let mult = *PTS_PER_CENTROID.get_or_init(|| {
-        std::env::var("INFINO_KMEANS_PTS_PER_CENTROID")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|&m| m > 0)
-            .unwrap_or(KMEANS_SAMPLE_NCENT_MULT)
-    });
+    let configured = config::global().vector.kmeans_pts_per_centroid;
+    let mult = if configured > 0 {
+        configured
+    } else {
+        KMEANS_SAMPLE_NCENT_MULT
+    };
     mult.saturating_mul(n_cent)
         .clamp(mult, KMEANS_SAMPLE_SIZE_CAP)
 }

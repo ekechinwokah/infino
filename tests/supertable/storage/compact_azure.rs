@@ -203,6 +203,7 @@ fn azure_compact_config(container: &str, prefix: &str, cache_root: &std::path::P
             ..StorageSettings::default()
         },
         compaction: CompactionSettings::default(),
+        ..Config::default()
     }
 }
 

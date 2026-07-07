@@ -1867,6 +1867,7 @@ pub(crate) mod diag {
                 ..StorageSettings::default()
             },
             compaction: CompactionSettings::default(),
+            ..Config::default()
         }
     }
 

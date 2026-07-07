@@ -85,6 +85,7 @@ use super::{
 };
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::{
+    config,
     storage::StorageProvider,
     superfile::{SuperfileReader, fts::reader::BoolMode},
     supertable::{
@@ -617,20 +618,29 @@ impl SupertableReader {
         // storage cells before centroid ranking) was the recall bug — not this.
         // User table (pre-drain): each superfile is its own IVF shard, so the
         // budget is `nprobe × eligible_superfiles` centroids ranked globally.
-        // `INFINO_INNER_BUDGET` overrides with an absolute centroid count.
+        // `vector.inner_budget` overrides with an absolute centroid count.
         let default_budget = if is_hidden_vector_index_table(&manifest.options) {
             nprobe.max(1)
         } else {
             nprobe.saturating_mul(n_eligible.max(1)).max(nprobe)
         };
-        let budget = std::env::var("INFINO_INNER_BUDGET")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
+        let budget = config::global()
+            .vector
+            .inner_budget
             .map(|b| b.max(1))
             .unwrap_or(default_budget);
         if scored.len() > budget {
+            // Break score ties by the centroid's `(superfile, cluster)` — a
+            // unique total order — so the selected set is deterministic. With
+            // an unstable partition on score alone, equidistant centroids
+            // (common when vectors share a direction) land in the kept set
+            // arbitrarily, so the fanned-out clusters, and thus the result
+            // set, would vary run to run. Tie order among equal scores is
+            // irrelevant to recall.
             scored.select_nth_unstable_by(budget, |a, b| {
-                a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)
+                a.2.partial_cmp(&b.2)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
             });
             scored.truncate(budget);
         }
@@ -1170,6 +1180,21 @@ fn subtract_tombstones(
 /// we never sort more than k elements — O(S·k·log k) instead of
 /// O(S·k·log(S·k)) for the full-sort approach.
 fn top_k_ascending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
+    // Total order over hits: distance ascending, then the unique
+    // `(superfile, local_doc_id)` key. The tie-break makes the kept set
+    // deterministic when scores are equal (common when many rows share a
+    // direction) — otherwise the k-boundary among ties would be resolved by
+    // heap feed order (HashMap iteration + fan-out completion), which varies
+    // run to run. Tie order never affects recall: equal-distance rows are
+    // interchangeable.
+    fn hit_order(a: &SuperfileHit, b: &SuperfileHit) -> Ordering {
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.superfile.cmp(&b.superfile))
+            .then_with(|| a.local_doc_id.cmp(&b.local_doc_id))
+    }
+
     #[derive(PartialEq)]
     struct MaxByScore(SuperfileHit);
     impl Eq for MaxByScore {}
@@ -1180,17 +1205,15 @@ fn top_k_ascending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<Super
     }
     impl Ord for MaxByScore {
         fn cmp(&self, other: &Self) -> Ordering {
-            self.0
-                .score
-                .partial_cmp(&other.0.score)
-                .unwrap_or(Ordering::Equal)
+            hit_order(&self.0, &other.0)
         }
     }
 
     // Boundary replicas are stored in different hidden cell superfiles but carry
     // the same user `_id` in `stable_id`. Collapse them before the top-k heap so
-    // one logical row cannot occupy multiple result slots. User-table hits
-    // without `stable_id` pass through unchanged.
+    // one logical row cannot occupy multiple result slots. On a score tie the
+    // smaller `(superfile, local_doc_id)` wins, so the survivor is deterministic.
+    // User-table hits without `stable_id` pass through unchanged.
     let mut best_by_id: HashMap<i128, SuperfileHit> = HashMap::new();
     let mut passthrough = Vec::new();
     for hit in per_superfile.into_iter().flatten() {
@@ -1198,7 +1221,7 @@ fn top_k_ascending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<Super
             best_by_id
                 .entry(id)
                 .and_modify(|existing| {
-                    if hit.score < existing.score {
+                    if hit_order(&hit, existing) == Ordering::Less {
                         *existing = hit;
                     }
                 })
@@ -1208,19 +1231,23 @@ fn top_k_ascending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<Super
         }
     }
 
+    // Max-heap keyed by `hit_order`: the peek is the current worst (largest
+    // distance, largest tie-break key). Keep the k smallest under that total
+    // order, evicting the worst when a strictly-better candidate arrives — so
+    // the kept set is independent of insertion order.
     let mut heap = BinaryHeap::with_capacity(k + 1);
     for hit in best_by_id.into_values().chain(passthrough) {
         if heap.len() < k {
             heap.push(MaxByScore(hit));
         } else if let Some(worst) = heap.peek()
-            && hit.score < worst.0.score
+            && hit_order(&hit, &worst.0) == Ordering::Less
         {
             heap.pop();
             heap.push(MaxByScore(hit));
         }
     }
     let mut result: Vec<SuperfileHit> = heap.into_iter().map(|m| m.0).collect();
-    result.sort_unstable_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal));
+    result.sort_unstable_by(hit_order);
     result
 }
 

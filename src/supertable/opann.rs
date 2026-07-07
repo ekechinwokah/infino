@@ -21,9 +21,10 @@
 //! manifest centroids and rows to fp32 before [`distance`]; rows are
 //! re-spliced with [`encode_encoded_rows`], never decoded to full fp32 corpora.
 
-use std::{cmp::Ordering, collections::HashMap, env, sync::OnceLock};
+use std::{cmp::Ordering, collections::HashMap};
 
 use crate::{
+    config,
     superfile::vector::{
         cell_posting::{
             EncodedCellRow, dequantize_sq8_residual_into, manifest_centroid_components_from_row,
@@ -34,21 +35,13 @@ use crate::{
     supertable::manifest::ClusterCentroids,
 };
 
-/// Doc count above which a merged cell superfile is split (OPANN step 7).
-const CELL_SPLIT_DOC_CAP_DEFAULT: u64 = 50_000;
-
 /// Lloyd iterations for 2-way Sq8+ε k-means at split time.
 const CELL_SPLIT_KMEANS_ITERS: usize = 5;
 
-/// Overflow threshold for cell split. Override with `INFINO_CELL_SPLIT_DOC_CAP` in tests.
+/// Overflow threshold for cell split (OPANN step 7). Sourced from
+/// `vector.cell_split_doc_cap`.
 pub(crate) fn cell_split_doc_cap() -> u64 {
-    static CAP: OnceLock<u64> = OnceLock::new();
-    *CAP.get_or_init(|| {
-        env::var("INFINO_CELL_SPLIT_DOC_CAP")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(CELL_SPLIT_DOC_CAP_DEFAULT)
-    })
+    config::global().vector.cell_split_doc_cap
 }
 
 /// True when a merged cell superfile should be split into two sub-cells.

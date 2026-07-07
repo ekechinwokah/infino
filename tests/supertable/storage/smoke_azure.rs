@@ -145,6 +145,7 @@ fn real_azure_config(container: &str, prefix: &str, cache_root: &std::path::Path
             ..StorageSettings::default()
         },
         compaction: CompactionSettings::default(),
+        ..Config::default()
     }
 }
 

@@ -36,6 +36,7 @@
 use std::{
     env, fmt,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use figment::{
@@ -69,7 +70,7 @@ impl From<figment::Error> for ConfigError {
 }
 
 /// System-wide infino settings.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct Config {
     /// Supertable runtime knobs (thread pools, id column,
     /// commit threshold).
@@ -83,6 +84,35 @@ pub struct Config {
     /// Compaction settings.
     #[serde(default)]
     pub compaction: CompactionSettings,
+    /// Vector-index build / search / drain tuning knobs.
+    #[serde(default)]
+    pub vector: VectorSettings,
+    /// Diagnostic and hardware-capability toggles. These gate
+    /// instrumentation (timers / tracing) or force a slower code
+    /// path for A/B measurement; none of them change query
+    /// results. Default: everything off.
+    #[serde(default)]
+    pub diagnostics: DiagnosticsSettings,
+}
+
+/// Process-wide config, loaded once from the standard hierarchy
+/// (see [`Config::load`]) on first access and cached for the life
+/// of the process.
+///
+/// This is the source for tuning knobs that are read deep in leaf
+/// code paths — SIMD dispatch, the I/O timeline, the vector drain —
+/// where threading a per-table [`crate::supertable::SupertableOptions`]
+/// down to the read site isn't practical. Such knobs were previously
+/// bespoke `std::env::var("INFINO_…")` reads; they now live in
+/// [`Config`] and are read from here, so a single YAML (or the
+/// `INFINO_<SECTION>__<FIELD>` env form figment already supports)
+/// controls them.
+///
+/// Load failure falls back to the embedded defaults so a read site
+/// never panics on a malformed host config.
+pub fn global() -> &'static Config {
+    static GLOBAL: OnceLock<Config> = OnceLock::new();
+    GLOBAL.get_or_init(|| Config::load().unwrap_or_default())
 }
 
 /// Supertable subsection of [`Config`]. Keeps supertable-
@@ -162,6 +192,125 @@ impl Default for CompactionSettings {
             max_memory_mb: DEFAULT_COMPACTION_MAX_MEMORY_MB,
         }
     }
+}
+
+// Vector-tuning defaults. Kept equal to the historical inline
+// literals so folding these knobs into config preserves behavior.
+/// Default overflow threshold before a merged cell superfile is split.
+const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 50_000;
+/// Default k-means training points per centroid for per-cell sub-builds.
+const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
+/// Default user superfiles the hidden-index drain materializes per batch.
+const DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES: i64 = 64;
+/// Default drain replica factor: `1.0` means no boundary replicas.
+const DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR: f32 = 1.0;
+
+/// How the writer aligns user-superfile vector clusters to the global
+/// cell grid. Selected by `vector.user_centroids`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CentroidAlignment {
+    /// Local per-superfile k-means (default). Each superfile trains
+    /// its own clusters.
+    #[default]
+    Local,
+    /// Build user superfiles aligned to the global cell grid
+    /// (cluster `c` == cell `c`) so the drain routes cluster → cell
+    /// doc-correctly without re-scoring.
+    Global,
+}
+
+/// Per-cell consolidation op the hidden-index drain applies. Selected
+/// by `vector.drain_consolidate`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DrainConsolidate {
+    /// Materialize each superfile's rows, assign to the nearest global
+    /// cell, and re-cluster per cell (default).
+    #[default]
+    Kmeans,
+    /// Route each superfile's local clusters to their nearest global
+    /// cell and keep them verbatim as multi-cluster fragments (no
+    /// re-cluster).
+    Splice,
+}
+
+/// Vector-index build / search / drain tuning knobs. Grouped so the
+/// vector-specific levers don't crowd the top-level namespace. All
+/// have defaults equal to the engine's built-in behavior; a fresh
+/// install never needs to set any of them.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct VectorSettings {
+    /// Absolute cap on fine IVF centroids probed per vector search.
+    /// `None` (the default) derives the budget from `nprobe` and the
+    /// number of eligible superfiles at query time; `Some(n)` forces
+    /// exactly `n`.
+    pub inner_budget: Option<usize>,
+    /// K-means training points per centroid for the drain's per-cell
+    /// sub-builds. Higher trains on more points (slower, tighter
+    /// clusters).
+    pub kmeans_pts_per_centroid: usize,
+    /// Doc count above which a merged cell superfile is split into two
+    /// sub-cells during hidden-index maintenance.
+    pub cell_split_doc_cap: u64,
+    /// How user-superfile clusters align to the global cell grid.
+    pub user_centroids: CentroidAlignment,
+    /// User superfiles the hidden-index drain materializes per batch
+    /// before publishing that batch's cell superfiles. Bounds drain
+    /// RAM to O(batch). `-1` = unbounded (one merge, O(corpus) RAM);
+    /// `0` = skip the drain entirely.
+    pub drain_batch_superfiles: i64,
+    /// Target storage amplification for boundary-only drain
+    /// replication. `1.2` lets the drain add at most `0.2 × rows`
+    /// extra copies of rows near a Voronoi boundary; `<= 1.0` disables
+    /// replication.
+    pub drain_replica_target_factor: f32,
+    /// Per-cell consolidation op the drain applies.
+    pub drain_consolidate: DrainConsolidate,
+    /// Read fan-out for the drain's superfile opens. `auto` resolves
+    /// to one in-flight read per hardware thread, floored at the
+    /// background-fill default and capped at 64.
+    pub drain_read_concurrency: ThreadCount,
+}
+
+impl Default for VectorSettings {
+    fn default() -> Self {
+        Self {
+            inner_budget: None,
+            kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
+            cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,
+            user_centroids: CentroidAlignment::Local,
+            drain_batch_superfiles: DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES,
+            drain_replica_target_factor: DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR,
+            drain_consolidate: DrainConsolidate::Kmeans,
+            drain_read_concurrency: ThreadCount::Auto,
+        }
+    }
+}
+
+/// Diagnostic and hardware-capability toggles. Each gates
+/// instrumentation or forces a slower path for A/B measurement; none
+/// change query results. Default: all `false`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct DiagnosticsSettings {
+    /// Accumulate per-phase timers during the vector drain build.
+    pub drain_build_timers: bool,
+    /// Emit the FTS builder's finish-phase profile.
+    pub fts_profile: bool,
+    /// Capture the object-store I/O timeline.
+    pub io_timeline: bool,
+    /// Skip the `LazyForegroundWithBackgroundFill` full-superfile
+    /// background promotion, serving cold queries over range GETs only
+    /// (measures cold fan-out cost in isolation).
+    pub disable_bg_fill: bool,
+    /// Force the AVX2 vector-distance path even where AVX-512 is
+    /// available (A/B measurement).
+    pub disable_avx512: bool,
+    /// Force the scalar vector-distance path even where AVX2 is
+    /// available (A/B measurement).
+    pub disable_avx2: bool,
 }
 
 /// Options for [`crate::Supertable::optimize`].
@@ -830,5 +979,81 @@ supertable:
         // A wrong-typed value (bool) fails through the default visitor,
         // which formats the `expecting` description.
         assert!(serde_json::from_str::<ThreadCount>("true").is_err());
+    }
+
+    #[test]
+    fn embedded_default_vector_equals_struct_default() {
+        // The shipped YAML and the Rust `Default` must not drift.
+        let cfg = Config::defaults().expect("embedded default must parse");
+        assert_eq!(cfg.vector, VectorSettings::default());
+        assert_eq!(cfg.vector.inner_budget, None);
+        assert_eq!(cfg.vector.cell_split_doc_cap, 50_000);
+        assert_eq!(cfg.vector.user_centroids, CentroidAlignment::Local);
+        assert_eq!(cfg.vector.drain_consolidate, DrainConsolidate::Kmeans);
+        assert_eq!(cfg.vector.drain_read_concurrency, ThreadCount::Auto);
+    }
+
+    #[test]
+    fn embedded_default_diagnostics_all_off() {
+        let cfg = Config::defaults().expect("embedded default must parse");
+        assert_eq!(cfg.diagnostics, DiagnosticsSettings::default());
+        assert!(!cfg.diagnostics.io_timeline);
+        assert!(!cfg.diagnostics.disable_avx512);
+    }
+
+    #[test]
+    fn vector_yaml_layer_overrides_defaults() {
+        let yaml = r#"
+vector:
+  inner_budget: 4096
+  cell_split_doc_cap: 100000
+  user_centroids: global
+  drain_consolidate: splice
+  drain_replica_target_factor: 1.25
+  drain_read_concurrency: 12
+"#;
+        let fig = Figment::new()
+            .merge(Yaml::string(EMBEDDED_DEFAULT))
+            .merge(Yaml::string(yaml));
+        let cfg = Config::from_figment(fig).expect("layered yaml");
+        assert_eq!(cfg.vector.inner_budget, Some(4096));
+        assert_eq!(cfg.vector.cell_split_doc_cap, 100_000);
+        assert_eq!(cfg.vector.user_centroids, CentroidAlignment::Global);
+        assert_eq!(cfg.vector.drain_consolidate, DrainConsolidate::Splice);
+        assert_eq!(cfg.vector.drain_replica_target_factor, 1.25);
+        assert_eq!(cfg.vector.drain_read_concurrency, ThreadCount::Fixed(12));
+        // Untouched keys fall through to the embedded default.
+        assert_eq!(cfg.vector.drain_batch_superfiles, 64);
+    }
+
+    #[test]
+    fn vector_nested_env_var_overrides_field() {
+        let _g = ENV_LOCK.lock().expect("acquire lock");
+        // SAFETY: serialized via ENV_LOCK; cleanup at end.
+        unsafe {
+            env::set_var("INFINO_VECTOR__USER_CENTROIDS", "global");
+            env::set_var("INFINO_VECTOR__DRAIN_BATCH_SUPERFILES", "32");
+        }
+        let cfg = Config::load().expect("load with vector env override");
+        assert_eq!(cfg.vector.user_centroids, CentroidAlignment::Global);
+        assert_eq!(cfg.vector.drain_batch_superfiles, 32);
+        unsafe {
+            env::remove_var("INFINO_VECTOR__USER_CENTROIDS");
+            env::remove_var("INFINO_VECTOR__DRAIN_BATCH_SUPERFILES");
+        }
+    }
+
+    #[test]
+    fn diagnostics_nested_env_var_overrides_field() {
+        let _g = ENV_LOCK.lock().expect("acquire lock");
+        // SAFETY: serialized via ENV_LOCK; cleanup at end.
+        unsafe {
+            env::set_var("INFINO_DIAGNOSTICS__IO_TIMELINE", "true");
+        }
+        let cfg = Config::load().expect("load with diagnostics env override");
+        assert!(cfg.diagnostics.io_timeline);
+        unsafe {
+            env::remove_var("INFINO_DIAGNOSTICS__IO_TIMELINE");
+        }
     }
 }

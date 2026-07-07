@@ -800,7 +800,7 @@ fn chunk_rows_for_dim(dim: usize) -> usize {
 /// Build one column's subsection from Sq8+ε maintenance rows. Reuses the same
 /// on-disk IVF layout and pass-3 assembly as [`build_subsection_streaming`].
 /// Opt-in phase timers for the materialized (drain) IVF build, enabled by
-/// `INFINO_DRAIN_BUILD_TIMERS=1`. The per-cell build runs in parallel (rayon),
+/// `diagnostics.drain_build_timers`. The per-cell build runs in parallel (rayon),
 /// so each phase accumulates into a shared atomic — the total is summed CPU
 /// across cells, not wall-clock, which is what tells us whether the build is
 /// compute-bound and where (train vs assign vs calibrate). The drain resets
@@ -821,11 +821,7 @@ pub(crate) mod build_phase_timers {
 
     pub fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| {
-            std::env::var("INFINO_DRAIN_BUILD_TIMERS")
-                .map(|v| v == "1" || v == "true")
-                .unwrap_or(false)
-        })
+        *ON.get_or_init(|| crate::config::global().diagnostics.drain_build_timers)
     }
 
     /// Run `f`, adding its elapsed micros to `counter` when timing is enabled.

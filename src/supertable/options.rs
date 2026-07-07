@@ -315,7 +315,8 @@ pub struct SupertableOptions {
     /// `-1` = unbounded (all user superfiles in one merge: lowest cell
     /// fragmentation, but O(corpus) RAM — the pre-batching behavior). `0` =
     /// skip the drain entirely. Default [`DEFAULT_DRAIN_BATCH_SUPERFILES`].
-    /// The `INFINO_DRAIN_BATCH_SUPERFILES` env var overrides this (bench/ops).
+    /// [`SupertableOptions::apply_config`] copies `vector.drain_batch_superfiles`
+    /// into this field; [`Self::with_drain_batch_superfiles`] overrides per table.
     pub drain_batch_superfiles: i64,
     /// Eager-load threshold for manifest parts at
     /// [`Supertable::open`] time. When the manifest list
@@ -822,6 +823,7 @@ impl SupertableOptions {
         );
         self.commit_threshold_size_mb = cfg.supertable.commit_threshold_size_mb;
         self.verify_crc_on_open = cfg.supertable.verify_crc_on_open;
+        self.drain_batch_superfiles = cfg.vector.drain_batch_superfiles;
         if cfg.supertable.id_column != self.id_column {
             if self
                 .schema

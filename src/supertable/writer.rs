@@ -100,6 +100,7 @@ use super::{
 use crate::superfile::ReadError;
 use crate::{
     InfinoError,
+    config::{self, CentroidAlignment, DrainConsolidate, ThreadCount},
     runtime_bridge::bridge_on_runtime,
     storage::{StorageError, StorageProvider},
     superfile::{
@@ -1236,16 +1237,13 @@ impl SupertableWriter {
         // Parallel publish: user + hidden manifest/storage commits overlap.
         let user_inner = Arc::clone(&self.inner);
         let user_options = Arc::clone(&self.inner.options);
-        // A/B knob (`INFINO_USER_CENTROIDS=global`): build user superfiles
+        // A/B knob (`vector.user_centroids: global`): build user superfiles
         // aligned to the GLOBAL cell grid (cluster c == cell c) instead of local
         // k-means — so the splice/kmeans drain routes cluster c → cell c
         // doc-correctly. The grid is read from THIS table's manifest (bootstrapped
         // above, Phase A). Default `local` is unchanged.
         let user_global_centroids: Option<std::sync::Arc<[f32]>> =
-            if std::env::var("INFINO_USER_CENTROIDS")
-                .map(|v| v == "global")
-                .unwrap_or(false)
-            {
+            if config::global().vector.user_centroids == CentroidAlignment::Global {
                 self.inner
                     .manifest
                     .load()
@@ -2004,26 +2002,29 @@ fn maint_pool() -> &'static rayon::ThreadPool {
 /// atomically with each batch's cell commit — so re-running (or running
 /// periodically) drains only newly-ingested commits, never duplicating cells.
 /// Pre-drain queries see an empty hidden index (0 results) until this runs.
+///
+/// Batch size comes from `vector.drain_batch_superfiles`, which
+/// [`SupertableOptions::apply_config`] copies into the option below; per-table
+/// callers can still override it via `with_drain_batch_superfiles`.
 fn drain_batch_superfiles(opts: &SupertableOptions) -> i64 {
-    std::env::var("INFINO_DRAIN_BATCH_SUPERFILES")
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(opts.drain_batch_superfiles)
+    opts.drain_batch_superfiles
 }
 
-/// Default drain replica factor: `1.0` means no boundary replicas.
+/// Drain replica factor at or below which no boundary replicas are added.
 const DEFAULT_DRAIN_REPLICA_TARGET_FACTOR: f32 = 1.0;
 
 /// Target storage amplification for boundary-only drain replication. For
 /// example, `1.2` means the drain may add at most `0.2 * rows` extra row copies,
 /// selected from rows closest to a Voronoi boundary. Values `<= 1.0` disable
-/// replication; the knob is explicit so the default drain path is unchanged.
+/// replication; the default drain path is unchanged. Sourced from
+/// `vector.drain_replica_target_factor`.
 fn drain_replica_target_factor() -> f32 {
-    std::env::var("INFINO_DRAIN_REPLICA_TARGET_FACTOR")
-        .ok()
-        .and_then(|v| v.trim().parse::<f32>().ok())
-        .filter(|v| v.is_finite() && *v > DEFAULT_DRAIN_REPLICA_TARGET_FACTOR)
-        .unwrap_or(DEFAULT_DRAIN_REPLICA_TARGET_FACTOR)
+    let factor = config::global().vector.drain_replica_target_factor;
+    if factor.is_finite() && factor > DEFAULT_DRAIN_REPLICA_TARGET_FACTOR {
+        factor
+    } else {
+        DEFAULT_DRAIN_REPLICA_TARGET_FACTOR
+    }
 }
 
 fn drain_replica_extra_budget(n_rows: usize, target_factor: f32) -> usize {
@@ -2074,8 +2075,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // drain working-set RAM stays O(batch) instead of O(corpus) (the >3M memory
     // wall). Each batch opens its readers, builds its cell superfiles, publishes
     // them (append — one file per touched cell), then frees its working set.
-    // Batch size is `drain_batch_superfiles` (env `INFINO_DRAIN_BATCH_SUPERFILES`
-    // overrides): `0` = skip, `-1` = unbounded single merge.
+    // Batch size is `vector.drain_batch_superfiles`: `0` = skip, `-1` =
+    // unbounded single merge.
     let user_manifest = user_inner.manifest.load_full();
     let sources: Vec<Arc<SuperfileEntry>> = user_manifest.get_all_superfiles().to_vec();
     if sources.is_empty() {
@@ -2155,18 +2156,19 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         .first()
         .map(|c| c.metric)
         .unwrap_or(Metric::L2Sq);
-    // A/B the per-cell consolidation op (`INFINO_DRAIN_CONSOLIDATE`):
+    // A/B the per-cell consolidation op (`vector.drain_consolidate`):
     //   `kmeans` (default) — materialize each superfile's rows, assign to the
     //     nearest global cell, re-cluster per cell → few clean clusters per cell.
     //   `splice` — route each superfile's LOCAL clusters to their nearest global
     //     cell, keep them verbatim as multi-cluster fragments (no re-cluster).
-    let mode = std::env::var("INFINO_DRAIN_CONSOLIDATE").unwrap_or_else(|_| "kmeans".into());
-    // assign-skip: with global-aligned user superfiles (`INFINO_USER_CENTROIDS=
+    let mode = match config::global().vector.drain_consolidate {
+        DrainConsolidate::Kmeans => "kmeans",
+        DrainConsolidate::Splice => "splice",
+    };
+    // assign-skip: with global-aligned user superfiles (`vector.user_centroids:
     // global`) cluster c == cell c, so group by the row's own cluster ordinal
     // instead of the O(n·n_cent) per-row nearest-cell scoring.
-    let assign_skip = std::env::var("INFINO_USER_CENTROIDS")
-        .map(|v| v == "global")
-        .unwrap_or(false);
+    let assign_skip = config::global().vector.user_centroids == CentroidAlignment::Global;
     let column_name = column.clone();
 
     let drain_t0 = std::time::Instant::now();
@@ -3169,13 +3171,12 @@ const DRAIN_READ_CONCURRENCY_CAP: usize = 64;
 /// portable runtime proxy for it (a cloud instance's NIC scales with its size).
 /// The auto default is one in-flight read per hardware thread, floored at the
 /// read layer's background-fill default (`prefetch_concurrency`) so small boxes
-/// still fan out, and capped at [`DRAIN_READ_CONCURRENCY_CAP`]. Overridable
-/// (unclamped) with `INFINO_DRAIN_READ_CONCURRENCY`.
+/// still fan out, and capped at [`DRAIN_READ_CONCURRENCY_CAP`]. Sourced from
+/// `vector.drain_read_concurrency`; an explicit integer there is used verbatim
+/// (unclamped), while `auto` applies the vCPU-derived default.
 fn drain_read_concurrency() -> usize {
-    if let Some(n) = std::env::var("INFINO_DRAIN_READ_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
+    if let ThreadCount::Fixed(n) = config::global().vector.drain_read_concurrency
+        && n > 0
     {
         return n;
     }
