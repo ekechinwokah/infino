@@ -2324,6 +2324,65 @@ mod tests {
         assert_eq!(cache.stats().n_cold_fetches, 1);
     }
 
+    /// Compaction opens hidden superfiles through
+    /// `reader_synchronous_with_storage`, which must return an eager reader
+    /// even when the cache currently holds a lazy entry from query fan-out.
+    #[tokio::test]
+    async fn reader_synchronous_with_storage_upgrades_lazy_hidden_entry() {
+        use crate::storage::{LocalFsStorageProvider, PrefixedStorageProvider};
+
+        let dir = TempDir::new().expect("tempdir");
+        let user_storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("user root"));
+        let hidden_root = dir.path().join("hidden_prefix");
+        std::fs::create_dir_all(&hidden_root).expect("hidden root");
+        let hidden_storage: Arc<dyn StorageProvider> = Arc::new(PrefixedStorageProvider::new(
+            Arc::clone(&user_storage),
+            "hidden_prefix",
+        ));
+
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&user_storage),
+            DiskCacheConfig {
+                cache_root: dir.path().join("cache"),
+                cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+                mmap_cold_threshold_secs: 0,
+                ..Default::default()
+            },
+        )
+        .expect("cache");
+
+        let uri = SuperfileUri::new_v4();
+        hidden_storage
+            .put_atomic(&uri.storage_path(), tiny_superfile_bytes())
+            .await
+            .expect("put at hidden prefix");
+
+        // Query path admission: lazy reader with no resident parquet bytes.
+        let lazy = cache
+            .reader_with_hints(&uri, None, Some(&hidden_storage))
+            .await
+            .expect("lazy cold fetch via caller storage");
+        assert!(
+            lazy.parquet_bytes().is_none(),
+            "lazy mode should not materialize full parquet bytes"
+        );
+
+        // Compaction path must force an eager reopen via caller storage.
+        let eager = cache
+            .reader_synchronous_with_storage(&uri, Arc::clone(&hidden_storage))
+            .await
+            .expect("synchronous compaction open");
+        assert!(
+            eager.parquet_bytes().is_some(),
+            "compaction input must have resident parquet bytes"
+        );
+        let batch = eager
+            .get_record_batch(None)
+            .expect("compaction should read full RecordBatch");
+        assert_eq!(batch.num_rows(), 1);
+    }
+
     // ----- RangeOnly mode rejects + open_range_only bypass -----
 
     #[tokio::test]

@@ -79,9 +79,9 @@
 //! `inf.fts.columns` JSON already carries a `"tokenizer"` field on
 //! each entry (currently always `"ascii_lower"`), so the on-disk
 //! format is forward-compatible without a file rewrite.
-use std::{collections::HashSet, fmt, sync::Arc};
+use std::{collections::HashSet, fmt, io::Error, sync::Arc};
 
-use arrow_array::{Array, LargeStringArray, RecordBatch};
+use arrow_array::{Array, Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Schema};
 use parquet::basic::{Compression, ZstdLevel};
 use roaring::RoaringBitmap;
@@ -417,6 +417,34 @@ pub struct SuperfileBuilder {
 }
 
 impl SuperfileBuilder {
+    fn record_batch_from_inline_ids(
+        reader: &SuperfileReader,
+        deleted: Option<Arc<RoaringBitmap>>,
+    ) -> Option<RecordBatch> {
+        let schema = reader.schema();
+        if schema.fields().len() != 1 {
+            return None;
+        }
+        let id_field = schema.field(0);
+        if id_field.name() != reader.id_column()
+            || id_field.data_type() != &DataType::Decimal128(38, 0)
+        {
+            return None;
+        }
+        let locals = if let Some(bitmap) = deleted.as_ref() {
+            (0..(reader.n_docs() as u32))
+                .filter(|local| !bitmap.contains(*local))
+                .collect::<Vec<u32>>()
+        } else {
+            (0..(reader.n_docs() as u32)).collect::<Vec<u32>>()
+        };
+        let ids = reader.vec()?.inline_stable_ids_for_locals(&locals)?;
+        let ids = Decimal128Array::from(ids)
+            .with_precision_and_scale(38, 0)
+            .ok()?;
+        RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(ids)]).ok()
+    }
+
     /// Construct from options. Validates schema + names; returns
     /// `BuildError::*` on any inconsistency.
     pub fn new(opts: BuilderOptions) -> Result<Self, BuildError> {
@@ -676,10 +704,22 @@ impl SuperfileBuilder {
         let mut merge_inputs: Vec<(&VectorReader, String, u32)> = Vec::with_capacity(readers.len());
         let mut local_base = 0u32;
 
-        for (reader, deleted) in readers {
-            let record_batch = reader
-                .get_record_batch(deleted.clone())
-                .map_err(|_| BuildError::BatchReadError)?;
+        for (idx, (reader, deleted)) in readers.iter().enumerate() {
+            let record_batch = match reader.get_record_batch(deleted.clone()) {
+                Ok(batch) => batch,
+                Err(e) => {
+                    if let Some(batch) = Self::record_batch_from_inline_ids(reader, deleted.clone())
+                    {
+                        batch
+                    } else {
+                        return Err(BuildError::Io(Error::other(format!(
+                            "sq8 merge input {idx}: read RecordBatch failed (n_docs={}, eager={}): {e}",
+                            reader.n_docs(),
+                            reader.parquet_bytes().is_some(),
+                        ))));
+                    }
+                }
+            };
             let stats = SuperfileStats::try_compute_from_record_batch(&record_batch)?;
             stats_collector.push(stats);
 

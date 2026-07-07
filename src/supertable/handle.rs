@@ -2116,6 +2116,250 @@ mod tests {
         );
     }
 
+    /// Regression guard for optimize/compaction on the hidden vector index:
+    /// after lazy hidden-index reads, hidden compaction must still open every
+    /// input as an eager reader and merge without `RecordBatch` read failures.
+    #[test]
+    fn hidden_compaction_succeeds_after_lazy_hidden_reads() {
+        use arrow_array::{Array, FixedSizeListArray, Float32Array};
+
+        use crate::{
+            config::CompactionSettings,
+            superfile::{
+                builder::VectorConfig,
+                reader::VectorSearchOptions,
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        };
+
+        const DIM: usize = 16;
+        const ROWS_PER_COMMIT: usize = 5_000;
+        const DRAIN_ROUNDS: usize = 3;
+
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "emb",
+            DataType::FixedSizeList(item_field.clone(), DIM as i32),
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+
+        let make_options = || {
+            SupertableOptions::new(
+                schema.clone(),
+                vec![],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim: DIM,
+                    n_cent: 4,
+                    rot_seed: 7,
+                    metric: Metric::Cosine,
+                    rerank_codec: RerankCodec::Sq8Residual,
+                    provided_centroids: None,
+                }],
+                None,
+            )
+            .expect("valid options")
+            .with_storage(Arc::clone(&storage))
+            .with_writer_pool(Arc::clone(&pool))
+        };
+
+        {
+            let producer = Supertable::create(make_options()).expect("create");
+            for _ in 0..DRAIN_ROUNDS {
+                let flat = vec![1.0f32; ROWS_PER_COMMIT * DIM];
+                let fsl = FixedSizeListArray::new(
+                    item_field.clone(),
+                    DIM as i32,
+                    Arc::new(Float32Array::from(flat)),
+                    None,
+                );
+                let batch = arrow_array::RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(fsl) as Arc<dyn Array>],
+                )
+                .expect("batch");
+                let mut w = producer.writer().expect("writer");
+                w.append(&batch).expect("append");
+                w.commit().expect("commit");
+                producer.drain_vectors_to_cells_sync().expect("drain");
+            }
+        }
+
+        let cfg = DiskCacheConfig {
+            cache_root: cache_dir.path().to_path_buf(),
+            disk_budget_bytes: 1 << 30,
+            cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+            cold_fetch_streams: 4,
+            cold_fetch_chunk_bytes: 1 << 20,
+            mmap_cold_threshold_secs: 0,
+            mmap_sweep_interval_secs: 0,
+            eviction: Box::new(LruPolicy::new()),
+            verify_crc_on_open: true,
+            ..Default::default()
+        };
+        let pinned_fn: Arc<dyn Fn() -> std::collections::HashSet<SuperfileUri> + Send + Sync> =
+            Arc::new(std::collections::HashSet::new);
+        let cache = DiskCacheStore::new(Arc::clone(&storage), cfg, pinned_fn).expect("cache");
+        let consumer =
+            Supertable::open(make_options().with_disk_cache(Arc::clone(&cache))).expect("open");
+
+        let hidden = consumer
+            .reader()
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        let mut per_cell: HashMap<Vec<u8>, usize> = HashMap::new();
+        for entry in &hidden.reader().manifest().superfiles {
+            *per_cell.entry(entry.partition_key.clone()).or_insert(0) += 1;
+        }
+        let max_per_cell = per_cell.values().copied().max().unwrap_or(0);
+        assert!(
+            max_per_cell >= 2,
+            "expected >=2 hidden superfiles in at least one cell, got max {max_per_cell}"
+        );
+
+        // Populate hidden readers through the lazy query path before compaction.
+        let query = vec![1.0f32; DIM];
+        let hits = consumer
+            .reader()
+            .vector_hits("emb", &query, 10, VectorSearchOptions::new(), None)
+            .expect("vector search");
+        assert!(!hits.is_empty(), "hidden index should return vector hits");
+
+        hidden
+            .compact(&CompactionSettings {
+                target_superfile_size_mb: 1,
+                min_fill_percent: 1,
+                max_memory_mb: 64,
+            })
+            .expect("hidden compaction should succeed after lazy reads");
+    }
+
+    /// Regression guard for user-table compaction after pre-drain lazy reads.
+    /// The pre-drain vector query path opens user superfiles lazily through the
+    /// disk cache; subsequent compaction must still read full record batches.
+    #[test]
+    fn user_compaction_succeeds_after_pre_drain_lazy_reads() {
+        use arrow_array::{Array, FixedSizeListArray, Float32Array};
+
+        use crate::{
+            config::CompactionSettings,
+            superfile::{
+                builder::VectorConfig,
+                reader::VectorSearchOptions,
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
+        };
+
+        const DIM: usize = 1024;
+        const ROWS_PER_COMMIT: usize = 512;
+        const N_COMMITS: usize = 4;
+
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "emb",
+            DataType::FixedSizeList(item_field.clone(), DIM as i32),
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+
+        let make_options = || {
+            SupertableOptions::new(
+                schema.clone(),
+                vec![],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim: DIM,
+                    n_cent: 4,
+                    rot_seed: 7,
+                    metric: Metric::Cosine,
+                    rerank_codec: RerankCodec::Sq8Residual,
+                    provided_centroids: None,
+                }],
+                None,
+            )
+            .expect("valid options")
+            .with_storage(Arc::clone(&storage))
+            .with_writer_pool(Arc::clone(&pool))
+        };
+
+        {
+            let producer = Supertable::create(make_options()).expect("create");
+            for _ in 0..N_COMMITS {
+                let flat = vec![1.0f32; ROWS_PER_COMMIT * DIM];
+                let fsl = FixedSizeListArray::new(
+                    item_field.clone(),
+                    DIM as i32,
+                    Arc::new(Float32Array::from(flat)),
+                    None,
+                );
+                let batch = arrow_array::RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(fsl) as Arc<dyn Array>],
+                )
+                .expect("batch");
+                let mut w = producer.writer().expect("writer");
+                w.append(&batch).expect("append");
+                w.commit().expect("commit");
+            }
+        }
+
+        let cfg = DiskCacheConfig {
+            cache_root: cache_dir.path().to_path_buf(),
+            disk_budget_bytes: 1 << 30,
+            cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+            cold_fetch_streams: 4,
+            cold_fetch_chunk_bytes: 1 << 20,
+            mmap_cold_threshold_secs: 0,
+            mmap_sweep_interval_secs: 0,
+            eviction: Box::new(LruPolicy::new()),
+            verify_crc_on_open: true,
+            ..Default::default()
+        };
+        let pinned_fn: Arc<dyn Fn() -> std::collections::HashSet<SuperfileUri> + Send + Sync> =
+            Arc::new(std::collections::HashSet::new);
+        let cache = DiskCacheStore::new(Arc::clone(&storage), cfg, pinned_fn).expect("cache");
+        let consumer =
+            Supertable::open(make_options().with_disk_cache(Arc::clone(&cache))).expect("open");
+
+        // Pre-drain query path: user superfiles are read lazily.
+        let query = vec![1.0f32; DIM];
+        let hits = consumer
+            .reader()
+            .vector_hits("emb", &query, 10, VectorSearchOptions::new(), None)
+            .expect("vector search");
+        assert!(!hits.is_empty(), "pre-drain user search should return hits");
+
+        consumer
+            .compact(&CompactionSettings {
+                target_superfile_size_mb: 1,
+                min_fill_percent: 1,
+                max_memory_mb: 64,
+            })
+            .expect("user compaction should succeed after lazy pre-drain reads");
+    }
+
     /// Each drain APPENDS one superfile per non-empty cell to the hidden
     /// manifest (no removals — the user superfiles stay as the durable
     /// source). So draining across successive commits accumulates multiple
