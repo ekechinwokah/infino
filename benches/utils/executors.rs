@@ -24,6 +24,18 @@ pub fn p50(samples: &mut [Duration]) -> Duration {
     samples[(samples.len() - 1) / 2]
 }
 
+/// Mean of per-iteration on-CPU seconds, or `None` when nothing was
+/// sampled (e.g. `/proc/self/task` unavailable). Shared by every tier's
+/// cold measurement so the cost ledger prices cold-query compute from
+/// measured on-CPU time — a cold query is almost all object-store I/O
+/// wait, so its wall latency wildly overstates its CPU.
+pub fn mean_opt(samples: &[f64]) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    Some(samples.iter().sum::<f64>() / samples.len() as f64)
+}
+
 /// Cold timings for one query, split at the open/search boundary:
 /// `open` is the fresh-consumer open (consumer + manifest + every
 /// superfile reader), `search` is the first query over the opened but
@@ -34,6 +46,13 @@ pub fn p50(samples: &mut [Duration]) -> Duration {
 pub struct ColdTiming {
     pub open: Duration,
     pub search: Duration,
+    /// Measured on-CPU seconds for the open / first-search windows
+    /// (all-thread schedstat delta), when sampled. `None` ⇒ the cost model
+    /// falls back to the wall-latency CPU approximation. A cold query is
+    /// almost all object-store I/O wait, so its on-CPU time is far below its
+    /// wall latency — measuring it is the only way the ledger reflects that.
+    pub open_cpu_s: Option<f64>,
+    pub search_cpu_s: Option<f64>,
 }
 
 /// Force-open every superfile reader on the consumer's pinned snapshot —
@@ -55,6 +74,7 @@ pub mod fts {
 
     use super::*;
     use crate::{
+        cpu,
         harness::{BoolMode, FtsQuery},
         markdown::{fmt_count, fmt_time},
         report::{Better, Block, Cell, Report, Section, metric, text},
@@ -425,13 +445,23 @@ pub mod fts {
             let mode = to_infino_mode(q.mode);
             let mut open_samples = Vec::with_capacity(iters);
             let mut search_samples = Vec::with_capacity(iters);
+            let mut open_cpu = Vec::with_capacity(iters);
+            let mut search_cpu = Vec::with_capacity(iters);
             for _ in 0..iters {
+                let oc0 = cpu::process_cpu_ns();
                 let t_open = Instant::now();
                 let guard = open_fresh();
                 open_samples.push(t_open.elapsed());
+                if let Some(c) = cpu::cpu_seconds_since(oc0) {
+                    open_cpu.push(c);
+                }
+                let sc0 = cpu::process_cpu_ns();
                 let t = Instant::now();
                 let rows = guard.bm25_rows(column, &query, k, mode);
                 search_samples.push(t.elapsed());
+                if let Some(c) = cpu::cpu_seconds_since(sc0) {
+                    search_cpu.push(c);
+                }
                 std::hint::black_box(rows);
                 drop(guard);
             }
@@ -440,6 +470,8 @@ pub mod fts {
                 ColdTiming {
                     open: p50(&mut open_samples),
                     search: p50(&mut search_samples),
+                    open_cpu_s: mean_opt(&open_cpu),
+                    search_cpu_s: mean_opt(&search_cpu),
                 },
             );
         }
@@ -672,6 +704,7 @@ pub mod vector {
     use super::*;
     use crate::{
         corpus::{self, Calibrated},
+        cpu,
         markdown::fmt_time,
         report::{Better, Block, Cell, Report, Section, metric, text},
         rss::{self, PeakSampler, RssStats},
@@ -1072,19 +1105,31 @@ pub mod vector {
     ) -> ColdTiming {
         let mut open_samples = Vec::with_capacity(iters);
         let mut search_samples = Vec::with_capacity(iters);
+        let mut open_cpu = Vec::with_capacity(iters);
+        let mut search_cpu = Vec::with_capacity(iters);
         for _ in 0..iters {
+            let oc0 = cpu::process_cpu_ns();
             let t_open = Instant::now();
             let guard = open_fresh();
             open_samples.push(t_open.elapsed());
+            if let Some(c) = cpu::cpu_seconds_since(oc0) {
+                open_cpu.push(c);
+            }
+            let sc0 = cpu::process_cpu_ns();
             let t0 = Instant::now();
             let hits = guard.topk_global(column, query, k, nprobe, rerank);
             search_samples.push(t0.elapsed());
+            if let Some(c) = cpu::cpu_seconds_since(sc0) {
+                search_cpu.push(c);
+            }
             black_box(hits);
             drop(guard);
         }
         ColdTiming {
             open: p50(&mut open_samples),
             search: p50(&mut search_samples),
+            open_cpu_s: mean_opt(&open_cpu),
+            search_cpu_s: mean_opt(&search_cpu),
         }
     }
 
@@ -1394,6 +1439,7 @@ pub mod sql {
 
     use super::*;
     use crate::{
+        cpu,
         harness::{InfinoSqlEngine, InfinoSqlIndex, SqlEngine, SqlQuery},
         markdown::{fmt_count, fmt_time},
         report::{Better, Block, Cell, Report, Section, metric, text},
@@ -1762,13 +1808,23 @@ pub mod sql {
             );
             let mut open_samples = Vec::with_capacity(iters);
             let mut search_samples = Vec::with_capacity(iters);
+            let mut open_cpu = Vec::with_capacity(iters);
+            let mut search_cpu = Vec::with_capacity(iters);
             for _ in 0..iters {
+                let oc0 = cpu::process_cpu_ns();
                 let t_open = Instant::now();
                 let guard = open_fresh();
                 open_samples.push(t_open.elapsed());
+                if let Some(c) = cpu::cpu_seconds_since(oc0) {
+                    open_cpu.push(c);
+                }
+                let sc0 = cpu::process_cpu_ns();
                 let t0 = Instant::now();
                 let rows = guard.query_rows(q.sql);
                 search_samples.push(t0.elapsed());
+                if let Some(c) = cpu::cpu_seconds_since(sc0) {
+                    search_cpu.push(c);
+                }
                 black_box(rows);
                 drop(guard);
             }
@@ -1777,6 +1833,8 @@ pub mod sql {
                 ColdTiming {
                     open: p50(&mut open_samples),
                     search: p50(&mut search_samples),
+                    open_cpu_s: mean_opt(&open_cpu),
+                    search_cpu_s: mean_opt(&search_cpu),
                 },
             );
         }

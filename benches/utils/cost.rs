@@ -163,6 +163,27 @@ impl Instance {
         p50_s * cpu_share.max(ram_share)
     }
 
+    /// vCPU·s for a CPU-labeled per-query row. Prefers measured on-CPU
+    /// seconds (`cpu_s`); a cold query's wall latency is almost all
+    /// object-store I/O wait, so pricing it as `latency × share` overstates
+    /// its compute by orders of magnitude. Falls back to the wall model only
+    /// when no measurement exists (e.g. `/proc` unavailable).
+    fn per_query_cpu_vcpu_seconds(
+        &self,
+        latency_s: f64,
+        cpu_s: Option<f64>,
+        resident_anon_bytes: u64,
+    ) -> f64 {
+        match cpu_s {
+            Some(c) => c,
+            None => self.per_query_vcpu_seconds(latency_s, resident_anon_bytes),
+        }
+    }
+
+    fn per_query_cpu_usd(&self, latency_s: f64, cpu_s: Option<f64>, resident_anon_bytes: u64) -> f64 {
+        self.per_query_cpu_vcpu_seconds(latency_s, cpu_s, resident_anon_bytes) * self.usd_per_sec()
+    }
+
     fn ram_binds(&self, resident_anon_bytes: u64) -> bool {
         let cpu_share = 1.0 / f64::from(self.vcpu.max(1));
         let ram_share = resident_anon_bytes as f64 / BYTES_PER_GIB / self.ram_gib;
@@ -175,6 +196,12 @@ pub struct ColdQuery {
     pub name: String,
     pub open_s: f64,
     pub search_s: f64,
+    /// Measured on-CPU seconds for the open / first-search windows, when
+    /// sampled. A cold query is mostly object-store I/O wait, so its wall
+    /// latency (`open_s`/`search_s`) drastically overstates its CPU; when
+    /// present these price the CPU-labeled rows from actual compute instead.
+    pub open_cpu_s: Option<f64>,
+    pub search_cpu_s: Option<f64>,
 }
 
 /// Metered object-store I/O for the lifecycle phases of one bench cell.
@@ -478,7 +505,8 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     // object-store requests for the first-query fetch window.
     let cold_query_req_usd = c.store.cold_query.map(|io| request_usd(&io));
     let cold_query_usd = anchor_cold.map(|q| {
-        inst.per_query_usd(q.search_s, c.resident_anon_bytes) + cold_query_req_usd.unwrap_or(0.0)
+        inst.per_query_cpu_usd(q.search_s, q.search_cpu_s, c.resident_anon_bytes)
+            + cold_query_req_usd.unwrap_or(0.0)
     });
 
     // ---- Block 1: rate card ----
@@ -880,26 +908,40 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         ]);
     }
     if let Some(q) = anchor_cold {
-        let open_vcpu = inst.per_query_vcpu_seconds(q.open_s, c.resident_anon_bytes);
+        let open_vcpu = inst.per_query_cpu_vcpu_seconds(q.open_s, q.open_cpu_s, c.resident_anon_bytes);
         let open_usd = open_vcpu * inst.usd_per_sec();
         let open_label = if c.cold_open_amortized {
             format!("Table open CPU (one-time, {})", q.name)
         } else {
             format!("Cold open CPU ({})", q.name)
         };
+        // The wall/basis cell notes measured CPU so a reader can see the
+        // vCPU·s is on-CPU time, not the (I/O-dominated) wall latency.
+        let open_basis = if q.open_cpu_s.is_some() {
+            format!("{} wall · measured CPU", fmt_wall_seconds(q.open_s))
+        } else {
+            fmt_wall_seconds(q.open_s)
+        };
         compute_rows.push(vec![
             text(open_label),
-            text(fmt_wall_seconds(q.open_s)),
+            text(open_basis),
             text(fmt_vcpu_seconds(open_vcpu)),
             metric(open_usd, usd(open_usd), Better::Lower),
         ]);
-        let search_per_q = inst.per_query_usd(q.search_s, c.resident_anon_bytes);
+        let search_per_q = inst.per_query_cpu_usd(q.search_s, q.search_cpu_s, c.resident_anon_bytes);
+        let search_basis = if q.search_cpu_s.is_some() {
+            format!("{} p50 · measured CPU", fmt_time(q.search_s * 1e9))
+        } else {
+            format!("{} p50", fmt_time(q.search_s * 1e9))
+        };
         compute_rows.push(vec![
             text(format!("Cold query CPU ({})", q.name)),
-            text(format!("{} p50", fmt_time(q.search_s * 1e9))),
-            text(fmt_vcpu_seconds(
-                inst.per_query_vcpu_seconds(q.search_s, c.resident_anon_bytes),
-            )),
+            text(search_basis),
+            text(fmt_vcpu_seconds(inst.per_query_cpu_vcpu_seconds(
+                q.search_s,
+                q.search_cpu_s,
+                c.resident_anon_bytes,
+            ))),
             metric(
                 search_per_q * PER_MILLION,
                 format!("{} queries", usd_per_million(search_per_q)),
@@ -1004,7 +1046,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         ]);
     }
     if let Some(q) = c.cold_pre.and_then(|rows| rows.first()) {
-        let per_q = inst.per_query_usd(q.search_s, c.resident_anon_bytes)
+        let per_q = inst.per_query_cpu_usd(q.search_s, q.search_cpu_s, c.resident_anon_bytes)
             + c.store
                 .cold_query_pre
                 .map(|io| request_usd(&io))
@@ -1086,6 +1128,8 @@ pub fn cold_from_timings(cold: &HashMap<&'static str, ColdTiming>) -> Vec<ColdQu
             name: (*name).to_string(),
             open_s: t.open.as_secs_f64(),
             search_s: t.search.as_secs_f64(),
+            open_cpu_s: t.open_cpu_s,
+            search_cpu_s: t.search_cpu_s,
         })
         .collect()
 }
@@ -1139,6 +1183,8 @@ pub fn cold_from_vector(rows: &[RecallRow]) -> Vec<ColdQuery> {
                     name: label,
                     open_s: t.open.as_secs_f64(),
                     search_s: t.search.as_secs_f64(),
+                    open_cpu_s: t.open_cpu_s,
+                    search_cpu_s: t.search_cpu_s,
                 }
             })
         })
