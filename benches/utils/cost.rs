@@ -20,9 +20,9 @@
 //!      [`crate::storage_meter`] wrapper; phases that did not run metered
 //!      are omitted, never guessed.
 //!   3. **Compute ledger** — one-time phases (ingest/drain/compaction)
-//!      priced from measured on-CPU seconds (wall × vCPU-share fallback);
-//!      per-query phases from p50 latency. One-time phases in absolute
-//!      dollars, per-query phases per 1M queries.
+//!      and per-query phases priced from measured on-CPU seconds (never a
+//!      wall-clock approximation). One-time phases in absolute dollars,
+//!      per-query phases per 1M queries.
 //!   4. **Serving** — latency per dollar; cold rows include request cost.
 //!
 //! Local NVMe (file-backed disk-cache mmap) is treated as free.
@@ -113,21 +113,29 @@ impl Instance {
         self.usd_per_hour / SECS_PER_HOUR
     }
 
+    /// Dollar rate of one vCPU-second on this instance.
+    fn usd_per_vcpu_sec(&self) -> f64 {
+        self.usd_per_sec() / f64::from(self.vcpu.max(1))
+    }
+
     /// Fraction of the instance's RAM a resident set occupies.
     fn ram_share(&self, resident_bytes: u64) -> f64 {
         resident_bytes as f64 / BYTES_PER_GIB / self.ram_gib
     }
 
-    /// RAM-hold leg for a one-time phase: `wall × peak-RSS share`. RAM is
-    /// allocated at phase start and dropped at the end, so a RAM-bound phase
-    /// bills its RSS share for the full wall duration.
+    /// RAM-hold leg for a one-time phase, in aggregate vCPU-seconds: `wall ×
+    /// peak-RSS share × vcpu`. Expressed in the same aggregate-vCPU-second unit
+    /// as measured CPU so `phase_vcpu_seconds` / `compute_usd` price CPU- and
+    /// RAM-bound phases uniformly — `compute_usd` divides the `vcpu` back out,
+    /// so a RAM-bound phase still bills exactly RSS-share × wall.
     fn ram_leg(&self, wall_s: f64, peak_rss_bytes: Option<u64>) -> f64 {
         wall_s * peak_rss_bytes.map(|b| self.ram_share(b)).unwrap_or(0.0)
+            * f64::from(self.vcpu.max(1))
     }
 
-    /// Binding vCPU·s for a one-time phase from MEASURED on-CPU seconds:
-    /// `max(measured CPU, RAM-hold leg)`. CPU is never approximated from wall
-    /// time — schedstat is the only compute basis, and a phase without a
+    /// Binding aggregate vCPU·s for a one-time phase from MEASURED on-CPU
+    /// seconds: `max(measured CPU, RAM-hold leg)`. CPU is never approximated
+    /// from wall time — schedstat is the only compute basis; a phase without a
     /// measurement is reported NOT METERED by the caller (never a wall guess).
     fn phase_vcpu_seconds(&self, cpu_s: f64, wall_s: f64, peak_rss_bytes: Option<u64>) -> f64 {
         cpu_s.max(self.ram_leg(wall_s, peak_rss_bytes))
@@ -138,24 +146,38 @@ impl Instance {
         cpu_s >= self.ram_leg(wall_s, peak_rss_bytes)
     }
 
-    fn per_query_usd(&self, p50_s: f64, resident_anon_bytes: u64) -> f64 {
-        self.per_query_vcpu_seconds(p50_s, resident_anon_bytes) * self.usd_per_sec()
+    /// Dollars for measured on-CPU work: aggregate vCPU-seconds (summed across
+    /// cores via schedstat) priced at the per-vCPU rate, never the whole-
+    /// instance rate. Every measured-CPU row — one-time phases, table open, and
+    /// per-query compute — prices through here.
+    fn compute_usd(&self, vcpu_s: f64) -> f64 {
+        vcpu_s * self.usd_per_vcpu_sec()
     }
 
-    fn per_query_vcpu_seconds(&self, p50_s: f64, resident_anon_bytes: u64) -> f64 {
-        let cpu_share = 1.0 / f64::from(self.vcpu.max(1));
-        let ram_share = resident_anon_bytes as f64 / BYTES_PER_GIB / self.ram_gib;
-        p50_s * cpu_share.max(ram_share)
+    /// RAM-hold leg for one query, in aggregate vCPU-seconds: the resident
+    /// heap's share of the box held for the query's COMPUTE window (`window ×
+    /// RSS-share × vcpu`). For a warm query the window is its own p50; for a
+    /// cold query it is the same-config warm p50 — once bytes are local the
+    /// scoring path holds the heap for about the warm window, while the rest
+    /// of the cold p50 is off-CPU I/O wait that holds no extra heap.
+    fn query_ram_leg(&self, window_s: f64, resident_anon_bytes: u64) -> f64 {
+        window_s * self.ram_share(resident_anon_bytes) * f64::from(self.vcpu.max(1))
     }
 
-    /// Dollars for a per-query CPU-labeled row from MEASURED on-CPU seconds.
-    /// A cold query is mostly object-store I/O wait, so its wall latency
-    /// overstates compute by orders of magnitude; only measured on-CPU time
-    /// is billed, and the caller reports NOT METERED when it's absent.
-    fn per_query_cpu_usd(&self, cpu_s: f64) -> f64 {
-        cpu_s * self.usd_per_sec()
+    /// Aggregate vCPU·s a query bills: `max(measured on-CPU, RAM-hold leg)` —
+    /// the binding resource over its compute window.
+    fn per_query_vcpu_seconds(&self, cpu_s: f64, window_s: f64, resident_anon_bytes: u64) -> f64 {
+        cpu_s.max(self.query_ram_leg(window_s, resident_anon_bytes))
     }
 
+    /// Per-query dollars from the binding leg (see `per_query_vcpu_seconds`),
+    /// priced per-vCPU.
+    fn per_query_usd(&self, cpu_s: f64, window_s: f64, resident_anon_bytes: u64) -> f64 {
+        self.compute_usd(self.per_query_vcpu_seconds(cpu_s, window_s, resident_anon_bytes))
+    }
+
+    /// Whether the resident heap outweighs a single core's share of the box —
+    /// the coarse serving-binding indicator (`DRAM` vs `CPU`).
     fn ram_binds(&self, resident_anon_bytes: u64) -> bool {
         let cpu_share = 1.0 / f64::from(self.vcpu.max(1));
         let ram_share = resident_anon_bytes as f64 / BYTES_PER_GIB / self.ram_gib;
@@ -168,13 +190,16 @@ pub struct ColdQuery {
     pub name: String,
     pub open_s: f64,
     pub search_s: f64,
-    /// Measured on-CPU seconds for the open / first-search windows, when
-    /// sampled. A cold query is mostly object-store I/O wait, so its wall
-    /// latency (`open_s`/`search_s`) drastically overstates its CPU; when
-    /// present these price the CPU-labeled rows from actual compute instead.
+    /// Measured on-CPU seconds for the table-open window, when sampled.
     pub open_cpu_s: Option<f64>,
+    /// Measured on-CPU seconds for the first-search window, when sampled.
+    /// Includes fetch-path on-CPU work (decompress, CRC, cache write) plus
+    /// scoring; excludes I/O wait. Priced separately — never copied from warm.
     pub search_cpu_s: Option<f64>,
 }
+
+/// Warm query timing and measured on-CPU seconds.
+pub type WarmQueryCost = (String, f64, Option<f64>);
 
 /// Metered object-store I/O for the lifecycle phases of one bench cell.
 /// Every field is optional: a phase that wasn't metered is reported as
@@ -256,11 +281,11 @@ pub struct CellCost<'a> {
     pub n_docs: usize,
     pub resident_anon_bytes: u64,
     /// Steady-state (post-drain, on a vector cell) warm latency battery.
-    pub warm: &'a [(String, f64)],
+    pub warm: &'a [WarmQueryCost],
     /// Cold latency rows (open and search timed separately), steady state.
     pub cold: Option<&'a [ColdQuery]>,
     /// Pre-drain warm battery — the transient shape before maintenance.
-    pub warm_pre: Option<&'a [(String, f64)]>,
+    pub warm_pre: Option<&'a [WarmQueryCost]>,
     /// Pre-drain cold latency rows.
     pub cold_pre: Option<&'a [ColdQuery]>,
     /// Measured object-store I/O per phase.
@@ -299,9 +324,21 @@ fn usd_per_million(per_unit: f64) -> String {
     format!("{}/1M", usd(per_unit * PER_MILLION))
 }
 
+/// One-time phase cost — always labeled so it is not compared to per-query $.
+fn usd_one_time(v: f64) -> String {
+    format!("{} one-time", usd(v))
+}
+
+/// Per-query cost with both scales visible — prevents comparing $/open to $/1M.
+fn usd_per_query_both_scales(per_query: f64) -> String {
+    format!("{}/query ({})", usd(per_query), usd_per_million(per_query))
+}
+
 fn usd_per_gb(v: f64) -> String {
-    if v < 0.01 {
-        format!("${v:.4}/GB")
+    // Three decimals below $0.10: the S3 capacity rate is $0.023/GB-mo and
+    // a two-decimal "$0.02/GB" would misstate the rate the math applies.
+    if v < 0.1 {
+        format!("${v:.3}/GB")
     } else {
         format!("${v:.2}/GB")
     }
@@ -320,8 +357,15 @@ fn storage_months() -> f64 {
 fn fmt_vcpu_seconds(s: f64) -> String {
     if s >= 10.0 {
         format!("{s:.1} vCPU·s")
-    } else {
+    } else if s >= 0.01 {
         format!("{s:.2} vCPU·s")
+    } else if s > 0.0 {
+        // Sub-centi vCPU·s: show enough digits that vCPU·s × per-vCPU-rate
+        // visibly reconciles with the $ column (0.00068 must not read "0.00").
+        let decimals = ((-s.log10()).ceil() as usize + 1).min(6);
+        format!("{s:.decimals$} vCPU·s")
+    } else {
+        "0.00 vCPU·s".into()
     }
 }
 
@@ -387,13 +431,13 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     let ingest_compute = c
         .ingest_cpu_s
         .map(|cpu| inst.phase_vcpu_seconds(cpu, c.ingest_wall_s, c.ingest_peak_rss_bytes))
-        .map(|vcpu| vcpu * inst.usd_per_sec());
+        .map(|vcpu| inst.compute_usd(vcpu));
     let drain_wall_s = c.store.drain_wall_s.unwrap_or(0.0);
     let drain_compute = c
         .store
         .drain_cpu_s
         .map(|cpu| inst.phase_vcpu_seconds(cpu, drain_wall_s, c.store.drain_peak_rss_bytes))
-        .map(|vcpu| vcpu * inst.usd_per_sec());
+        .map(|vcpu| inst.compute_usd(vcpu));
     let compaction_wall_s = c.store.compaction_wall_s.unwrap_or(0.0);
     let compaction_compute = c
         .store
@@ -401,7 +445,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         .map(|cpu| {
             inst.phase_vcpu_seconds(cpu, compaction_wall_s, c.store.compaction_peak_rss_bytes)
         })
-        .map(|vcpu| vcpu * inst.usd_per_sec());
+        .map(|vcpu| inst.compute_usd(vcpu));
 
     let ingest_req_usd = match (c.store.ingest, c.unmetered_put_count) {
         (Some(io), _) => request_usd(&io),
@@ -434,13 +478,17 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     let gb_months = stored_gb * retention_months;
     let storage_month = gb_months * USD_PER_GB_MONTH;
 
-    // ---- Warm query battery (CPU-priced) ----
+    // ---- Warm query battery (priced from MEASURED on-CPU seconds) ----
+    // Only entries with a sampled cpu are priced; an unmetered warm query is
+    // omitted from the battery rather than back-filled with a wall guess.
     let warm_costs: Vec<(f64, f64, String)> = c
         .warm
         .iter()
-        .map(|(name, p50_s)| {
-            let per_q = inst.per_query_usd(*p50_s, c.resident_anon_bytes);
-            (per_q, *p50_s, name.clone())
+        .filter_map(|(name, p50_s, cpu_s)| {
+            cpu_s.map(|cpu| {
+                let per_q = inst.per_query_usd(cpu, *p50_s, c.resident_anon_bytes);
+                (per_q, *p50_s, name.clone())
+            })
         })
         .collect();
     let (min_q_cost, max_q_cost, fastest_name, fastest_p50) = if warm_costs.is_empty() {
@@ -467,12 +515,26 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             .or_else(|| rows.first())
     });
 
-    // Per-query cold dollars = marginal CPU for the search + measured
-    // object-store requests for the first-query fetch window.
+    // The same-config warm p50 — the cold query's RAM-hold window (the heap
+    // is held for the compute portion of a cold query, about the warm window;
+    // the rest of the cold p50 is off-CPU I/O wait holding no extra heap).
+    let warm_window_for = |name: &str| -> Option<f64> {
+        c.warm
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .or_else(|| c.warm.first())
+            .map(|(_, p50_s, _)| *p50_s)
+    };
+
+    // Per-query cold dollars = binding(MEASURED cold-search on-CPU, RAM leg
+    // over the warm-scale compute window) + measured object-store requests
+    // for the first-query fetch window. Cold search CPU is metered separately
+    // (includes decompress/decode/scoring); it is never copied from warm.
     let cold_query_req_usd = c.store.cold_query.map(|io| request_usd(&io));
     let cold_query_usd = anchor_cold.map(|q| {
+        let window = warm_window_for(&q.name).unwrap_or(0.0);
         q.search_cpu_s
-            .map(|cpu| inst.per_query_cpu_usd(cpu))
+            .map(|cpu| inst.per_query_usd(cpu, window, c.resident_anon_bytes))
             .unwrap_or(0.0)
             + cold_query_req_usd.unwrap_or(0.0)
     });
@@ -754,15 +816,18 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 let per_query_get = io.get_count as f64 / iters as f64;
                 let per_query_usd = request_usd(&io) / iters as f64;
                 let per_million = per_query_usd * PER_MILLION;
+                // Enough decimals that e.g. 1 GET / 20 queries reads 0.05,
+                // not a doubled-looking "0.1".
+                let get_cell = if per_query_get > 0.0 && per_query_get < 0.1 {
+                    format!("{per_query_get:.2} GET/query")
+                } else {
+                    format!("{per_query_get:.1} GET/query")
+                };
                 rows.push(vec![
                     text(label),
                     text(format!("{} over {iters} queries", fmt_requests(&io))),
                     text(fmt_io_bytes(&io)),
-                    metric(
-                        per_query_get,
-                        format!("{per_query_get:.1} GET/query"),
-                        Better::Lower,
-                    ),
+                    metric(per_query_get, get_cell, Better::Lower),
                     metric(
                         per_million,
                         format!("{}/1M queries", usd(per_million)),
@@ -809,11 +874,12 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         let Some(cpu) = cpu_s else {
             return vec![text(label), text("NOT METERED"), text("—"), text("—")];
         };
+        let ram = inst.ram_leg(wall_s, peak_rss);
         let vcpu = inst.phase_vcpu_seconds(cpu, wall_s, peak_rss);
-        let usd_v = vcpu * inst.usd_per_sec();
+        let usd_v = inst.compute_usd(vcpu);
         let binding = match peak_rss {
             Some(rss) if !inst.phase_cpu_binds(cpu, wall_s, peak_rss) => {
-                format!(" — RAM-bound: {} peak held for the window", fmt_bytes(rss))
+                format!(" — RAM-bound: {} peak held {}", fmt_bytes(rss), fmt_wall_seconds(wall_s))
             }
             Some(rss) => format!(" — {} peak, CPU binds", fmt_bytes(rss)),
             None => String::new(),
@@ -821,8 +887,14 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         vec![
             text(format!("{label}{binding}")),
             text(format!("{} · measured CPU", fmt_wall_seconds(wall_s))),
-            text(fmt_vcpu_seconds(vcpu)),
-            metric(usd_v, usd(usd_v), Better::Lower),
+            // Both legs of the binding rule, so the RAM input is never silent.
+            text(format!(
+                "max(cpu {}, ram {}) = {}",
+                fmt_vcpu_seconds(cpu),
+                fmt_vcpu_seconds(ram),
+                fmt_vcpu_seconds(vcpu),
+            )),
+            metric(usd_v, usd_one_time(usd_v), Better::Lower),
         ]
     };
     let mut compute_rows = vec![phase_row(
@@ -867,31 +939,42 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         } else {
             format!("Cold open CPU ({})", q.name)
         };
-        // Cold open / query CPU are priced from MEASURED on-CPU seconds — a
-        // cold path is mostly object-store I/O wait, so its wall latency is
-        // not its compute. NOT METERED (never latency × share) when unsampled.
+        // Table open is compute-bound (manifest parse + reader CRC: measured
+        // cpu ≈ wall), so it's priced from its MEASURED on-CPU seconds. NOT
+        // METERED (never latency × share) when unsampled.
         compute_rows.push(match q.open_cpu_s {
             Some(cpu) => {
-                let open_usd = inst.per_query_cpu_usd(cpu);
+                let open_usd = inst.compute_usd(cpu);
                 vec![
                     text(open_label),
                     text(format!("{} · measured CPU", fmt_wall_seconds(q.open_s))),
                     text(fmt_vcpu_seconds(cpu)),
-                    metric(open_usd, usd(open_usd), Better::Lower),
+                    metric(open_usd, usd_one_time(open_usd), Better::Lower),
                 ]
             }
             None => vec![text(open_label), text("NOT METERED"), text("—"), text("—")],
         });
+        // Cold search CPU: MEASURED on-CPU during the search window (decompress,
+        // decode, scoring — not copied from warm), with the RAM leg over the
+        // warm-scale compute window. NOT METERED when unsampled.
         compute_rows.push(match q.search_cpu_s {
             Some(cpu) => {
-                let per_q = inst.per_query_cpu_usd(cpu);
+                let window = warm_window_for(&q.name).unwrap_or(0.0);
+                let ram = inst.query_ram_leg(window, c.resident_anon_bytes);
+                let vcpu = inst.per_query_vcpu_seconds(cpu, window, c.resident_anon_bytes);
+                let per_q = inst.compute_usd(vcpu);
                 vec![
                     text(format!("Cold query CPU ({})", q.name)),
                     text(format!("{} p50 · measured CPU", fmt_time(q.search_s * 1e9))),
-                    text(fmt_vcpu_seconds(cpu)),
+                    text(format!(
+                        "max(cpu {}, ram {}) = {}",
+                        fmt_vcpu_seconds(cpu),
+                        fmt_vcpu_seconds(ram),
+                        fmt_vcpu_seconds(vcpu),
+                    )),
                     metric(
                         per_q * PER_MILLION,
-                        format!("{} queries", usd_per_million(per_q)),
+                        usd_per_query_both_scales(per_q),
                         Better::Lower,
                     ),
                 ]
@@ -904,39 +987,62 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             ],
         });
     }
-    if let Some((name, p50_s)) = c
+    if let Some((name, p50_s, cpu_s)) = c
         .warm
         .iter()
-        .find(|(n, _)| n == "ten_term_or")
+        .find(|(n, _, _)| n == "ten_term_or")
         .or_else(|| c.warm.first())
     {
-        let per_q = inst.per_query_usd(*p50_s, c.resident_anon_bytes);
-        compute_rows.push(vec![
-            text(format!("Warm query CPU ({name})")),
-            text(format!("{} p50", fmt_time(*p50_s * 1e9))),
-            text(fmt_vcpu_seconds(
-                inst.per_query_vcpu_seconds(*p50_s, c.resident_anon_bytes),
-            )),
-            metric(
-                per_q * PER_MILLION,
-                format!("{} queries", usd_per_million(per_q)),
-                Better::Lower,
-            ),
-        ]);
+        // Warm query priced from MEASURED on-CPU seconds (per-vCPU) with the
+        // RAM leg over its own p50 window. NOT METERED when unsampled.
+        compute_rows.push(match cpu_s {
+            Some(cpu) => {
+                let ram = inst.query_ram_leg(*p50_s, c.resident_anon_bytes);
+                let vcpu = inst.per_query_vcpu_seconds(*cpu, *p50_s, c.resident_anon_bytes);
+                let per_q = inst.compute_usd(vcpu);
+                vec![
+                    text(format!("Warm query CPU ({name})")),
+                    text(format!("{} p50 · measured CPU", fmt_time(*p50_s * 1e9))),
+                    text(format!(
+                        "max(cpu {}, ram {}) = {}",
+                        fmt_vcpu_seconds(*cpu),
+                        fmt_vcpu_seconds(ram),
+                        fmt_vcpu_seconds(vcpu),
+                    )),
+                    metric(
+                        per_q * PER_MILLION,
+                        usd_per_query_both_scales(per_q),
+                        Better::Lower,
+                    ),
+                ]
+            }
+            None => vec![
+                text(format!("Warm query CPU ({name})")),
+                text("NOT METERED"),
+                text("—"),
+                text("—"),
+            ],
+        });
     }
     let compute_ledger = Block {
         subtitle: format!(
-            "Compute — one-time phases (ingest/drain/compaction) priced from measured on-CPU \
-             seconds (I/O wait excluded; wall × pool-share fallback when /proc is unavailable), \
-             per-query phases from p50 latency. Priced on {} ({} vCPU / {:.0} GiB / {:.0} GB \
-             NVMe @ ${:.4}/hr); one-time phases in absolute $, per-query phases per 1M queries",
-            inst.name, inst.vcpu, inst.ram_gib, inst.nvme_gb, inst.usd_per_hour,
+            "Compute — each row bills its BINDING resource, shown as max(cpu, ram): `cpu` is \
+             MEASURED on-CPU seconds (schedstat, I/O wait excluded — cold-search CPU is metered \
+             separately, never copied from warm), `ram` is the RAM-hold leg (RSS share of \
+             {:.0} GiB × hold window × {} vCPU; one-time phases hold peak RSS for their wall, \
+             queries hold resident heap for their compute window). The winner is priced at the \
+             per-vCPU rate: {}/{} vCPU = {}/vCPU-hr. Unsampled CPU ⇒ NOT METERED.",
+            inst.ram_gib,
+            inst.vcpu,
+            usd(inst.usd_per_hour),
+            inst.vcpu,
+            usd(inst.usd_per_hour / f64::from(inst.vcpu.max(1))),
         ),
         headers: vec![
             "Phase".into(),
             "Wall / p50".into(),
             "vCPU·s".into(),
-            "Cost".into(),
+            "Cost (one-time $ or $/query · $/1M)".into(),
         ],
         rows: compute_rows,
     };
@@ -950,11 +1056,12 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     let mut serving_rows: Vec<Vec<Cell>> = c
         .warm
         .iter()
-        .map(|(name, p50_s)| {
-            let per_q = inst.per_query_usd(*p50_s, c.resident_anon_bytes);
+        .filter_map(|(name, p50_s, cpu_s)| {
+            let cpu = (*cpu_s)?;
+            let per_q = inst.per_query_usd(cpu, *p50_s, c.resident_anon_bytes);
             let per_q_usd = per_q.max(f64::MIN_POSITIVE);
             let queries_per_usd = 1.0 / per_q_usd;
-            vec![
+            Some(vec![
                 text(format!("{name} — warm")),
                 text(fmt_time(p50_s * 1e9)),
                 metric(
@@ -963,7 +1070,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                     Better::Higher,
                 ),
                 text(usd(per_q * PER_MILLION)),
-            ]
+            ])
         })
         .collect();
     if let (Some(q), Some(per_q)) = (anchor_cold, cold_query_usd) {
@@ -986,8 +1093,8 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     }
     // Pre-drain (transient) serving rows: what a query costs on a fresh
     // table before maintenance drains the hidden index.
-    if let Some((name, p50_s)) = c.warm_pre.and_then(|rows| rows.first()) {
-        let per_q = inst.per_query_usd(*p50_s, c.resident_anon_bytes);
+    if let Some((name, p50_s, Some(cpu))) = c.warm_pre.and_then(|rows| rows.first()) {
+        let per_q = inst.per_query_usd(*cpu, *p50_s, c.resident_anon_bytes);
         let queries_per_usd = 1.0 / per_q.max(f64::MIN_POSITIVE);
         serving_rows.push(vec![
             text(format!("{name} — warm, pre-drain (transient)")),
@@ -1001,9 +1108,16 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         ]);
     }
     if let Some(q) = c.cold_pre.and_then(|rows| rows.first()) {
+        // Same binding rule as the steady-state cold row: measured cold CPU
+        // vs the RAM leg over the pre-drain warm compute window.
+        let pre_window = c
+            .warm_pre
+            .and_then(|rows| rows.first())
+            .map(|(_, p50_s, _)| *p50_s)
+            .unwrap_or(0.0);
         let per_q = q
             .search_cpu_s
-            .map(|cpu| inst.per_query_cpu_usd(cpu))
+            .map(|cpu| inst.per_query_usd(cpu, pre_window, c.resident_anon_bytes))
             .unwrap_or(0.0)
             + c.store
                 .cold_query_pre
@@ -1092,27 +1206,27 @@ pub fn cold_from_timings(cold: &HashMap<&'static str, ColdTiming>) -> Vec<ColdQu
         .collect()
 }
 
-/// Flatten warm FTS stats into `(name, p50_seconds)` for the cost model.
-pub fn warm_from_fts(stats: &[FtsQueryStat]) -> Vec<(String, f64)> {
+/// Flatten warm FTS stats into `(name, p50_seconds, measured_cpu_seconds)`.
+pub fn warm_from_fts(stats: &[FtsQueryStat]) -> Vec<WarmQueryCost> {
     stats
         .iter()
-        .map(|s| (s.name.to_string(), s.p50.as_secs_f64()))
+        .map(|s| (s.name.to_string(), s.p50.as_secs_f64(), s.cpu_s))
         .collect()
 }
 
-/// Flatten warm SQL query sets into `(name, p50_seconds)`.
-pub fn warm_from_sql(sets: &QuerySets) -> Vec<(String, f64)> {
+/// Flatten warm SQL query sets into `(name, p50_seconds, measured_cpu_seconds)`.
+pub fn warm_from_sql(sets: &QuerySets) -> Vec<WarmQueryCost> {
     sets.scalar
         .iter()
         .chain(&sets.tvf)
         .chain(&sets.fts_pushdown)
         .chain(&sets.agg_idx)
-        .map(|s| (s.name.to_string(), s.p50.as_secs_f64()))
+        .map(|s| (s.name.to_string(), s.p50.as_secs_f64(), s.cpu_s))
         .collect()
 }
 
-/// Flatten warm vector recall rows into `(label, p50_seconds)`.
-pub fn warm_from_vector(rows: &[RecallRow]) -> Vec<(String, f64)> {
+/// Flatten warm vector recall rows into `(label, p50_seconds, measured_cpu_seconds)`.
+pub fn warm_from_vector(rows: &[RecallRow]) -> Vec<WarmQueryCost> {
     rows.iter()
         .filter_map(|r| {
             r.warm.as_ref().map(|w| {
@@ -1121,7 +1235,7 @@ pub fn warm_from_vector(rows: &[RecallRow]) -> Vec<(String, f64)> {
                 } else {
                     format!("{} ({})", r.target, r.params)
                 };
-                (label, w.p50_ns / 1e9)
+                (label, w.p50_ns / 1e9, w.cpu_s)
             })
         })
         .collect()
@@ -1175,23 +1289,53 @@ mod tests {
     #[test]
     fn ram_bound_phase_bills_rss_share_for_full_wall() {
         let inst = test_instance();
-        // 8 GiB peak on 16 GiB = 50% RAM share over a 10s wall = 5 vCPU·s RAM
-        // leg; a smaller measured CPU is dominated by it → phase is RAM-bound.
+        // 8 GiB peak on 16 GiB = 50% RAM share over a 10s wall on an 8-vCPU
+        // box = 0.5 × 10 × 8 = 40 aggregate vCPU·s of RAM hold; a smaller
+        // measured CPU is dominated by it → phase is RAM-bound.
         let eight_gib = 8u64 << 30;
-        assert!((inst.phase_vcpu_seconds(1.0, 10.0, Some(eight_gib)) - 5.0).abs() < 1e-9);
+        assert!((inst.phase_vcpu_seconds(1.0, 10.0, Some(eight_gib)) - 40.0).abs() < 1e-9);
         assert!(!inst.phase_cpu_binds(1.0, 10.0, Some(eight_gib)));
         // Measured CPU above the RAM leg binds on CPU and is billed as-is.
-        assert!(inst.phase_cpu_binds(6.0, 10.0, Some(eight_gib)));
-        assert!((inst.phase_vcpu_seconds(6.0, 10.0, Some(eight_gib)) - 6.0).abs() < 1e-9);
+        assert!(inst.phase_cpu_binds(41.0, 10.0, Some(eight_gib)));
+        assert!((inst.phase_vcpu_seconds(41.0, 10.0, Some(eight_gib)) - 41.0).abs() < 1e-9);
+        // A RAM-bound phase still bills exactly RSS-share × wall in dollars —
+        // compute_usd divides the vcpu back out: 40 vCPU·s ⇒ 0.5 × 10 × $/s.
+        let ram_bound_usd = inst.compute_usd(inst.phase_vcpu_seconds(1.0, 10.0, Some(eight_gib)));
+        assert!((ram_bound_usd - 0.5 * 10.0 * inst.usd_per_sec()).abs() < 1e-12);
     }
 
     #[test]
-    fn lower_latency_yields_more_queries_per_dollar() {
+    fn query_cpu_priced_per_vcpu_from_measured_seconds() {
         let inst = test_instance();
-        let fast = inst.per_query_usd(0.001, 1 << 20);
-        let slow = inst.per_query_usd(0.010, 1 << 20);
-        assert!(slow > fast);
-        assert!((slow / fast - 10.0).abs() < 1e-6);
+        // Tiny resident heap ⇒ RAM leg negligible ⇒ measured compute binds. A
+        // query measured at 10× the on-CPU seconds costs 10× more, and it's
+        // priced at the PER-VCPU rate (whole-instance rate ÷ vcpu), never the
+        // whole-instance rate — the bug that inflated cold queries.
+        let small = 1u64 << 20;
+        let cheap = inst.per_query_usd(0.001, 0.001, small);
+        let dear = inst.per_query_usd(0.010, 0.001, small);
+        assert!(dear > cheap);
+        assert!((dear / cheap - 10.0).abs() < 1e-6);
+        assert!((dear - 0.010 * inst.usd_per_sec() / 8.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fmt_vcpu_seconds_reconciles_with_per_vcpu_rate() {
+        // 0.00542 vCPU·s must not display as "0.00" — the user audits by
+        // multiplying vCPU·s × rate and comparing to the $ column.
+        assert_eq!(fmt_vcpu_seconds(0.00542), "0.0054 vCPU·s");
+        assert_eq!(fmt_vcpu_seconds(0.000678), "0.00068 vCPU·s");
+        assert_eq!(fmt_vcpu_seconds(0.05), "0.05 vCPU·s");
+    }
+
+    #[test]
+    fn cold_search_cpu_priced_from_measured_not_warm() {
+        let inst = test_instance();
+        // 0.05 vCPU·s measured cold search @ per-vCPU rate — NOT copied from warm.
+        let cold = inst.compute_usd(0.05);
+        assert!((cold * PER_MILLION - 0.63).abs() < 0.05, "got ${}/1M", cold * PER_MILLION);
+        // Whole-instance rate would 8× overcharge to ~$5/1M — the old bug.
+        assert!(cold * PER_MILLION < 1.0);
     }
 
     #[test]

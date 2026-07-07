@@ -63,6 +63,9 @@ impl ColdSamples {
     }
 
     /// Record one first-search's wall duration and measured on-CPU seconds.
+    /// The search window includes all on-CPU work during a cold query:
+    /// fetch-path decode (TLS, decompress, CRC, cache write) plus IVF scoring.
+    /// I/O wait is off-CPU and excluded by schedstat.
     pub fn push_search(&mut self, wall: Duration, cpu: Option<f64>) {
         self.search_wall.push(wall);
         self.search_cpu.extend(cpu);
@@ -88,12 +91,12 @@ impl ColdSamples {
 pub struct ColdTiming {
     pub open: Duration,
     pub search: Duration,
-    /// Measured on-CPU seconds for the open / first-search windows
-    /// (all-thread schedstat delta), when sampled. `None` ⇒ the cost model
-    /// falls back to the wall-latency CPU approximation. A cold query is
-    /// almost all object-store I/O wait, so its on-CPU time is far below its
-    /// wall latency — measuring it is the only way the ledger reflects that.
+    /// Measured on-CPU seconds for the table-open window (all-thread schedstat
+    /// delta), when sampled.
     pub open_cpu_s: Option<f64>,
+    /// Measured on-CPU seconds for the first-search window (all-thread
+    /// schedstat delta), when sampled. Includes fetch-path on-CPU work
+    /// (decompress, CRC, cache write) plus scoring; excludes I/O wait.
     pub search_cpu_s: Option<f64>,
 }
 
@@ -415,6 +418,10 @@ pub mod fts {
         pub name: &'static str,
         pub p50: Duration,
         pub p50_fetched: Duration,
+        /// Amortized on-CPU seconds of one warm query-phase search — the
+        /// query's measured compute (cache hot, 0 GET), the basis for both the
+        /// warm and cold query CPU cost.
+        pub cpu_s: Option<f64>,
         pub rss: RssStats,
     }
 
@@ -438,12 +445,14 @@ pub mod fts {
                 let _ = reader.bm25_rows(column, &query, k, mode);
                 let sampler = PeakSampler::start_default();
                 let mut samples = Vec::with_capacity(iters);
+                let cpu0 = cpu::process_cpu_ns();
                 for _ in 0..iters {
                     let t = Instant::now();
                     let rows = reader.bm25_rows(column, &query, k, mode);
                     samples.push(t.elapsed());
                     std::hint::black_box(rows);
                 }
+                let cpu_s = cpu::cpu_seconds_since(cpu0).map(|s| s / iters as f64);
                 let _ = reader.bm25_rows_fetched(column, &query, k, mode);
                 let mut fetched_samples = Vec::with_capacity(iters);
                 for _ in 0..iters {
@@ -457,6 +466,7 @@ pub mod fts {
                     name: q.name,
                     p50: p50(&mut samples),
                     p50_fetched: p50(&mut fetched_samples),
+                    cpu_s,
                     rss,
                 }
             })
@@ -1086,10 +1096,15 @@ pub mod vector {
             .collect()
     }
 
-    /// Warm p50 (+ RSS) for one config on an already-warm reader.
+    /// Warm p50 (+ RSS + measured on-CPU) for one config on an already-warm
+    /// reader. `cpu_s` is the amortized on-CPU seconds of one warm query —
+    /// the query's true compute, measured (not a wall proxy). It's the basis
+    /// for BOTH warm and cold query CPU cost: a cold query runs the identical
+    /// scoring, so its compute equals this; the cold premium is I/O requests.
     #[derive(Clone, Copy)]
     pub struct VecTiming {
         pub p50_ns: f64,
+        pub cpu_s: Option<f64>,
         pub rss: RssStats,
     }
 
@@ -1103,16 +1118,22 @@ pub mod vector {
     ) -> VecTiming {
         let sampler = PeakSampler::start_default();
         let _ = reader.topk_global(column, query, k, nprobe, rerank);
+        // Amortize on-CPU over the whole sample loop: one warm query is far
+        // too short to sample schedstat precisely, so measure the batch and
+        // divide. Cache is hot here (0 GET), so this is clean scoring compute.
         let mut samples = Vec::with_capacity(CALIBRATION_P50_ITERS);
+        let cpu0 = cpu::process_cpu_ns();
         for _ in 0..CALIBRATION_P50_ITERS {
             let t0 = Instant::now();
             let hits = reader.topk_global(column, query, k, nprobe, rerank);
             samples.push(t0.elapsed());
             black_box(hits);
         }
+        let cpu_s = cpu::cpu_seconds_since(cpu0).map(|s| s / CALIBRATION_P50_ITERS as f64);
         let rss = sampler.stop_stats();
         VecTiming {
             p50_ns: p50(&mut samples).as_secs_f64() * NS_PER_SEC,
+            cpu_s,
             rss,
         }
     }
@@ -1565,6 +1586,9 @@ pub mod sql {
         pub name: &'static str,
         pub p50: Duration,
         pub rows: usize,
+        /// Amortized on-CPU seconds of one warm query — the query's measured
+        /// compute (cache hot), the basis for both warm and cold query CPU.
+        pub cpu_s: Option<f64>,
         pub rss: RssStats,
     }
 
@@ -1582,17 +1606,20 @@ pub mod sql {
         let sampler = PeakSampler::start_default();
         let warm_rows = reader.query_rows(sql);
         let mut samples = Vec::with_capacity(iters);
+        let cpu0 = cpu::process_cpu_ns();
         for _ in 0..iters {
             let t0 = Instant::now();
             let r = reader.query_rows(sql);
             samples.push(t0.elapsed());
             black_box(r);
         }
+        let cpu_s = cpu::cpu_seconds_since(cpu0).map(|s| s / iters as f64);
         let rss = sampler.stop_stats();
         SqlQueryStat {
             name,
             p50: p50(&mut samples),
             rows: warm_rows,
+            cpu_s,
             rss,
         }
     }

@@ -59,7 +59,7 @@ fn emit_cost_warm(
     stored_bytes: u64,
     corpus_bytes: u64,
     n_docs: usize,
-    warm: &[(String, f64)],
+    warm: &[cost::WarmQueryCost],
 ) {
     if warm.is_empty() {
         return;

@@ -491,7 +491,7 @@ fn store_phases_from_split(split: Option<storage_meter::ColdStoreSplit>) -> cost
 
 /// Pre-drain (transient-shape) latency rows: the warm battery and the
 /// cold `(open, search)` rows measured before hidden-index maintenance.
-type PreDrainLatencies<'a> = (&'a [(String, f64)], &'a [cost::ColdQuery]);
+type PreDrainLatencies<'a> = (&'a [cost::WarmQueryCost], &'a [cost::ColdQuery]);
 
 #[allow(clippy::too_many_arguments)]
 fn emit_cost_warm(
@@ -501,7 +501,7 @@ fn emit_cost_warm(
     built: &supertable::IngestResult,
     metrics: Option<&ShapeMetrics>,
     n_docs: usize,
-    warm: &[(String, f64)],
+    warm: &[cost::WarmQueryCost],
     cold: Option<&[cost::ColdQuery]>,
     pre_drain: Option<PreDrainLatencies<'_>>,
     vector_cell: bool,
