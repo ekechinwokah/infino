@@ -24,8 +24,10 @@
 //! per-chunk loop runs inside.
 
 use std::{
-    fs::{File, OpenOptions},
-    io::{BufWriter, Error, ErrorKind, Write},
+    collections::HashMap,
+    fs::{self, File, OpenOptions},
+    io::{BufReader, BufWriter, Error, ErrorKind, Read, Write},
+    mem::size_of,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -33,7 +35,10 @@ use std::{
 use bytemuck::{cast_slice, try_cast_slice};
 use memmap2::Mmap;
 
-use crate::superfile::BuildError;
+use crate::superfile::{
+    BuildError,
+    vector::cell_posting::{EncodedCellRow, MaterializedIvfRow},
+};
 
 /// Append-only spill writer for f32 vectors. Backed by a
 /// `BufWriter<File>` so the hot path (per-vector `write_vec` in
@@ -345,6 +350,256 @@ impl ChunkedVectorSource for MmapVectorSource {
     }
 }
 
+/// Bytes of the fixed per-row prefix in a [`MaterializedRowSpillWriter`]
+/// record: `stable_id` (i128) + `cluster` (u32) + quantizer-table index (u32)
+/// + `norm_sq` presence flag (u8) + `norm_sq` payload (f32, zero when absent).
+const ROW_SPILL_PREFIX_BYTES: usize =
+    size_of::<i128>() + size_of::<u32>() + size_of::<u32>() + size_of::<u8>() + size_of::<f32>();
+
+/// `norm_sq` presence flag values in the spilled row prefix.
+const NORM_ABSENT: u8 = 0;
+const NORM_PRESENT: u8 = 1;
+
+/// One finished per-cell spill: the row-record file, its quantizer-table
+/// sidecar, and the counts needed to read them back.
+pub(crate) struct SpilledCellRows {
+    rows_path: PathBuf,
+    quants_path: PathBuf,
+    n_rows: u32,
+    n_quants: u32,
+    dim: usize,
+    rabitq_len: usize,
+}
+
+impl SpilledCellRows {
+    /// Rows recorded in this spill.
+    pub(crate) fn n_rows(&self) -> u32 {
+        self.n_rows
+    }
+
+    /// On-disk size of the row-record file — the working-set estimate the
+    /// drain uses to group cells into memory-bounded build waves.
+    pub(crate) fn row_bytes(&self) -> u64 {
+        (self.n_rows as u64) * record_bytes(self.dim, self.rabitq_len) as u64
+    }
+
+    /// Delete both backing files. Called after the cell superfile is built
+    /// and uploaded so drain scratch shrinks as cells complete; the owning
+    /// tempdir still sweeps anything left behind on early exit.
+    pub(crate) fn remove_files(&self) {
+        let _ = fs::remove_file(&self.rows_path);
+        let _ = fs::remove_file(&self.quants_path);
+    }
+}
+
+/// Byte length of one spilled row record for a `(dim, rabitq_len)` shape:
+/// the fixed prefix plus the RaBitQ code and the Sq8+epsilon `codes`/`residuals`
+/// legs (each `dim` bytes).
+fn record_bytes(dim: usize, rabitq_len: usize) -> usize {
+    ROW_SPILL_PREFIX_BYTES + rabitq_len + 2 * dim
+}
+
+/// Append-only spill for [`MaterializedIvfRow`]s of ONE cell, accumulated
+/// across the drain's memory-bounded batches so the drain can build exactly
+/// one superfile per cell per run regardless of its batch size.
+///
+/// Rows are written as their already-encoded Sq8+epsilon bytes — no decode, no
+/// re-quantization. The per-cluster dequant params (`scale`/`offset`, shared
+/// `Arc<[f32]>`s) are NOT duplicated per row: each distinct quantizer is
+/// appended once to a sidecar table and rows reference it by index.
+pub(crate) struct MaterializedRowSpillWriter {
+    rows: BufWriter<File>,
+    quants: BufWriter<File>,
+    rows_path: PathBuf,
+    quants_path: PathBuf,
+    dim: usize,
+    rabitq_len: usize,
+    n_rows: u32,
+    n_quants: u32,
+    quant_idx_by_ptr: HashMap<usize, u32>,
+}
+
+impl MaterializedRowSpillWriter {
+    /// Create the row + quantizer spill files for `cell` under `dir`.
+    pub(crate) fn create(
+        dir: &Path,
+        cell: u32,
+        dim: usize,
+        rabitq_len: usize,
+    ) -> Result<Self, BuildError> {
+        let rows_path = dir.join(format!("cell-{cell}.rows"));
+        let quants_path = dir.join(format!("cell-{cell}.quants"));
+        let rows_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&rows_path)?;
+        let quants_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&quants_path)?;
+        Ok(Self {
+            rows: BufWriter::with_capacity(SpillWriter::BUF_CAPACITY, rows_file),
+            quants: BufWriter::with_capacity(SpillWriter::BUF_CAPACITY, quants_file),
+            rows_path,
+            quants_path,
+            dim,
+            rabitq_len,
+            n_rows: 0,
+            n_quants: 0,
+            quant_idx_by_ptr: HashMap::new(),
+        })
+    }
+
+    /// Reset the pointer-identity dedup at a batch boundary.
+    pub(crate) fn begin_batch(&mut self) {
+        self.quant_idx_by_ptr.clear();
+    }
+
+    /// Append one row's encoded bytes (and its quantizer when first seen in
+    /// this batch).
+    pub(crate) fn append(&mut self, row: &MaterializedIvfRow) -> Result<(), BuildError> {
+        let enc = &row.encoded;
+        if enc.codes.len() != self.dim
+            || enc.residuals.len() != self.dim
+            || row.rabitq_code.len() != self.rabitq_len
+            || enc.scale.len() != self.dim
+            || enc.offset.len() != self.dim
+        {
+            return Err(BuildError::Io(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "drain spill: row shape mismatch (codes {}, residuals {}, rabitq {}, \
+                     scale {}, offset {}) vs expected dim {} / rabitq {}",
+                    enc.codes.len(),
+                    enc.residuals.len(),
+                    row.rabitq_code.len(),
+                    enc.scale.len(),
+                    enc.offset.len(),
+                    self.dim,
+                    self.rabitq_len,
+                ),
+            )));
+        }
+        let ptr = Arc::as_ptr(&enc.scale) as *const () as usize;
+        let quant_idx = match self.quant_idx_by_ptr.get(&ptr) {
+            Some(&idx) => idx,
+            None => {
+                let idx = self.n_quants;
+                self.quants.write_all(cast_slice(enc.scale.as_ref()))?;
+                self.quants.write_all(cast_slice(enc.offset.as_ref()))?;
+                self.n_quants += 1;
+                self.quant_idx_by_ptr.insert(ptr, idx);
+                idx
+            }
+        };
+        self.rows.write_all(&row.stable_id.to_le_bytes())?;
+        self.rows.write_all(&row.cluster.to_le_bytes())?;
+        self.rows.write_all(&quant_idx.to_le_bytes())?;
+        match enc.norm_sq {
+            Some(n) => {
+                self.rows.write_all(&[NORM_PRESENT])?;
+                self.rows.write_all(&n.to_le_bytes())?;
+            }
+            None => {
+                self.rows.write_all(&[NORM_ABSENT])?;
+                self.rows.write_all(&0f32.to_le_bytes())?;
+            }
+        }
+        self.rows.write_all(&row.rabitq_code)?;
+        self.rows.write_all(&enc.codes)?;
+        self.rows.write_all(&enc.residuals)?;
+        self.n_rows += 1;
+        Ok(())
+    }
+
+    /// Flush both files and return the readable spill handle.
+    pub(crate) fn finish(mut self) -> Result<SpilledCellRows, BuildError> {
+        self.rows.flush()?;
+        self.quants.flush()?;
+        Ok(SpilledCellRows {
+            rows_path: self.rows_path,
+            quants_path: self.quants_path,
+            n_rows: self.n_rows,
+            n_quants: self.n_quants,
+            dim: self.dim,
+            rabitq_len: self.rabitq_len,
+        })
+    }
+}
+
+/// Read one cell's spilled rows back into [`MaterializedIvfRow`]s.
+pub(crate) fn read_spilled_cell_rows(
+    spill: &SpilledCellRows,
+) -> Result<Vec<MaterializedIvfRow>, BuildError> {
+    let dim = spill.dim;
+    let mut quants: Vec<(Arc<[f32]>, Arc<[f32]>)> = Vec::with_capacity(spill.n_quants as usize);
+    {
+        let mut reader = BufReader::new(File::open(&spill.quants_path)?);
+        let mut f32_buf = vec![0u8; dim * size_of::<f32>()];
+        for _ in 0..spill.n_quants {
+            reader.read_exact(&mut f32_buf)?;
+            let scale: Arc<[f32]> = Arc::from(cast_f32_vec(&f32_buf));
+            reader.read_exact(&mut f32_buf)?;
+            let offset: Arc<[f32]> = Arc::from(cast_f32_vec(&f32_buf));
+            quants.push((scale, offset));
+        }
+    }
+
+    let mut rows = Vec::with_capacity(spill.n_rows as usize);
+    let mut reader = BufReader::new(File::open(&spill.rows_path)?);
+    let mut prefix = [0u8; ROW_SPILL_PREFIX_BYTES];
+    for _ in 0..spill.n_rows {
+        reader.read_exact(&mut prefix)?;
+        let stable_id = i128::from_le_bytes(prefix[0..16].try_into().expect("16-byte i128 slice"));
+        let cluster = u32::from_le_bytes(prefix[16..20].try_into().expect("4-byte u32 slice"));
+        let quant_idx =
+            u32::from_le_bytes(prefix[20..24].try_into().expect("4-byte u32 slice")) as usize;
+        let norm_flag = prefix[24];
+        let norm = f32::from_le_bytes(prefix[25..29].try_into().expect("4-byte f32 slice"));
+        let (scale, offset) = quants.get(quant_idx).cloned().ok_or_else(|| {
+            BuildError::Io(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "drain spill: quantizer index {quant_idx} out of range ({} entries)",
+                    quants.len()
+                ),
+            ))
+        })?;
+        let mut rabitq_code = vec![0u8; spill.rabitq_len];
+        reader.read_exact(&mut rabitq_code)?;
+        let mut codes = vec![0u8; dim];
+        reader.read_exact(&mut codes)?;
+        let mut residuals = vec![0u8; dim];
+        reader.read_exact(&mut residuals)?;
+        let norm_sq = (norm_flag == NORM_PRESENT).then_some(norm);
+        rows.push(MaterializedIvfRow {
+            local_doc_id: 0,
+            stable_id,
+            cluster,
+            rabitq_code,
+            encoded: EncodedCellRow {
+                stable_id,
+                scale,
+                offset,
+                codes,
+                residuals,
+                norm_sq,
+            },
+        });
+    }
+    Ok(rows)
+}
+
+/// Decode a raw little-endian f32 byte buffer into an owned vec.
+fn cast_f32_vec(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(size_of::<f32>())
+        .map(|c| f32::from_le_bytes(c.try_into().expect("4-byte f32 chunk")))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -432,6 +687,85 @@ mod tests {
             emitted.extend_from_slice(chunk);
         }
         assert_eq!(emitted, corpus, "per-row write_vec round-trip mismatch");
+    }
+
+    /// Row-spill round trip: rows written across two "batches" (dedup reset
+    /// between them) read back bit-identical, with quantizers shared per
+    /// source cluster and the batch-boundary reset forcing a re-append.
+    #[test]
+    fn materialized_row_spill_round_trips() {
+        const DIM: usize = 8;
+        const RABITQ_LEN: usize = 2;
+        let tmp = tempdir().expect("tempdir");
+
+        let quant_a: (Arc<[f32]>, Arc<[f32]>) =
+            (Arc::from(vec![1.0f32; DIM]), Arc::from(vec![0.5f32; DIM]));
+        let quant_b: (Arc<[f32]>, Arc<[f32]>) =
+            (Arc::from(vec![2.0f32; DIM]), Arc::from(vec![0.25f32; DIM]));
+        let row = |id: i128, cluster: u32, q: &(Arc<[f32]>, Arc<[f32]>), norm: Option<f32>| {
+            MaterializedIvfRow {
+                local_doc_id: 0,
+                stable_id: id,
+                cluster,
+                rabitq_code: vec![id as u8, cluster as u8],
+                encoded: EncodedCellRow {
+                    stable_id: id,
+                    scale: Arc::clone(&q.0),
+                    offset: Arc::clone(&q.1),
+                    codes: vec![id as u8; DIM],
+                    residuals: vec![cluster as u8; DIM],
+                    norm_sq: norm,
+                },
+            }
+        };
+
+        let mut w =
+            MaterializedRowSpillWriter::create(tmp.path(), 7, DIM, RABITQ_LEN).expect("create");
+        w.begin_batch();
+        w.append(&row(1, 10, &quant_a, Some(3.5))).expect("append");
+        w.append(&row(2, 10, &quant_a, None)).expect("append");
+        w.append(&row(3, 11, &quant_b, Some(1.25))).expect("append");
+        // Second batch: same quantizer content as quant_a but the dedup map
+        // was reset, so it re-appends (correctness over dedup ratio).
+        w.begin_batch();
+        w.append(&row(4, 10, &quant_a, Some(9.0))).expect("append");
+        let spill = w.finish().expect("finish");
+
+        assert_eq!(spill.n_rows(), 4);
+        assert_eq!(
+            spill.row_bytes(),
+            4 * (ROW_SPILL_PREFIX_BYTES + RABITQ_LEN + 2 * DIM) as u64
+        );
+
+        let rows = read_spilled_cell_rows(&spill).expect("read back");
+        assert_eq!(rows.len(), 4);
+        for (got, want_id) in rows.iter().zip([1i128, 2, 3, 4]) {
+            assert_eq!(got.stable_id, want_id);
+            assert_eq!(got.encoded.stable_id, want_id);
+            assert_eq!(got.rabitq_code.len(), RABITQ_LEN);
+            assert_eq!(got.encoded.codes, vec![want_id as u8; DIM]);
+        }
+        assert_eq!(rows[0].cluster, 10);
+        assert_eq!(rows[2].cluster, 11);
+        assert_eq!(rows[0].encoded.norm_sq, Some(3.5));
+        assert_eq!(rows[1].encoded.norm_sq, None);
+        assert_eq!(rows[2].encoded.norm_sq, Some(1.25));
+        assert_eq!(rows[2].encoded.scale.as_ref(), vec![2.0f32; DIM].as_slice());
+        assert_eq!(
+            rows[2].encoded.offset.as_ref(),
+            vec![0.25f32; DIM].as_slice()
+        );
+        // Rows 0 and 1 share one quantizer Arc (same batch, same cluster).
+        assert!(Arc::ptr_eq(&rows[0].encoded.scale, &rows[1].encoded.scale));
+
+        // Shape mismatches are rejected.
+        let mut w2 =
+            MaterializedRowSpillWriter::create(tmp.path(), 8, DIM, RABITQ_LEN).expect("create");
+        let mut bad = row(9, 12, &quant_a, None);
+        bad.encoded.codes = vec![0u8; DIM - 1];
+        assert!(w2.append(&bad).is_err(), "shape mismatch must be rejected");
+
+        spill.remove_files();
     }
 
     #[test]
