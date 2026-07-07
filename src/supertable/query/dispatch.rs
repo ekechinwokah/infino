@@ -95,11 +95,27 @@ pub(crate) async fn open_compaction_input(
     storage: Option<&Arc<dyn StorageProvider>>,
     entry: &SuperfileEntry,
 ) -> Result<Arc<SuperfileReader>, QueryError> {
-    if let (Some(cache), Some(storage)) = (disk_cache, storage) {
-        return cache
-            .reader_synchronous_with_storage(&entry.uri, Arc::clone(storage))
+    if let Some(storage) = storage {
+        if let Some(cache) = disk_cache {
+            let reader = cache
+                .reader_synchronous_with_storage(&entry.uri, Arc::clone(storage))
+                .await
+                .map_err(|e| QueryError::Store(e.to_string()));
+            if let Ok(reader) = reader
+                && reader.parquet_bytes().is_some()
+            {
+                return Ok(reader);
+            }
+        }
+        // Compaction needs synchronous Parquet/id-column access; if the hidden
+        // table was opened without a disk cache, force an eager open here.
+        let path = entry.uri.storage_path();
+        let (bytes, _) = storage
+            .get(&path)
             .await
-            .map_err(|e| QueryError::Store(e.to_string()));
+            .map_err(|e| QueryError::Store(e.to_string()))?;
+        let reader = SuperfileReader::open(bytes).map_err(|e| QueryError::Store(e.to_string()))?;
+        return Ok(Arc::new(reader));
     }
     open_reader(store, disk_cache, storage, entry).await
 }

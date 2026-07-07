@@ -1247,13 +1247,9 @@ pub mod vector {
         // gate are forced off below and queries are corpus-free.
         let existing = tiers::block_on(tiers::existing_supertable_storage_fixture());
 
-        // Corpus to disk + mmap (engine-only window), EXCEPT in existing-prefix
-        // mode. Kept alive for the search phase: the same vectors back the
-        // brute-force ground truth, so dataset mode regenerates it too
-        // (skipping only the ingest).
-        let corpus = existing
-            .is_none()
-            .then(|| supertable::prepare_corpus(Modality::Vector));
+        // Always prepare the corpus for vector benches so recall is always
+        // measurable (including existing-prefix runs).
+        let corpus = Some(supertable::prepare_corpus(Modality::Vector));
 
         let (built, ingest_metrics) = if let Some(fixture) = existing {
             (supertable::open_existing(Modality::Vector, fixture), None)
@@ -1288,9 +1284,7 @@ pub mod vector {
         }
 
         if phases.warm || phases.cold {
-            // No corpus (existing-prefix) => no ground truth possible => force
-            // skip-calibration: this path measures latency + memory only.
-            let skip_cal = skip_calibration(n_docs) || corpus.is_none();
+            let skip_cal = skip_calibration(n_docs);
             let nprobe = fixed_nprobe();
             let rerank = fixed_rerank_mult();
 
@@ -1301,7 +1295,10 @@ pub mod vector {
                 Vec<Vec<u32>>,
                 Vec<Vec<u32>>,
                 Option<Vec<Vec<u32>>>,
-            ) = if let Some(corpus) = &corpus {
+            ) = {
+                let corpus = corpus
+                    .as_ref()
+                    .expect("vector benches always prepare a corpus");
                 // The ingested vectors are still mmapped from the prepared
                 // corpus — queries and ground truth come from them instead
                 // of a regeneration. Skip-calibration still computes
@@ -1362,21 +1359,6 @@ pub mod vector {
                     (gt_all, gt_cal, Some(filtered_gt))
                 };
                 (q_correct, q_cal, gt_correct, gt_cal, filtered_gt)
-            } else {
-                // Existing-prefix: no corpus → corpus-free Gaussian queries
-                // and no ground truth. Recall is meaningless here; this path
-                // reuses the normal vector search implementation to measure
-                // cold/warm latency and RSS against a retained large table.
-                eprintln!(
-                    "[supertable_vector] existing-prefix: corpus-free queries, calibration + recall gate disabled",
-                );
-                (
-                    corpus::generate_queries(N_CORRECTNESS_QUERIES, QUERY_CORRECTNESS_SEED),
-                    corpus::generate_queries(N_CALIBRATION_QUERIES, QUERY_CALIBRATION_SEED),
-                    Vec::new(),
-                    Vec::new(),
-                    None,
-                )
             };
             // Queries + ground truth extracted; free the corpus pages
             // + temp file so the warm/cold samplers measure the engine
