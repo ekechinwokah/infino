@@ -44,7 +44,7 @@ use crate::{
     supertable::{
         ManifestLoadError, SuperfileUri, SupertableStats,
         options::Consistency,
-        reader_cache::disk::{DiskCacheError, skip_background_fill},
+        reader_cache::disk::DiskCacheError,
         stats::process_rss_bytes,
         tombstones::{SidecarCache, cache::DEFAULT_REFRESH_TTL},
         utils::idgen::IdGenerator,
@@ -592,58 +592,12 @@ impl Supertable {
     }
     }
 
-    /// Block until the on-disk cache has fully promoted every superfile
-    /// in the current manifest to an mmap-backed reader, or `timeout`
-    /// elapses for one of them. This is the public "warm-readiness"
-    /// primitive: once it returns `Ok(())`, subsequent searches read
-    /// from resident mmap pages instead of issuing object-store range
-    /// GETs through the lazy foreground source, so latency drops from
-    /// the cold/lazy path (hundreds of ms — seconds against real S3) to
-    /// the in-memory steady state (single-digit ms).
-    ///
-    /// A real serving node calls this on startup, after `open`, to take
-    /// traffic only once its cache is hot. No-op when no disk cache is
-    /// attached, and a short-circuit when background fill is disabled
-    /// (`INFINO_DISABLE_BG_FILL`) — nothing is ever promoted then, so
-    /// there is nothing to wait for and blocking until `timeout` would
-    /// be pointless.
-    ///
-    /// Crucially, requesting promotion here is also what *drives* it to
-    /// completion: registering a promotion waiter releases the
-    /// background full-superfile fill that otherwise idles behind
-    /// foreground lazy readers under steady query load. Warming purely
-    /// by replaying queries does not register that waiter, so the
-    /// superfiles can stay lazy/S3-backed indefinitely.
+    /// Legacy warm barrier. With block-level lazy caching, warm-up is
+    /// query-driven and does not require full-file promotion.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn wait_until_warm(&self, timeout: Duration) -> Result<(), DiskCacheError> {
-        let Some(cache) = self.inner.options.disk_cache.as_ref() else {
-            return Ok(());
-        };
-        if skip_background_fill() {
-            return Ok(());
-        }
-        let cache = Arc::clone(cache);
-        let manifest = self.inner.manifest.load_full();
-        let hidden_manifest = self
-            .inner
-            .vector_index_table
-            .as_ref()
-            .map(|hidden| hidden.inner.manifest.load_full());
-        self.block_on_query(async move {
-            for entry in manifest.superfiles.iter() {
-                if cache.is_cached(&entry.uri) {
-                    cache.wait_until_mmap_promoted(&entry.uri, timeout).await?;
-                }
-            }
-            if let Some(hidden) = hidden_manifest {
-                for entry in hidden.superfiles.iter() {
-                    if cache.is_cached(&entry.uri) {
-                        cache.wait_until_mmap_promoted(&entry.uri, timeout).await?;
-                    }
-                }
-            }
-            Ok(())
-        })
+        let _ = timeout;
+        Ok(())
     }
 
     /// This handle's lease-owner id. Stamped on every WAL the
@@ -2261,11 +2215,10 @@ mod tests {
         );
     }
 
-    /// Bounded-batch drain: with `drain_batch_superfiles = 1`, a SINGLE drain
-    /// call over N user superfiles processes them in N batches, each appending
-    /// one file per touched cell — so the (single) cell ends up with N files.
-    /// `drain_batch_superfiles = 0` skips the drain entirely. This exercises the
-    /// per-batch loop itself (vs. the multi-drain-call path above).
+    /// Bounded-batch drain: `drain_batch_superfiles` is a memory bound and must
+    /// never change the published layout. One drain over N user superfiles
+    /// publishes exactly one file per touched cell whether the budget forces N
+    /// batches (`1`) or a single merge (`-1`).
     #[test]
     fn bounded_drain_batches_by_superfile_count() {
         use std::{collections::HashMap, sync::Arc};
@@ -2358,15 +2311,16 @@ mod tests {
             by_cell.values().copied().max().unwrap_or(0)
         };
 
-        // batch=1: 3 user superfiles → 3 batches → 3 files in the cell.
+        // batch=1: 3 user superfiles -> 3 memory batches, but still one file
+        // per cell.
         let st1 = make(1);
         assert_eq!(
             max_files_per_cell(&st1),
-            3,
-            "batch=1 over 3 user superfiles must append 3 cell files in one drain"
+            1,
+            "batch=1 over 3 user superfiles must still publish one file per cell"
         );
 
-        // batch=-1 (unbounded): all 3 in one merge → 1 file in the cell.
+        // batch=-1 (unbounded): all 3 in one merge -> identical layout.
         let st_unb = make(-1);
         assert_eq!(
             max_files_per_cell(&st_unb),
@@ -2384,6 +2338,122 @@ mod tests {
                 .n_superfiles(),
             0,
             "batch=0 must skip the drain"
+        );
+    }
+
+    /// The drain batch budget is a memory bound (how many user superfiles are
+    /// materialized at once) and must not change the published layout.
+    #[test]
+    fn drain_batch_budget_never_changes_cell_layout() {
+        use std::{collections::HashMap, sync::Arc};
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        options.drain_batch_superfiles = 1;
+        let st = Supertable::create(options).expect("create");
+
+        const N_COMMITS: usize = 3;
+        for commit in 0..N_COMMITS {
+            let titles = LargeStringArray::from(vec![format!("doc-{commit}")]);
+            let flat = Float32Array::from(vec![1.0f32; dim]);
+            let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(titles) as Arc<dyn Array>,
+                    Arc::new(fsl) as Arc<dyn Array>,
+                ],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        let reader = hidden.reader();
+        let manifest = reader.manifest();
+        let mut per_cell = HashMap::<Vec<u8>, usize>::new();
+        let mut total_rows = 0u64;
+        for e in manifest.superfiles.iter() {
+            *per_cell.entry(e.partition_key.clone()).or_default() += 1;
+            total_rows += e.n_docs;
+        }
+        let max_per_cell = per_cell.values().copied().max().unwrap_or(0);
+        assert_eq!(
+            max_per_cell, 1,
+            "one drain run must publish one superfile per cell (got {max_per_cell})"
+        );
+        assert_eq!(
+            total_rows, N_COMMITS as u64,
+            "every drained row lands exactly once"
+        );
+        assert!(
+            !manifest.get_drained_ranges().is_empty(),
+            "single publish must advance drained watermark"
+        );
+
+        st.drain_vectors_to_cells_sync().expect("re-drain no-op");
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        let n_after = hidden.reader().manifest().superfiles.iter().count();
+        assert_eq!(
+            n_after,
+            per_cell.len(),
+            "no-op re-drain must not append cell files"
         );
     }
 

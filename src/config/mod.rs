@@ -301,10 +301,6 @@ pub struct DiagnosticsSettings {
     pub fts_profile: bool,
     /// Capture the object-store I/O timeline.
     pub io_timeline: bool,
-    /// Skip the `LazyForegroundWithBackgroundFill` full-superfile
-    /// background promotion, serving cold queries over range GETs only
-    /// (measures cold fan-out cost in isolation).
-    pub disable_bg_fill: bool,
     /// Force the AVX2 vector-distance path even where AVX-512 is
     /// available (A/B measurement).
     pub disable_avx512: bool,

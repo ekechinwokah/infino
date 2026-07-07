@@ -125,10 +125,10 @@ const DEFAULT_PART_SIZE_THRESHOLD_BYTES: u64 = 10 * (1 << 20);
 const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = 4;
 /// Default optimistic-commit retry budget under contention.
 const DEFAULT_MAX_COMMIT_RETRIES: u32 = 10;
-/// Default user-superfile batch size for the hidden-index drain. Bounds drain
-/// working-set RAM to O(batch) regardless of corpus size (the >3M memory wall).
+/// Default user-superfile batch size for the hidden-index drain. `1` streams
+/// one source superfile at a time to keep drain RAM bounded on large corpora.
 /// `-1` = unbounded (single merge), `0` = skip the drain.
-const DEFAULT_DRAIN_BATCH_SUPERFILES: i64 = 64;
+const DEFAULT_DRAIN_BATCH_SUPERFILES: i64 = 1;
 /// Default writer auto-flush threshold (1 GiB, in MiB units).
 const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Default object size (100 MiB) above which uploads route through

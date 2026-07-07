@@ -49,10 +49,11 @@
 
 use std::{
     cmp,
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     fmt, io,
     marker::PhantomData,
     mem,
+    path::Path,
     sync::{Arc, atomic::Ordering},
     time,
 };
@@ -84,8 +85,8 @@ use super::{
         CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
         PendingDelete, PendingUpdate,
     },
-    options::{DECIMAL128_PRECISION, DECIMAL128_SCALE, SupertableOptions},
     opann,
+    options::{DECIMAL128_PRECISION, DECIMAL128_SCALE, SupertableOptions},
     utils::vector_split::split_vectors,
     wal::{
         WalStore,
@@ -124,6 +125,7 @@ use crate::{
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
             reader::VectorReader,
+            spill::{MaterializedRowSpillWriter, SpilledCellRows, read_spilled_cell_rows},
         },
     },
     supertable::{
@@ -2010,6 +2012,33 @@ fn drain_batch_superfiles(opts: &SupertableOptions) -> i64 {
     opts.drain_batch_superfiles
 }
 
+/// Working-set cap for one wave of the drain's end-of-run per-cell builds.
+const DRAIN_BUILD_GROUP_BYTES: u64 = 4 * (1 << 30);
+
+/// Append one materialized row to `cell`'s spill, creating the cell writer on
+/// first touch.
+fn spill_row_to_cell(
+    spills: &mut HashMap<u32, MaterializedRowSpillWriter>,
+    added: &mut HashMap<u32, u32>,
+    scratch: &Path,
+    cell: u32,
+    row: &MaterializedIvfRow,
+) -> Result<(), BuildError> {
+    let writer = match spills.entry(cell) {
+        Entry::Occupied(o) => o.into_mut(),
+        Entry::Vacant(v) => v.insert(MaterializedRowSpillWriter::create(
+            scratch,
+            cell,
+            row.encoded.codes.len(),
+            row.rabitq_code.len(),
+        )?),
+    };
+    writer.append(row)?;
+    let n = added.entry(cell).or_insert(0);
+    *n = n.saturating_add(1);
+    Ok(())
+}
+
 /// Drain replica factor at or below which no boundary replicas are added.
 const DEFAULT_DRAIN_REPLICA_TARGET_FACTOR: f32 = 1.0;
 
@@ -2165,6 +2194,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         DrainConsolidate::Kmeans => "kmeans",
         DrainConsolidate::Splice => "splice",
     };
+    let is_splice = mode == "splice";
     // assign-skip: with global-aligned user superfiles (`vector.user_centroids:
     // global`) cluster c == cell c, so group by the row's own cluster ordinal
     // instead of the O(n·n_cent) per-row nearest-cell scoring.
@@ -2178,6 +2208,20 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // are immutable (owned by the user manifest), so each batch's
     // `apply_cell_updates` builds on the prior batches' running totals.
     let mut running_clusters = clusters;
+    // kmeans mode decouples the batch budget (a memory bound on how many user
+    // superfiles are materialized at once) from the published layout: every
+    // batch spills rows per cell to scratch, and one superfile per touched cell
+    // is built after the last batch.
+    let drain_scratch = if is_splice {
+        None
+    } else {
+        Some(
+            tempfile::tempdir()
+                .map_err(|e| BuildError::Store(format!("drain spill scratch dir: {e}")))?,
+        )
+    };
+    let mut cell_spills: HashMap<u32, MaterializedRowSpillWriter> = HashMap::new();
+    let mut added_per_cell: HashMap<u32, u32> = HashMap::new();
 
     for (batch_idx, (batch_versions, batch_sources)) in batches.iter().enumerate() {
         let batch_t0 = std::time::Instant::now();
@@ -2358,13 +2402,26 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             let t_mat = batch_t0.elapsed().as_secs_f64() * 1e3;
 
             let all_rows: Vec<MaterializedIvfRow> = row_sets.into_iter().flatten().collect();
-            let mut by_cell: HashMap<u32, Vec<MaterializedIvfRow>> = HashMap::new();
+            let n_batch_rows = all_rows.len();
+            let scratch = drain_scratch
+                .as_ref()
+                .expect("kmeans drain owns a scratch dir")
+                .path();
+            // Batch boundary: reset spill writers' Arc-pointer dedup.
+            for writer in cell_spills.values_mut() {
+                writer.begin_batch();
+            }
             let replica_target = drain_replica_target_factor();
-            let replica_extra_budget =
-                drain_replica_extra_budget(all_rows.len(), replica_target);
+            let replica_extra_budget = drain_replica_extra_budget(all_rows.len(), replica_target);
             if replica_extra_budget == 0 && assign_skip {
-                for row in all_rows {
-                    by_cell.entry(row.cluster).or_default().push(row);
+                for row in &all_rows {
+                    spill_row_to_cell(
+                        &mut cell_spills,
+                        &mut added_per_cell,
+                        scratch,
+                        row.cluster,
+                        row,
+                    )?;
                 }
             } else {
                 let clusters_ref = &running_clusters;
@@ -2397,94 +2454,47 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     })
                     .collect();
                 replica_candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
-                let replicas: Vec<(usize, u32)> = replica_candidates
-                    .into_iter()
-                    .take(replica_extra_budget)
-                    .map(|(row_idx, neighbor, _)| (row_idx, neighbor))
-                    .collect();
-                for &(row_idx, cell) in &replicas {
-                    by_cell.entry(cell).or_default().push(all_rows[row_idx].clone());
+                // Boundary replicas: append the same row bytes to neighbor cells.
+                for (row_idx, cell, _) in replica_candidates.into_iter().take(replica_extra_budget)
+                {
+                    spill_row_to_cell(
+                        &mut cell_spills,
+                        &mut added_per_cell,
+                        scratch,
+                        cell,
+                        &all_rows[row_idx],
+                    )?;
                 }
-                for (row, assignment) in all_rows.into_iter().zip(assignments) {
-                    by_cell.entry(assignment.primary).or_default().push(row);
+                for (row, assignment) in all_rows.iter().zip(&assignments) {
+                    spill_row_to_cell(
+                        &mut cell_spills,
+                        &mut added_per_cell,
+                        scratch,
+                        assignment.primary,
+                        row,
+                    )?;
                 }
             }
-            let t_assign = batch_t0.elapsed().as_secs_f64() * 1e3;
-
-            crate::superfile::vector::builder::build_phase_timers::reset();
-            let shards: Vec<(u32, ShardOutput, u32)> =
-                hidden_inner.options.writer_pool.install(|| {
-                    by_cell
-                        .into_par_iter()
-                        .filter(|(_, rows)| !rows.is_empty())
-                        .map(|(cell_id, mut rows)| {
-                            rows.sort_by_key(|r| r.stable_id);
-                            for (local, row) in rows.iter_mut().enumerate() {
-                                row.local_doc_id = local as u32;
-                            }
-                            let added = rows.len() as u32;
-                            let shard = build_one_shard_from_materialized(
-                                &rows,
-                                &hidden_inner.options,
-                                VectorLayout::Ivf,
-                            )?;
-                            Ok::<_, BuildError>((cell_id, shard, added))
-                        })
-                        .collect::<Result<Vec<_>, BuildError>>()
-                })?;
-            let n_cells = shards.len();
-
-            for (cell_id, shard, added) in shards {
-                let prep =
-                    prepare_superfile(&hidden_inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
-                let entry = finish_superfile_entry(&hidden_inner, prep.entry, Some(cell_id))?;
-                let base = running_clusters
-                    .counts
-                    .get(cell_id as usize)
-                    .copied()
-                    .unwrap_or(0);
-                cell_updates.insert(cell_id, base.saturating_add(added));
-                prepared.push(PreparedSuperfile {
-                    entry,
-                    bytes_for_store: prep.bytes_for_store,
-                    bytes_for_storage: prep.bytes_for_storage,
-                    bytes_for_cache: prep.bytes_for_cache,
-                });
-            }
+            let t_spill = batch_t0.elapsed().as_secs_f64() * 1e3;
             eprintln!(
-                "[supertable drain] batch {}/{} ({} sf, kmeans): materialize {:.1}ms + {} {:.1}ms + build {:.1}ms, {} cell file(s)",
+                "[supertable drain] batch {}/{} ({} sf, kmeans): materialize {:.1}ms + {} {:.1}ms, {} batch row(s) -> {} cell spill(s)",
                 batch_idx + 1,
                 n_batches,
                 batch_sources.len(),
                 t_mat,
                 if assign_skip {
-                    "group(assign-skip)"
+                    "group(assign-skip)+spill"
                 } else {
-                    "assign"
+                    "assign+spill"
                 },
-                t_assign - t_mat,
-                batch_t0.elapsed().as_secs_f64() * 1e3 - t_assign,
-                n_cells,
+                t_spill - t_mat,
+                n_batch_rows,
+                cell_spills.len(),
             );
-            // Optional intra-build breakdown (INFINO_DRAIN_BUILD_TIMERS=1): summed
-            // CPU across the parallel per-cell builds, to see whether the build is
-            // train- / assign- / calibrate-bound (the SIMD/GPU decision).
-            if crate::superfile::vector::builder::build_phase_timers::enabled() {
-                let (train_ms, assign_ms, calib_ms) =
-                    crate::superfile::vector::builder::build_phase_timers::snapshot_ms();
-                eprintln!(
-                    "[supertable drain] batch {}/{} build phases (summed CPU, {} cells): train {:.1}ms + assign {:.1}ms + calibrate {:.1}ms",
-                    batch_idx + 1,
-                    n_batches,
-                    n_cells,
-                    train_ms,
-                    assign_ms,
-                    calib_ms,
-                );
-            }
         }
 
         if prepared.is_empty() {
+            // kmeans mode spills rows above and publishes once after the loop.
             continue;
         }
         // Publish this batch's cell superfiles (append — no removals; the user
@@ -2565,6 +2575,131 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             );
         }
     }
+
+    // kmeans cell build: turn per-cell spills into exactly one superfile per
+    // touched cell, in memory-bounded waves, then publish everything in one
+    // atomic CAS.
+    if !cell_spills.is_empty() {
+        let build_t0 = time::Instant::now();
+        let mut spilled: Vec<(u32, SpilledCellRows)> = cell_spills
+            .into_iter()
+            .map(|(cell, writer)| writer.finish().map(|s| (cell, s)).map_err(BuildError::from))
+            .collect::<Result<Vec<_>, BuildError>>()?;
+        spilled.sort_unstable_by_key(|(cell, _)| *cell);
+        let n_cells_total = spilled.len();
+        let total_rows: u64 = spilled.iter().map(|(_, s)| s.n_rows() as u64).sum();
+
+        crate::superfile::vector::builder::build_phase_timers::reset();
+        let mut new_entries: Vec<Arc<SuperfileEntry>> = Vec::with_capacity(n_cells_total);
+        let mut wave: Vec<(u32, SpilledCellRows)> = Vec::new();
+        let mut wave_bytes: u64 = 0;
+        let mut n_waves = 0usize;
+        let mut spilled_iter = spilled.into_iter().peekable();
+        while let Some((cell, spill)) = spilled_iter.next() {
+            wave_bytes += spill.row_bytes();
+            wave.push((cell, spill));
+            let flush = wave_bytes >= DRAIN_BUILD_GROUP_BYTES || spilled_iter.peek().is_none();
+            if !flush {
+                continue;
+            }
+            n_waves += 1;
+            let cells_rows: Vec<(u32, Vec<MaterializedIvfRow>)> = wave
+                .iter()
+                .map(|(cell, spill)| {
+                    read_spilled_cell_rows(spill)
+                        .map(|rows| (*cell, rows))
+                        .map_err(BuildError::from)
+                })
+                .collect::<Result<Vec<_>, BuildError>>()?;
+            let prepared_wave: Vec<PreparedSuperfile> =
+                hidden_inner.options.writer_pool.install(|| {
+                    cells_rows
+                        .into_par_iter()
+                        .filter(|(_, rows)| !rows.is_empty())
+                        .map(|(cell, mut rows)| {
+                            rows.sort_by_key(|r| r.stable_id);
+                            for (local, row) in rows.iter_mut().enumerate() {
+                                row.local_doc_id = local as u32;
+                            }
+                            build_prepared_ivf_from_materialized(&hidden_inner, cell, rows)
+                        })
+                        .collect::<Result<Vec<_>, BuildError>>()
+                })?;
+            let publish = collect_prepared_superfiles(&hidden_inner, prepared_wave)?;
+            let mut pending_writes = publish.pending_storage_writes;
+            let mut pending_replaces: Vec<(SuperfileUri, Bytes)> = Vec::new();
+            write_superfile_list(
+                &storage,
+                &hidden_inner.options,
+                &mut pending_writes,
+                &mut pending_replaces,
+            )
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+            new_entries.extend(publish.new_entries);
+            for (_, spill) in wave.drain(..) {
+                spill.remove_files();
+            }
+            wave_bytes = 0;
+        }
+
+        let mut cell_updates: HashMap<u32, u32> = HashMap::new();
+        for (cell, added) in &added_per_cell {
+            let base = running_clusters
+                .counts
+                .get(*cell as usize)
+                .copied()
+                .unwrap_or(0);
+            cell_updates.insert(*cell, base.saturating_add(*added));
+        }
+        running_clusters = opann::apply_cell_updates(&running_clusters, &cell_updates);
+        let mut new_drained = hidden_inner.manifest.load_full().get_drained_ranges();
+        let drained_max = batches
+            .iter()
+            .flat_map(|(versions, _)| versions.iter().copied())
+            .max()
+            .unwrap_or(0);
+        let lo = new_drained.prefix_end().map(|end| end + 1).unwrap_or(0);
+        new_drained.insert_range(lo.min(drained_max), drained_max);
+        hidden_inner.manifest.store(Arc::new(
+            hidden_inner
+                .manifest
+                .load()
+                .with_partition_strategy(PartitionStrategy::VectorCell {
+                    column: column.clone(),
+                    clusters: running_clusters.clone(),
+                    routing,
+                })
+                .with_drained_ranges(new_drained),
+        ));
+        let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
+        let new_manifest = persist_commit_async(
+            &hidden_inner,
+            Arc::clone(&storage),
+            new_entries,
+            &no_removals,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+        hidden_inner.manifest.store(Arc::new(new_manifest));
+        eprintln!(
+            "[supertable drain] cell build: {} row(s) -> {} cell superfile(s) (1 per cell) in {} wave(s), {:.1}ms",
+            total_rows,
+            n_cells_total,
+            n_waves,
+            build_t0.elapsed().as_secs_f64() * 1e3,
+        );
+        if crate::superfile::vector::builder::build_phase_timers::enabled() {
+            let (train_ms, assign_ms, calib_ms) =
+                crate::superfile::vector::builder::build_phase_timers::snapshot_ms();
+            eprintln!(
+                "[supertable drain] cell build phases (summed CPU, {n_cells_total} cells): train {train_ms:.1}ms + assign {assign_ms:.1}ms + calibrate {calib_ms:.1}ms",
+            );
+        }
+    }
+
     eprintln!(
         "[supertable drain] done ({mode}, {} batch(es), budget {} sf): total {:.1}ms; RSS {} -> {} MiB",
         n_batches,

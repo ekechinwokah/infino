@@ -182,10 +182,6 @@ diagnostics:
   # Capture the object-store I/O timeline.
   io_timeline: false
 
-  # Skip the lazy_foreground_with_background_fill full-superfile
-  # background promotion, serving cold queries over range GETs only.
-  disable_bg_fill: false
-
   # Force the AVX2 vector-distance path even where AVX-512 is available.
   disable_avx512: false
 
