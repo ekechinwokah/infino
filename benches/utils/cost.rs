@@ -19,8 +19,10 @@
 //!      (PUT/commit, GET/query). Counts come from the
 //!      [`crate::storage_meter`] wrapper; phases that did not run metered
 //!      are omitted, never guessed.
-//!   3. **Compute ledger** — wall × vCPU share per phase, one-time
-//!      phases in absolute dollars, per-query phases per 1M queries.
+//!   3. **Compute ledger** — one-time phases (ingest/drain/compaction)
+//!      priced from measured on-CPU seconds (wall × vCPU-share fallback);
+//!      per-query phases from p50 latency. One-time phases in absolute
+//!      dollars, per-query phases per 1M queries.
 //!   4. **Serving** — latency per dollar; cold rows include request cost.
 //!
 //! Local NVMe (file-backed disk-cache mmap) is treated as free.
@@ -927,8 +929,10 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     }
     let compute_ledger = Block {
         subtitle: format!(
-            "Compute — wall × vCPU share priced on {} ({} vCPU / {:.0} GiB / {:.0} GB NVMe @ \
-             ${:.4}/hr); one-time phases in absolute $, per-query phases per 1M queries",
+            "Compute — one-time phases (ingest/drain/compaction) priced from measured on-CPU \
+             seconds (I/O wait excluded; wall × pool-share fallback when /proc is unavailable), \
+             per-query phases from p50 latency. Priced on {} ({} vCPU / {:.0} GiB / {:.0} GB \
+             NVMe @ ${:.4}/hr); one-time phases in absolute $, per-query phases per 1M queries",
             inst.name, inst.vcpu, inst.ram_gib, inst.nvme_gb, inst.usd_per_hour,
         ),
         headers: vec![
