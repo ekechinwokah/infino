@@ -91,6 +91,10 @@ pub struct ShapeMetrics {
     /// Raw input corpus size (text + vector bytes) — the source data
     /// fed to ingest, distinct from `index_bytes` (what's written out).
     pub corpus_bytes: u64,
+    /// Measured on-CPU seconds over the ingest build window (all-thread
+    /// schedstat delta). `None` on a platform without `/proc` sampling ⇒
+    /// the cost model falls back to the wall-clock CPU approximation.
+    pub ingest_cpu_s: Option<f64>,
 }
 
 pub struct SupertableShapeResult {
@@ -103,7 +107,7 @@ impl ShapeMetrics {
     /// Render as the single stdout line the parent parses.
     fn to_result_line(&self) -> String {
         format!(
-            "{RESULT_PREFIX}wall_ns={} n_superfiles={} peak={} median={} p90={} index_bytes={} corpus_bytes={}",
+            "{RESULT_PREFIX}wall_ns={} n_superfiles={} peak={} median={} p90={} index_bytes={} corpus_bytes={} ingest_cpu_ns={}",
             self.wall_ns,
             self.n_superfiles,
             self.peak_rss_bytes,
@@ -111,6 +115,8 @@ impl ShapeMetrics {
             self.p90_rss_bytes,
             self.index_bytes,
             self.corpus_bytes,
+            // -1 sentinel = not measured (Option<f64> can't cross the line).
+            self.ingest_cpu_s.map(|s| (s * 1e9) as i128).unwrap_or(-1),
         )
     }
 
@@ -125,6 +131,8 @@ impl ShapeMetrics {
         let mut p90 = None;
         let mut index_bytes = None;
         let mut corpus_bytes = None;
+        // Optional (older/other producers may omit it); `-1` = not measured.
+        let mut ingest_cpu_s: Option<f64> = None;
         for tok in body.split_whitespace() {
             let (k, v) = tok.split_once('=')?;
             match k {
@@ -135,6 +143,13 @@ impl ShapeMetrics {
                 "p90" => p90 = v.parse().ok(),
                 "index_bytes" => index_bytes = v.parse().ok(),
                 "corpus_bytes" => corpus_bytes = v.parse().ok(),
+                "ingest_cpu_ns" => {
+                    ingest_cpu_s = v
+                        .parse::<i128>()
+                        .ok()
+                        .filter(|ns| *ns >= 0)
+                        .map(|ns| ns as f64 / 1e9);
+                }
                 _ => {}
             }
         }
@@ -146,6 +161,7 @@ impl ShapeMetrics {
             p90_rss_bytes: p90?,
             index_bytes: index_bytes?,
             corpus_bytes: corpus_bytes?,
+            ingest_cpu_s,
         })
     }
 }
@@ -178,9 +194,11 @@ fn run_child_shape(key: &str) {
     // measured window covers the engine only.
     let corpus = supertable::prepare_corpus(modality);
     let sampler = PeakSampler::start_default();
+    let cpu0 = cpu::process_cpu_ns();
     let t0 = Instant::now();
     let built = supertable::build_on_storage(modality, &corpus);
     let wall = t0.elapsed();
+    let ingest_cpu_s = cpu::cpu_seconds_since(cpu0);
     let rss = sampler.stop_stats();
 
     // This child wrote its own unique prefix; delete it before exiting so the
@@ -199,6 +217,7 @@ fn run_child_shape(key: &str) {
         p90_rss_bytes: rss.p90_rss_bytes,
         index_bytes: built.total_index_bytes,
         corpus_bytes: corpus.byte_size(),
+        ingest_cpu_s,
     };
     println!("{}", metrics.to_result_line());
 }
@@ -510,9 +529,7 @@ fn emit_cost_warm(
             ingest_wall_s: wall_s,
             writers: supertable::n_writers() as u32,
             ingest_peak_rss_bytes: metrics.map(|m| m.peak_rss_bytes),
-            // Ingest on-CPU measurement not yet threaded through the shared
-            // build path; falls back to the wall model.
-            ingest_cpu_s: None,
+            ingest_cpu_s: metrics.and_then(|m| m.ingest_cpu_s),
             n_commits: supertable::n_commits() as u64,
             unmetered_put_count: None,
             stored_bytes: stored_bytes_override.unwrap_or(built.total_index_bytes),
@@ -629,9 +646,11 @@ fn build_measured(
     phases: Phases,
 ) -> (supertable::IngestResult, Option<ShapeMetrics>) {
     let sampler = PeakSampler::start_default();
+    let cpu0 = cpu::process_cpu_ns();
     let t0 = Instant::now();
     let built = supertable::build_on_storage(modality, corpus);
     let wall = t0.elapsed();
+    let ingest_cpu_s = cpu::cpu_seconds_since(cpu0);
     let rss = sampler.stop_stats();
     let metrics = phases.build.then_some(ShapeMetrics {
         wall_ns: wall.as_secs_f64() * 1e9,
@@ -641,6 +660,7 @@ fn build_measured(
         p90_rss_bytes: rss.p90_rss_bytes,
         index_bytes: built.total_index_bytes,
         corpus_bytes: corpus.byte_size(),
+        ingest_cpu_s,
     });
     (built, metrics)
 }
