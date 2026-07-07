@@ -978,7 +978,10 @@ pub mod vector {
     use super::*;
     use crate::{
         corpus,
-        executors::{vector as exec_vec, vector::{SupertableVectorRead, VectorRead}},
+        executors::{
+            vector as exec_vec,
+            vector::{SupertableVectorRead, VectorRead},
+        },
     };
 
     // Correctness gate, recall targets, calibration grid, and p50 iters
@@ -1387,7 +1390,11 @@ pub mod vector {
             // Fresh ingest leaves hidden IVF in INCOMING; dataset / existing-prefix
             // tables may already be post-drain — run the two-phase comparison only
             // when we just built the table in this process.
-            let pre_post_drain = ingest_metrics.is_some();
+            let pre_post_drain = ingest_metrics.is_some()
+                || std::env::var("INFINO_BENCH_FORCE_PRE_POST_DRAIN")
+                    .ok()
+                    .as_deref()
+                    == Some("1");
 
             let search_title = |phase: &str| {
                 format!(
@@ -1545,24 +1552,27 @@ pub mod vector {
             if phases.warm
                 && let Some(filtered_gt) = filtered_gt.as_ref()
             {
-                let mut allow = RoaringBitmap::new();
-                for i in (0..n_docs as u32).step_by(FILTER_KEEP_EVERY) {
-                    allow.insert(i);
-                }
-                let allow = Arc::new(allow);
-
                 let consumer_reader = consumer.reader();
+                let mut allow_stable_ids: Vec<i128> = id_to_dense
+                    .iter()
+                    .filter_map(|(stable_id, dense_id)| {
+                        ((*dense_id as usize).is_multiple_of(FILTER_KEEP_EVERY))
+                            .then_some(*stable_id)
+                    })
+                    .collect();
+                allow_stable_ids.sort_unstable();
+                allow_stable_ids.dedup();
                 let prepared_allow = tiers::block_on(
-                    consumer_reader.prepare_vector_global_allow_async(Arc::clone(&allow)),
+                    consumer_reader.prepare_vector_stable_allow_async(Arc::new(allow_stable_ids)),
                 )
-                .expect("prepare global allow bitmaps");
+                .expect("prepare stable-id allow bitmaps");
                 let mut recalls = Vec::new();
                 let mut latencies = Vec::new();
                 let filtered_before = consumer_meter.snapshot();
                 for (q, gt) in q_correct.iter().zip(filtered_gt) {
                     let t0 = Instant::now();
-                    let hits = tiers::block_on(
-                        consumer_reader.vector_hits_prepared_global_allow_async(
+                    let hits =
+                        tiers::block_on(consumer_reader.vector_hits_prepared_global_allow_async(
                             supertable::VEC_COLUMN,
                             q,
                             TOP_K,
@@ -1571,9 +1581,8 @@ pub mod vector {
                                 FILTERED_DEFAULT_RERANK_MULT,
                             ),
                             &prepared_allow,
-                        ),
-                    )
-                    .expect("filtered recall query");
+                        ))
+                        .expect("filtered recall query");
                     latencies.push(t0.elapsed());
                     let dense_hits = hits_to_dense_u32(&consumer, &id_to_dense, &hits);
                     recalls.push(corpus::recall_at_k(&dense_hits, gt));

@@ -774,22 +774,14 @@ impl Supertable {
         let hidden = self.inner.vector_index_table.as_ref()?;
         let reader = hidden.reader();
         let manifest = reader.manifest();
+        // Parts are table-level size buckets; per-cell identity lives on each
+        // superfile entry's partition key.
         let mut by_cell: HashMap<Vec<u8>, usize> = HashMap::new();
         let flat_superfiles = manifest.get_all_superfiles();
-        let total = if flat_superfiles.is_empty() {
-            let mut total = 0usize;
-            for entry in manifest.get_all_list_entries() {
-                let n_superfiles = entry.n_superfiles as usize;
-                total = total.saturating_add(n_superfiles);
-                *by_cell.entry(entry.partition_key.clone()).or_default() += n_superfiles;
-            }
-            total
-        } else {
-            for entry in flat_superfiles {
-                *by_cell.entry(entry.partition_key.clone()).or_default() += 1;
-            }
-            flat_superfiles.len()
-        };
+        for entry in flat_superfiles {
+            *by_cell.entry(entry.partition_key.clone()).or_default() += 1;
+        }
+        let total = flat_superfiles.len();
         if total == 0 {
             return Some((0, 0));
         }
@@ -870,7 +862,19 @@ impl Supertable {
 /// holding) can be wired here if a workload ever needs it —
 /// but that is a *bounded* set, never the whole manifest.
 /// Default number of global vector-index cells for routed search.
-pub(crate) const GLOBAL_VECTOR_CELL_COUNT: usize = 64;
+const DEFAULT_GLOBAL_VECTOR_CELL_COUNT: usize = 64;
+
+/// Runtime override for the global vector-index cell count.
+///
+/// Useful for benchmark/ops tuning without rebuilding. Invalid or unset values
+/// fall back to [`DEFAULT_GLOBAL_VECTOR_CELL_COUNT`].
+pub(crate) fn global_vector_cell_count() -> usize {
+    std::env::var("INFINO_GLOBAL_VECTOR_CELL_COUNT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_GLOBAL_VECTOR_CELL_COUNT)
+}
 
 /// Reserved VectorCell partition id for the hidden index's "incoming" append
 /// region. Each hidden commit writes one IVF superfile under this sentinel
@@ -887,14 +891,6 @@ pub(crate) const GLOBAL_VECTOR_KMEANS_ITERS: usize = 8;
 
 /// Fixed PRNG seed for global centroid training.
 pub(crate) const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
-
-/// Eager-load every part of a hidden vector-index manifest whose part count is
-/// at or below this. Set high enough to keep the whole cell manifest eager: the
-/// grid shards one part per cell, and lazy open resolves the routed cells' parts
-/// one at a time (serial), so cold search cost would otherwise grow with cell
-/// count. Eager instead loads all parts once at open, in parallel, and the query
-/// prunes cells in memory — reading only the routed cells' data.
-const HIDDEN_VECTOR_INDEX_EAGER_LOAD_THRESHOLD: u32 = 1_000_000;
 
 /// Headroom an engine-managed (auto-sized) cache budget keeps over the
 /// table's on-storage footprint, in divisor form (`footprint +
@@ -1054,14 +1050,13 @@ fn build_vector_index_options(
     .ok()?;
     hidden_opts = hidden_opts
         .with_storage(Arc::clone(&sub_storage))
-        .with_vector_layout(crate::superfile::vector::layout::VectorLayout::Ivf)
-        .with_eager_load_threshold(HIDDEN_VECTOR_INDEX_EAGER_LOAD_THRESHOLD);
+        .with_vector_layout(crate::superfile::vector::layout::VectorLayout::Ivf);
     if let Some(cache) = user_opts.disk_cache.as_ref() {
         hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
     }
     if let Some(manifest) = user_manifest
         && let Some(clusters) =
-            train_global_centroids(user_opts, manifest, GLOBAL_VECTOR_CELL_COUNT)
+            train_global_centroids(user_opts, manifest, global_vector_cell_count())
     {
         hidden_opts = hidden_opts.with_partition_strategy(
             crate::supertable::manifest::list::PartitionStrategy::VectorCell {

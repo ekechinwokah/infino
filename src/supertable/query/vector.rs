@@ -473,7 +473,10 @@ async fn user_placement_for_scalar_resolve(
                 stable_id: Some(user_row_id),
             });
         } else {
-            gapped.entry(user_entry.uri).or_default().push((i, user_row_id));
+            gapped
+                .entry(user_entry.uri)
+                .or_default()
+                .push((i, user_row_id));
         }
     }
     for (uri, entries) in gapped {
@@ -517,15 +520,8 @@ impl SupertableReader {
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
-        self.vector_fanout_over_superfiles(
-            superfiles.to_vec(),
-            column,
-            query,
-            k,
-            options,
-            None,
-        )
-        .await
+        self.vector_fanout_over_superfiles(superfiles.to_vec(), column, query, k, options, None)
+            .await
     }
 
     async fn vector_fanout_over_superfiles(
@@ -555,9 +551,7 @@ impl SupertableReader {
             .iter()
             .find(|vc| vc.column == column)
             .map(|vc| vc.metric)
-            .ok_or_else(|| {
-                QueryError::Execute(format!("unknown vector column `{column}`"))
-            })?;
+            .ok_or_else(|| QueryError::Execute(format!("unknown vector column `{column}`")))?;
 
         let mut scored: Vec<(usize, u32, f32)> = Vec::new();
         for (si, entry) in superfiles.iter().enumerate() {
@@ -969,37 +963,39 @@ impl SupertableReader {
                 .get_all_superfiles_loaded()
                 .await
                 .map_err(QueryError::ManifestLoad)?;
-            if superfiles.is_empty() {
-                return Ok(PreparedGlobalAllow {
-                    use_hidden_index: true,
-                    allow_by_uri: HashMap::new(),
-                });
-            }
-            let allow_for_cell = Arc::clone(&allow_global);
-            let manifest_for_ids = Arc::clone(&hidden_manifest);
-            let allow_by_uri = hidden_reader
-                .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
-                    let allow_for_cell = Arc::clone(&allow_for_cell);
-                    let manifest_for_ids = Arc::clone(&manifest_for_ids);
-                    async move {
-                        let stable_ids =
-                            stable_ids_by_local_for_routing(&manifest_for_ids, &entry, &r).await?;
-                        let mut local = RoaringBitmap::new();
-                        for (local_doc_id, stable_id) in stable_ids.into_iter().enumerate() {
-                            if let Ok(global_id) = u32::try_from(stable_id)
-                                && allow_for_cell.contains(global_id)
-                            {
-                                local.insert(local_doc_id as u32);
+            if !superfiles.is_empty() {
+                let allow_for_cell = Arc::clone(&allow_global);
+                let manifest_for_ids = Arc::clone(&hidden_manifest);
+                let allow_by_uri = hidden_reader
+                    .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
+                        let allow_for_cell = Arc::clone(&allow_for_cell);
+                        let manifest_for_ids = Arc::clone(&manifest_for_ids);
+                        async move {
+                            let stable_ids = stable_ids_by_local_for_routing(
+                                &manifest_for_ids,
+                                &entry,
+                                &r,
+                            )
+                            .await?;
+                            let mut local = RoaringBitmap::new();
+                            for (local_doc_id, stable_id) in stable_ids.into_iter().enumerate() {
+                                if let Ok(global_id) = u32::try_from(stable_id)
+                                    && allow_for_cell.contains(global_id)
+                                {
+                                    local.insert(local_doc_id as u32);
+                                }
                             }
+                            Ok(local)
                         }
-                        Ok(local)
-                    }
-                })
-                .await?;
-            return Ok(PreparedGlobalAllow {
-                use_hidden_index: true,
-                allow_by_uri,
-            });
+                    })
+                    .await?;
+                if !allow_by_uri.is_empty() {
+                    return Ok(PreparedGlobalAllow {
+                        use_hidden_index: true,
+                        allow_by_uri,
+                    });
+                }
+            }
         }
 
         let manifest = self.manifest();
@@ -1035,6 +1031,99 @@ impl SupertableReader {
                 .into_iter()
                 .map(|(uri, bm)| (uri, Arc::new(bm)))
                 .collect(),
+        })
+    }
+
+    /// Build a per-superfile allow-set from stable `_id` values.
+    ///
+    /// This is the bench helper for post-drain filtered recall: hidden-cell
+    /// superfiles are cluster-ordered, so corpus-dense row ids no longer match
+    /// local doc-id order, but stable `_id`s remain invariant.
+    #[cfg(feature = "test-helpers")]
+    pub async fn prepare_vector_stable_allow_async(
+        &self,
+        allow_stable_ids: Arc<Vec<i128>>,
+    ) -> Result<PreparedGlobalAllow, QueryError> {
+        if allow_stable_ids.is_empty() {
+            return Ok(PreparedGlobalAllow {
+                use_hidden_index: self.vector_index_table().is_some(),
+                allow_by_uri: HashMap::new(),
+            });
+        }
+        let allow_set: Arc<HashSet<i128>> =
+            Arc::new(allow_stable_ids.iter().copied().collect::<HashSet<i128>>());
+        if let Some(vit) = self.vector_index_table() {
+            let hidden_reader = vit.reader();
+            let hidden_manifest = Arc::clone(hidden_reader.manifest());
+            let superfiles = hidden_manifest
+                .get_all_superfiles_loaded()
+                .await
+                .map_err(QueryError::ManifestLoad)?;
+            if !superfiles.is_empty() {
+                let allow_for_cell = Arc::clone(&allow_set);
+                let manifest_for_ids = Arc::clone(&hidden_manifest);
+                let allow_by_uri = hidden_reader
+                    .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
+                        let allow_for_cell = Arc::clone(&allow_for_cell);
+                        let manifest_for_ids = Arc::clone(&manifest_for_ids);
+                        async move {
+                            let stable_ids = stable_ids_by_local_for_routing(
+                                &manifest_for_ids,
+                                &entry,
+                                &r,
+                            )
+                            .await?;
+                            let mut local = RoaringBitmap::new();
+                            for (local_doc_id, stable_id) in stable_ids.into_iter().enumerate() {
+                                if allow_for_cell.contains(&stable_id) {
+                                    local.insert(local_doc_id as u32);
+                                }
+                            }
+                            Ok(local)
+                        }
+                    })
+                    .await?;
+                if !allow_by_uri.is_empty() {
+                    return Ok(PreparedGlobalAllow {
+                        use_hidden_index: true,
+                        allow_by_uri,
+                    });
+                }
+            }
+        }
+        let manifest = self.manifest();
+        let superfiles = manifest
+            .get_all_superfiles_loaded()
+            .await
+            .map_err(QueryError::ManifestLoad)?;
+        if superfiles.is_empty() {
+            return Ok(PreparedGlobalAllow {
+                use_hidden_index: false,
+                allow_by_uri: HashMap::new(),
+            });
+        }
+        let allow_for_user = Arc::clone(&allow_set);
+        let manifest_for_ids = Arc::clone(&manifest);
+        let allow_by_uri = self
+            .fanout_candidate_bitmaps(&superfiles, move |r, entry| {
+                let allow_for_user = Arc::clone(&allow_for_user);
+                let manifest_for_ids = Arc::clone(&manifest_for_ids);
+                async move {
+                    let stable_ids =
+                        stable_ids_by_local_for_routing(&manifest_for_ids, &entry, &r).await?;
+                    let mut local = RoaringBitmap::new();
+                    for (local_doc_id, stable_id) in stable_ids.into_iter().enumerate() {
+                        if allow_for_user.contains(&stable_id) {
+                            local.insert(local_doc_id as u32);
+                        }
+                    }
+                    Ok(local)
+                }
+            })
+            .await?;
+        Ok(PreparedGlobalAllow {
+            use_hidden_index: false,
+            allow_by_uri,
         })
     }
 
