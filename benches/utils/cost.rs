@@ -116,31 +116,39 @@ impl Instance {
         resident_bytes as f64 / BYTES_PER_GIB / self.ram_gib
     }
 
-    /// Compute dollars for a saturating parallel phase (ingest, drain,
-    /// compaction): wall time billed at the phase's **binding** share of
-    /// the machine — the writer pool's CPU share or the phase's peak-RSS
-    /// share of RAM, whichever is larger. RAM is held for the whole phase
-    /// wall (allocated at phase start, dropped at phase end), so a
-    /// RAM-bound phase bills its RSS share for its full duration.
-    fn phase_compute_usd(&self, wall_s: f64, writers: u32, peak_rss_bytes: Option<u64>) -> f64 {
-        wall_s * self.phase_binding_share(writers, peak_rss_bytes) * self.usd_per_sec()
-    }
-
-    /// The binding share for a parallel phase; `> cpu_share` ⇒ RAM-bound.
-    fn phase_binding_share(&self, writers: u32, peak_rss_bytes: Option<u64>) -> f64 {
-        let cpu_share = f64::from(writers.min(self.vcpu)) / f64::from(self.vcpu.max(1));
-        cpu_share.max(peak_rss_bytes.map(|b| self.ram_share(b)).unwrap_or(0.0))
-    }
-
-    /// Whether RAM (not the pool's CPU share) binds a parallel phase.
-    fn phase_ram_binds(&self, writers: u32, peak_rss_bytes: Option<u64>) -> bool {
-        let cpu_share = f64::from(writers.min(self.vcpu)) / f64::from(self.vcpu.max(1));
-        peak_rss_bytes.map(|b| self.ram_share(b)).unwrap_or(0.0) > cpu_share
-    }
-
     fn parallel_vcpu_seconds(&self, wall_s: f64, writers: u32) -> f64 {
         let cpu_share = f64::from(writers.min(self.vcpu)) / f64::from(self.vcpu.max(1));
         wall_s * cpu_share
+    }
+
+    /// Binding vCPU·s for a one-time parallel phase, preferring measured
+    /// on-CPU time. The CPU leg is the measured `cpu_s` when present
+    /// (schedstat excludes I/O wait — the correct compute basis), else the
+    /// modeled `wall × pool-share`. The RAM leg is `wall × peak-RSS share`
+    /// (RAM is held for the whole wall). The phase bills on whichever binds.
+    fn phase_vcpu_seconds(
+        &self,
+        wall_s: f64,
+        writers: u32,
+        peak_rss_bytes: Option<u64>,
+        cpu_s: Option<f64>,
+    ) -> f64 {
+        let cpu_leg = cpu_s.unwrap_or_else(|| self.parallel_vcpu_seconds(wall_s, writers));
+        let ram_leg = wall_s * peak_rss_bytes.map(|b| self.ram_share(b)).unwrap_or(0.0);
+        cpu_leg.max(ram_leg)
+    }
+
+    /// Whether the measured/modeled CPU leg (not RAM) binds a one-time phase.
+    fn phase_cpu_binds(
+        &self,
+        wall_s: f64,
+        writers: u32,
+        peak_rss_bytes: Option<u64>,
+        cpu_s: Option<f64>,
+    ) -> bool {
+        let cpu_leg = cpu_s.unwrap_or_else(|| self.parallel_vcpu_seconds(wall_s, writers));
+        let ram_leg = wall_s * peak_rss_bytes.map(|b| self.ram_share(b)).unwrap_or(0.0);
+        cpu_leg >= ram_leg
     }
 
     fn per_query_usd(&self, p50_s: f64, resident_anon_bytes: u64) -> f64 {
@@ -180,6 +188,10 @@ pub struct StorePhases {
     pub drain: Option<ObjectStoreMeter>,
     /// Wall-clock seconds of the drain window, when it ran.
     pub drain_wall_s: Option<f64>,
+    /// Measured on-CPU seconds (all-thread schedstat delta) over the drain
+    /// window. `Some` ⇒ price compute from this instead of `wall × share`;
+    /// `None` ⇒ fall back to the wall-clock model.
+    pub drain_cpu_s: Option<f64>,
     /// Peak RSS sampled over the drain window — the drain is billed at
     /// `max(pool CPU share, peak-RSS share)` for its wall duration.
     pub drain_peak_rss_bytes: Option<u64>,
@@ -188,6 +200,9 @@ pub struct StorePhases {
     pub compaction: Option<ObjectStoreMeter>,
     /// Wall-clock seconds of the compaction window, when it ran.
     pub compaction_wall_s: Option<f64>,
+    /// Measured on-CPU seconds over the compaction window (same semantics as
+    /// [`Self::drain_cpu_s`]).
+    pub compaction_cpu_s: Option<f64>,
     /// Peak RSS sampled over the compaction window (same billing rule).
     pub compaction_peak_rss_bytes: Option<u64>,
     /// One cold table open on a fresh cache (manifest + pointer + open
@@ -226,6 +241,9 @@ pub struct CellCost<'a> {
     /// on the *binding* resource — `max(writer-pool CPU share, peak-RSS
     /// share of RAM)` — same rule queries use; `None` bills CPU share.
     pub ingest_peak_rss_bytes: Option<u64>,
+    /// Measured on-CPU seconds over the ingest window. `Some` ⇒ price the
+    /// CPU leg from this instead of `wall × pool-share`; `None` ⇒ wall model.
+    pub ingest_cpu_s: Option<f64>,
     /// Commits in the ingest window, for PUT-per-commit normalization.
     pub n_commits: u64,
     /// Exact PUT count for write paths that are known without metering
@@ -362,21 +380,34 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     // ---- Write path: ingest + drain + compaction (compute and requests).
     // Each phase is billed at its binding share — pool CPU or peak-RSS
     // share of RAM, whichever is larger — for its full wall duration.
-    let ingest_vcpu_s = inst.parallel_vcpu_seconds(c.ingest_wall_s, c.writers);
-    let ingest_compute =
-        inst.phase_compute_usd(c.ingest_wall_s, c.writers, c.ingest_peak_rss_bytes);
+    // Compute is priced from measured on-CPU seconds when the harness
+    // captured them (schedstat, I/O wait excluded); otherwise it falls back
+    // to the `wall × pool-share` model. vCPU·s and $ share one basis so the
+    // ledger's two columns can't disagree.
+    let ingest_vcpu_s = inst.phase_vcpu_seconds(
+        c.ingest_wall_s,
+        c.writers,
+        c.ingest_peak_rss_bytes,
+        c.ingest_cpu_s,
+    );
+    let ingest_compute = ingest_vcpu_s * inst.usd_per_sec();
     let drain_wall_s = c.store.drain_wall_s.unwrap_or(0.0);
-    let drain_vcpu_s = inst.parallel_vcpu_seconds(drain_wall_s, c.writers);
-    let drain_compute =
-        inst.phase_compute_usd(drain_wall_s, c.writers, c.store.drain_peak_rss_bytes);
+    let drain_vcpu_s = inst.phase_vcpu_seconds(
+        drain_wall_s,
+        c.writers,
+        c.store.drain_peak_rss_bytes,
+        c.store.drain_cpu_s,
+    );
+    let drain_compute = drain_vcpu_s * inst.usd_per_sec();
 
     let compaction_wall_s = c.store.compaction_wall_s.unwrap_or(0.0);
-    let compaction_vcpu_s = inst.parallel_vcpu_seconds(compaction_wall_s, c.writers);
-    let compaction_compute = inst.phase_compute_usd(
+    let compaction_vcpu_s = inst.phase_vcpu_seconds(
         compaction_wall_s,
         c.writers,
         c.store.compaction_peak_rss_bytes,
+        c.store.compaction_cpu_s,
     );
+    let compaction_compute = compaction_vcpu_s * inst.usd_per_sec();
 
     let ingest_req_usd = match (c.store.ingest, c.unmetered_put_count) {
         (Some(io), _) => request_usd(&io),
@@ -775,14 +806,24 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     let writers_used = c.writers.min(inst.vcpu);
     let vcpu_share = format!("{writers_used}/{}/vCPU share", inst.vcpu);
     // A parallel phase's label carries its binding resource: peak RSS when
-    // the phase's RAM share exceeds the pool's CPU share, else CPU.
-    let phase_binding_tag = |peak_rss: Option<u64>| -> String {
+    // the phase's RAM share exceeds the (measured or modeled) CPU leg, else
+    // CPU.
+    let phase_binding_tag = |wall_s: f64, peak_rss: Option<u64>, cpu_s: Option<f64>| -> String {
         match peak_rss {
-            Some(rss) if inst.phase_ram_binds(c.writers, Some(rss)) => {
+            Some(rss) if !inst.phase_cpu_binds(wall_s, c.writers, Some(rss), cpu_s) => {
                 format!(" — RAM-bound: {} peak held for the window", fmt_bytes(rss))
             }
             Some(rss) => format!(" — {} peak, CPU binds", fmt_bytes(rss)),
             None => String::new(),
+        }
+    };
+    // Wall/basis cell: measured on-CPU time when captured, else the
+    // `wall × pool-share` model.
+    let phase_wall_cell = |wall_s: f64, cpu_s: Option<f64>| -> String {
+        if cpu_s.is_some() {
+            format!("{} · measured CPU", fmt_wall_seconds(wall_s))
+        } else {
+            format!("{} × {vcpu_share}", fmt_wall_seconds(wall_s))
         }
     };
     let mut compute_rows = vec![vec![
@@ -790,12 +831,9 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             "Ingest ({}w on {} vCPU{})",
             c.writers,
             inst.vcpu,
-            phase_binding_tag(c.ingest_peak_rss_bytes),
+            phase_binding_tag(c.ingest_wall_s, c.ingest_peak_rss_bytes, c.ingest_cpu_s),
         )),
-        text(format!(
-            "{} × {vcpu_share}",
-            fmt_wall_seconds(c.ingest_wall_s)
-        )),
+        text(phase_wall_cell(c.ingest_wall_s, c.ingest_cpu_s)),
         text(fmt_vcpu_seconds(ingest_vcpu_s)),
         metric(ingest_compute, usd(ingest_compute), Better::Lower),
     ]];
@@ -803,9 +841,9 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         compute_rows.push(vec![
             text(format!(
                 "Drain (hidden index, one-time{})",
-                phase_binding_tag(c.store.drain_peak_rss_bytes),
+                phase_binding_tag(drain_wall_s, c.store.drain_peak_rss_bytes, c.store.drain_cpu_s),
             )),
-            text(format!("{} × {vcpu_share}", fmt_wall_seconds(drain_wall_s))),
+            text(phase_wall_cell(drain_wall_s, c.store.drain_cpu_s)),
             text(fmt_vcpu_seconds(drain_vcpu_s)),
             metric(drain_compute, usd(drain_compute), Better::Lower),
         ]);
@@ -821,12 +859,13 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         compute_rows.push(vec![
             text(format!(
                 "Compaction (optimize, one-time{})",
-                phase_binding_tag(c.store.compaction_peak_rss_bytes),
+                phase_binding_tag(
+                    compaction_wall_s,
+                    c.store.compaction_peak_rss_bytes,
+                    c.store.compaction_cpu_s,
+                ),
             )),
-            text(format!(
-                "{} × {vcpu_share}",
-                fmt_wall_seconds(compaction_wall_s)
-            )),
+            text(phase_wall_cell(compaction_wall_s, c.store.compaction_cpu_s)),
             text(fmt_vcpu_seconds(compaction_vcpu_s)),
             metric(compaction_compute, usd(compaction_compute), Better::Lower),
         ]);
@@ -1119,8 +1158,8 @@ mod tests {
     #[test]
     fn parallel_ingest_costs_more_per_second_than_single_writer() {
         let inst = test_instance();
-        let single = inst.phase_compute_usd(10.0, 1, None);
-        let full = inst.phase_compute_usd(10.0, 8, None);
+        let single = inst.phase_vcpu_seconds(10.0, 1, None, None) * inst.usd_per_sec();
+        let full = inst.phase_vcpu_seconds(10.0, 8, None, None) * inst.usd_per_sec();
         assert!((full / single - 8.0).abs() < 1e-9);
     }
 
@@ -1130,12 +1169,26 @@ mod tests {
         // 1 writer on 8 vCPU = 12.5% CPU share; 8 GiB peak on 16 GiB = 50%
         // RAM share → RAM binds and the phase bills 4× the CPU-only price.
         let eight_gib = 8u64 << 30;
-        let cpu_only = inst.phase_compute_usd(10.0, 1, None);
-        let ram_bound = inst.phase_compute_usd(10.0, 1, Some(eight_gib));
-        assert!(inst.phase_ram_binds(1, Some(eight_gib)));
+        let cpu_only = inst.phase_vcpu_seconds(10.0, 1, None, None) * inst.usd_per_sec();
+        let ram_bound = inst.phase_vcpu_seconds(10.0, 1, Some(eight_gib), None) * inst.usd_per_sec();
+        assert!(!inst.phase_cpu_binds(10.0, 1, Some(eight_gib), None));
         assert!((ram_bound / cpu_only - 4.0).abs() < 1e-9);
         // Full-pool CPU (100%) dominates the same 50% RAM share.
-        assert!(!inst.phase_ram_binds(8, Some(eight_gib)));
+        assert!(inst.phase_cpu_binds(10.0, 8, Some(eight_gib), None));
+    }
+
+    #[test]
+    fn measured_cpu_overrides_wall_model_for_phase() {
+        let inst = test_instance();
+        // No measurement → wall model: 10s × (8/8 pool share) = 10 vCPU·s.
+        assert!((inst.phase_vcpu_seconds(10.0, 8, None, None) - 10.0).abs() < 1e-9);
+        // Measured on-CPU 3.5s (I/O wait excluded) is billed verbatim when it
+        // exceeds the RAM leg — the whole point of measuring instead of wall.
+        assert!((inst.phase_vcpu_seconds(10.0, 8, None, Some(3.5)) - 3.5).abs() < 1e-9);
+        // RAM leg (50% of 16 GiB over a 10s wall = 5 vCPU·s) still binds when
+        // it exceeds the measured CPU.
+        let eight_gib = 8u64 << 30;
+        assert!((inst.phase_vcpu_seconds(10.0, 8, Some(eight_gib), Some(3.5)) - 5.0).abs() < 1e-9);
     }
 
     #[test]

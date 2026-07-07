@@ -73,6 +73,7 @@ fn emit_cost_warm(
             ingest_wall_s,
             writers,
             ingest_peak_rss_bytes: None,
+            ingest_cpu_s: None,
             // A single-superfile commit is exactly one `put_atomic`.
             n_commits: 1,
             unmetered_put_count: Some(1),

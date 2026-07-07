@@ -53,6 +53,7 @@ use tempfile::TempDir;
 use crate::{
     corpus::DIM,
     cost,
+    cpu,
     ingest::supertable::{self, Modality, modality_label},
     markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
     report::{Better, Block, Cell, Report, Section, metric, text},
@@ -509,6 +510,9 @@ fn emit_cost_warm(
             ingest_wall_s: wall_s,
             writers: supertable::n_writers() as u32,
             ingest_peak_rss_bytes: metrics.map(|m| m.peak_rss_bytes),
+            // Ingest on-CPU measurement not yet threaded through the shared
+            // build path; falls back to the wall model.
+            ingest_cpu_s: None,
             n_commits: supertable::n_commits() as u64,
             unmetered_put_count: None,
             stored_bytes: stored_bytes_override.unwrap_or(built.total_index_bytes),
@@ -1411,7 +1415,8 @@ pub mod vector {
                 table: &consumer,
                 id_to_dense: Arc::clone(&id_to_dense),
             };
-            let mut drain_stats: Option<(f64, storage_meter::ObjectStoreMeter, u64)> = None;
+            let mut drain_stats: Option<(f64, storage_meter::ObjectStoreMeter, u64, Option<f64>)> =
+                None;
             let mut filtered_stats: Option<(storage_meter::ObjectStoreMeter, u64)> = None;
             let mut cold_split_pre: Option<storage_meter::ColdStoreSplit> = None;
             let mut pre_search_rows = None;
@@ -1459,9 +1464,11 @@ pub mod vector {
 
                 let before_drain = consumer_meter.snapshot();
                 let drain_sampler = PeakSampler::start_default();
+                let drain_cpu0 = cpu::process_cpu_ns();
                 let drain_t0 = Instant::now();
                 drain_hidden_incoming(&consumer);
                 let drain_wall_s = drain_t0.elapsed().as_secs_f64();
+                let drain_cpu_s = cpu::cpu_seconds_since(drain_cpu0);
                 let drain_peak_rss = drain_sampler.stop_stats().peak_rss_bytes;
                 let drain_io = consumer_meter.snapshot().since(&before_drain);
                 eprintln!(
@@ -1473,7 +1480,7 @@ pub mod vector {
                     drain_io.head_count,
                     rss::fmt_bytes(drain_peak_rss),
                 );
-                drain_stats = Some((drain_wall_s, drain_io, drain_peak_rss));
+                drain_stats = Some((drain_wall_s, drain_io, drain_peak_rss, drain_cpu_s));
 
                 if phases.warm {
                     log_hidden_stats(&consumer, "at warm open (post-drain)");
@@ -1709,11 +1716,13 @@ pub mod vector {
                     eprintln!("[supertable_vector] compacting (optimize: user + hidden)...");
                     let before = consumer_meter.snapshot();
                     let sampler = PeakSampler::start_default();
+                    let cpu0 = cpu::process_cpu_ns();
                     let t0 = Instant::now();
                     consumer
                         .optimize(&OptimizeOptions::default())
                         .expect("optimize (compaction)");
                     let wall_s = t0.elapsed().as_secs_f64();
+                    let cpu_s = cpu::cpu_seconds_since(cpu0);
                     let peak_rss = sampler.stop_stats().peak_rss_bytes;
                     let io = consumer_meter.snapshot().since(&before);
                     eprintln!(
@@ -1725,7 +1734,7 @@ pub mod vector {
                         rss::fmt_bytes(peak_rss),
                     );
                     log_hidden_stats(&consumer, "after compaction");
-                    (wall_s, io, peak_rss)
+                    (wall_s, io, peak_rss, cpu_s)
                 });
 
                 // Steady-state footprint = user table + derived hidden vector
@@ -1766,12 +1775,14 @@ pub mod vector {
                     })
                     .flatten();
                 let store = cost::StorePhases {
-                    drain: drain_stats.map(|(_, io, _)| io),
-                    drain_wall_s: drain_stats.map(|(wall_s, _, _)| wall_s),
-                    drain_peak_rss_bytes: drain_stats.map(|(_, _, peak)| peak),
-                    compaction: compaction_stats.map(|(_, io, _)| io),
-                    compaction_wall_s: compaction_stats.map(|(wall_s, _, _)| wall_s),
-                    compaction_peak_rss_bytes: compaction_stats.map(|(_, _, peak)| peak),
+                    drain: drain_stats.map(|(_, io, _, _)| io),
+                    drain_wall_s: drain_stats.map(|(wall_s, _, _, _)| wall_s),
+                    drain_cpu_s: drain_stats.and_then(|(_, _, _, cpu_s)| cpu_s),
+                    drain_peak_rss_bytes: drain_stats.map(|(_, _, peak, _)| peak),
+                    compaction: compaction_stats.map(|(_, io, _, _)| io),
+                    compaction_wall_s: compaction_stats.map(|(wall_s, _, _, _)| wall_s),
+                    compaction_cpu_s: compaction_stats.and_then(|(_, _, _, cpu_s)| cpu_s),
+                    compaction_peak_rss_bytes: compaction_stats.map(|(_, _, peak, _)| peak),
                     cold_open_pre: cold_split_pre.map(|s| s.open),
                     cold_query_pre: cold_split_pre.map(|s| s.first_query),
                     warm_query: warm_io.map(|(io, _)| io),
