@@ -1186,6 +1186,70 @@ pub(crate) fn build_merged_subsection_from_materialized(
     })
 }
 
+/// Build one complete cell-IVF subsection from an in-memory fp32 corpus.
+///
+/// Rows are streamed via [`InMemoryVectorSource`] — the same pass-2 path as
+/// ingest when the pre-spill buffer never crossed the threshold — so no
+/// spill file is opened. Intended for commit/drain callers that already hold
+/// the vectors in RAM and want the drain pack workflow without a disk round-trip.
+///
+/// `vectors` is row-major (`n_docs × dim`); length must be a multiple of `cfg.dim`.
+pub(crate) fn build_merged_subsection_from_fp32(
+    cfg: VectorConfig,
+    vectors: Arc<Vec<f32>>,
+) -> Result<MergedIvfSubsection, BuildError> {
+    let dim = cfg.dim;
+    if dim == 0 {
+        return Err(BuildError::VectorSchemaMismatch(
+            "fp32 cell IVF build requires dim > 0".into(),
+        ));
+    }
+    if vectors.len() % dim != 0 {
+        return Err(BuildError::VectorSchemaMismatch(format!(
+            "fp32 corpus length {} is not a multiple of dim {}",
+            vectors.len(),
+            dim
+        )));
+    }
+    let n_docs = vectors.len() / dim;
+    if n_docs == 0 {
+        return Err(BuildError::VectorSchemaMismatch(
+            "fp32 cell IVF build requires at least one row".into(),
+        ));
+    }
+    let sample_size = default_kmeans_sample_size(cfg.n_cent).min(n_docs);
+    let reservoir_seed = cfg.rot_seed ^ RESERVOIR_SEED_XOR_MASK;
+    let mut reservoir = Reservoir::new(sample_size, dim, reservoir_seed);
+    for r in 0..n_docs {
+        reservoir.update(&vectors[r * dim..(r + 1) * dim]);
+    }
+    // Force the in-memory path: spill threshold larger than the corpus so
+    // `build_subsection_streaming` wraps `pre_spill_buffer` in
+    // `InMemoryVectorSource` and never opens a SpillWriter.
+    let corpus_bytes = vectors.len().saturating_mul(4);
+    let col = ColumnState {
+        config: cfg,
+        n_docs: n_docs as u32,
+        reservoir,
+        pre_spill_buffer: Arc::try_unwrap(vectors).unwrap_or_else(|arc| (*arc).clone()),
+        spill: None,
+        spill_threshold_bytes: corpus_bytes.saturating_add(1),
+        materialized_rows: None,
+        prebuilt_subsection: None,
+    };
+    let mut scratch = ScratchDir::default();
+    let scratch_path = scratch.path()?.to_path_buf();
+    let sub = build_subsection_streaming(0, col, &scratch_path)?;
+    Ok(MergedIvfSubsection {
+        bytes: sub.bytes,
+        n_cent: sub.n_cent,
+        n_docs: n_docs as u32,
+        summary_offset_in_sub: sub.summary_offset_in_sub,
+        codec_meta_offset_in_sub: sub.codec_meta_offset_in_sub,
+        codec_meta_size: sub.codec_meta_size,
+    })
+}
+
 fn build_subsection_streaming(
     column_id: u32,
     col: ColumnState,
@@ -2217,6 +2281,31 @@ mod tests {
         );
         let reader = VectorReader::open(Bytes::from(blob), &json).expect("open tiny sq8 shard");
         assert_eq!(reader.n_docs(), 1);
+    }
+
+    #[test]
+    fn build_merged_subsection_from_fp32_stays_in_memory() {
+        let dim = 16;
+        let n = 32;
+        let mut corpus = Vec::with_capacity(n * dim);
+        for r in 0..n {
+            for c in 0..dim {
+                corpus.push((r as f32) * 0.01 + (c as f32) * 0.001);
+            }
+        }
+        let cfg = VectorConfig {
+            column: "v".into(),
+            dim,
+            n_cent: 4,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        };
+        let sub = build_merged_subsection_from_fp32(cfg, Arc::new(corpus)).expect("fp32 build");
+        assert_eq!(sub.n_docs, n as u32);
+        assert!(sub.n_cent >= 1);
+        assert!(!sub.bytes.is_empty());
     }
 
     #[test]

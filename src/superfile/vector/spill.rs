@@ -3,7 +3,7 @@
 
 //! Streaming spill primitives for the bounded-memory build path.
 //!
-//! Two cooperating abstractions:
+//! Cooperating abstractions:
 //!
 //! - [`SpillWriter`] — append-only writer that buffers raw f32
 //!   vector bytes into a temp file on disk. Used during
@@ -16,6 +16,10 @@
 //!   Two implementations: [`InMemoryVectorSource`] (wraps an
 //!   `Arc<Vec<f32>>`, no spill needed) and [`MmapVectorSource`]
 //!   (wraps a memory-mapped spill file).
+//! - [`CellRowAccumulator`] — per-cell drain accumulator that keeps
+//!   [`MaterializedIvfRow`]s in RAM when the working set is already
+//!   memory-resident, and only opens [`MaterializedRowSpillWriter`]
+//!   scratch files when cross-batch accumulation must bound RAM.
 //!
 //! Both `ChunkedVectorSource` implementations own their backing
 //! storage so the trait isn't tied to an external lifetime; the
@@ -24,7 +28,7 @@
 //! per-chunk loop runs inside.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, Error, ErrorKind, Read, Write},
     mem::size_of,
@@ -373,12 +377,14 @@ pub(crate) struct SpilledCellRows {
 
 impl SpilledCellRows {
     /// Rows recorded in this spill.
+    #[allow(dead_code)] // used by tests + disk-path wave sizing callers
     pub(crate) fn n_rows(&self) -> u32 {
         self.n_rows
     }
 
     /// On-disk size of the row-record file — the working-set estimate the
     /// drain uses to group cells into memory-bounded build waves.
+    #[allow(dead_code)] // used by tests + disk-path wave sizing callers
     pub(crate) fn row_bytes(&self) -> u64 {
         (self.n_rows as u64) * record_bytes(self.dim, self.rabitq_len) as u64
     }
@@ -386,6 +392,7 @@ impl SpilledCellRows {
     /// Delete both backing files. Called after the cell superfile is built
     /// and uploaded so drain scratch shrinks as cells complete; the owning
     /// tempdir still sweeps anything left behind on early exit.
+    #[allow(dead_code)] // used by tests; disk drain path relies on tempdir drop
     pub(crate) fn remove_files(&self) {
         let _ = fs::remove_file(&self.rows_path);
         let _ = fs::remove_file(&self.quants_path);
@@ -395,8 +402,128 @@ impl SpilledCellRows {
 /// Byte length of one spilled row record for a `(dim, rabitq_len)` shape:
 /// the fixed prefix plus the RaBitQ code and the Sq8+epsilon `codes`/`residuals`
 /// legs (each `dim` bytes).
+#[allow(dead_code)] // paired with `SpilledCellRows::row_bytes`
 fn record_bytes(dim: usize, rabitq_len: usize) -> usize {
     ROW_SPILL_PREFIX_BYTES + rabitq_len + 2 * dim
+}
+
+/// Per-cell store for drain accumulation: either an in-RAM row vec (when
+/// the source working set is already memory-resident) or a disk spill
+/// writer (cross-batch RAM bound).
+enum CellRowStore {
+    Memory(Vec<MaterializedIvfRow>),
+    Disk(MaterializedRowSpillWriter),
+}
+
+/// Drain-side accumulator of [`MaterializedIvfRow`]s keyed by cell.
+///
+/// When `prefer_memory` is true (single-batch drain, or an fp32 stream
+/// already resident in RAM), rows stay in `Vec`s and never open spill
+/// files. When false, each cell uses [`MaterializedRowSpillWriter`] so
+/// multi-batch drains stay O(batch) in RAM.
+pub(crate) struct CellRowAccumulator {
+    prefer_memory: bool,
+    scratch: Option<PathBuf>,
+    cells: HashMap<u32, CellRowStore>,
+}
+
+impl CellRowAccumulator {
+    /// In-memory accumulator — no scratch directory.
+    pub(crate) fn memory() -> Self {
+        Self {
+            prefer_memory: true,
+            scratch: None,
+            cells: HashMap::new(),
+        }
+    }
+
+    /// Disk-backed accumulator under `scratch` (created on first append).
+    pub(crate) fn disk(scratch: PathBuf) -> Self {
+        Self {
+            prefer_memory: false,
+            scratch: Some(scratch),
+            cells: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn prefer_memory(&self) -> bool {
+        self.prefer_memory
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+
+    /// Reset disk writers' Arc-pointer quantizer dedup at a batch boundary.
+    /// No-op for in-memory stores.
+    pub(crate) fn begin_batch(&mut self) {
+        for store in self.cells.values_mut() {
+            if let CellRowStore::Disk(w) = store {
+                w.begin_batch();
+            }
+        }
+    }
+
+    /// Append one row to `cell`, creating the cell store on first touch.
+    pub(crate) fn append(
+        &mut self,
+        cell: u32,
+        row: &MaterializedIvfRow,
+    ) -> Result<(), BuildError> {
+        match self.cells.entry(cell) {
+            Entry::Occupied(mut o) => match o.get_mut() {
+                CellRowStore::Memory(rows) => {
+                    rows.push(row.clone());
+                    Ok(())
+                }
+                CellRowStore::Disk(w) => w.append(row),
+            },
+            Entry::Vacant(v) => {
+                if self.prefer_memory {
+                    v.insert(CellRowStore::Memory(vec![row.clone()]));
+                    Ok(())
+                } else {
+                    let scratch = self.scratch.as_ref().ok_or_else(|| {
+                        BuildError::Io(Error::new(
+                            ErrorKind::NotFound,
+                            "disk cell accumulator missing scratch dir",
+                        ))
+                    })?;
+                    let mut w = MaterializedRowSpillWriter::create(
+                        scratch,
+                        cell,
+                        row.encoded.codes.len(),
+                        row.rabitq_code.len(),
+                    )?;
+                    w.append(row)?;
+                    v.insert(CellRowStore::Disk(w));
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// Finish every cell into `(cell_id, rows)` ready for IVF build.
+    /// Memory stores move their vecs; disk stores read spill files back.
+    pub(crate) fn into_cell_rows(self) -> Result<Vec<(u32, Vec<MaterializedIvfRow>)>, BuildError> {
+        let mut out = Vec::with_capacity(self.cells.len());
+        for (cell, store) in self.cells {
+            let rows = match store {
+                CellRowStore::Memory(rows) => rows,
+                CellRowStore::Disk(w) => {
+                    let spill = w.finish()?;
+                    read_spilled_cell_rows(&spill)?
+                }
+            };
+            out.push((cell, rows));
+        }
+        out.sort_unstable_by_key(|(cell, _)| *cell);
+        Ok(out)
+    }
 }
 
 /// Append-only spill for [`MaterializedIvfRow`]s of ONE cell, accumulated
@@ -767,6 +894,44 @@ mod tests {
         assert!(w2.append(&bad).is_err(), "shape mismatch must be rejected");
 
         spill.remove_files();
+    }
+
+    #[test]
+    fn cell_row_accumulator_memory_keeps_rows_without_spill() {
+        const DIM: usize = 4;
+        let quant: (Arc<[f32]>, Arc<[f32]>) =
+            (Arc::from(vec![1.0f32; DIM]), Arc::from(vec![0.0f32; DIM]));
+        let row = |id: i128, cell: u32| MaterializedIvfRow {
+            local_doc_id: 0,
+            stable_id: id,
+            cluster: cell,
+            rabitq_code: vec![id as u8],
+            encoded: EncodedCellRow {
+                stable_id: id,
+                scale: Arc::clone(&quant.0),
+                offset: Arc::clone(&quant.1),
+                codes: vec![id as u8; DIM],
+                residuals: vec![0u8; DIM],
+                norm_sq: None,
+            },
+        };
+
+        let mut acc = CellRowAccumulator::memory();
+        assert!(acc.prefer_memory());
+        acc.append(3, &row(10, 3)).expect("append");
+        acc.append(1, &row(11, 1)).expect("append");
+        acc.append(3, &row(12, 3)).expect("append");
+        assert_eq!(acc.len(), 2);
+
+        let cells = acc.into_cell_rows().expect("finish");
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].0, 1);
+        assert_eq!(cells[0].1.len(), 1);
+        assert_eq!(cells[0].1[0].stable_id, 11);
+        assert_eq!(cells[1].0, 3);
+        assert_eq!(cells[1].1.len(), 2);
+        assert_eq!(cells[1].1[0].stable_id, 10);
+        assert_eq!(cells[1].1[1].stable_id, 12);
     }
 
     #[test]

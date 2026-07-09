@@ -49,11 +49,10 @@
 
 use std::{
     cmp,
-    collections::{HashMap, hash_map::Entry},
+    collections::HashMap,
     fmt, io,
     marker::PhantomData,
     mem,
-    path::Path,
     sync::{Arc, atomic::Ordering},
     time,
 };
@@ -125,7 +124,7 @@ use crate::{
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
             reader::VectorReader,
-            spill::{MaterializedRowSpillWriter, SpilledCellRows, read_spilled_cell_rows},
+            spill::{CellRowAccumulator},
         },
     },
     supertable::{
@@ -2070,25 +2069,20 @@ fn drain_batch_superfiles(opts: &SupertableOptions) -> i64 {
 /// Working-set cap for one wave of the drain's end-of-run per-cell builds.
 const DRAIN_BUILD_GROUP_BYTES: u64 = 4 * (1 << 30);
 
-/// Append one materialized row to `cell`'s spill, creating the cell writer on
-/// first touch.
-fn spill_row_to_cell(
-    spills: &mut HashMap<u32, MaterializedRowSpillWriter>,
+/// Rough per-row byte estimate for wave sizing when rows are already in RAM
+/// (prefix + RaBitQ + Sq8 codes/residuals). Matches the spill layout's
+/// variable payload closely enough for the 4 GiB wave budget.
+const DRAIN_MEMORY_ROW_BYTES_ESTIMATE: u64 = 29 + 128 + 2 * 1024;
+
+/// Append one materialized row to `cell`'s accumulator and bump the
+/// per-cell added count.
+fn accumulate_row_to_cell(
+    cells: &mut CellRowAccumulator,
     added: &mut HashMap<u32, u32>,
-    scratch: &Path,
     cell: u32,
     row: &MaterializedIvfRow,
 ) -> Result<(), BuildError> {
-    let writer = match spills.entry(cell) {
-        Entry::Occupied(o) => o.into_mut(),
-        Entry::Vacant(v) => v.insert(MaterializedRowSpillWriter::create(
-            scratch,
-            cell,
-            row.encoded.codes.len(),
-            row.rabitq_code.len(),
-        )?),
-    };
-    writer.append(row)?;
+    cells.append(cell, row)?;
     let n = added.entry(cell).or_insert(0);
     *n = n.saturating_add(1);
     Ok(())
@@ -2265,9 +2259,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     let mut running_clusters = clusters;
     // kmeans mode decouples the batch budget (a memory bound on how many user
     // superfiles are materialized at once) from the published layout: every
-    // batch spills rows per cell to scratch, then packs cell IVFs into ≤N
-    // shard objects after the last batch.
-    let drain_scratch = if is_splice {
+    // batch accumulates rows per cell, then packs cell IVFs into ≤N shard
+    // objects after the last batch. A single-batch drain keeps rows in RAM
+    // (source is already resident); multi-batch drains spill to scratch so
+    // peak RAM stays O(batch).
+    let prefer_memory_accum = !is_splice && n_batches <= 1;
+    let drain_scratch = if is_splice || prefer_memory_accum {
         None
     } else {
         Some(
@@ -2275,7 +2272,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 .map_err(|e| BuildError::Store(format!("drain spill scratch dir: {e}")))?,
         )
     };
-    let mut cell_spills: HashMap<u32, MaterializedRowSpillWriter> = HashMap::new();
+    let mut cell_rows: CellRowAccumulator = if prefer_memory_accum {
+        CellRowAccumulator::memory()
+    } else if let Some(ref scratch) = drain_scratch {
+        CellRowAccumulator::disk(scratch.path().to_path_buf())
+    } else {
+        CellRowAccumulator::memory()
+    };
     let mut added_per_cell: HashMap<u32, u32> = HashMap::new();
 
     for (batch_idx, (batch_versions, batch_sources)) in batches.iter().enumerate() {
@@ -2468,22 +2471,15 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
 
             let all_rows: Vec<MaterializedIvfRow> = row_sets.into_iter().flatten().collect();
             let n_batch_rows = all_rows.len();
-            let scratch = drain_scratch
-                .as_ref()
-                .expect("kmeans drain owns a scratch dir")
-                .path();
-            // Batch boundary: reset spill writers' Arc-pointer dedup.
-            for writer in cell_spills.values_mut() {
-                writer.begin_batch();
-            }
+            // Batch boundary: reset disk writers' Arc-pointer dedup (no-op in RAM).
+            cell_rows.begin_batch();
             let replica_target = drain_replica_target_factor();
             let replica_extra_budget = drain_replica_extra_budget(all_rows.len(), replica_target);
             if replica_extra_budget == 0 && assign_skip {
                 for row in &all_rows {
-                    spill_row_to_cell(
-                        &mut cell_spills,
+                    accumulate_row_to_cell(
+                        &mut cell_rows,
                         &mut added_per_cell,
-                        scratch,
                         row.cluster,
                         row,
                     )?;
@@ -2522,39 +2518,43 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 // Boundary replicas: append the same row bytes to neighbor cells.
                 for (row_idx, cell, _) in replica_candidates.into_iter().take(replica_extra_budget)
                 {
-                    spill_row_to_cell(
-                        &mut cell_spills,
+                    accumulate_row_to_cell(
+                        &mut cell_rows,
                         &mut added_per_cell,
-                        scratch,
                         cell,
                         &all_rows[row_idx],
                     )?;
                 }
                 for (row, assignment) in all_rows.iter().zip(&assignments) {
-                    spill_row_to_cell(
-                        &mut cell_spills,
+                    accumulate_row_to_cell(
+                        &mut cell_rows,
                         &mut added_per_cell,
-                        scratch,
                         assignment.primary,
                         row,
                     )?;
                 }
             }
-            let t_spill = batch_t0.elapsed().as_secs_f64() * 1e3;
+            let t_accum = batch_t0.elapsed().as_secs_f64() * 1e3;
+            let accum_label = if cell_rows.prefer_memory() {
+                "memory"
+            } else {
+                "spill"
+            };
             eprintln!(
-                "[supertable drain] batch {}/{} ({} sf, kmeans): materialize {:.1}ms + {} {:.1}ms, {} batch row(s) -> {} cell spill(s)",
+                "[supertable drain] batch {}/{} ({} sf, kmeans): materialize {:.1}ms + {} {:.1}ms, {} batch row(s) -> {} cell {} store(s)",
                 batch_idx + 1,
                 n_batches,
                 batch_sources.len(),
                 t_mat,
                 if assign_skip {
-                    "group(assign-skip)+spill"
+                    "group(assign-skip)+accum"
                 } else {
-                    "assign+spill"
+                    "assign+accum"
                 },
-                t_spill - t_mat,
+                t_accum - t_mat,
                 n_batch_rows,
-                cell_spills.len(),
+                cell_rows.len(),
+                accum_label,
             );
         }
 
@@ -2641,41 +2641,30 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         }
     }
 
-    // kmeans cell build: turn per-cell spills into exactly one superfile per
-    // touched cell, in memory-bounded waves, then publish everything in one
-    // atomic CAS.
-    if !cell_spills.is_empty() {
+    // kmeans cell build: turn per-cell accumulated rows into packed multi-cell
+    // shards, in memory-bounded waves, then publish everything in one atomic CAS.
+    if !cell_rows.is_empty() {
         let build_t0 = time::Instant::now();
-        let mut spilled: Vec<(u32, SpilledCellRows)> = cell_spills
-            .into_iter()
-            .map(|(cell, writer)| writer.finish().map(|s| (cell, s)).map_err(BuildError::from))
-            .collect::<Result<Vec<_>, BuildError>>()?;
-        spilled.sort_unstable_by_key(|(cell, _)| *cell);
-        let n_cells_total = spilled.len();
-        let total_rows: u64 = spilled.iter().map(|(_, s)| s.n_rows() as u64).sum();
+        let cells_all = cell_rows.into_cell_rows()?;
+        let n_cells_total = cells_all.len();
+        let total_rows: u64 = cells_all.iter().map(|(_, r)| r.len() as u64).sum();
 
         crate::superfile::vector::builder::build_phase_timers::reset();
         let mut new_entries: Vec<Arc<SuperfileEntry>> = Vec::with_capacity(n_cells_total);
-        let mut wave: Vec<(u32, SpilledCellRows)> = Vec::new();
+        let mut wave: Vec<(u32, Vec<MaterializedIvfRow>)> = Vec::new();
         let mut wave_bytes: u64 = 0;
         let mut n_waves = 0usize;
-        let mut spilled_iter = spilled.into_iter().peekable();
-        while let Some((cell, spill)) = spilled_iter.next() {
-            wave_bytes += spill.row_bytes();
-            wave.push((cell, spill));
-            let flush = wave_bytes >= DRAIN_BUILD_GROUP_BYTES || spilled_iter.peek().is_none();
+        let mut cells_iter = cells_all.into_iter().peekable();
+        while let Some((cell, rows)) = cells_iter.next() {
+            wave_bytes += rows.len() as u64 * DRAIN_MEMORY_ROW_BYTES_ESTIMATE;
+            wave.push((cell, rows));
+            let flush = wave_bytes >= DRAIN_BUILD_GROUP_BYTES || cells_iter.peek().is_none();
             if !flush {
                 continue;
             }
             n_waves += 1;
-            let cells_rows: Vec<(u32, Vec<MaterializedIvfRow>)> = wave
-                .iter()
-                .map(|(cell, spill)| {
-                    read_spilled_cell_rows(spill)
-                        .map(|rows| (*cell, rows))
-                        .map_err(BuildError::from)
-                })
-                .collect::<Result<Vec<_>, BuildError>>()?;
+            let cells_rows = std::mem::take(&mut wave);
+            wave_bytes = 0;
             let prepared_wave: Vec<PreparedSuperfile> =
                 hidden_inner.options.writer_pool.install(|| {
                     let n_shards = packed_cell_shard_count(&hidden_inner.options);
@@ -2729,10 +2718,6 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
             new_entries.extend(publish.new_entries);
-            for (_, spill) in wave.drain(..) {
-                spill.remove_files();
-            }
-            wave_bytes = 0;
         }
 
         let mut cell_updates: HashMap<u32, u32> = HashMap::new();
