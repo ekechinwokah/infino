@@ -6,12 +6,9 @@
 //! each lifecycle phase (ingest, drain, cold open, per-query fetch) from
 //! these measured counts — never from estimates.
 //!
-//! One blind spot, by design: reads issued through
-//! `StorageProvider::object_store_handle` hand the caller the raw inner
-//! `ObjectStore`, bypassing this wrapper, so requests on that escape
-//! hatch are not counted. Today that path serves row materialization
-//! (`take_rows_object_store`); the `_id` + `score` search shapes the
-//! metered iterations run do not hit it.
+//! Reads issued through `StorageProvider::object_store_handle` are wrapped
+//! in [`CountingObjectStore`] so parquet range GETs (row materialization,
+//! cold `_id` resolution) land in the same meter as provider-level reads.
 
 use std::{
     fmt,
@@ -24,9 +21,12 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::BoxStream;
 use infino::storage::{ObjectMeta, StorageError, StorageProvider};
 use object_store::{
-    MultipartUpload, PutPayload, PutResult, Result as ObjectStoreResult, UploadPart,
+    path::Path as ObjPath, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload,
+    ObjectMeta as OsObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, Result as ObjectStoreResult, UploadPart,
 };
 
 use crate::rss::fmt_bytes;
@@ -120,6 +120,10 @@ pub struct ObjectStoreMeter {
     pub get_bytes: u64,
     pub put_count: u64,
     pub put_bytes: u64,
+    /// LIST requests (billed at the PUT/list rate on S3).
+    pub list_count: u64,
+    /// DELETE requests (free on S3; counted for completeness, not priced).
+    pub delete_count: u64,
     /// GET counts attributed per URI class (indexed by `UriClass::index`).
     pub get_by_class: [ClassIo; N_URI_CLASSES],
 }
@@ -143,6 +147,8 @@ impl ObjectStoreMeter {
             get_bytes: self.get_bytes.saturating_sub(earlier.get_bytes),
             put_count: self.put_count.saturating_sub(earlier.put_count),
             put_bytes: self.put_bytes.saturating_sub(earlier.put_bytes),
+            list_count: self.list_count.saturating_sub(earlier.list_count),
+            delete_count: self.delete_count.saturating_sub(earlier.delete_count),
             get_by_class,
         }
     }
@@ -197,6 +203,8 @@ struct MeterCounters {
     get_bytes: AtomicU64,
     put_count: AtomicU64,
     put_bytes: AtomicU64,
+    list_count: AtomicU64,
+    delete_count: AtomicU64,
     /// Per-[`UriClass`] GET request counts (indexed by `UriClass::index`).
     class_get_count: [AtomicU64; N_URI_CLASSES],
     /// Per-[`UriClass`] GET byte volumes (indexed by `UriClass::index`).
@@ -220,6 +228,8 @@ impl MeterCounters {
             get_bytes: self.get_bytes.load(Ordering::Relaxed),
             put_count: self.put_count.load(Ordering::Relaxed),
             put_bytes: self.put_bytes.load(Ordering::Relaxed),
+            list_count: self.list_count.load(Ordering::Relaxed),
+            delete_count: self.delete_count.load(Ordering::Relaxed),
             get_by_class,
         }
     }
@@ -391,18 +401,137 @@ impl StorageProvider for CountingStorage {
     }
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+        self.counters.delete_count.fetch_add(1, Ordering::Relaxed);
         self.inner.delete(uri).await
     }
 
     async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        self.counters.list_count.fetch_add(1, Ordering::Relaxed);
         self.inner.list_with_prefix(prefix).await
+    }
+
+    async fn list_with_prefix_metadata(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
+        self.counters.list_count.fetch_add(1, Ordering::Relaxed);
+        self.inner.list_with_prefix_metadata(prefix).await
     }
 
     fn object_store_handle(
         &self,
         uri: &str,
-    ) -> Option<(Arc<dyn object_store::ObjectStore>, object_store::path::Path)> {
-        self.inner.object_store_handle(uri)
+    ) -> Option<(Arc<dyn ObjectStore>, ObjPath)> {
+        let (inner, path) = self.inner.object_store_handle(uri)?;
+        // Wrap the raw store so parquet range reads issued straight against the
+        // object-store handle (row materialization via `take_rows_object_store`,
+        // cold `_id` resolution) are metered too. Without this, those GETs
+        // bypass the meter entirely — a real per-query blind spot.
+        let counted: Arc<dyn ObjectStore> = Arc::new(CountingObjectStore {
+            inner,
+            counters: Arc::clone(&self.counters),
+        });
+        Some((counted, path))
+    }
+}
+
+/// Counting wrapper around a raw [`ObjectStore`] handed out by
+/// [`CountingStorage::object_store_handle`]. Only the read surface is
+/// metered (`get_opts` / `get_ranges`); every other method delegates
+/// unchanged. Reads land in the *same* [`MeterCounters`] as the
+/// `StorageProvider`-level reads, so a query's full GET fan is captured
+/// whether it flows through the provider or the parquet object-store path.
+struct CountingObjectStore {
+    inner: Arc<dyn ObjectStore>,
+    counters: Arc<MeterCounters>,
+}
+
+impl fmt::Debug for CountingObjectStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CountingObjectStore").finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for CountingObjectStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CountingObjectStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for CountingObjectStore {
+    async fn get_opts(&self, location: &ObjPath, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        let is_head = options.head;
+        let res = self.inner.get_opts(location, options).await?;
+        if is_head {
+            self.counters.head_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // The resolved `range` gives the byte count without consuming the
+            // (streamed) payload.
+            let len = res.range.end.saturating_sub(res.range.start);
+            self.counters
+                .record_get(location.as_ref(), Some((res.range.start, res.range.end)), len);
+        }
+        Ok(res)
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &ObjPath,
+        ranges: &[std::ops::Range<u64>],
+    ) -> ObjectStoreResult<Vec<Bytes>> {
+        // Delegate so the inner store's range coalescing is preserved, then
+        // count one GET per requested range with its returned byte length.
+        let out = self.inner.get_ranges(location, ranges).await?;
+        for (r, b) in ranges.iter().zip(&out) {
+            self.counters
+                .record_get(location.as_ref(), Some((r.start, r.end)), b.len() as u64);
+        }
+        Ok(out)
+    }
+
+    async fn put_opts(
+        &self,
+        location: &ObjPath,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> ObjectStoreResult<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &ObjPath,
+        opts: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<ObjPath>>,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjPath>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&ObjPath>) -> BoxStream<'static, ObjectStoreResult<OsObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjPath>,
+    ) -> ObjectStoreResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &ObjPath,
+        to: &ObjPath,
+        options: CopyOptions,
+    ) -> ObjectStoreResult<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }
 
@@ -491,5 +620,60 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(m.read_requests(), 5);
+    }
+
+    /// LIST and DELETE at the provider level are counted (LIST is billed; the
+    /// count feeds the detailed I/O ledger either way).
+    #[tokio::test]
+    async fn list_and_delete_are_counted() {
+        use infino::storage::LocalFsStorageProvider;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let provider: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        let meter = wrap(provider);
+        let p = meter.provider();
+        p.put_atomic("seg/a.bin", Bytes::from_static(b"a"))
+            .await
+            .expect("put");
+        let before = meter.snapshot();
+        let _ = p.list_with_prefix("seg").await.expect("list");
+        p.delete("seg/a.bin").await.expect("delete");
+        let delta = meter.snapshot().since(&before);
+        assert_eq!(delta.list_count, 1);
+        assert_eq!(delta.delete_count, 1);
+    }
+
+    /// Regression: a read issued straight against the raw store from
+    /// `object_store_handle` (the parquet row-materialization / cold `_id`
+    /// path) must be metered, not silently bypass the wrapper.
+    #[tokio::test]
+    async fn object_store_handle_reads_are_metered() {
+        use infino::storage::LocalFsStorageProvider;
+        use object_store::ObjectStoreExt;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let provider: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        provider
+            .put_atomic("seg/x.bin", Bytes::from_static(b"0123456789"))
+            .await
+            .expect("put");
+
+        let meter = wrap(provider);
+        let before = meter.snapshot();
+        let (store, path) = meter
+            .provider()
+            .object_store_handle("seg/x.bin")
+            .expect("handle");
+        let bytes = store.get_range(&path, 2..5).await.expect("range");
+        assert_eq!(&bytes[..], b"234");
+
+        let delta = meter.snapshot().since(&before);
+        assert_eq!(
+            delta.get_count, 1,
+            "a read via object_store_handle must be metered, not bypassed"
+        );
+        assert_eq!(delta.get_bytes, 3);
     }
 }

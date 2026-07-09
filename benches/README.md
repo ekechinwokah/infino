@@ -116,11 +116,12 @@ and let you skip the sweep:
 - `INFINO_BENCH_VECTOR_NPROBE` — probe count for the `default` row (default 8).
 - `INFINO_BENCH_VECTOR_RERANK` — rerank multiplier for the `default` row
   (default 256 at the 1M×1024 bench scale; clears the 0.80 default-config gate).
-- `INFINO_BENCH_SKIP_CALIBRATION=1` — measure **only** the fixed
-  `(nprobe, rerank)` `default` row: skips the correctness gate, the
-  recall-target calibration sweep, and brute-force ground-truth generation.
-  This is the fast path for a fixed-config **cold-only** latency number on a
-  many-segment supertable, where sweeping the full grid over a cold table is
+- `INFINO_BENCH_SKIP_CALIBRATION=1` — measure the fixed `(nprobe, rerank)`
+  `default` row without the recall-target calibration sweep or the
+  high-nprobe correctness gate. Brute-force ground truth for the
+  correctness query set (and filtered GT) is still built so default /
+  filtered recall can be reported. This is the fast path for a fixed-config
+  latency number on a many-segment table, where sweeping the full grid is
   prohibitively slow.
 - `INFINO_BENCH_PREFETCH_CONCURRENCY` — disk-cache prefetch fan-out for the
   cold-fill / promotion path on many-segment tables (default 8).

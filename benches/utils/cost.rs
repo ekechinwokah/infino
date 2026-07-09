@@ -377,13 +377,14 @@ fn fmt_wall_seconds(s: f64) -> String {
     }
 }
 
-/// Request dollars for one metered window (PUTs at the PUT rate,
-/// HEAD + GET at the GET rate).
+/// Request dollars for one metered window: PUT + LIST at the PUT/list rate,
+/// HEAD + GET at the GET rate. DELETE is free on S3, so it is counted but not
+/// priced.
 fn request_usd(io: &ObjectStoreMeter) -> f64 {
-    io.put_count as f64 * USD_PER_PUT + io.read_requests() as f64 * USD_PER_GET
+    (io.put_count + io.list_count) as f64 * USD_PER_PUT + io.read_requests() as f64 * USD_PER_GET
 }
 
-/// "N PUT + M GET (+ K HEAD)" — the request-count cell of an I/O row.
+/// "N PUT + M GET (+ K HEAD / LIST / DELETE)" — the request-count cell of an I/O row.
 fn fmt_requests(io: &ObjectStoreMeter) -> String {
     let mut parts = Vec::new();
     if io.put_count > 0 {
@@ -394,6 +395,12 @@ fn fmt_requests(io: &ObjectStoreMeter) -> String {
     }
     if io.head_count > 0 {
         parts.push(format!("{} HEAD", io.head_count));
+    }
+    if io.list_count > 0 {
+        parts.push(format!("{} LIST", io.list_count));
+    }
+    if io.delete_count > 0 {
+        parts.push(format!("{} DELETE", io.delete_count));
     }
     if parts.is_empty() {
         "0".into()
@@ -1364,17 +1371,19 @@ mod tests {
     }
 
     #[test]
-    fn request_usd_prices_puts_and_reads() {
+    fn request_usd_prices_puts_lists_and_reads() {
         let io = ObjectStoreMeter {
             head_count: 10,
             get_count: 90,
             get_bytes: 0,
             put_count: 1000,
             put_bytes: 0,
+            list_count: 50,
+            delete_count: 20,
             ..Default::default()
         };
-        // 1000 PUT × $5e-6 + 100 reads × $4e-7.
-        let expected = 1000.0 * 5.0e-6 + 100.0 * 4.0e-7;
+        // (1000 PUT + 50 LIST) × $5e-6 + 100 reads × $4e-7; DELETE unpriced.
+        let expected = 1050.0 * 5.0e-6 + 100.0 * 4.0e-7;
         assert!((request_usd(&io) - expected).abs() < 1e-12);
     }
 }

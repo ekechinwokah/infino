@@ -289,6 +289,7 @@ impl StorageProvider for S3StorageProvider {
             .head(&path)
             .await
             .map_err(|e| translate(uri, e))?;
+        crate::storage::io_counters::record_head();
         Ok(ObjectMeta {
             size: meta.size as u64,
             etag: meta.e_tag,
@@ -313,6 +314,7 @@ impl StorageProvider for S3StorageProvider {
         })
         .await;
         if let Ok((b, _)) = &out {
+            crate::storage::io_counters::record_get(b.len() as u64);
             crate::storage::io_counters::timeline_record("get", uri, 0, b.len() as u64, tl);
         }
         out
@@ -385,15 +387,21 @@ impl StorageProvider for S3StorageProvider {
 
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         let path = self.path(uri)?;
+        let n = bytes.len() as u64;
         let opts = PutOptions {
             mode: PutMode::Create,
             ..Default::default()
         };
-        self.store
+        let out = self
+            .store
             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
             .await
             .map(|r| r.e_tag)
-            .map_err(|e| translate(uri, e))
+            .map_err(|e| translate(uri, e));
+        if out.is_ok() {
+            crate::storage::io_counters::record_put(n);
+        }
+        out
     }
 
     async fn put_if_match(
@@ -425,11 +433,17 @@ impl StorageProvider for S3StorageProvider {
                 ..Default::default()
             },
         };
-        self.store
+        let n = bytes.len() as u64;
+        let out = self
+            .store
             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
             .await
             .map(|r| r.e_tag)
-            .map_err(|e| translate(uri, e))
+            .map_err(|e| translate(uri, e));
+        if out.is_ok() {
+            crate::storage::io_counters::record_put(n);
+        }
+        out
     }
 
     async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
@@ -442,6 +456,7 @@ impl StorageProvider for S3StorageProvider {
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
         let path = self.path(uri)?;
+        crate::storage::io_counters::record_delete();
         match self.store.delete(&path).await {
             Ok(()) => Ok(()),
             Err(ObjError::NotFound { .. }) => Ok(()),
@@ -453,6 +468,7 @@ impl StorageProvider for S3StorageProvider {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
+        crate::storage::io_counters::record_list();
         let path = ObjPath::from(prefix);
         let mut stream = self.store.list(Some(&path));
         let mut out = Vec::new();

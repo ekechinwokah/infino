@@ -109,6 +109,7 @@ impl StorageProvider for LocalFsStorageProvider {
             .head(&path)
             .await
             .map_err(|e| translate(uri, e))?;
+        crate::storage::io_counters::record_head();
         Ok(ObjectMeta {
             size: meta.size as u64,
             etag: meta.e_tag,
@@ -127,28 +128,40 @@ impl StorageProvider for LocalFsStorageProvider {
             last_modified: result.meta.last_modified.into(),
         };
         let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
+        crate::storage::io_counters::record_get(bytes.len() as u64);
         Ok((bytes, meta))
     }
 
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let path = Self::path(uri)?;
-        self.store
+        let out = self
+            .store
             .get_range(&path, range)
             .await
-            .map_err(|e| translate(uri, e))
+            .map_err(|e| translate(uri, e));
+        if let Ok(b) = &out {
+            crate::storage::io_counters::record_get(b.len() as u64);
+        }
+        out
     }
 
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         let path = Self::path(uri)?;
+        let n = bytes.len() as u64;
         let opts = PutOptions {
             mode: PutMode::Create,
             ..Default::default()
         };
-        self.store
+        let out = self
+            .store
             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
             .await
             .map(|r| r.e_tag)
-            .map_err(|e| translate(uri, e))
+            .map_err(|e| translate(uri, e));
+        if out.is_ok() {
+            crate::storage::io_counters::record_put(n);
+        }
+        out
     }
 
     async fn put_if_match(
@@ -161,15 +174,21 @@ impl StorageProvider for LocalFsStorageProvider {
         match expected_etag {
             // None == create-only-if-absent. Same as put_atomic.
             None => {
+                let n = bytes.len() as u64;
                 let opts = PutOptions {
                     mode: PutMode::Create,
                     ..Default::default()
                 };
-                self.store
+                let out = self
+                    .store
                     .put_opts(&path, PutPayload::from_bytes(bytes), opts)
                     .await
                     .map(|r| r.e_tag)
-                    .map_err(|e| translate(uri, e))
+                    .map_err(|e| translate(uri, e));
+                if out.is_ok() {
+                    crate::storage::io_counters::record_put(n);
+                }
+                out
             }
             // Some(tag) == update-if-etag-matches.
             //
@@ -244,15 +263,21 @@ impl StorageProvider for LocalFsStorageProvider {
                     if current_etag != expected {
                         return Err(StorageError::PreconditionFailed { uri: uri.into() });
                     }
+                    let put_bytes = bytes.len() as u64;
                     let opts = PutOptions {
                         mode: PutMode::Overwrite,
                         ..Default::default()
                     };
-                    self.store
+                    let out = self
+                        .store
                         .put_opts(&path, PutPayload::from_bytes(bytes), opts)
                         .await
                         .map(|r| r.e_tag)
-                        .map_err(|e| translate(uri, e))
+                        .map_err(|e| translate(uri, e));
+                    if out.is_ok() {
+                        crate::storage::io_counters::record_put(put_bytes);
+                    }
+                    out
                 }
                 .await;
                 // `lock_file` drops here → POSIX flock
@@ -275,6 +300,7 @@ impl StorageProvider for LocalFsStorageProvider {
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
         let path = Self::path(uri)?;
+        crate::storage::io_counters::record_delete();
         match self.store.delete(&path).await {
             Ok(()) => Ok(()),
             Err(ObjError::NotFound { .. }) => Ok(()),
@@ -286,6 +312,7 @@ impl StorageProvider for LocalFsStorageProvider {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
+        crate::storage::io_counters::record_list();
         let path = ObjPath::from(prefix);
         let mut stream = self.store.list(Some(&path));
         let mut out = Vec::new();

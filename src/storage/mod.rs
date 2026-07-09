@@ -110,12 +110,41 @@ pub mod io_counters {
     static BYTES: AtomicU64 = AtomicU64::new(0);
     static HIDDEN_FETCHES: AtomicU64 = AtomicU64::new(0);
     static HIDDEN_BYTES: AtomicU64 = AtomicU64::new(0);
+    // Full per-op counters (read via [`snapshot`]; never reset by `take`, which
+    // stays scoped to the get-family for the existing timeline diagnostics).
+    static HEADS: AtomicU64 = AtomicU64::new(0);
+    static PUTS: AtomicU64 = AtomicU64::new(0);
+    static PUT_BYTES: AtomicU64 = AtomicU64::new(0);
+    static LISTS: AtomicU64 = AtomicU64::new(0);
+    static DELETES: AtomicU64 = AtomicU64::new(0);
 
-    /// Record one object-store range fetch returning `bytes` bytes. The real
-    /// providers call this on every `get_range`, so it counts the *total*.
+    /// Record one object-store range/get/tail fetch returning `bytes` bytes.
+    /// Every provider calls this on the successful result (after the retry
+    /// wrapper, so re-issues are not double-counted), so it counts the *total*.
     pub fn record_get(bytes: u64) {
         FETCHES.fetch_add(1, Ordering::Relaxed);
         BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record one HEAD (metadata) request.
+    pub fn record_head() {
+        HEADS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one PUT (or conditional PUT) writing `bytes` bytes.
+    pub fn record_put(bytes: u64) {
+        PUTS.fetch_add(1, Ordering::Relaxed);
+        PUT_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record one LIST request.
+    pub fn record_list() {
+        LISTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one DELETE request.
+    pub fn record_delete() {
+        DELETES.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Tag a fetch as targeting the hidden vector index (prefixed namespace).
@@ -127,7 +156,9 @@ pub mod io_counters {
     }
 
     /// `(fetches, bytes, hidden_fetches, hidden_bytes)` since the last call;
-    /// resets all. Derive the user-table share as `total − hidden`.
+    /// resets those four. Derive the user-table share as `total − hidden`.
+    /// (Scoped to the get-family so the existing per-batch timeline diagnostics
+    /// keep working; use [`snapshot`] for the full, non-resetting picture.)
     pub fn take() -> (u64, u64, u64, u64) {
         (
             FETCHES.swap(0, Ordering::Relaxed),
@@ -135,6 +166,62 @@ pub mod io_counters {
             HIDDEN_FETCHES.swap(0, Ordering::Relaxed),
             HIDDEN_BYTES.swap(0, Ordering::Relaxed),
         )
+    }
+
+    /// Cumulative per-op counts since process start (never reset). The
+    /// complete engine-side I/O picture across every provider — the counterpart
+    /// of the bench's storage meter, for embedders that read engine counters
+    /// directly rather than wrapping the provider.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct Snapshot {
+        pub get_count: u64,
+        pub get_bytes: u64,
+        pub hidden_get_count: u64,
+        pub hidden_get_bytes: u64,
+        pub head_count: u64,
+        pub put_count: u64,
+        pub put_bytes: u64,
+        pub list_count: u64,
+        pub delete_count: u64,
+    }
+
+    impl Snapshot {
+        /// Per-op counts accrued since an `earlier` snapshot — the window delta
+        /// to price. Makes window-scoped measurement first-class over the
+        /// process-global counters: snapshot, do work, `snapshot().since(&start)`.
+        /// Saturating, since a window never runs backwards.
+        pub fn since(&self, earlier: &Snapshot) -> Snapshot {
+            Snapshot {
+                get_count: self.get_count.saturating_sub(earlier.get_count),
+                get_bytes: self.get_bytes.saturating_sub(earlier.get_bytes),
+                hidden_get_count: self
+                    .hidden_get_count
+                    .saturating_sub(earlier.hidden_get_count),
+                hidden_get_bytes: self
+                    .hidden_get_bytes
+                    .saturating_sub(earlier.hidden_get_bytes),
+                head_count: self.head_count.saturating_sub(earlier.head_count),
+                put_count: self.put_count.saturating_sub(earlier.put_count),
+                put_bytes: self.put_bytes.saturating_sub(earlier.put_bytes),
+                list_count: self.list_count.saturating_sub(earlier.list_count),
+                delete_count: self.delete_count.saturating_sub(earlier.delete_count),
+            }
+        }
+    }
+
+    /// Read all counters without resetting any.
+    pub fn snapshot() -> Snapshot {
+        Snapshot {
+            get_count: FETCHES.load(Ordering::Relaxed),
+            get_bytes: BYTES.load(Ordering::Relaxed),
+            hidden_get_count: HIDDEN_FETCHES.load(Ordering::Relaxed),
+            hidden_get_bytes: HIDDEN_BYTES.load(Ordering::Relaxed),
+            head_count: HEADS.load(Ordering::Relaxed),
+            put_count: PUTS.load(Ordering::Relaxed),
+            put_bytes: PUT_BYTES.load(Ordering::Relaxed),
+            list_count: LISTS.load(Ordering::Relaxed),
+            delete_count: DELETES.load(Ordering::Relaxed),
+        }
     }
 
     /// Per-fetch *timeline* — diagnostic for the cold-search critical path.
@@ -854,5 +941,28 @@ mod tests {
         assert_eq!(cloned.size, 7);
         assert_eq!(cloned.etag.as_deref(), Some("e"));
         assert!(format!("{meta:?}").contains("ObjectMeta"));
+    }
+
+    /// Each per-op recorder advances its counter; `snapshot` reads them all
+    /// without resetting. Assertions are relative (before/after) because the
+    /// counters are process-global and other tests may increment concurrently.
+    #[test]
+    fn io_counters_record_and_snapshot_are_monotonic() {
+        use super::io_counters;
+        let before = io_counters::snapshot();
+        io_counters::record_get(100);
+        io_counters::record_head();
+        io_counters::record_put(50);
+        io_counters::record_list();
+        io_counters::record_delete();
+        let after = io_counters::snapshot();
+        let delta = after.since(&before);
+        assert!(delta.get_count >= 1);
+        assert!(delta.get_bytes >= 100);
+        assert!(delta.head_count >= 1);
+        assert!(delta.put_count >= 1);
+        assert!(delta.put_bytes >= 50);
+        assert!(delta.list_count >= 1);
+        assert!(delta.delete_count >= 1);
     }
 }
