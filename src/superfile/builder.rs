@@ -79,9 +79,14 @@
 //! `inf.fts.columns` JSON already carries a `"tokenizer"` field on
 //! each entry (currently always `"ascii_lower"`), so the on-disk
 //! format is forward-compatible without a file rewrite.
-use std::{collections::HashSet, fmt, io::Error, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    io::Error,
+    sync::Arc,
+};
 
-use arrow_array::{Array, LargeStringArray, RecordBatch};
+use arrow_array::{Array, Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Schema};
 use parquet::basic::{Compression, ZstdLevel};
 use roaring::RoaringBitmap;
@@ -100,10 +105,13 @@ use crate::superfile::{
     },
     stats::SuperfileStats,
     vector::{
-        builder::VectorBuilder,
+        builder::{VectorBuilder, build_merged_subsection_from_materialized},
         cell_posting::{CellPostingBuilder, MaterializedIvfRow},
         distance::Metric,
-        ivf_merge::{MergedIvfSubsection, merge_sq8_ivf_subsections},
+        ivf_merge::{
+            MergedIvfSubsection, Sq8IvfMergeInput, merge_sq8_ivf_subsections,
+            merge_sq8_ivf_subsections_from_parsed, stable_ids_in_merged_local_order,
+        },
         layout::VectorLayout,
         reader::{ColumnReader, VectorReader},
         rerank_codec::RerankCodec,
@@ -287,20 +295,43 @@ impl BuilderOptions {
             Vec::new()
         };
 
-        let vector_columns = if let Some(vec) = &reader.vec() {
-            vec.vector_columns_config()
-                .map(|v| {
-                    VectorConfig::new(
+        let (vector_columns, vector_layout) = if let Some(vec) = &reader.vec() {
+            if vec.is_multi_cell() {
+                // One logical column; cell IVFs live in the v2 cell directory.
+                let v = vec
+                    .vector_columns_config()
+                    .next()
+                    .expect("multi-cell reader has at least one cell ColumnReader");
+                (
+                    vec![VectorConfig::new(
                         v.name.clone(),
                         v.dim,
                         v.n_cent as usize,
                         v.rot_seed,
                         v.metric,
                     )
-                })
-                .collect::<Vec<_>>()
+                    .with_rerank_codec(v.rerank_codec)],
+                    VectorLayout::MultiCellIvf,
+                )
+            } else {
+                (
+                    vec.vector_columns_config()
+                        .map(|v| {
+                            VectorConfig::new(
+                                v.name.clone(),
+                                v.dim,
+                                v.n_cent as usize,
+                                v.rot_seed,
+                                v.metric,
+                            )
+                            .with_rerank_codec(v.rerank_codec)
+                        })
+                        .collect::<Vec<_>>(),
+                    VectorLayout::Ivf,
+                )
+            }
         } else {
-            Vec::new()
+            (Vec::new(), VectorLayout::Ivf)
         };
 
         BuilderOptions::new(
@@ -310,6 +341,7 @@ impl BuilderOptions {
             vector_columns,
             Some(tokenizer),
         )
+        .with_vector_layout(vector_layout)
     }
 
     fn check_mergeability(
@@ -411,6 +443,10 @@ pub struct SuperfileBuilder {
     /// `None` if `opts.vector_columns` is empty.
     vec_builder: Option<VectorBuilder>,
     cell_posting_builder: Option<CellPostingBuilder>,
+    /// Pre-built cell-IVF subsections for [`VectorLayout::MultiCellIvf`].
+    /// When set, `finish` assembles a v2 multi-cell vector blob instead of
+    /// running the streaming IVF builder.
+    prebuilt_multi_cell: Option<Vec<(u32, MergedIvfSubsection)>>,
     /// Running local doc-id counter, increments with every row in
     /// every `add_batch`.
     next_local_doc_id: u32,
@@ -508,6 +544,10 @@ impl SuperfileBuilder {
                 cb.register_column(vc.clone())?;
             }
             (None, Some(cb))
+        } else if opts.vector_layout == VectorLayout::MultiCellIvf {
+            // Multi-cell blobs are assembled from prebuilt cell IVFs at
+            // finish time; no streaming VectorBuilder is needed.
+            (None, None)
         } else {
             let mut vb = VectorBuilder::new();
             for vc in &opts.vector_columns {
@@ -523,6 +563,7 @@ impl SuperfileBuilder {
             fts_builder,
             vec_builder,
             cell_posting_builder,
+            prebuilt_multi_cell: None,
             next_local_doc_id: 0,
         })
     }
@@ -653,6 +694,36 @@ impl SuperfileBuilder {
         Ok(())
     }
 
+    /// Inject many complete cell-IVF subsections for a multi-cell packed
+    /// superfile ([`VectorLayout::MultiCellIvf`]). Cells must be unique and
+    /// will be sorted by `cell_id` at finish.
+    pub(crate) fn set_prebuilt_multi_cell_ivfs(
+        &mut self,
+        mut cells: Vec<(u32, MergedIvfSubsection)>,
+    ) -> Result<(), BuildError> {
+        if self.opts.vector_layout != VectorLayout::MultiCellIvf {
+            return Err(BuildError::VectorSchemaMismatch(
+                "set_prebuilt_multi_cell_ivfs requires MultiCellIvf layout".into(),
+            ));
+        }
+        if cells.is_empty() {
+            return Err(BuildError::VectorSchemaMismatch(
+                "multi-cell pack requires at least one cell IVF".into(),
+            ));
+        }
+        cells.sort_unstable_by_key(|(cell, _)| *cell);
+        for w in cells.windows(2) {
+            if w[0].0 == w[1].0 {
+                return Err(BuildError::VectorSchemaMismatch(format!(
+                    "duplicate cell_id {} in multi-cell pack",
+                    w[0].0
+                )));
+            }
+        }
+        self.prebuilt_multi_cell = Some(cells);
+        Ok(())
+    }
+
     /// Merge Sq8 IVF superfiles without fp32 corpus decode — byte-splices
     /// per-cluster IVF blocks and remaps doc ids.
     pub fn build_from_sq8_ivf_readers(
@@ -705,6 +776,156 @@ impl SuperfileBuilder {
         let merged_sub = merge_sq8_ivf_subsections(&merge_refs)?;
         superfile_builder.set_prebuilt_ivf_subsection(0, merged_sub)?;
 
+        let bytes = superfile_builder.finish()?;
+        let stats = SuperfileStats::from_children(stats_collector.as_slice());
+        Ok((bytes, stats))
+    }
+
+    /// Merge multi-cell (v2) Sq8 IVF superfiles **per global cell id**, then
+    /// repack into one multi-cell output. Never flattens different cells into
+    /// one IVF. Parquet `_id` rows follow cell-directory order (same as drain).
+    ///
+    /// Tombstones (file-local doc ids) drop rows before the per-cell rebuild;
+    /// empty tombstones use the byte-splice path.
+    pub fn build_from_multi_cell_sq8_ivf_readers(
+        readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+    ) -> Result<(Vec<u8>, SuperfileStats), BuildError> {
+        let first = readers.first().ok_or(BuildError::BatchReadError)?;
+        let builder_opts = BuilderOptions::new_from_reader(&first.0);
+        if builder_opts.vector_layout != VectorLayout::MultiCellIvf {
+            return Err(BuildError::VectorSchemaMismatch(
+                "build_from_multi_cell_sq8_ivf_readers requires multi-cell inputs".into(),
+            ));
+        }
+        let scalar_schema = builder_opts.schema.clone();
+        let vec_cfg = builder_opts
+            .vector_columns
+            .first()
+            .cloned()
+            .ok_or(BuildError::VectorReadError)?;
+        let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
+
+        let any_tombstones = readers
+            .iter()
+            .any(|(_, deleted)| deleted.as_ref().is_some_and(|b| !b.is_empty()));
+
+        let mut stats_collector = Vec::with_capacity(readers.len());
+        for (idx, (reader, deleted)) in readers.iter().enumerate() {
+            let record_batch = reader.get_record_batch(deleted.clone()).map_err(|e| {
+                BuildError::Io(Error::other(format!(
+                    "multi-cell merge input {idx}: read RecordBatch failed: {e}"
+                )))
+            })?;
+            stats_collector.push(SuperfileStats::try_compute_from_record_batch(
+                &record_batch,
+            )?);
+            let v = reader.vec().ok_or(BuildError::VectorReadError)?;
+            if !v.is_multi_cell() {
+                return Err(BuildError::VectorSchemaMismatch(
+                    "build_from_multi_cell_sq8_ivf_readers requires multi-cell inputs".into(),
+                ));
+            }
+        }
+
+        let mut packed_cells: Vec<(u32, MergedIvfSubsection)> = Vec::new();
+        let mut all_stable_ids: Vec<i128> = Vec::new();
+
+        if any_tombstones {
+            // Materialize → filter by file-local tombstone id → rebuild per cell.
+            // Also track the max fine-cluster count seen per cell so rebuilds
+            // keep the source IVF width (empty clusters stay empty).
+            let mut by_cell: HashMap<u32, (usize, Vec<MaterializedIvfRow>)> = HashMap::new();
+            for (reader, deleted) in readers {
+                let v = reader.vec().ok_or(BuildError::VectorReadError)?;
+                let mut file_doc_base = 0u32;
+                let cell_cols: Vec<&ColumnReader> = v.vector_columns_config().collect();
+                for (ci, &cell_id) in v.packed_cell_ids().iter().enumerate() {
+                    let col = cell_cols.get(ci).ok_or(BuildError::VectorReadError)?;
+                    let mut rows = v.materialized_cell_rows_at(ci)?;
+                    if let Some(deny) = deleted.as_ref() {
+                        rows.retain(|r| !deny.contains(file_doc_base + r.local_doc_id));
+                    }
+                    file_doc_base = file_doc_base.saturating_add(col.n_docs);
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    let entry = by_cell.entry(cell_id).or_insert_with(|| (0, Vec::new()));
+                    entry.0 = entry.0.max(col.n_cent as usize);
+                    entry.1.extend(rows);
+                }
+            }
+
+            let mut cell_ids: Vec<u32> = by_cell.keys().copied().collect();
+            cell_ids.sort_unstable();
+            for cell_id in cell_ids {
+                let (n_cent, mut rows) = by_cell.remove(&cell_id).expect("cell present");
+                for (i, row) in rows.iter_mut().enumerate() {
+                    row.local_doc_id = i as u32;
+                }
+                let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
+                let mut cfg = vec_cfg.clone();
+                cfg.n_cent = n_cent.max(1);
+                let merged = build_merged_subsection_from_materialized(cfg, rows)?;
+                if stable_ids.len() != merged.n_docs as usize {
+                    return Err(BuildError::VectorSchemaMismatch(format!(
+                        "cell {cell_id}: stable_ids len {} != merged n_docs {}",
+                        stable_ids.len(),
+                        merged.n_docs
+                    )));
+                }
+                all_stable_ids.extend_from_slice(&stable_ids);
+                packed_cells.push((cell_id, merged));
+            }
+        } else {
+            let mut by_cell: HashMap<u32, Vec<Sq8IvfMergeInput>> = HashMap::new();
+            for (reader, _) in readers {
+                let v = reader.vec().ok_or(BuildError::VectorReadError)?;
+                for (ci, &cell_id) in v.packed_cell_ids().iter().enumerate() {
+                    let inp = v.sq8_ivf_merge_input_at(ci, 0)?;
+                    by_cell.entry(cell_id).or_default().push(inp);
+                }
+            }
+
+            let mut cell_ids: Vec<u32> = by_cell.keys().copied().collect();
+            cell_ids.sort_unstable();
+            for cell_id in cell_ids {
+                let mut inputs = by_cell.remove(&cell_id).expect("cell present");
+                let mut doc_base = 0u32;
+                for inp in &mut inputs {
+                    inp.doc_id_offset = doc_base;
+                    doc_base = doc_base.saturating_add(inp.n_docs);
+                }
+                let merged = merge_sq8_ivf_subsections_from_parsed(&inputs)?;
+                let cell_ids_col = stable_ids_in_merged_local_order(&inputs)?;
+                if cell_ids_col.len() != merged.n_docs as usize {
+                    return Err(BuildError::VectorSchemaMismatch(format!(
+                        "cell {cell_id}: stable_ids len {} != merged n_docs {}",
+                        cell_ids_col.len(),
+                        merged.n_docs
+                    )));
+                }
+                all_stable_ids.extend_from_slice(&cell_ids_col);
+                packed_cells.push((cell_id, merged));
+            }
+        }
+
+        if packed_cells.is_empty() {
+            return Err(BuildError::VectorSchemaMismatch(
+                "multi-cell merge produced no live cells after tombstone filter".into(),
+            ));
+        }
+
+        // Decimal128(38, 0) is the fixed id-column type enforced by BuilderOptions.
+        let id_array = Decimal128Array::from_iter_values(all_stable_ids.iter().copied())
+            .with_precision_and_scale(38, 0)
+            .map_err(|_| BuildError::BatchSchemaMismatch)?;
+        let id_batch = RecordBatch::try_new(
+            scalar_schema,
+            vec![Arc::new(id_array) as Arc<dyn Array>],
+        )
+        .map_err(|_| BuildError::BatchSchemaMismatch)?;
+        superfile_builder.add_batch_ids_only(&id_batch)?;
+        superfile_builder.set_prebuilt_multi_cell_ivfs(packed_cells)?;
         let bytes = superfile_builder.finish()?;
         let stats = SuperfileStats::from_children(stats_collector.as_slice());
         Ok((bytes, stats))
@@ -838,6 +1059,7 @@ impl SuperfileBuilder {
         let fts_builder = self.fts_builder.take();
         let vec_builder = self.vec_builder.take();
         let cell_posting_builder = self.cell_posting_builder.take();
+        let prebuilt_multi_cell = self.prebuilt_multi_cell.take();
 
         // Assemble inf.* KV metadata (cheap; do it before the parallel
         // section so the splice has it ready).
@@ -864,6 +1086,13 @@ impl SuperfileBuilder {
                     kv::VEC_LAYOUT.into(),
                     self.opts.vector_layout.as_kv_value().into(),
                 ));
+            }
+            if let Some(ref cells) = prebuilt_multi_cell {
+                let cell_ids: Vec<u32> = cells.iter().map(|(id, _)| *id).collect();
+                let cells_json = serde_json::to_string(&cell_ids).map_err(|e| {
+                    BuildError::VectorSchemaMismatch(format!("inf.vec.cells JSON: {e}"))
+                })?;
+                kvs.push((kv::VEC_CELLS.into(), cells_json));
             }
         }
 
@@ -893,14 +1122,26 @@ impl SuperfileBuilder {
                 &id_page_limit,
             )
         };
-        let (body, fts_blob, vec_blob) = if vec_builder.is_some() {
-            let (fts_blob, vec_blob) =
-                finish_index_blobs(fts_builder, vec_builder, cell_posting_builder)?;
+        let has_vector = vec_builder.is_some()
+            || cell_posting_builder.is_some()
+            || prebuilt_multi_cell.is_some();
+        let (body, fts_blob, vec_blob) = if has_vector {
+            let (fts_blob, vec_blob) = finish_index_blobs(
+                fts_builder,
+                vec_builder,
+                cell_posting_builder,
+                prebuilt_multi_cell,
+            )?;
             let body = encode_body()?;
             (body, fts_blob, vec_blob)
         } else {
             let (body_res, blobs_res) = rayon::join(encode_body, || {
-                finish_index_blobs(fts_builder, vec_builder, cell_posting_builder)
+                finish_index_blobs(
+                    fts_builder,
+                    vec_builder,
+                    cell_posting_builder,
+                    prebuilt_multi_cell,
+                )
             });
             let body = body_res?;
             let (fts_blob, vec_blob) = blobs_res?;
@@ -920,19 +1161,27 @@ fn finish_index_blobs(
     fts_builder: Option<FtsBuilder>,
     vec_builder: Option<VectorBuilder>,
     cell_posting_builder: Option<CellPostingBuilder>,
+    prebuilt_multi_cell: Option<Vec<(u32, MergedIvfSubsection)>>,
 ) -> Result<(Vec<u8>, Vec<u8>), BuildError> {
-    match (fts_builder, vec_builder, cell_posting_builder) {
-        (Some(fb), Some(vb), None) => {
+    let vec_blob = if let Some(cells) = prebuilt_multi_cell {
+        crate::superfile::vector::builder::finish_multi_cell_blob(&cells)?
+    } else {
+        Vec::new()
+    };
+    match (fts_builder, vec_builder, cell_posting_builder, vec_blob.is_empty()) {
+        (Some(fb), Some(vb), None, true) => {
             let (fts, vec) = rayon::join(|| fb.finish(), || vb.finish());
             Ok((fts?, vec?))
         }
-        (Some(fb), None, Some(cb)) => Ok((fb.finish()?, cb.finish()?)),
-        (Some(fb), None, None) => Ok((fb.finish()?, Vec::new())),
-        (None, Some(vb), None) => Ok((Vec::new(), vb.finish()?)),
-        (None, None, Some(cb)) => Ok((Vec::new(), cb.finish()?)),
-        (None, None, None) => Ok((Vec::new(), Vec::new())),
+        (Some(fb), None, Some(cb), true) => Ok((fb.finish()?, cb.finish()?)),
+        (Some(fb), None, None, true) => Ok((fb.finish()?, Vec::new())),
+        (None, Some(vb), None, true) => Ok((Vec::new(), vb.finish()?)),
+        (None, None, Some(cb), true) => Ok((Vec::new(), cb.finish()?)),
+        (None, None, None, true) => Ok((Vec::new(), Vec::new())),
+        (Some(fb), None, None, false) => Ok((fb.finish()?, vec_blob)),
+        (None, None, None, false) => Ok((Vec::new(), vec_blob)),
         _ => Err(BuildError::VectorSchemaMismatch(
-            "mixed ivf and cell_posting builders".into(),
+            "mixed ivf, cell_posting, and multi-cell builders".into(),
         )),
     }
 }
@@ -2638,5 +2887,155 @@ mod tests {
             rendered.contains("n_fts_columns"),
             "debug output lists fts columns: {rendered}"
         );
+    }
+
+    /// Build one multi-cell packed superfile with two cell IVFs for merge tests.
+    fn pack_two_cell_superfile(id_base: i128) -> Arc<SuperfileReader> {
+        use crate::superfile::vector::{
+            builder::build_merged_subsection_from_materialized,
+            cell_posting::{EncodedCellRow, MaterializedIvfRow},
+        };
+
+        let dim = 16usize;
+        let make_rows = |cell: u32, n: usize| -> Vec<MaterializedIvfRow> {
+            let scale: Arc<[f32]> = Arc::from(vec![1.0f32; dim]);
+            let offset: Arc<[f32]> = Arc::from(vec![0.0f32; dim]);
+            (0..n)
+                .map(|i| {
+                    let local = i as u32;
+                    let stable_id = id_base + (cell as i128) * 100 + local as i128;
+                    let mut codes = vec![0u8; dim];
+                    codes[0] = (cell as u8).wrapping_add(i as u8);
+                    MaterializedIvfRow {
+                        local_doc_id: local,
+                        stable_id,
+                        cluster: 0,
+                        rabitq_code: vec![0u8; dim.div_ceil(8)],
+                        encoded: EncodedCellRow {
+                            stable_id,
+                            scale: Arc::clone(&scale),
+                            offset: Arc::clone(&offset),
+                            codes,
+                            residuals: vec![0u8; dim],
+                            norm_sq: Some(1.0),
+                        },
+                    }
+                })
+                .collect()
+        };
+        let cfg = VectorConfig {
+            column: "emb".into(),
+            dim,
+            n_cent: 2,
+            rot_seed: 1,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        };
+        let rows0 = make_rows(0, 3);
+        let rows1 = make_rows(1, 2);
+        let ids: Vec<i128> = rows0
+            .iter()
+            .chain(rows1.iter())
+            .map(|r| r.stable_id)
+            .collect();
+        let sub0 = build_merged_subsection_from_materialized(cfg.clone(), rows0).expect("cell0");
+        let sub1 = build_merged_subsection_from_materialized(cfg.clone(), rows1).expect("cell1");
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "doc_id",
+            DataType::Decimal128(38, 0),
+            false,
+        )]));
+        let id_array = Decimal128Array::from_iter_values(ids.iter().copied())
+            .with_precision_and_scale(38, 0)
+            .expect("decimal");
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(id_array) as Arc<dyn Array>])
+            .expect("batch");
+        let opts = BuilderOptions::new(schema, "doc_id", vec![], vec![cfg], None)
+            .with_vector_layout(VectorLayout::MultiCellIvf);
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+        b.add_batch_ids_only(&batch).expect("ids");
+        b.set_prebuilt_multi_cell_ivfs(vec![(0, sub0), (1, sub1)])
+            .expect("pack");
+        let bytes = b.finish().expect("finish");
+        Arc::new(SuperfileReader::open(Bytes::from(bytes)).expect("open"))
+    }
+
+    /// Manifest / prepare path must publish the concatenated flat centroid
+    /// directory (sum of per-cell `n_cent`), not only the first packed cell.
+    /// Otherwise global nprobe only ever scores one cell per shard.
+    #[test]
+    fn packed_superfile_cluster_summary_covers_all_cells() {
+        let sf = pack_two_cell_superfile(1_000);
+        let v = sf.vec().expect("vec");
+        assert_eq!(v.packed_cell_ids(), &[0, 1]);
+        let per_cell: Vec<u32> = v.vector_columns_config().map(|c| c.n_cent).collect();
+        assert_eq!(per_cell.len(), 2);
+        let (flat_n_cent, dim, centroids, counts) =
+            v.cluster_centroids("emb").expect("flat centroids");
+        assert_eq!(dim, 16);
+        assert_eq!(
+            flat_n_cent,
+            per_cell.iter().sum::<u32>(),
+            "flat n_cent must equal sum of packed cell n_cent ({per_cell:?})"
+        );
+        assert_eq!(counts.len(), flat_n_cent as usize);
+        assert_eq!(centroids.len(), (flat_n_cent as usize) * 16);
+        // First-cell-only would equal per_cell[0]; that is the recall cliff.
+        assert!(
+            flat_n_cent > per_cell[0],
+            "flat n_cent={flat_n_cent} collapsed to first cell n_cent={}",
+            per_cell[0]
+        );
+    }
+
+    #[test]
+    fn multi_cell_merge_preserves_cell_directory() {
+        let a = pack_two_cell_superfile(1_000);
+        let b = pack_two_cell_superfile(2_000);
+        assert_eq!(a.vec().expect("vec").packed_cell_ids(), &[0, 1]);
+        assert_eq!(a.n_docs(), 5);
+
+        let (merged_bytes, stats) = SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[
+            (a, None),
+            (b, None),
+        ])
+        .expect("merge");
+        assert_eq!(stats.n_docs, 10);
+
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged");
+        let v = merged.vec().expect("vec");
+        assert!(v.is_multi_cell());
+        assert_eq!(v.packed_cell_ids(), &[0, 1]);
+        assert_eq!(merged.n_docs(), 10);
+        // Each cell merged 3+3 and 2+2 rows respectively.
+        let cols: Vec<_> = v.vector_columns_config().collect();
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].n_docs, 6);
+        assert_eq!(cols[1].n_docs, 4);
+    }
+
+    #[test]
+    fn multi_cell_merge_drops_tombstoned_local_docs() {
+        let a = pack_two_cell_superfile(1_000);
+        // File-local doc ids: cell0 → 0,1,2; cell1 → 3,4. Drop local 1 and 3.
+        let mut deny = RoaringBitmap::new();
+        deny.insert(1);
+        deny.insert(3);
+
+        let (merged_bytes, _stats) = SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(
+            a,
+            Some(Arc::new(deny)),
+        )])
+        .expect("merge with tombstones");
+
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open");
+        assert_eq!(merged.n_docs(), 3);
+        let v = merged.vec().expect("vec");
+        assert_eq!(v.packed_cell_ids(), &[0, 1]);
+        let cols: Vec<_> = v.vector_columns_config().collect();
+        assert_eq!(cols[0].n_docs, 2); // kept locals 0,2 from cell0
+        assert_eq!(cols[1].n_docs, 1); // kept local 4 from cell1
     }
 }

@@ -12,16 +12,21 @@ pub(crate) enum VectorLayout {
     /// Single contiguous cell posting blob (`cell_posting` module).
     /// One GET loads the whole posting list; search scans in memory.
     CellPosting,
+    /// One logical vector column packing many complete cell-IVF
+    /// subsections behind a cell directory (`vec::VERSION_MULTI_CELL`).
+    MultiCellIvf,
 }
 
 impl VectorLayout {
     pub(crate) const KV_VALUE_IVF: &'static str = "ivf";
     pub(crate) const KV_VALUE_CELL_POSTING: &'static str = "cell_posting";
+    pub(crate) const KV_VALUE_MULTI_CELL_IVF: &'static str = "multi_cell_ivf";
 
     pub(crate) fn as_kv_value(self) -> &'static str {
         match self {
             Self::Ivf => Self::KV_VALUE_IVF,
             Self::CellPosting => Self::KV_VALUE_CELL_POSTING,
+            Self::MultiCellIvf => Self::KV_VALUE_MULTI_CELL_IVF,
         }
     }
 
@@ -29,6 +34,7 @@ impl VectorLayout {
         match s {
             Self::KV_VALUE_IVF => Some(Self::Ivf),
             Self::KV_VALUE_CELL_POSTING => Some(Self::CellPosting),
+            Self::KV_VALUE_MULTI_CELL_IVF => Some(Self::MultiCellIvf),
             _ => None,
         }
     }

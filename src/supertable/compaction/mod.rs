@@ -341,14 +341,18 @@ impl Supertable {
         }
 
         let (merged_bytes, superfile_stats) = {
-            let sq8_merge = readers_with_tombstones.first().and_then(|(reader, _)| {
-                reader.vec().and_then(|v| {
-                    v.vector_columns_config()
-                        .next()
-                        .map(|c| c.rerank_codec == RerankCodec::Sq8Residual)
-                })
+            let first_vec = readers_with_tombstones
+                .first()
+                .and_then(|(reader, _)| reader.vec());
+            let multi_cell = first_vec.is_some_and(|v| v.is_multi_cell());
+            let sq8_merge = first_vec.and_then(|v| {
+                v.vector_columns_config()
+                    .next()
+                    .map(|c| c.rerank_codec == RerankCodec::Sq8Residual)
             });
-            if sq8_merge == Some(true) {
+            if multi_cell && sq8_merge == Some(true) {
+                SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&readers_with_tombstones)?
+            } else if sq8_merge == Some(true) {
                 SuperfileBuilder::build_from_sq8_ivf_readers(&readers_with_tombstones)?
             } else {
                 SuperfileBuilder::build_from_readers(&readers_with_tombstones)?
@@ -538,11 +542,9 @@ impl Supertable {
                     )
                     .await;
                     if is_hidden_vector_index_table(&inner.options)
-                        && let Some(cell_id) = partition_hint
                         && let Err(e) = split_overflow_cell_after_compaction(
                             Arc::clone(inner),
                             &new_entries[0],
-                            cell_id,
                         )
                         .await
                     {

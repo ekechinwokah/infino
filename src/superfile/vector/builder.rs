@@ -27,8 +27,8 @@ use crate::superfile::{
         self, FST_SEPARATOR, RESERVED_PREFIX,
         checksum::{crc32c, crc32c_append},
         vec::{
-            CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES, U32_BYTES, U64_BYTES,
-            sub_hdr,
+            CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES,
+            U32_BYTES, U64_BYTES, cell_dir_entry, sub_hdr,
         },
     },
     vector::{
@@ -722,6 +722,91 @@ impl VectorBuilder {
     }
 }
 
+/// Assemble a v2 multi-cell vector blob: one logical column packing many
+/// complete cell-IVF subsections behind a cell directory of
+/// `(global_cell_id, subsection_off, subsection_len)`.
+///
+/// `cells` must be non-empty and sorted by ascending `global_cell_id` with
+/// unique ids. Each subsection is a standard `INFVECC1` IVF (unchanged).
+pub(crate) fn finish_multi_cell_blob(
+    cells: &[(u32, MergedIvfSubsection)],
+) -> Result<Vec<u8>, BuildError> {
+    if cells.is_empty() {
+        return Err(BuildError::VectorSchemaMismatch(
+            "multi-cell vector blob requires at least one cell IVF".into(),
+        ));
+    }
+    for w in cells.windows(2) {
+        if w[0].0 >= w[1].0 {
+            return Err(BuildError::VectorSchemaMismatch(
+                "multi-cell cells must be sorted by unique ascending cell_id".into(),
+            ));
+        }
+    }
+
+    let n_cells = cells.len() as u32;
+    let n_docs: u64 = cells.iter().map(|(_, s)| u64::from(s.n_docs)).sum();
+    let directory_offset = OUTER_HEADER_SIZE as u64;
+    let directory_size = cells.len() * CELL_DIR_ENTRY_SIZE;
+    let mut subsection_start =
+        directory_offset + directory_size as u64 + format::CRC_BYTES as u64;
+
+    let mut directory = Vec::with_capacity(directory_size);
+    for (cell_id, sub) in cells {
+        directory.extend_from_slice(&cell_id.to_le_bytes());
+        directory.extend_from_slice(&subsection_start.to_le_bytes());
+        directory.extend_from_slice(&(sub.bytes.len() as u64).to_le_bytes());
+        directory.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        debug_assert_eq!(directory.len() % CELL_DIR_ENTRY_SIZE, 0);
+        let _ = cell_dir_entry::CELL_ID_OFF;
+        subsection_start += sub.bytes.len() as u64;
+    }
+    let dir_crc = crc32c(&directory);
+
+    let mut outer_header = [0u8; OUTER_HEADER_SIZE];
+    {
+        let mut cursor = &mut outer_header[..];
+        cursor
+            .write_all(format::vec::OUTER_MAGIC)
+            .map_err(BuildError::Io)?;
+        cursor
+            .write_all(&format::vec::VERSION_MULTI_CELL.to_le_bytes())
+            .map_err(BuildError::Io)?;
+        cursor
+            .write_all(&n_cells.to_le_bytes())
+            .map_err(BuildError::Io)?;
+        cursor
+            .write_all(&n_docs.to_le_bytes())
+            .map_err(BuildError::Io)?;
+        cursor
+            .write_all(&directory_offset.to_le_bytes())
+            .map_err(BuildError::Io)?;
+        debug_assert!(cursor.is_empty());
+    }
+
+    let mut out = Vec::with_capacity(
+        OUTER_HEADER_SIZE
+            + directory_size
+            + format::CRC_BYTES
+            + cells.iter().map(|(_, s)| s.bytes.len()).sum::<usize>()
+            + format::CRC_BYTES,
+    );
+    let mut outer_crc_acc: u32 = 0;
+    out.extend_from_slice(&outer_header);
+    outer_crc_acc = crc32c_append(outer_crc_acc, &outer_header);
+    out.extend_from_slice(&directory);
+    outer_crc_acc = crc32c_append(outer_crc_acc, &directory);
+    let dir_crc_le = dir_crc.to_le_bytes();
+    out.extend_from_slice(&dir_crc_le);
+    outer_crc_acc = crc32c_append(outer_crc_acc, &dir_crc_le);
+    for (_, sub) in cells {
+        out.extend_from_slice(&sub.bytes);
+        outer_crc_acc = crc32c_append(outer_crc_acc, &sub.bytes);
+    }
+    out.extend_from_slice(&outer_crc_acc.to_le_bytes());
+    Ok(out)
+}
+
 /// Builder output for one column's subsection.
 struct SubsectionBytes {
     bytes: Vec<u8>,
@@ -1080,6 +1165,24 @@ fn build_subsection_from_materialized(
             layout.codec_meta_off
         },
         codec_meta_size,
+    })
+}
+
+/// Build one complete cell-IVF subsection from materialized Sq8 rows,
+/// returned as a [`MergedIvfSubsection`] ready for multi-cell packing.
+pub(crate) fn build_merged_subsection_from_materialized(
+    cfg: VectorConfig,
+    rows: Vec<MaterializedIvfRow>,
+) -> Result<MergedIvfSubsection, BuildError> {
+    let n_docs = rows.len() as u32;
+    let sub = build_subsection_from_materialized(cfg, rows)?;
+    Ok(MergedIvfSubsection {
+        bytes: sub.bytes,
+        n_cent: sub.n_cent,
+        n_docs,
+        summary_offset_in_sub: sub.summary_offset_in_sub,
+        codec_meta_offset_in_sub: sub.codec_meta_offset_in_sub,
+        codec_meta_size: sub.codec_meta_size,
     })
 }
 
@@ -2465,5 +2568,374 @@ mod tests {
             Ok(_) => panic!("scratch path is a file, expected rejection"),
             Err(err) => assert!(matches!(err, BuildError::Io(_))),
         }
+    }
+
+    /// Two complete cell-IVFs packed into one v2 multi-cell blob round-trip
+    /// through open + flat cluster_centroids + packed_cell_ids.
+    #[test]
+    fn multi_cell_blob_round_trips_cell_directory_and_centroids() {
+        use std::sync::Arc;
+
+        use bytes::Bytes;
+
+        use crate::superfile::vector::{
+            builder::{build_merged_subsection_from_materialized, finish_multi_cell_blob},
+            cell_posting::EncodedCellRow,
+            reader::VectorReader,
+        };
+
+        let dim = 16;
+        let make_rows = |cell: u32, n: usize| -> Vec<MaterializedIvfRow> {
+            let scale: Arc<[f32]> = Arc::from(vec![1.0f32; dim]);
+            let offset: Arc<[f32]> = Arc::from(vec![0.0f32; dim]);
+            (0..n)
+                .map(|i| {
+                    let local = i as u32;
+                    let stable_id = (cell as i128) * 1_000 + local as i128;
+                    let mut codes = vec![0u8; dim];
+                    codes[0] = (cell as u8).wrapping_add(i as u8);
+                    let encoded = EncodedCellRow {
+                        stable_id,
+                        scale: Arc::clone(&scale),
+                        offset: Arc::clone(&offset),
+                        codes,
+                        residuals: vec![0u8; dim],
+                        norm_sq: Some(1.0),
+                    };
+                    MaterializedIvfRow {
+                        local_doc_id: local,
+                        stable_id,
+                        cluster: 0,
+                        rabitq_code: vec![0u8; dim.div_ceil(8)],
+                        encoded,
+                    }
+                })
+                .collect()
+        };
+        let cfg = |n_cent: usize| VectorConfig {
+            column: "emb".into(),
+            dim,
+            n_cent,
+            rot_seed: 1,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        };
+        let sub0 = build_merged_subsection_from_materialized(cfg(2), make_rows(0, 4))
+            .expect("cell 0 subsection");
+        let sub1 = build_merged_subsection_from_materialized(cfg(2), make_rows(1, 3))
+            .expect("cell 1 subsection");
+        let blob = finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack");
+        let json =
+            format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
+        let reader = VectorReader::open(Bytes::from(blob), &json).expect("open multi-cell");
+        assert!(reader.is_multi_cell());
+        assert_eq!(reader.packed_cell_ids(), &[0, 1]);
+        assert_eq!(reader.n_docs(), 7);
+        let (n_cent, got_dim, _centroids, counts) = reader
+            .cluster_centroids("emb")
+            .expect("concatenated centroids");
+        assert_eq!(got_dim, dim as u32);
+        // Two cells × n_cent=2 each → flat directory must expose all four
+        // fine centroids (not only the first cell).
+        assert_eq!(n_cent, 4, "flat n_cent must sum packed cells, got {n_cent}");
+        assert_eq!(counts.len(), n_cent as usize);
+        assert!(counts.iter().any(|&c| c > 0));
+        assert_eq!(reader.resolve_flat_cluster(0), Some((0, 0)));
+        assert_eq!(reader.resolve_flat_cluster(2), Some((1, 0)));
+        assert_eq!(reader.resolve_flat_cluster(3), Some((1, 1)));
+    }
+
+    /// Multi-cell cluster search must return nearest-first. A descending
+    /// merge truncates to the farthest hits and collapses packed-shard recall.
+    #[tokio::test]
+    async fn multi_cell_search_returns_ascending_distance() {
+        use std::sync::Arc;
+
+        use bytes::Bytes;
+
+        use crate::superfile::vector::{
+            builder::{build_merged_subsection_from_materialized, finish_multi_cell_blob},
+            cell_posting::EncodedCellRow,
+            reader::VectorReader,
+        };
+
+        let dim = 16;
+        let make_rows = |cell: u32, n: usize| -> Vec<MaterializedIvfRow> {
+            let scale: Arc<[f32]> = Arc::from(vec![1.0f32; dim]);
+            let offset: Arc<[f32]> = Arc::from(vec![0.0f32; dim]);
+            (0..n)
+                .map(|i| {
+                    let local = i as u32;
+                    let stable_id = (cell as i128) * 1_000 + local as i128;
+                    let mut codes = vec![0u8; dim];
+                    codes[0] = (cell as u8).wrapping_add(i as u8);
+                    MaterializedIvfRow {
+                        local_doc_id: local,
+                        stable_id,
+                        cluster: 0,
+                        rabitq_code: vec![0u8; dim.div_ceil(8)],
+                        encoded: EncodedCellRow {
+                            stable_id,
+                            scale: Arc::clone(&scale),
+                            offset: Arc::clone(&offset),
+                            codes,
+                            residuals: vec![0u8; dim],
+                            norm_sq: Some(1.0),
+                        },
+                    }
+                })
+                .collect()
+        };
+        let cfg = |n_cent: usize| VectorConfig {
+            column: "emb".into(),
+            dim,
+            n_cent,
+            rot_seed: 1,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        };
+        let sub0 = build_merged_subsection_from_materialized(cfg(2), make_rows(0, 4))
+            .expect("cell 0");
+        let sub1 = build_merged_subsection_from_materialized(cfg(2), make_rows(1, 3))
+            .expect("cell 1");
+        let blob = finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack");
+        let json =
+            format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
+        let reader = VectorReader::open(Bytes::from(blob), &json).expect("open");
+        let q = vec![0.0f32; dim];
+        let hits = reader
+            .search_clusters_async("emb", &q, 3, &[0, 1, 2, 3], 8, None, None)
+            .await
+            .expect("search");
+        assert_eq!(hits.len(), 3);
+        assert!(
+            hits[0].1 <= hits[1].1 && hits[1].1 <= hits[2].1,
+            "multi-cell hits must be ascending distance, got {hits:?}"
+        );
+    }
+
+    /// File-local allow bitmaps must be remapped to cell-local ids before
+    /// probing each packed cell. Passing the file-local set through unchanged
+    /// drops every match in cells after the first (cell-local ids restart at 0).
+    #[tokio::test]
+    async fn multi_cell_search_remaps_file_local_allow() {
+        use std::sync::Arc;
+
+        use bytes::Bytes;
+        use roaring::RoaringBitmap;
+
+        use crate::superfile::vector::{
+            builder::{build_merged_subsection_from_materialized, finish_multi_cell_blob},
+            cell_posting::EncodedCellRow,
+            reader::VectorReader,
+        };
+
+        let dim = 16;
+        let make_rows = |cell: u32, n: usize| -> Vec<MaterializedIvfRow> {
+            let scale: Arc<[f32]> = Arc::from(vec![1.0f32; dim]);
+            let offset: Arc<[f32]> = Arc::from(vec![0.0f32; dim]);
+            (0..n)
+                .map(|i| {
+                    let local = i as u32;
+                    let stable_id = (cell as i128) * 1_000 + local as i128;
+                    let mut codes = vec![0u8; dim];
+                    codes[0] = (cell as u8).wrapping_add(i as u8);
+                    MaterializedIvfRow {
+                        local_doc_id: local,
+                        stable_id,
+                        cluster: 0,
+                        rabitq_code: vec![0u8; dim.div_ceil(8)],
+                        encoded: EncodedCellRow {
+                            stable_id,
+                            scale: Arc::clone(&scale),
+                            offset: Arc::clone(&offset),
+                            codes,
+                            residuals: vec![0u8; dim],
+                            norm_sq: Some(1.0),
+                        },
+                    }
+                })
+                .collect()
+        };
+        let cfg = |n_cent: usize| VectorConfig {
+            column: "emb".into(),
+            dim,
+            n_cent,
+            rot_seed: 1,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        };
+        // cell0 → file-local 0..3; cell1 → file-local 4..6.
+        let sub0 = build_merged_subsection_from_materialized(cfg(2), make_rows(0, 4))
+            .expect("cell 0");
+        let sub1 = build_merged_subsection_from_materialized(cfg(2), make_rows(1, 3))
+            .expect("cell 1");
+        let blob = finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack");
+        let json =
+            format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
+        let reader = VectorReader::open(Bytes::from(blob), &json).expect("open");
+        let mut allow = RoaringBitmap::new();
+        allow.insert(4);
+        allow.insert(5);
+        allow.insert(6);
+        let q = vec![0.0f32; dim];
+        let hits = reader
+            .search_clusters_async(
+                "emb",
+                &q,
+                3,
+                &[0, 1, 2, 3],
+                8,
+                Some(Arc::new(allow)),
+                None,
+            )
+            .await
+            .expect("filtered multi-cell search");
+        assert_eq!(hits.len(), 3, "expected all three allowed cell1 rows, got {hits:?}");
+        for (file_local, _) in &hits {
+            assert!(
+                *file_local >= 4,
+                "allow was cell1-only (file-local 4..6); got hit {file_local}"
+            );
+        }
+    }
+
+    /// Materializing a multi-cell blob by cell id returns only that cell's
+    /// rows; full materialize concatenates all cells with file-local ids.
+    #[tokio::test]
+    async fn multi_cell_materialize_filters_by_cell_directory() {
+        use std::sync::Arc;
+
+        use bytes::Bytes;
+
+        use crate::superfile::vector::{
+            builder::{build_merged_subsection_from_materialized, finish_multi_cell_blob},
+            cell_posting::EncodedCellRow,
+            reader::VectorReader,
+        };
+
+        let dim = 16;
+        let make_rows = |cell: u32, n: usize| -> Vec<MaterializedIvfRow> {
+            let scale: Arc<[f32]> = Arc::from(vec![1.0f32; dim]);
+            let offset: Arc<[f32]> = Arc::from(vec![0.0f32; dim]);
+            (0..n)
+                .map(|i| {
+                    let local = i as u32;
+                    let stable_id = (cell as i128) * 1_000 + local as i128;
+                    MaterializedIvfRow {
+                        local_doc_id: local,
+                        stable_id,
+                        cluster: 0,
+                        rabitq_code: vec![0u8; dim.div_ceil(8)],
+                        encoded: EncodedCellRow {
+                            stable_id,
+                            scale: Arc::clone(&scale),
+                            offset: Arc::clone(&offset),
+                            codes: vec![cell as u8; dim],
+                            residuals: vec![0u8; dim],
+                            norm_sq: Some(1.0),
+                        },
+                    }
+                })
+                .collect()
+        };
+        let cfg = |n_cent: usize| VectorConfig {
+            column: "emb".into(),
+            dim,
+            n_cent,
+            rot_seed: 1,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        };
+        let sub0 = build_merged_subsection_from_materialized(cfg(2), make_rows(7, 3))
+            .expect("cell 7");
+        let sub1 = build_merged_subsection_from_materialized(cfg(2), make_rows(15, 2))
+            .expect("cell 15");
+        let blob = finish_multi_cell_blob(&[(7, sub0), (15, sub1)]).expect("pack");
+        let json =
+            format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
+        let reader = VectorReader::open(Bytes::from(blob), &json).expect("open");
+
+        let only15 = reader
+            .materialized_cells_rows_async(Some(&[15]))
+            .await
+            .expect("materialize cell 15");
+        assert_eq!(only15.len(), 1);
+        assert_eq!(only15[0].0, 15);
+        assert_eq!(only15[0].1.len(), 2);
+        assert!(only15[0].1.iter().all(|r| r.stable_id / 1000 == 15));
+
+        let all = reader
+            .materialized_index_rows_async("emb")
+            .await
+            .expect("all cells");
+        assert_eq!(all.len(), 5);
+        // File-local ids: cell 7 → 0..2, cell 15 → 3..4.
+        let locals: Vec<u32> = all.iter().map(|r| r.local_doc_id).collect();
+        assert_eq!(locals, vec![0, 1, 2, 3, 4]);
+        assert_eq!(reader.packed_cell_n_docs(7), Some(3));
+        assert_eq!(reader.packed_cell_n_docs(15), Some(2));
+        assert_eq!(reader.packed_cell_n_docs(99), None);
+
+        // Overflow discovery uses per-cell counts from the directory — the
+        // largest cell (7 with 3 docs) is preferred over cell 15 (2 docs).
+        let counts: Vec<(u32, u32)> = reader
+            .packed_cell_ids()
+            .iter()
+            .filter_map(|&c| reader.packed_cell_n_docs(c).map(|n| (c, n)))
+            .collect();
+        let overflow = counts
+            .iter()
+            .copied()
+            .max_by_key(|(_, n)| *n)
+            .expect("counts");
+        assert_eq!(overflow, (7, 3));
+
+        // Packed summary is doc-weighted across cells (3 docs in cell 7 +
+        // 2 in cell 15), not just the first cell's IVF summary.
+        let packed_summary = reader.summary("emb").expect("packed summary");
+        assert_eq!(packed_summary.len(), dim);
+        let cell7_only = {
+            let sub0 = build_merged_subsection_from_materialized(cfg(2), make_rows(7, 3))
+                .expect("cell 7 alone");
+            let blob0 = finish_multi_cell_blob(&[(7, sub0)]).expect("pack one");
+            VectorReader::open(Bytes::from(blob0), &json)
+                .expect("open")
+                .summary("emb")
+                .expect("cell7 summary")
+        };
+        let cell15_only = {
+            let sub1 = build_merged_subsection_from_materialized(cfg(2), make_rows(15, 2))
+                .expect("cell 15 alone");
+            let blob1 = finish_multi_cell_blob(&[(15, sub1)]).expect("pack one");
+            VectorReader::open(Bytes::from(blob1), &json)
+                .expect("open")
+                .summary("emb")
+                .expect("cell15 summary")
+        };
+        for d in 0..dim {
+            let expected = (cell7_only[d] * 3.0 + cell15_only[d] * 2.0) / 5.0;
+            assert!(
+                (packed_summary[d] - expected).abs() < 1e-5,
+                "dim {d}: packed={} expected={expected}",
+                packed_summary[d]
+            );
+        }
+
+        // File-local ids (search / parquet order) must resolve across cells —
+        // not only against the first cell's stable_id region.
+        let file_locals: Vec<u32> = (0..5).collect();
+        let resolved = reader
+            .inline_stable_ids_for_locals(&file_locals)
+            .expect("multi-cell file-local stable ids");
+        assert_eq!(
+            resolved,
+            vec![7000, 7001, 7002, 15000, 15001],
+            "file-local → stable_id must span both packed cells"
+        );
     }
 }

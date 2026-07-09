@@ -143,9 +143,15 @@ pub mod vec {
     /// codec_meta_end` (`0` or `n_docs * STABLE_ID_BYTES`), needing no header
     /// flag. The streaming/merge builds emit no such region.
     pub const STABLE_ID_BYTES: usize = 16;
-    /// Outer-blob version. Written at bytes [8..12] of the outer
-    /// header. Bump on outer-blob-shape changes (currently 1).
+    /// Outer-blob version for the single-column IVF layout (one
+    /// subsection directory entry per vector column). Written at
+    /// bytes [8..12] of the outer header.
     pub const VERSION: u32 = 1;
+    /// Outer-blob version for the multi-cell IVF layout: one logical
+    /// vector column whose blob packs many complete cell-IVF
+    /// subsections behind a cell directory of
+    /// `(global_cell_id, subsection_off, subsection_len)`.
+    pub const VERSION_MULTI_CELL: u32 = 2;
 
     /// subsection layout version stamped at
     /// bytes [8..12] of each per-column sub-header.
@@ -208,11 +214,17 @@ pub mod vec {
     /// Width of the 8-byte section/sub-section magic.
     pub const MAGIC_BYTES: usize = 8;
 
-    /// Outer-header size: magic + version + n_columns + n_docs +
-    /// dir_offset.
+    /// Outer-header size: magic + version + n_columns/n_cells + n_docs +
+    /// dir_offset. Same 32-byte shape for v1 and v2; the u32 at
+    /// [`outer_hdr::N_COLUMNS_OFF`] is `n_columns` for v1 and
+    /// `n_cells` for v2.
     pub const OUTER_HEADER_SIZE: usize = 32;
-    /// Per-column subsection-directory entry size in bytes.
+    /// Per-column subsection-directory entry size in bytes (v1).
     pub const DIR_ENTRY_SIZE: usize = 64;
+    /// Per-cell directory entry size in bytes (v2 multi-cell):
+    /// `global_cell_id (u32) + subsection_off (u64) + subsection_len (u64)
+    /// + reserved (u32)` = 24 bytes.
+    pub const CELL_DIR_ENTRY_SIZE: usize = 24;
     /// Per-column sub-header size (inside each subsection).
     pub const SUB_HEADER_SIZE: usize = 56;
 
@@ -233,12 +245,26 @@ pub mod vec {
     pub mod outer_hdr {
         /// `[8..12]` outer-blob version (`u32` LE).
         pub const VERSION_OFF: usize = 8;
-        /// `[12..16]` column count (`u32` LE).
+        /// `[12..16]` column count (v1) or cell count (v2) (`u32` LE).
         pub const N_COLUMNS_OFF: usize = 12;
+        /// Alias for [`N_COLUMNS_OFF`] when reading a v2 multi-cell blob.
+        pub const N_CELLS_OFF: usize = 12;
         /// `[16..24]` document count (`u64` LE).
         pub const N_DOCS_OFF: usize = 16;
         /// `[24..32]` directory byte offset (`u64` LE).
         pub const DIR_OFFSET_OFF: usize = 24;
+    }
+
+    /// Per-cell directory-entry field offsets (24-byte entry, v2).
+    pub mod cell_dir_entry {
+        /// `[+0..+4]` global cell id (`u32` LE).
+        pub const CELL_ID_OFF: usize = 0;
+        /// `[+4..+12]` subsection byte offset relative to blob start (`u64` LE).
+        pub const SUBSECTION_OFF_OFF: usize = 4;
+        /// `[+12..+20]` subsection byte length (`u64` LE).
+        pub const SUBSECTION_LEN_OFF: usize = 12;
+        /// `[+20..+24]` reserved (`u32` LE).
+        pub const RESERVED_OFF: usize = 20;
     }
 
     /// Per-column directory-entry field offsets (64-byte entry).
@@ -323,6 +349,11 @@ pub mod kv {
     /// Present iff vector blob uses a non-default layout (`ivf` default).
     pub const VEC_LAYOUT: &str = "inf.vec.layout";
 
+    /// Optional: JSON array of global cell ids packed into a multi-cell
+    /// vector blob, in cell-directory order. Present when
+    /// `inf.vec.layout = multi_cell_ivf`.
+    pub const VEC_CELLS: &str = "inf.vec.cells";
+
     /// Sentinel value for the `inf.format` key.
     pub const FORMAT_VALUE: &str = "infino-superfile";
 
@@ -349,6 +380,7 @@ pub mod kv {
         VEC_LENGTH,
         VEC_COLUMNS,
         VEC_LAYOUT,
+        VEC_CELLS,
     ];
 }
 

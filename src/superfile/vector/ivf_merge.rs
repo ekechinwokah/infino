@@ -91,6 +91,19 @@ pub(crate) fn merge_sq8_ivf_subsections(
         .iter()
         .map(|(r, col, off)| r.sq8_ivf_merge_input(col, *off))
         .collect::<Result<_, _>>()?;
+    merge_sq8_ivf_subsections_from_parsed(&parsed)
+}
+
+/// Same as [`merge_sq8_ivf_subsections`], but takes already-parsed cell IVFs
+/// (used when packing/unpacking multi-cell v2 blobs per `global_cell_id`).
+pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
+    parsed: &[Sq8IvfMergeInput],
+) -> Result<MergedIvfSubsection, BuildError> {
+    if parsed.is_empty() {
+        return Err(BuildError::VectorSchemaMismatch(
+            "merge requires at least one IVF input".into(),
+        ));
+    }
 
     let dim = parsed[0].dim;
     let n_cent = parsed[0].n_cent;
@@ -115,7 +128,7 @@ pub(crate) fn merge_sq8_ivf_subsections(
     for c in 0..n_cent {
         let mut acc = vec![0.0f64; dim];
         let mut total = 0u64;
-        for inp in &parsed {
+        for inp in parsed {
             let (_, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
             if count == 0 {
                 continue;
@@ -139,7 +152,7 @@ pub(crate) fn merge_sq8_ivf_subsections(
     let mut dst_scale = vec![1.0f32; n_cent * dim];
     let mut dst_offset = vec![0.0f32; n_cent * dim];
     for c in 0..n_cent {
-        for inp in &parsed {
+        for inp in parsed {
             let (_, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
             if count == 0 {
                 continue;
@@ -228,7 +241,7 @@ pub(crate) fn merge_sq8_ivf_subsections(
             let offset_c = &dst_offset[centroid_id * dim..centroid_id * dim + dim];
             let mut out_i = 0usize;
 
-            for inp in &parsed {
+            for inp in parsed {
                 let (doc_off, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, centroid_id);
                 if count == 0 {
                     continue;
@@ -329,6 +342,31 @@ pub(crate) fn merge_sq8_ivf_subsections(
         },
         codec_meta_size,
     })
+}
+
+/// Stable `_id`s in merged local-doc-id order for inputs that all carry an
+/// inline stable-id region (hidden / materialized cells).
+pub(crate) fn stable_ids_in_merged_local_order(
+    parsed: &[Sq8IvfMergeInput],
+) -> Result<Vec<i128>, BuildError> {
+    if parsed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !parsed.iter().all(|p| p.stable_ids.is_some()) {
+        return Err(BuildError::VectorSchemaMismatch(
+            "multi-cell merge requires inline stable_ids on every cell IVF".into(),
+        ));
+    }
+    let n_docs: usize = parsed.iter().map(|p| p.n_docs as usize).sum();
+    let mut ids = vec![0i128; n_docs];
+    for inp in parsed {
+        let src = inp.stable_ids.as_ref().expect("checked above");
+        let base = inp.doc_id_offset as usize;
+        for (i, &sid) in src.iter().enumerate() {
+            ids[base + i] = sid;
+        }
+    }
+    Ok(ids)
 }
 
 /// Splice routed source clusters into one hidden-cell superfile as a

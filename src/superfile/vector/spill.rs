@@ -400,8 +400,9 @@ fn record_bytes(dim: usize, rabitq_len: usize) -> usize {
 }
 
 /// Append-only spill for [`MaterializedIvfRow`]s of ONE cell, accumulated
-/// across the drain's memory-bounded batches so the drain can build exactly
-/// one superfile per cell per run regardless of its batch size.
+/// across the drain's memory-bounded batches so the drain can build each
+/// cell's IVF once per run (then pack many cell IVFs into shard objects)
+/// regardless of batch size.
 ///
 /// Rows are written as their already-encoded Sq8+epsilon bytes — no decode, no
 /// re-quantization. The per-cluster dequant params (`scale`/`offset`, shared

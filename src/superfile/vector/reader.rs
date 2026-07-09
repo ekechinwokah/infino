@@ -32,8 +32,8 @@ use crate::superfile::{
     format::{
         checksum::crc32c,
         vec::{
-            CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES, U32_BYTES, U64_BYTES,
-            dir_entry, outer_hdr, sub_hdr,
+            CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES,
+            U32_BYTES, U64_BYTES, cell_dir_entry, dir_entry, outer_hdr, sub_hdr,
         },
         {self},
     },
@@ -312,6 +312,14 @@ pub struct VectorReader {
     n_docs: u64,
     columns: Vec<ColumnReader>,
     column_id_by_name: HashMap<String, u32>,
+    /// Global cell ids parallel to [`Self::columns`] for multi-cell (v2)
+    /// blobs. Empty for the single-column v1 layout.
+    cell_ids: Vec<u32>,
+    /// Prefix sums of per-cell `n_cent` for flat cluster routing on
+    /// multi-cell blobs: flat id `c` maps to cell `i` where
+    /// `flat_cluster_base[i] <= c < flat_cluster_base[i+1]` (with a
+    /// trailing total at the end). Empty for v1.
+    flat_cluster_base: Vec<u32>,
     /// Cold-path stash of the inline stable-`_id` region bytes, prefetched
     /// in the same fan-out wave as the cluster blocks (see
     /// [`Self::probe_clusters_async`]). The remap step resolves hidden→user
@@ -401,10 +409,13 @@ impl VectorReader {
         }
         let version =
             read_u32_le(&header_bytes[outer_hdr::VERSION_OFF..outer_hdr::VERSION_OFF + U32_BYTES]);
-        if version != format::vec::VERSION {
+        if version != format::vec::VERSION && version != format::vec::VERSION_MULTI_CELL {
             return Err(VectorError::Read(ReadError::UnsupportedVersion(format!(
                 "vector blob version {version}"
             ))));
+        }
+        if version == format::vec::VERSION_MULTI_CELL {
+            return Self::open_lazy_multi_cell(source, columns_json, header_bytes, blob_size).await;
         }
         let n_columns = read_u32_le(
             &header_bytes[outer_hdr::N_COLUMNS_OFF..outer_hdr::N_COLUMNS_OFF + U32_BYTES],
@@ -640,10 +651,13 @@ impl VectorReader {
 
         let version =
             read_u32_le(&header[outer_hdr::VERSION_OFF..outer_hdr::VERSION_OFF + U32_BYTES]);
-        if version != format::vec::VERSION {
+        if version != format::vec::VERSION && version != format::vec::VERSION_MULTI_CELL {
             return Err(VectorError::Read(ReadError::UnsupportedVersion(format!(
                 "vector blob version {version}"
             ))));
+        }
+        if version == format::vec::VERSION_MULTI_CELL {
+            return Self::open_multi_cell_with_source(source, columns_json, opts, header);
         }
 
         let n_columns =
@@ -1156,8 +1170,439 @@ impl VectorReader {
             n_docs,
             columns,
             column_id_by_name,
+            cell_ids: Vec::new(),
+            flat_cluster_base: Vec::new(),
             cold_stable_id_region: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Sync open for a v2 multi-cell blob (cell directory + complete cell IVFs).
+    fn open_multi_cell_with_source(
+        source: Source,
+        columns_json: &str,
+        opts: OpenOptions,
+        header: Bytes,
+    ) -> Result<Self, VectorError> {
+        let n_cells =
+            read_u32_le(&header[outer_hdr::N_CELLS_OFF..outer_hdr::N_CELLS_OFF + U32_BYTES])
+                as usize;
+        let n_docs = read_u64_le(&header[outer_hdr::N_DOCS_OFF..outer_hdr::N_DOCS_OFF + U64_BYTES]);
+        let dir_offset =
+            read_u64_le(&header[outer_hdr::DIR_OFFSET_OFF..outer_hdr::DIR_OFFSET_OFF + U64_BYTES])
+                as usize;
+        let dir_size = n_cells * CELL_DIR_ENTRY_SIZE;
+        if dir_offset + dir_size + format::CRC_BYTES > source.len() {
+            return Err(VectorError::Read(ReadError::MalformedVersion(
+                "multi-cell directory runs past blob".into(),
+            )));
+        }
+        let dir_bytes = fetch_sync(&source, dir_offset..dir_offset + dir_size, "cell directory")?;
+        let dir_crc_bytes = fetch_sync(
+            &source,
+            dir_offset + dir_size..dir_offset + dir_size + format::CRC_BYTES,
+            "cell directory crc",
+        )?;
+        let dir_crc_expected = read_u32_le(&dir_crc_bytes);
+        if dir_crc_expected != crc32c(&dir_bytes) {
+            return Err(VectorError::Read(ReadError::ChecksumMismatch {
+                section: "vector/cell_directory",
+                column: String::new(),
+            }));
+        }
+
+        let cols_json: Vec<VectorColumnConfig> =
+            serde_json::from_str(columns_json).map_err(|e| {
+                VectorError::Read(ReadError::MalformedVersion(format!(
+                    "inf.vec.columns JSON: {e}"
+                )))
+            })?;
+        if cols_json.len() != 1 {
+            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                "multi-cell blob requires exactly one logical column in inf.vec.columns, got {}",
+                cols_json.len()
+            ))));
+        }
+        let cfg = &cols_json[0];
+        let metric = match cfg.metric.as_str() {
+            "l2sq" => Metric::L2Sq,
+            "cosine" => Metric::Cosine,
+            "negdot" => Metric::NegDot,
+            other => {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "unknown metric {other}"
+                ))));
+            }
+        };
+        // Hidden multi-cell packs are Sq8 residual IVF cell subsections.
+        let rerank_codec = RerankCodec::Sq8Residual;
+
+        let mut columns = Vec::with_capacity(n_cells);
+        let mut cell_ids = Vec::with_capacity(n_cells);
+        let mut flat_cluster_base = Vec::with_capacity(n_cells + 1);
+        flat_cluster_base.push(0);
+        let mut flat_total = 0u32;
+
+        for i in 0..n_cells {
+            let entry_off = i * CELL_DIR_ENTRY_SIZE;
+            let cell_id = read_u32_le(
+                &dir_bytes[entry_off + cell_dir_entry::CELL_ID_OFF
+                    ..entry_off + cell_dir_entry::CELL_ID_OFF + U32_BYTES],
+            );
+            let subsection_off = read_u64_le(
+                &dir_bytes[entry_off + cell_dir_entry::SUBSECTION_OFF_OFF
+                    ..entry_off + cell_dir_entry::SUBSECTION_OFF_OFF + U64_BYTES],
+            ) as usize;
+            let subsection_len = read_u64_le(
+                &dir_bytes[entry_off + cell_dir_entry::SUBSECTION_LEN_OFF
+                    ..entry_off + cell_dir_entry::SUBSECTION_LEN_OFF + U64_BYTES],
+            ) as usize;
+            if i > 0 && cell_id <= cell_ids[i - 1] {
+                return Err(VectorError::Read(ReadError::MalformedVersion(
+                    "multi-cell directory cell_ids must be strictly ascending".into(),
+                )));
+            }
+            let col = Self::parse_cell_subsection(
+                &source,
+                cfg,
+                metric,
+                rerank_codec,
+                subsection_off,
+                subsection_len,
+                opts.verify_crc,
+            )?;
+            flat_total = flat_total.saturating_add(col.n_cent);
+            flat_cluster_base.push(flat_total);
+            columns.push(col);
+            cell_ids.push(cell_id);
+        }
+
+        let mut column_id_by_name = HashMap::new();
+        column_id_by_name.insert(cfg.column.clone(), 0);
+
+        Ok(VectorReader {
+            source,
+            n_docs,
+            columns,
+            column_id_by_name,
+            cell_ids,
+            flat_cluster_base,
+            cold_stable_id_region: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Lazy open for a v2 multi-cell blob: prefetch header + cell directory,
+    /// then hand off to the sync multi-cell open over a prefetched overlay.
+    async fn open_lazy_multi_cell(
+        source: Arc<dyn LazyByteSource>,
+        columns_json: &str,
+        header_bytes: Bytes,
+        blob_size: usize,
+    ) -> Result<Self, VectorError> {
+        let n_cells = read_u32_le(
+            &header_bytes[outer_hdr::N_CELLS_OFF..outer_hdr::N_CELLS_OFF + U32_BYTES],
+        ) as usize;
+        let dir_offset = read_u64_le(
+            &header_bytes[outer_hdr::DIR_OFFSET_OFF..outer_hdr::DIR_OFFSET_OFF + U64_BYTES],
+        ) as usize;
+        let dir_size = n_cells * CELL_DIR_ENTRY_SIZE;
+        let dir_end = dir_offset + dir_size + format::CRC_BYTES;
+        if dir_end > blob_size {
+            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                "lazy multi-cell: directory end {dir_end} exceeds blob size {blob_size}",
+            ))));
+        }
+        let dir_prefetch = source
+            .range(dir_offset as u64, (dir_end - dir_offset) as u64)
+            .await
+            .map_err(|e| {
+                VectorError::Read(ReadError::MalformedVersion(format!(
+                    "lazy multi-cell: directory fetch: {e}"
+                )))
+            })?;
+        let dir_bytes_slice = &dir_prefetch[0..dir_size];
+        let dir_crc_expected = read_u32_le(&dir_prefetch[dir_size..dir_size + format::CRC_BYTES]);
+        if dir_crc_expected != crc32c(dir_bytes_slice) {
+            return Err(VectorError::Read(ReadError::ChecksumMismatch {
+                section: "vector/cell_directory",
+                column: String::new(),
+            }));
+        }
+
+        // Prefetch each cell's open-time region (sub-header through
+        // per_cluster_blocks_off) so structural decode is resident.
+        let mut overlay = PrefetchedSource::new(Arc::clone(&source));
+        overlay.install(0, header_bytes.clone());
+        overlay.install(dir_offset as u64, dir_prefetch.clone());
+
+        let mut open_ranges: Vec<(u64, u64)> = Vec::with_capacity(n_cells);
+        for i in 0..n_cells {
+            let entry_off = i * CELL_DIR_ENTRY_SIZE;
+            let subsection_off = read_u64_le(
+                &dir_bytes_slice[entry_off + cell_dir_entry::SUBSECTION_OFF_OFF
+                    ..entry_off + cell_dir_entry::SUBSECTION_OFF_OFF + U64_BYTES],
+            );
+            let subsection_len = read_u64_le(
+                &dir_bytes_slice[entry_off + cell_dir_entry::SUBSECTION_LEN_OFF
+                    ..entry_off + cell_dir_entry::SUBSECTION_LEN_OFF + U64_BYTES],
+            );
+            if subsection_len < SUB_HEADER_SIZE as u64 + format::CRC_BYTES as u64 {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "multi-cell subsection {i} too short ({subsection_len} bytes)"
+                ))));
+            }
+            // Fetch sub-header first to learn open-time end.
+            let sub_hdr_bytes = source
+                .range(subsection_off, SUB_HEADER_SIZE as u64)
+                .await
+                .map_err(|e| {
+                    VectorError::Read(ReadError::MalformedVersion(format!(
+                        "lazy multi-cell: sub-header {i}: {e}"
+                    )))
+                })?;
+            overlay.install(subsection_off, sub_hdr_bytes.clone());
+            let per_cluster_blocks_off = read_u64_le(
+                &sub_hdr_bytes[sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF
+                    ..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES],
+            );
+            open_ranges.push((subsection_off, per_cluster_blocks_off));
+        }
+        for (subsection_off, open_len) in open_ranges {
+            if open_len <= SUB_HEADER_SIZE as u64 {
+                continue;
+            }
+            let rest = source
+                .range(
+                    subsection_off + SUB_HEADER_SIZE as u64,
+                    open_len - SUB_HEADER_SIZE as u64,
+                )
+                .await
+                .map_err(|e| {
+                    VectorError::Read(ReadError::MalformedVersion(format!(
+                        "lazy multi-cell: open-time region: {e}"
+                    )))
+                })?;
+            overlay.install(subsection_off + SUB_HEADER_SIZE as u64, rest);
+        }
+
+        Self::open_multi_cell_with_source(
+            Source::Lazy(Arc::new(overlay)),
+            columns_json,
+            OpenOptions::for_object_store(),
+            header_bytes,
+        )
+    }
+
+    /// Parse one complete cell-IVF subsection into a [`ColumnReader`].
+    fn parse_cell_subsection(
+        source: &Source,
+        cfg: &VectorColumnConfig,
+        metric: Metric,
+        rerank_codec: RerankCodec,
+        subsection_off: usize,
+        subsection_len: usize,
+        verify_crc: bool,
+    ) -> Result<ColumnReader, VectorError> {
+        let dim = cfg.dim;
+        let rot_seed = cfg.rot_seed;
+        let sub_end = subsection_off + subsection_len;
+        if sub_end > source.len() {
+            return Err(VectorError::Read(ReadError::MalformedVersion(
+                "cell subsection runs past blob".into(),
+            )));
+        }
+        if subsection_len < SUB_HEADER_SIZE + format::CRC_BYTES {
+            return Err(VectorError::Read(ReadError::MalformedVersion(
+                "cell subsection too short".into(),
+            )));
+        }
+        let sub_header = fetch_sync(
+            source,
+            subsection_off..subsection_off + SUB_HEADER_SIZE,
+            "cell sub_header",
+        )?;
+        if &sub_header[0..MAGIC_BYTES] != format::vec::SUB_MAGIC {
+            return Err(VectorError::Read(ReadError::BadMagic {
+                section: "vector/subsection",
+                expected: format::vec::SUB_MAGIC,
+                actual: sub_header[0..MAGIC_BYTES].to_vec(),
+            }));
+        }
+        let subsection_version =
+            read_u32_le(&sub_header[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]);
+        if subsection_version != format::vec::SUBSECTION_VERSION {
+            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                "cell subsection unsupported layout version {subsection_version}"
+            ))));
+        }
+        if verify_crc {
+            let body = fetch_sync(source, subsection_off..sub_end, "cell subsection crc")?;
+            let crc_pos = subsection_len - format::CRC_BYTES;
+            let expected = read_u32_le(&body[crc_pos..crc_pos + format::CRC_BYTES]);
+            if expected != crc32c(&body[..crc_pos]) {
+                return Err(VectorError::Read(ReadError::ChecksumMismatch {
+                    section: "vector/subsection",
+                    column: cfg.column.clone(),
+                }));
+            }
+        }
+
+        let quant = BitQuantizer::new(dim);
+        let code_bytes = quant.code_bytes();
+        let per_vec_bytes = rerank_codec.per_vector_bytes(dim);
+        let codec_meta_size = read_u32_le(
+            &sub_header[sub_hdr::CODEC_META_SIZE_OFF..sub_hdr::CODEC_META_SIZE_OFF + U32_BYTES],
+        ) as usize;
+        let summary_off = read_u64_le(
+            &sub_header[sub_hdr::SUMMARY_OFF_OFF..sub_hdr::SUMMARY_OFF_OFF + U64_BYTES],
+        ) as usize;
+        let centroids_off = read_u64_le(
+            &sub_header[sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES],
+        ) as usize;
+        let cluster_idx_off = read_u64_le(
+            &sub_header[sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES],
+        ) as usize;
+        let per_cluster_blocks_off = read_u64_le(
+            &sub_header[sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF
+                ..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES],
+        ) as usize;
+
+        if dim == 0 || !cluster_idx_off.saturating_sub(centroids_off).is_multiple_of(dim * 4) {
+            return Err(VectorError::Read(ReadError::MalformedVersion(
+                "cell subsection centroids region not divisible by dim*4".into(),
+            )));
+        }
+        let n_cent = (cluster_idx_off - centroids_off) / (dim * 4);
+        let n_cent_u32 = n_cent as u32;
+        let cluster_idx_size = n_cent * CLUSTER_IDX_ENTRY_BYTES;
+        let codec_meta_off = if codec_meta_size == 0 {
+            0
+        } else {
+            cluster_idx_off + cluster_idx_size
+        };
+        let preceding_end = if codec_meta_size == 0 {
+            cluster_idx_off + cluster_idx_size
+        } else {
+            codec_meta_off + codec_meta_size
+        };
+        let sub_crc_pos = subsection_len - format::CRC_BYTES;
+        let stable_ids_region_bytes =
+            per_cluster_blocks_off.checked_sub(preceding_end).ok_or_else(|| {
+                VectorError::Read(ReadError::MalformedVersion(
+                    "cell subsection regions overrun per_cluster_blocks_off".into(),
+                ))
+            })?;
+        let blocks_region_size = sub_crc_pos - per_cluster_blocks_off;
+        let per_doc_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
+        if per_doc_stride == 0 || !blocks_region_size.is_multiple_of(per_doc_stride) {
+            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                "cell subsection blocks region {blocks_region_size} not divisible by stride {per_doc_stride}"
+            ))));
+        }
+        let col_n_docs = (blocks_region_size / per_doc_stride) as u32;
+        let expected_stable_ids_bytes = (col_n_docs as usize) * format::vec::STABLE_ID_BYTES;
+        if stable_ids_region_bytes != 0 && stable_ids_region_bytes != expected_stable_ids_bytes {
+            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                "cell subsection stable-id gap {stable_ids_region_bytes}, expected 0 or {expected_stable_ids_bytes}"
+            ))));
+        }
+        let stable_ids_off = (stable_ids_region_bytes != 0).then_some(preceding_end);
+        let expected_codec_meta_size =
+            rerank_codec.codec_meta_bytes(dim, col_n_docs as usize, n_cent, metric);
+        if codec_meta_size != expected_codec_meta_size {
+            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                "cell subsection codec_meta_size={codec_meta_size}, expected {expected_codec_meta_size}"
+            ))));
+        }
+
+        let sq8_meta = if matches!(rerank_codec, RerankCodec::Sq8Residual) {
+            let meta_abs_start = subsection_off + codec_meta_off;
+            let meta_abs_end = meta_abs_start + codec_meta_size;
+            let so_block_bytes = n_cent * dim * 4;
+            let scale_end = so_block_bytes;
+            let offset_end = scale_end + so_block_bytes;
+            if let Some(meta_bytes) = source.try_get_range_sync(meta_abs_start..meta_abs_end) {
+                let scale = parse_f32_le_vec(&meta_bytes[0..scale_end]);
+                let offset = parse_f32_le_vec(&meta_bytes[scale_end..offset_end]);
+                let per_doc_norms: Option<Arc<[f32]>> =
+                    if matches!(metric, Metric::L2Sq | Metric::Cosine) {
+                        let norms_end = offset_end + (col_n_docs as usize) * 4;
+                        Some(Arc::from(parse_f32_le_vec(
+                            &meta_bytes[offset_end..norms_end],
+                        )))
+                    } else {
+                        None
+                    };
+                Some(Sq8ColumnMeta::Eager {
+                    scale,
+                    offset,
+                    per_doc_norms,
+                })
+            } else {
+                Some(Sq8ColumnMeta::Lazy {
+                    scale_abs_off: meta_abs_start,
+                    offset_abs_off: meta_abs_start + scale_end,
+                    norms_abs_off: matches!(metric, Metric::L2Sq | Metric::Cosine)
+                        .then_some(meta_abs_start + offset_end),
+                })
+            }
+        } else {
+            None
+        };
+
+        Ok(ColumnReader {
+            name: cfg.column.clone(),
+            dim,
+            n_cent: n_cent_u32,
+            n_docs: col_n_docs,
+            metric,
+            rot_seed,
+            rerank_codec,
+            sq8_meta,
+            lazy_sq8_parsed: OnceLock::new(),
+            subsection_range: subsection_off..sub_end,
+            summary_off,
+            centroids_off,
+            cluster_idx_off,
+            codec_meta_off,
+            per_cluster_blocks_off,
+            stable_ids_off,
+            quant,
+            rot: RandomRotation::new(dim, rot_seed),
+        })
+    }
+
+    /// Packed global cell ids for a multi-cell blob (empty for v1).
+    pub(crate) fn packed_cell_ids(&self) -> &[u32] {
+        &self.cell_ids
+    }
+
+    /// Whether this reader is a v2 multi-cell pack.
+    pub(crate) fn is_multi_cell(&self) -> bool {
+        !self.cell_ids.is_empty()
+    }
+
+    /// Map a flat cluster id (manifest / query fan-out) to
+    /// `(cell_column_index, local_cluster)` for multi-cell blobs.
+    pub(crate) fn resolve_flat_cluster(&self, flat: u32) -> Option<(usize, u32)> {
+        if self.flat_cluster_base.is_empty() {
+            return Some((0, flat));
+        }
+        // flat_cluster_base is prefix sums of length n_cells+1.
+        let bases = &self.flat_cluster_base;
+        if flat >= *bases.last()? {
+            return None;
+        }
+        let mut lo = 0usize;
+        let mut hi = bases.len() - 1;
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if bases[mid] <= flat {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        Some((lo, flat - bases[lo]))
     }
 
     pub fn n_docs(&self) -> u64 {
@@ -1177,7 +1622,40 @@ impl VectorReader {
 
     /// Per-column summary centroid, copied into the manifest's
     /// per-superfile [`VectorSummary`] at commit time.
+    ///
+    /// For multi-cell (v2) blobs this is the **doc-weighted mean** of each
+    /// packed cell's IVF summary centroid (weights = cell `n_docs`), so
+    /// superfile skip ordering sees the whole packed object — not only the
+    /// first cell in the directory.
     pub fn summary(&self, column: &str) -> Option<Vec<f32>> {
+        if !self.column_id_by_name.contains_key(column) {
+            return None;
+        }
+        if self.is_multi_cell() {
+            let dim = self.columns.first()?.dim;
+            let mut acc = vec![0.0f64; dim];
+            let mut total_docs = 0u64;
+            for col in &self.columns {
+                let sub = self.source.try_get_range_sync(col.subsection_range.clone())?;
+                let mut cell_summary = vec![0f32; dim];
+                decode_f32_le_into(
+                    &sub[col.summary_off..col.summary_off + dim * 4],
+                    &mut cell_summary,
+                );
+                let w = f64::from(col.n_docs);
+                if w > 0.0 {
+                    for (a, &v) in acc.iter_mut().zip(cell_summary.iter()) {
+                        *a += f64::from(v) * w;
+                    }
+                    total_docs = total_docs.saturating_add(u64::from(col.n_docs));
+                }
+            }
+            if total_docs == 0 {
+                return Some(vec![0.0; dim]);
+            }
+            let inv = 1.0 / total_docs as f64;
+            return Some(acc.iter().map(|&a| (a * inv) as f32).collect());
+        }
         let cid = *self.column_id_by_name.get(column)?;
         let col = &self.columns[cid as usize];
         // byte access routed through `Source::try_get_range_sync`
@@ -1198,7 +1676,40 @@ impl VectorReader {
     /// quantized cluster centroids into the manifest for cross-superfile
     /// global cluster selection. `None` if the column is unknown or the
     /// centroid/cluster_idx bytes aren't resident.
+    ///
+    /// For multi-cell (v2) blobs, concatenates fine centroids across all
+    /// packed cells in cell-directory order so flat cluster ids match
+    /// [`Self::resolve_flat_cluster`] / [`Self::search_clusters_async`].
     pub fn cluster_centroids(&self, column: &str) -> Option<(u32, u32, Vec<f32>, Vec<u32>)> {
+        if !self.column_id_by_name.contains_key(column) {
+            return None;
+        }
+        if self.is_multi_cell() {
+            let dim = self.columns.first()?.dim;
+            let mut centroids = Vec::new();
+            let mut counts = Vec::new();
+            for col in &self.columns {
+                let sub = self.source.try_get_range_sync(col.subsection_range.clone())?;
+                let n_cent = col.n_cent as usize;
+                let stride = dim * 4;
+                for c in 0..n_cent {
+                    let base = col.centroids_off + c * stride;
+                    let mut buf = vec![0f32; dim];
+                    decode_f32_le_into(&sub[base..base + stride], &mut buf);
+                    centroids.extend_from_slice(&buf);
+                    let b =
+                        col.cluster_idx_off + c * CLUSTER_IDX_ENTRY_BYTES + CLUSTER_IDX_COUNT_OFFSET;
+                    counts.push(u32::from_le_bytes([
+                        sub[b],
+                        sub[b + 1],
+                        sub[b + 2],
+                        sub[b + 3],
+                    ]));
+                }
+            }
+            let n_cent = counts.len() as u32;
+            return Some((n_cent, dim as u32, centroids, counts));
+        }
         let cid = *self.column_id_by_name.get(column)?;
         let col = &self.columns[cid as usize];
         let sub = self
@@ -1234,14 +1745,76 @@ impl VectorReader {
         Some((col.n_cent, dim as u32, centroids, counts))
     }
 
+    /// Map a file-local doc id (parquet / multi-cell search hit space) to
+    /// `(cell_column_index, cell_local_doc_id)`. Cells are laid out in
+    /// directory order with contiguous `[base, base + n_docs)` spans.
+    fn file_local_to_cell(&self, file_local: u32) -> Option<(usize, u32)> {
+        let mut running = 0u32;
+        for (i, col) in self.columns.iter().enumerate() {
+            let next = running.saturating_add(col.n_docs);
+            if file_local < next {
+                return Some((i, file_local - running));
+            }
+            running = next;
+        }
+        None
+    }
+
+    /// Remap a file-local allow/deny bitmap onto one packed cell's local
+    /// id space (`0..n_docs`). IVF cluster blocks store cell-local ids;
+    /// callers pass file-local bitmaps (parquet / packed-shard space).
+    fn cell_local_filter_bitmap(
+        &self,
+        file_local: Option<&RoaringBitmap>,
+        cell_idx: usize,
+        doc_base: u32,
+    ) -> Option<Arc<RoaringBitmap>> {
+        let bm = file_local?;
+        let n_docs = self.columns.get(cell_idx)?.n_docs;
+        if n_docs == 0 {
+            return Some(Arc::new(RoaringBitmap::new()));
+        }
+        let end = doc_base.saturating_add(n_docs);
+        let mut local = RoaringBitmap::new();
+        for file_id in bm.range(doc_base..end) {
+            local.insert(file_id - doc_base);
+        }
+        Some(Arc::new(local))
+    }
+
     /// Resolve the stable `_id` for each `local_doc_id` straight from the inline
-    /// stable-`_id` region of this blob's (single) materialized/hidden-cell
-    /// vector column — no scalar `_id` column read. `None` when no column
+    /// stable-`_id` region — no scalar `_id` column read. `None` when no column
     /// carries a region, or the region bytes are not resident (a lazy reader the
     /// caller hasn't warmed); the caller then falls back to the scalar column.
-    /// The region is indexed by `local_doc_id`, matching the positional doc-id a
-    /// hidden hit carries.
+    ///
+    /// For single-cell (v1) blobs the region is indexed by cell-local
+    /// `local_doc_id`. For multi-cell (v2) packed shards, search / parquet use
+    /// **file-local** ids (running sum of prior cells' `n_docs`); this maps
+    /// each id onto the owning cell's region before indexing.
     pub(crate) fn inline_stable_ids_for_locals(&self, locals: &[u32]) -> Option<Vec<i128>> {
+        if self.is_multi_cell() {
+            // Per-cell regions; do not use `cold_stable_id_region` (that stash
+            // holds at most one cell from the last probe wave).
+            let mut out = Vec::with_capacity(locals.len());
+            for &file_local in locals {
+                let (cell_idx, cell_local) = self.file_local_to_cell(file_local)?;
+                let col = &self.columns[cell_idx];
+                if !col.has_inline_stable_ids() {
+                    return None;
+                }
+                let region = self
+                    .source
+                    .try_get_range_sync(col.stable_ids_region_range()?)?;
+                let p = (cell_local as usize) * format::vec::STABLE_ID_BYTES;
+                let end = p + format::vec::STABLE_ID_BYTES;
+                if end > region.len() {
+                    return None;
+                }
+                let arr: [u8; format::vec::STABLE_ID_BYTES] = region[p..end].try_into().ok()?;
+                out.push(i128::from_le_bytes(arr));
+            }
+            return Some(out);
+        }
         let col = self.columns.iter().find(|c| c.has_inline_stable_ids())?;
         // Prefer the cold-path region stashed during the fan-out wave
         // (`cold_stable_id_region`); otherwise serve a resident (warm) slice.
@@ -1285,6 +1858,47 @@ impl VectorReader {
         &self,
         locals: &[u32],
     ) -> Result<Option<Vec<i128>>, VectorError> {
+        if self.is_multi_cell() {
+            if !self.columns.iter().any(|c| c.has_inline_stable_ids()) {
+                return Ok(None);
+            }
+            let mut out = Vec::with_capacity(locals.len());
+            for &file_local in locals {
+                let Some((cell_idx, cell_local)) = self.file_local_to_cell(file_local) else {
+                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                        "inline stable_id region: file-local {file_local} out of range \
+                         (n_docs={})",
+                        self.n_docs
+                    ))));
+                };
+                let col = &self.columns[cell_idx];
+                let Some(range) = col.stable_ids_region_range() else {
+                    return Ok(None);
+                };
+                let region = self
+                    .source
+                    .range_async(range)
+                    .await
+                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                let p = (cell_local as usize) * format::vec::STABLE_ID_BYTES;
+                let end = p + format::vec::STABLE_ID_BYTES;
+                if end > region.len() {
+                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                        "inline stable_id region: cell-local {cell_local} out of range \
+                         ({} bytes, cell_idx={cell_idx})",
+                        region.len()
+                    ))));
+                }
+                let arr: [u8; format::vec::STABLE_ID_BYTES] =
+                    region[p..end].try_into().map_err(|_| {
+                        VectorError::Read(ReadError::MalformedVersion(
+                            "inline stable_id region slice".into(),
+                        ))
+                    })?;
+                out.push(i128::from_le_bytes(arr));
+            }
+            return Ok(Some(out));
+        }
         let Some(col) = self.columns.iter().find(|c| c.has_inline_stable_ids()) else {
             return Ok(None);
         };
@@ -1327,10 +1941,22 @@ impl VectorReader {
             .column_id_by_name
             .get(column)
             .ok_or_else(|| BuildError::VectorSchemaMismatch(format!("unknown column {column}")))?;
-        let col = &self.columns[cid as usize];
+        self.sq8_ivf_merge_input_at(cid as usize, doc_id_offset)
+    }
+
+    /// Like [`Self::sq8_ivf_merge_input`], but addresses a packed cell by its
+    /// column-slot index (multi-cell v2: one [`ColumnReader`] per cell).
+    pub(crate) fn sq8_ivf_merge_input_at(
+        &self,
+        col_idx: usize,
+        doc_id_offset: u32,
+    ) -> Result<Sq8IvfMergeInput, BuildError> {
+        let col = self.columns.get(col_idx).ok_or_else(|| {
+            BuildError::VectorSchemaMismatch(format!("cell column index {col_idx} out of range"))
+        })?;
         if col.rerank_codec != RerankCodec::Sq8Residual {
             return Err(BuildError::VectorRerankCodecUnimplemented {
-                column: column.to_string(),
+                column: col.name.clone(),
                 codec: col.rerank_codec.name(),
             });
         }
@@ -1362,9 +1988,6 @@ impl VectorReader {
             .source
             .try_get_range_sync(col.subsection_range.clone())
             .ok_or(BuildError::VectorReadError)?;
-        // Inline stable-`_id` region (materialized/hidden cells): parse it out of
-        // the already-materialized `sub` so a compaction merge can carry it
-        // forward. Indexed by local doc id; one i128 per doc.
         let stable_ids = col.stable_ids_off.map(|so| {
             (0..col.n_docs as usize)
                 .map(|local| {
@@ -1396,24 +2019,65 @@ impl VectorReader {
         })
     }
 
-    /// Read Sq8+ε rerank rows plus preserved 1-bit RaBitQ codes for maintenance
-    /// rebuilds through the normal IVF writer (no fp32 reconstruction).
-    ///
-    /// Async because this is the OPANN drain/maintenance read-back: the hidden
-    /// incoming superfile it reads is routinely evicted from the disk cache by
-    /// the pre-drain search, so it must fetch-on-miss — and the drain's source
-    /// (`StorageRangeSource`) has no sync-resident tier, so a resident-only read
-    /// would spuriously fail. It fetches the subsection (and any non-resident
-    /// Sq8 meta) via `range_async`, awaited directly on the caller's runtime,
-    /// then parses the rows from those bytes. It deliberately avoids the sync
-    /// `get_range` bridge, whose nested `block_in_place` + `block_on` deadlocks
-    /// when called inside the drain's async task.
-    pub(crate) async fn materialized_index_rows_async(
+    /// Sync materialize of one packed cell's IVF rows (eager / resident
+    /// sources only — compaction opens inputs eagerly).
+    pub(crate) fn materialized_cell_rows_at(
         &self,
-        index_name: &str,
+        col_idx: usize,
+    ) -> Result<Vec<MaterializedIvfRow>, BuildError> {
+        let col = self.columns.get(col_idx).ok_or_else(|| {
+            BuildError::VectorSchemaMismatch(format!("cell column index {col_idx} out of range"))
+        })?;
+        if col.rerank_codec != RerankCodec::Sq8Residual {
+            return Err(BuildError::VectorRerankCodecUnimplemented {
+                column: col.name.clone(),
+                codec: col.rerank_codec.name(),
+            });
+        }
+        let dim = col.dim;
+        let so_block_bytes = (col.n_cent as usize) * dim * 4;
+        let (scale, offset) = match &col.sq8_meta {
+            Some(Sq8ColumnMeta::Eager { scale, offset, .. }) => (scale.clone(), offset.clone()),
+            Some(Sq8ColumnMeta::Lazy {
+                scale_abs_off,
+                offset_abs_off,
+                ..
+            }) => {
+                let scale_bytes = self
+                    .source
+                    .try_get_range_sync(*scale_abs_off..*scale_abs_off + so_block_bytes)
+                    .ok_or(BuildError::VectorReadError)?;
+                let offset_bytes = self
+                    .source
+                    .try_get_range_sync(*offset_abs_off..*offset_abs_off + so_block_bytes)
+                    .ok_or(BuildError::VectorReadError)?;
+                (
+                    parse_f32_le_vec(scale_bytes.as_ref()),
+                    parse_f32_le_vec(offset_bytes.as_ref()),
+                )
+            }
+            _ => return Err(BuildError::VectorReadError),
+        };
+        let sub = self
+            .source
+            .try_get_range_sync(col.subsection_range.clone())
+            .ok_or(BuildError::VectorReadError)?;
+        Ok(Self::parse_materialized_index_rows(
+            col,
+            sub.as_ref(),
+            &scale,
+            &offset,
+        ))
+    }
+
+    /// Async materialize of one cell column slot (v1 single column or one
+    /// packed-cell subsection). Fetches via `range_async` so cold maintenance
+    /// works when the subsection is not resident.
+    pub(crate) async fn materialized_cell_rows_async_at(
+        &self,
+        col_idx: usize,
     ) -> Option<Vec<MaterializedIvfRow>> {
-        let cid = *self.column_id_by_name.get(index_name)?;
-        let col = &self.columns[cid as usize];
+        let col = self.columns.get(col_idx)?;
         if col.rerank_codec != RerankCodec::Sq8Residual {
             return None;
         }
@@ -1454,6 +2118,98 @@ impl VectorReader {
             &scale_buf,
             &offset_buf,
         ))
+    }
+
+    /// Materialize packed cells as `(global_cell_id, rows)`.
+    ///
+    /// - `only_cells = None` → every cell in the directory (v1: one synthetic
+    ///   cell using column 0; callers that need a cell id should prefer the
+    ///   entry's `partition_hint`).
+    /// - `only_cells = Some(&[…])` → only those global cell ids present in
+    ///   this blob's cell directory.
+    ///
+    /// Row `local_doc_id` values stay **cell-local** (`0..n_docs` within that
+    /// cell IVF). Callers that need file-local ids must offset by prior cells.
+    pub(crate) async fn materialized_cells_rows_async(
+        &self,
+        only_cells: Option<&[u32]>,
+    ) -> Option<Vec<(u32, Vec<MaterializedIvfRow>)>> {
+        if self.is_multi_cell() {
+            let mut out = Vec::new();
+            for (ci, &cell_id) in self.cell_ids.iter().enumerate() {
+                if only_cells.is_some_and(|want| !want.contains(&cell_id)) {
+                    continue;
+                }
+                let rows = self.materialized_cell_rows_async_at(ci).await?;
+                out.push((cell_id, rows));
+            }
+            Some(out)
+        } else {
+            // v1: single IVF. `only_cells` of length 1 names that cell; otherwise 0.
+            let cell_id = only_cells.and_then(|c| c.first().copied()).unwrap_or(0);
+            if let Some(want) = only_cells
+                && !want.is_empty()
+                && !want.contains(&cell_id)
+            {
+                return Some(Vec::new());
+            }
+            let rows = self.materialized_cell_rows_async_at(0).await?;
+            Some(vec![(cell_id, rows)])
+        }
+    }
+
+    /// Doc count for packed cell `cell_id`, or `None` if this blob does not
+    /// contain that cell (v1 always returns column-0 `n_docs` when `cell_id`
+    /// matches the caller's expected single cell — use [`Self::n_docs`] for
+    /// the whole blob).
+    pub(crate) fn packed_cell_n_docs(&self, cell_id: u32) -> Option<u32> {
+        if self.is_multi_cell() {
+            let ci = self.cell_ids.iter().position(|&c| c == cell_id)?;
+            Some(self.columns.get(ci)?.n_docs)
+        } else {
+            Some(self.columns.first()?.n_docs)
+        }
+    }
+
+    /// Read Sq8+ε rerank rows plus preserved 1-bit RaBitQ codes for maintenance
+    /// rebuilds through the normal IVF writer (no fp32 reconstruction).
+    ///
+    /// Async because this is the OPANN drain/maintenance read-back: the hidden
+    /// incoming superfile it reads is routinely evicted from the disk cache by
+    /// the pre-drain search, so it must fetch-on-miss — and the drain's source
+    /// (`StorageRangeSource`) has no sync-resident tier, so a resident-only read
+    /// would spuriously fail. It fetches the subsection (and any non-resident
+    /// Sq8 meta) via `range_async`, awaited directly on the caller's runtime,
+    /// then parses the rows from those bytes. It deliberately avoids the sync
+    /// `get_range` bridge, whose nested `block_in_place` + `block_on` deadlocks
+    /// when called inside the drain's async task.
+    ///
+    /// For multi-cell (v2) blobs this concatenates **every** packed cell's rows
+    /// in cell-directory order and remaps `local_doc_id` to file-local offsets
+    /// (matching parquet id-column order). Prefer
+    /// [`Self::materialized_cells_rows_async`] when only some cells are needed.
+    pub(crate) async fn materialized_index_rows_async(
+        &self,
+        index_name: &str,
+    ) -> Option<Vec<MaterializedIvfRow>> {
+        if !self.column_id_by_name.contains_key(index_name) {
+            return None;
+        }
+        if self.is_multi_cell() {
+            let cells = self.materialized_cells_rows_async(None).await?;
+            let mut out = Vec::new();
+            let mut file_doc_base = 0u32;
+            for (_cell_id, rows) in cells {
+                let n = rows.len() as u32;
+                for mut row in rows {
+                    row.local_doc_id = file_doc_base + row.local_doc_id;
+                    out.push(row);
+                }
+                file_doc_base = file_doc_base.saturating_add(n);
+            }
+            return Some(out);
+        }
+        self.materialized_cell_rows_async_at(0).await
     }
 
     /// Decode every IVF row from `sub` (the full subsection bytes) using the
@@ -1857,6 +2613,19 @@ impl VectorReader {
         // before the coarse heap so the top-k is selected from live rows.
         deny: Option<Arc<RoaringBitmap>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
+        if self.is_multi_cell() {
+            return self
+                .search_clusters_async_multi_cell(
+                    column,
+                    query,
+                    k,
+                    clusters,
+                    rerank_mult,
+                    allow,
+                    deny,
+                )
+                .await;
+        }
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
             return Ok(Vec::new());
@@ -1889,6 +2658,107 @@ impl VectorReader {
         };
         self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await
+    }
+
+    /// Multi-cell probe: map flat cluster ids → (cell, local), probe each
+    /// touched cell, merge hits. Local doc ids are unique within a cell
+    /// subsection; across cells they may collide, so hits are tagged with
+    /// a cell-local id space by offsetting with a running base equal to
+    /// the sum of prior cells' `n_docs` (matching parquet id-column order
+    /// when cells are concatenated in directory order).
+    async fn search_clusters_async_multi_cell(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        clusters: &[u32],
+        rerank_mult: usize,
+        allow: Option<Arc<RoaringBitmap>>,
+        deny: Option<Arc<RoaringBitmap>>,
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
+        if !self.column_id_by_name.contains_key(column) {
+            return Err(VectorError::UnknownColumn(column.to_string()));
+        }
+        let dim = self
+            .columns
+            .first()
+            .map(|c| c.dim)
+            .ok_or_else(|| VectorError::UnknownColumn(column.to_string()))?;
+        if query.len() != dim {
+            return Err(VectorError::DimensionMismatch {
+                expected: dim,
+                got: query.len(),
+            });
+        }
+        if k == 0 || self.n_docs == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Group flat cluster ids by cell index.
+        let mut by_cell: HashMap<usize, Vec<usize>> = HashMap::new();
+        for &flat in clusters {
+            let Some((cell_idx, local)) = self.resolve_flat_cluster(flat) else {
+                continue;
+            };
+            by_cell.entry(cell_idx).or_default().push(local as usize);
+        }
+        if by_cell.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Doc-id bases: parquet rows are concatenated in cell-directory order.
+        let mut doc_base = vec![0u32; self.columns.len()];
+        let mut running = 0u32;
+        for (i, col) in self.columns.iter().enumerate() {
+            doc_base[i] = running;
+            running = running.saturating_add(col.n_docs);
+        }
+
+        let mut merged: Vec<(u32, f32)> = Vec::new();
+        for (cell_idx, locals) in by_cell {
+            let col = &self.columns[cell_idx];
+            if col.n_docs == 0 {
+                continue;
+            }
+            let base = doc_base[cell_idx];
+            // Allow/deny are file-local; each cell IVF checks cell-local ids.
+            let cell_allow =
+                self.cell_local_filter_bitmap(allow.as_deref(), cell_idx, base);
+            let cell_deny = self.cell_local_filter_bitmap(deny.as_deref(), cell_idx, base);
+            let sub_start = col.subsection_range.start;
+            let idx_start = sub_start + col.cluster_idx_off;
+            let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
+            let cluster_idx = self
+                .source
+                .range_async(idx_start..idx_end)
+                .await
+                .map_err(|e| VectorError::LazySource(e.to_string()))?;
+            let mut q_rot = vec![0f32; col.dim];
+            col.rot.apply(query, &mut q_rot);
+            let filter_mult = filter_selectivity_mult(&cell_allow, col.n_docs);
+            if filter_mult == 0 {
+                continue;
+            }
+            let ctx = ProbeCtx {
+                q_rot: &q_rot,
+                k,
+                rerank_mult: effective_filtered_rerank_mult(rerank_mult, filter_mult),
+                allow: cell_allow,
+                deny: cell_deny,
+            };
+            let hits = self
+                .probe_clusters_async(col, query, &ctx, &cluster_idx, &locals)
+                .await?;
+            for (local_id, score) in hits {
+                merged.push((base.saturating_add(local_id), score));
+            }
+        }
+        // Distance ascending (smaller = closer), matching every other vector
+        // search path. Descending here kept the farthest k hits and collapsed
+        // packed-shard recall to ~0.
+        merged.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        merged.truncate(k);
+        Ok(merged)
     }
 
     /// Shared async tail of the IVF probe: given a chosen set of cluster

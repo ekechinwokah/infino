@@ -912,7 +912,8 @@ const HIDDEN_VECTOR_INDEX_MAX_MEMORY_MB: u64 = 512;
 /// Train global VectorCell centroids from the user manifest and queue them
 /// on the hidden index table for its next commit.
 /// Aggressive compaction profile for the hidden vector-index table: keep
-/// ~one compact superfile per cell instead of many shard-sized files.
+/// ~one compact packed shard object per partition key instead of many
+/// small delta files.
 /// True for the derived hidden vector-index sibling (VectorCell routing, no FTS).
 pub(crate) fn is_hidden_vector_index_table(opts: &SupertableOptions) -> bool {
     !opts.vector_columns.is_empty()
@@ -2288,10 +2289,10 @@ mod tests {
             .expect("user compaction should succeed after lazy pre-drain reads");
     }
 
-    /// Each drain APPENDS one superfile per non-empty cell to the hidden
-    /// manifest (no removals — the user superfiles stay as the durable
-    /// source). So draining across successive commits accumulates multiple
-    /// superfiles per cell, which compaction later collapses.
+    /// Each drain APPENDS packed shard object(s) to the hidden manifest (no
+    /// removals — the user superfiles stay as the durable source). Draining
+    /// across successive commits accumulates multiple files under the same
+    /// partition key, which compaction later collapses.
     #[test]
     fn drain_appends_multiple_files_per_cell() {
         use std::{collections::HashMap, sync::Arc};
@@ -2360,7 +2361,7 @@ mod tests {
             let mut w = st.writer().expect("writer");
             w.append(&batch).expect("append");
             w.commit().expect("commit");
-            // Phase B: drain after each commit; each drain appends a file per cell.
+            // Phase B: drain after each commit; each drain appends packed shard files.
             st.drain_vectors_to_cells_sync().expect("drain to cells");
         }
 
@@ -2378,14 +2379,124 @@ mod tests {
         let max_visible = by_cell.values().copied().max().unwrap_or(0);
         assert!(
             max_visible >= 2,
-            "each drain should append a file per cell, got {max_visible}"
+            "each drain should append a packed shard file, got {max_visible}"
         );
+    }
+
+    /// With writer_pool=N>1 and multiple touched cells, drain publishes at most
+    /// N packed shard objects and stamps partition_hint = shard_id (cell % N).
+    #[test]
+    fn drain_packs_cells_into_at_most_writer_pool_shards() {
+        use std::{collections::HashSet, sync::Arc};
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        const POOL: usize = 2;
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(POOL)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        // Distinct directions so drain touches multiple cells.
+        for i in 0..8usize {
+            let titles = LargeStringArray::from(vec![format!("doc{i}")]);
+            let mut v = vec![0.0f32; dim];
+            v[i % dim] = 1.0;
+            let flat = Float32Array::from(v);
+            let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(titles) as Arc<dyn Array>,
+                    Arc::new(fsl) as Arc<dyn Array>,
+                ],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden")
+            .clone();
+        let hidden_reader = hidden.reader();
+        let manifest = hidden_reader.manifest();
+        let n_objects = manifest.superfiles.len();
+        assert!(
+            n_objects > 0 && n_objects <= POOL,
+            "expected 1..={POOL} packed shards, got {n_objects}"
+        );
+        let mut hints = HashSet::new();
+        for entry in manifest.superfiles.iter() {
+            assert_eq!(entry.vector_layout, VectorLayout::MultiCellIvf);
+            let hint = entry.partition_hint.expect("shard partition_hint");
+            assert!(
+                (hint as usize) < POOL,
+                "partition_hint={hint} must be a shard id in 0..{POOL}"
+            );
+            hints.insert(hint);
+            // Each packed object should open with a non-empty cell directory.
+            assert!(
+                !entry
+                    .vector_summary
+                    .get("emb")
+                    .map(|v| v.clusters.is_empty())
+                    .unwrap_or(true),
+                "packed shard missing cluster summary"
+            );
+        }
+        assert_eq!(hints.len(), n_objects, "each shard object has a distinct hint");
     }
 
     /// Bounded-batch drain: `drain_batch_superfiles` is a memory bound and must
     /// never change the published layout. One drain over N user superfiles
-    /// publishes exactly one file per touched cell whether the budget forces N
-    /// batches (`1`) or a single merge (`-1`).
+    /// publishes ≤ writer_pool packed shard objects (here pool=1 ⇒ one shard),
+    /// whether the budget forces N batches (`1`) or a single merge (`-1`).
     #[test]
     fn bounded_drain_batches_by_superfile_count() {
         use std::{collections::HashMap, sync::Arc};
@@ -2478,13 +2589,13 @@ mod tests {
             by_cell.values().copied().max().unwrap_or(0)
         };
 
-        // batch=1: 3 user superfiles -> 3 memory batches, but still one file
-        // per cell.
+        // batch=1: 3 user superfiles -> 3 memory batches, but still one packed
+        // shard object (writer_pool=1 ⇒ N=1; identical vectors ⇒ one cell).
         let st1 = make(1);
         assert_eq!(
             max_files_per_cell(&st1),
             1,
-            "batch=1 over 3 user superfiles must still publish one file per cell"
+            "batch=1 over 3 user superfiles must still publish one packed shard"
         );
 
         // batch=-1 (unbounded): all 3 in one merge -> identical layout.
@@ -2492,7 +2603,7 @@ mod tests {
         assert_eq!(
             max_files_per_cell(&st_unb),
             1,
-            "unbounded drain must merge all user superfiles into one file per cell"
+            "unbounded drain must merge all user superfiles into one packed shard"
         );
 
         // batch=0: drain skipped → hidden index stays empty.
@@ -2599,7 +2710,7 @@ mod tests {
         let max_per_cell = per_cell.values().copied().max().unwrap_or(0);
         assert_eq!(
             max_per_cell, 1,
-            "one drain run must publish one superfile per cell (got {max_per_cell})"
+            "one drain run must publish one packed shard object (got {max_per_cell})"
         );
         assert_eq!(
             total_rows, N_COMMITS as u64,
@@ -2620,7 +2731,7 @@ mod tests {
         assert_eq!(
             n_after,
             per_cell.len(),
-            "no-op re-drain must not append cell files"
+            "no-op re-drain must not append shard files"
         );
     }
 
@@ -3378,20 +3489,22 @@ mod tests {
             .vector_index_table()
             .expect("hidden vector index")
             .clone();
-        let count_by_cell = |manifest: &crate::supertable::manifest::Manifest| -> usize {
-            let mut by_cell = HashMap::<Vec<u8>, usize>::new();
+        let count_by_shard = |manifest: &crate::supertable::manifest::Manifest| -> usize {
+            let mut by_shard = HashMap::<Vec<u8>, usize>::new();
             for entry in manifest.superfiles.iter() {
-                if entry.vector_layout != VectorLayout::Ivf {
+                if entry.vector_layout != VectorLayout::MultiCellIvf
+                    && entry.vector_layout != VectorLayout::Ivf
+                {
                     continue;
                 }
-                *by_cell.entry(entry.partition_key.clone()).or_default() += 1;
+                *by_shard.entry(entry.partition_key.clone()).or_default() += 1;
             }
-            by_cell.values().copied().max().unwrap_or(0)
+            by_shard.values().copied().max().unwrap_or(0)
         };
-        let before = count_by_cell(hidden.reader().manifest());
+        let before = count_by_shard(hidden.reader().manifest());
         assert!(
             before >= 2,
-            "need multiple drained superfiles per cell before compaction, got {before}"
+            "need multiple drained packed shards before compaction, got {before}"
         );
 
         let cfg = CompactionSettings {
@@ -3403,15 +3516,17 @@ mod tests {
 
         let after_reader = hidden.reader();
         let after_manifest = after_reader.manifest();
-        let after = count_by_cell(after_manifest);
+        let after = count_by_shard(after_manifest);
         assert!(
             after < before,
-            "compaction should collapse per-cell superfiles: before={before} after={after}"
+            "compaction should collapse packed shards: before={before} after={after}"
         );
         for entry in &after_manifest.superfiles {
-            assert_eq!(
-                entry.vector_layout,
-                crate::superfile::vector::layout::VectorLayout::Ivf
+            assert!(
+                entry.vector_layout == VectorLayout::MultiCellIvf
+                    || entry.vector_layout == VectorLayout::Ivf,
+                "unexpected layout {:?}",
+                entry.vector_layout
             );
             assert!(
                 entry
@@ -3419,7 +3534,7 @@ mod tests {
                     .as_ref()
                     .and_then(|o| o.vec)
                     .is_some(),
-                "compacted hidden IVF entry {:?} missing vec subsection",
+                "compacted hidden entry {:?} missing vec subsection",
                 entry.uri
             );
         }
