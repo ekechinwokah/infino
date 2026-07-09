@@ -952,8 +952,7 @@ impl<'a> Sq8ResidualKernel<'a> {
             }
             Metric::NegDot => -dot,
             Metric::L2Sq => {
-                let x_norm_sq =
-                    norm.expect("Sq8ResidualKernel + L2Sq requires per_doc_norms");
+                let x_norm_sq = norm.expect("Sq8ResidualKernel + L2Sq requires per_doc_norms");
                 self.q_norm_sq - L2_CROSS_TERM_COEFF * dot + x_norm_sq
             }
         }

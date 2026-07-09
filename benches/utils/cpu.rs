@@ -51,7 +51,11 @@ pub fn process_cpu_ns() -> Option<u128> {
             // A thread can exit between the readdir and the open — skip it.
             continue;
         };
-        if let Some(ns) = raw.split_whitespace().next().and_then(|f| f.parse::<u128>().ok()) {
+        if let Some(ns) = raw
+            .split_whitespace()
+            .next()
+            .and_then(|f| f.parse::<u128>().ok())
+        {
             total += ns;
             any = true;
         }
@@ -119,7 +123,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         let slept = (thread_cpu_ns().expect("cpu") - start_sleep) as f64 / NS_PER_SEC;
 
-        assert!(busy > 0.010, "50ms of busy work must accrue on-CPU time, got {busy}s");
+        assert!(
+            busy > 0.010,
+            "50ms of busy work must accrue on-CPU time, got {busy}s"
+        );
         assert!(
             slept < busy / 5.0,
             "a sleep ({slept}s) must accrue far less on-CPU time than busy work ({busy}s)"

@@ -469,11 +469,7 @@ impl CellRowAccumulator {
     }
 
     /// Append one row to `cell`, creating the cell store on first touch.
-    pub(crate) fn append(
-        &mut self,
-        cell: u32,
-        row: &MaterializedIvfRow,
-    ) -> Result<(), BuildError> {
+    pub(crate) fn append(&mut self, cell: u32, row: &MaterializedIvfRow) -> Result<(), BuildError> {
         match self.cells.entry(cell) {
             Entry::Occupied(mut o) => match o.get_mut() {
                 CellRowStore::Memory(rows) => {

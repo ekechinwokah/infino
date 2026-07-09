@@ -1238,10 +1238,7 @@ fn list_to_dto(l: &ManifestList) -> Result<ManifestListDto, ListEncodeError> {
         drained_ranges: l.drained_ranges.intervals().to_vec(),
         deleted_user_ids_inline_b64: l.deleted_user_ids_inline.as_deref().map(encode_b64),
         slow_vector_state_uri: l.slow_vector_state_uri.clone(),
-        slow_vector_state_content_hash: l
-            .slow_vector_state_content_hash
-            .as_ref()
-            .map(encode_hash),
+        slow_vector_state_content_hash: l.slow_vector_state_content_hash.as_ref().map(encode_hash),
         parts,
     })
 }

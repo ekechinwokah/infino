@@ -121,8 +121,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        storage::LocalFsStorageProvider,
-        superfile::vector::layout::VectorLayout,
+        storage::LocalFsStorageProvider, superfile::vector::layout::VectorLayout,
         supertable::manifest::SuperfileUri,
     };
 
@@ -213,6 +212,9 @@ mod tests {
         let missing = load_state(&storage, "slow-vector-state/absent.bin", &hash)
             .await
             .expect_err("missing object");
-        assert!(matches!(missing, SlowVectorStateError::Storage(_)), "{missing:?}");
+        assert!(
+            matches!(missing, SlowVectorStateError::Storage(_)),
+            "{missing:?}"
+        );
     }
 }

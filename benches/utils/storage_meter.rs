@@ -24,9 +24,9 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use infino::storage::{ObjectMeta, StorageError, StorageProvider};
 use object_store::{
-    path::Path as ObjPath, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload,
-    ObjectMeta as OsObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
-    PutResult, Result as ObjectStoreResult, UploadPart,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta as OsObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    Result as ObjectStoreResult, UploadPart, path::Path as ObjPath,
 };
 
 use crate::rss::fmt_bytes;
@@ -418,10 +418,7 @@ impl StorageProvider for CountingStorage {
         self.inner.list_with_prefix_metadata(prefix).await
     }
 
-    fn object_store_handle(
-        &self,
-        uri: &str,
-    ) -> Option<(Arc<dyn ObjectStore>, ObjPath)> {
+    fn object_store_handle(&self, uri: &str) -> Option<(Arc<dyn ObjectStore>, ObjPath)> {
         let (inner, path) = self.inner.object_store_handle(uri)?;
         // Wrap the raw store so parquet range reads issued straight against the
         // object-store handle (row materialization via `take_rows_object_store`,
@@ -448,7 +445,8 @@ struct CountingObjectStore {
 
 impl fmt::Debug for CountingObjectStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CountingObjectStore").finish_non_exhaustive()
+        f.debug_struct("CountingObjectStore")
+            .finish_non_exhaustive()
     }
 }
 
@@ -460,7 +458,11 @@ impl fmt::Display for CountingObjectStore {
 
 #[async_trait]
 impl ObjectStore for CountingObjectStore {
-    async fn get_opts(&self, location: &ObjPath, options: GetOptions) -> ObjectStoreResult<GetResult> {
+    async fn get_opts(
+        &self,
+        location: &ObjPath,
+        options: GetOptions,
+    ) -> ObjectStoreResult<GetResult> {
         let is_head = options.head;
         let res = self.inner.get_opts(location, options).await?;
         if is_head {
@@ -469,8 +471,11 @@ impl ObjectStore for CountingObjectStore {
             // The resolved `range` gives the byte count without consuming the
             // (streamed) payload.
             let len = res.range.end.saturating_sub(res.range.start);
-            self.counters
-                .record_get(location.as_ref(), Some((res.range.start, res.range.end)), len);
+            self.counters.record_get(
+                location.as_ref(),
+                Some((res.range.start, res.range.end)),
+                len,
+            );
         }
         Ok(res)
     }
@@ -514,14 +519,14 @@ impl ObjectStore for CountingObjectStore {
         self.inner.delete_stream(locations)
     }
 
-    fn list(&self, prefix: Option<&ObjPath>) -> BoxStream<'static, ObjectStoreResult<OsObjectMeta>> {
+    fn list(
+        &self,
+        prefix: Option<&ObjPath>,
+    ) -> BoxStream<'static, ObjectStoreResult<OsObjectMeta>> {
         self.inner.list(prefix)
     }
 
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&ObjPath>,
-    ) -> ObjectStoreResult<ListResult> {
+    async fn list_with_delimiter(&self, prefix: Option<&ObjPath>) -> ObjectStoreResult<ListResult> {
         self.inner.list_with_delimiter(prefix).await
     }
 

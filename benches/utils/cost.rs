@@ -129,7 +129,8 @@ impl Instance {
     /// RAM-bound phases uniformly — `compute_usd` divides the `vcpu` back out,
     /// so a RAM-bound phase still bills exactly RSS-share × wall.
     fn ram_leg(&self, wall_s: f64, peak_rss_bytes: Option<u64>) -> f64 {
-        wall_s * peak_rss_bytes.map(|b| self.ram_share(b)).unwrap_or(0.0)
+        wall_s
+            * peak_rss_bytes.map(|b| self.ram_share(b)).unwrap_or(0.0)
             * f64::from(self.vcpu.max(1))
     }
 
@@ -462,8 +463,9 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     let drain_req_usd = c.store.drain.map(|io| request_usd(&io)).unwrap_or(0.0);
     let compaction_req_usd = c.store.compaction.map(|io| request_usd(&io)).unwrap_or(0.0);
 
-    let write_compute =
-        ingest_compute.unwrap_or(0.0) + drain_compute.unwrap_or(0.0) + compaction_compute.unwrap_or(0.0);
+    let write_compute = ingest_compute.unwrap_or(0.0)
+        + drain_compute.unwrap_or(0.0)
+        + compaction_compute.unwrap_or(0.0);
     let write_requests = ingest_req_usd + drain_req_usd + compaction_req_usd;
     let write_total = write_compute + write_requests;
     let write_per_million_docs = if c.n_docs > 0 {
@@ -877,33 +879,38 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     // METERED (the phase ran but schedstat was unavailable) — never a
     // wall-clock substitute. Shared by ingest / drain / compaction so the
     // Some/None handling and cell layout live in one place.
-    let phase_row = |label: String, wall_s: f64, peak_rss: Option<u64>, cpu_s: Option<f64>| -> Vec<Cell> {
-        let Some(cpu) = cpu_s else {
-            return vec![text(label), text("NOT METERED"), text("—"), text("—")];
+    let phase_row =
+        |label: String, wall_s: f64, peak_rss: Option<u64>, cpu_s: Option<f64>| -> Vec<Cell> {
+            let Some(cpu) = cpu_s else {
+                return vec![text(label), text("NOT METERED"), text("—"), text("—")];
+            };
+            let ram = inst.ram_leg(wall_s, peak_rss);
+            let vcpu = inst.phase_vcpu_seconds(cpu, wall_s, peak_rss);
+            let usd_v = inst.compute_usd(vcpu);
+            let binding = match peak_rss {
+                Some(rss) if !inst.phase_cpu_binds(cpu, wall_s, peak_rss) => {
+                    format!(
+                        " — RAM-bound: {} peak held {}",
+                        fmt_bytes(rss),
+                        fmt_wall_seconds(wall_s)
+                    )
+                }
+                Some(rss) => format!(" — {} peak, CPU binds", fmt_bytes(rss)),
+                None => String::new(),
+            };
+            vec![
+                text(format!("{label}{binding}")),
+                text(format!("{} · measured CPU", fmt_wall_seconds(wall_s))),
+                // Both legs of the binding rule, so the RAM input is never silent.
+                text(format!(
+                    "max(cpu {}, ram {}) = {}",
+                    fmt_vcpu_seconds(cpu),
+                    fmt_vcpu_seconds(ram),
+                    fmt_vcpu_seconds(vcpu),
+                )),
+                metric(usd_v, usd_one_time(usd_v), Better::Lower),
+            ]
         };
-        let ram = inst.ram_leg(wall_s, peak_rss);
-        let vcpu = inst.phase_vcpu_seconds(cpu, wall_s, peak_rss);
-        let usd_v = inst.compute_usd(vcpu);
-        let binding = match peak_rss {
-            Some(rss) if !inst.phase_cpu_binds(cpu, wall_s, peak_rss) => {
-                format!(" — RAM-bound: {} peak held {}", fmt_bytes(rss), fmt_wall_seconds(wall_s))
-            }
-            Some(rss) => format!(" — {} peak, CPU binds", fmt_bytes(rss)),
-            None => String::new(),
-        };
-        vec![
-            text(format!("{label}{binding}")),
-            text(format!("{} · measured CPU", fmt_wall_seconds(wall_s))),
-            // Both legs of the binding rule, so the RAM input is never silent.
-            text(format!(
-                "max(cpu {}, ram {}) = {}",
-                fmt_vcpu_seconds(cpu),
-                fmt_vcpu_seconds(ram),
-                fmt_vcpu_seconds(vcpu),
-            )),
-            metric(usd_v, usd_one_time(usd_v), Better::Lower),
-        ]
-    };
     let mut compute_rows = vec![phase_row(
         format!("Ingest ({}w on {} vCPU)", c.writers, inst.vcpu),
         c.ingest_wall_s,
@@ -1340,7 +1347,11 @@ mod tests {
         let inst = test_instance();
         // 0.05 vCPU·s measured cold search @ per-vCPU rate — NOT copied from warm.
         let cold = inst.compute_usd(0.05);
-        assert!((cold * PER_MILLION - 0.63).abs() < 0.05, "got ${}/1M", cold * PER_MILLION);
+        assert!(
+            (cold * PER_MILLION - 0.63).abs() < 0.05,
+            "got ${}/1M",
+            cold * PER_MILLION
+        );
         // Whole-instance rate would 8× overcharge to ~$5/1M — the old bug.
         assert!(cold * PER_MILLION < 1.0);
     }

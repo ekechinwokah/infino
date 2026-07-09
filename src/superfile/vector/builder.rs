@@ -748,8 +748,7 @@ pub(crate) fn finish_multi_cell_blob(
     let n_docs: u64 = cells.iter().map(|(_, s)| u64::from(s.n_docs)).sum();
     let directory_offset = OUTER_HEADER_SIZE as u64;
     let directory_size = cells.len() * CELL_DIR_ENTRY_SIZE;
-    let mut subsection_start =
-        directory_offset + directory_size as u64 + format::CRC_BYTES as u64;
+    let mut subsection_start = directory_offset + directory_size as u64 + format::CRC_BYTES as u64;
 
     let mut directory = Vec::with_capacity(directory_size);
     for (cell_id, sub) in cells {
@@ -2785,10 +2784,10 @@ mod tests {
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         };
-        let sub0 = build_merged_subsection_from_materialized(cfg(2), make_rows(0, 4))
-            .expect("cell 0");
-        let sub1 = build_merged_subsection_from_materialized(cfg(2), make_rows(1, 3))
-            .expect("cell 1");
+        let sub0 =
+            build_merged_subsection_from_materialized(cfg(2), make_rows(0, 4)).expect("cell 0");
+        let sub1 =
+            build_merged_subsection_from_materialized(cfg(2), make_rows(1, 3)).expect("cell 1");
         let blob = finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack");
         let json =
             format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
@@ -2858,10 +2857,10 @@ mod tests {
             provided_centroids: None,
         };
         // cell0 → file-local 0..3; cell1 → file-local 4..6.
-        let sub0 = build_merged_subsection_from_materialized(cfg(2), make_rows(0, 4))
-            .expect("cell 0");
-        let sub1 = build_merged_subsection_from_materialized(cfg(2), make_rows(1, 3))
-            .expect("cell 1");
+        let sub0 =
+            build_merged_subsection_from_materialized(cfg(2), make_rows(0, 4)).expect("cell 0");
+        let sub1 =
+            build_merged_subsection_from_materialized(cfg(2), make_rows(1, 3)).expect("cell 1");
         let blob = finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack");
         let json =
             format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
@@ -2872,18 +2871,14 @@ mod tests {
         allow.insert(6);
         let q = vec![0.0f32; dim];
         let hits = reader
-            .search_clusters_async(
-                "emb",
-                &q,
-                3,
-                &[0, 1, 2, 3],
-                8,
-                Some(Arc::new(allow)),
-                None,
-            )
+            .search_clusters_async("emb", &q, 3, &[0, 1, 2, 3], 8, Some(Arc::new(allow)), None)
             .await
             .expect("filtered multi-cell search");
-        assert_eq!(hits.len(), 3, "expected all three allowed cell1 rows, got {hits:?}");
+        assert_eq!(
+            hits.len(),
+            3,
+            "expected all three allowed cell1 rows, got {hits:?}"
+        );
         for (file_local, _) in &hits {
             assert!(
                 *file_local >= 4,
@@ -2940,10 +2935,10 @@ mod tests {
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         };
-        let sub0 = build_merged_subsection_from_materialized(cfg(2), make_rows(7, 3))
-            .expect("cell 7");
-        let sub1 = build_merged_subsection_from_materialized(cfg(2), make_rows(15, 2))
-            .expect("cell 15");
+        let sub0 =
+            build_merged_subsection_from_materialized(cfg(2), make_rows(7, 3)).expect("cell 7");
+        let sub1 =
+            build_merged_subsection_from_materialized(cfg(2), make_rows(15, 2)).expect("cell 15");
         let blob = finish_multi_cell_blob(&[(7, sub0), (15, sub1)]).expect("pack");
         let json =
             format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);

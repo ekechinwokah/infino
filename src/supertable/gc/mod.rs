@@ -228,12 +228,14 @@ mod tests {
         );
         let live = build_live_set(&manifest);
         assert!(live.contains(&uri), "referenced blob must be live");
-        assert!(!live.contains(&orphan), "unreferenced blob must be sweepable");
+        assert!(
+            !live.contains(&orphan),
+            "unreferenced blob must be sweepable"
+        );
 
         // A manifest without a ref keeps nothing under the prefix live.
         let bare = Manifest::empty(opts());
         let live = build_live_set(&bare);
         assert!(!live.contains(&uri));
     }
-
 }

@@ -323,9 +323,7 @@ where
     // whose tombstones are resolved elsewhere (the hidden path filters via
     // the resident deleted-set, so its per-cell sidecars are always empty
     // and prefetching them is a wasted wave of GETs on the cold critical path).
-    if prefetch_tombstones
-        && let Some(cache) = tombstone_cache.as_ref()
-    {
+    if prefetch_tombstones && let Some(cache) = tombstone_cache.as_ref() {
         let mut ids: Vec<Uuid> = units.iter().map(|(e, _)| e.superfile_id).collect();
         ids.sort_unstable();
         ids.dedup();

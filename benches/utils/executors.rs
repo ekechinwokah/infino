@@ -12,7 +12,10 @@
 //! per-modality trait here, so the measured + reported surface can never
 //! drift between the two tiers again.
 
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 /// p50 of a sample set (lower-median; matches the historical bench
 /// definition shared by every runner).
@@ -505,10 +508,7 @@ pub mod fts {
                 std::hint::black_box(rows);
                 drop(guard);
             }
-            out.insert(
-                q.name,
-                cold.finish(),
-            );
+            out.insert(q.name, cold.finish());
         }
         out
     }
@@ -1850,10 +1850,7 @@ pub mod sql {
                 black_box(rows);
                 drop(guard);
             }
-            out.insert(
-                q.name,
-                cold.finish(),
-            );
+            out.insert(q.name, cold.finish());
         }
         out
     }

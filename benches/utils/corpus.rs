@@ -907,14 +907,8 @@ pub fn recall_at_k(predicted: &[Hit], truth: &[u32]) -> f32 {
 pub fn id_scores_from_vector_search(batches: &[RecordBatch]) -> Vec<(i128, f32)> {
     let mut out = Vec::new();
     for batch in batches {
-        let id_idx = batch
-            .schema()
-            .index_of("_id")
-            .unwrap_or(0);
-        let score_idx = batch
-            .schema()
-            .index_of("score")
-            .unwrap_or(1);
+        let id_idx = batch.schema().index_of("_id").unwrap_or(0);
+        let score_idx = batch.schema().index_of("score").unwrap_or(1);
         let ids = batch
             .column(id_idx)
             .as_any()
@@ -985,11 +979,7 @@ pub fn engine_id_to_dense(
 /// `row_ids[d]` is the engine `_id` for corpus row `d`.
 pub fn oracle_to_engine_ids(gt: &[Vec<u32>], row_ids: &[i128]) -> Vec<Vec<i128>> {
     gt.iter()
-        .map(|row| {
-            row.iter()
-                .map(|&d| row_ids[d as usize])
-                .collect()
-        })
+        .map(|row| row.iter().map(|&d| row_ids[d as usize]).collect())
         .collect()
 }
 

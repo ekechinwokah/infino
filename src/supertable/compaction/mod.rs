@@ -542,11 +542,9 @@ impl Supertable {
                     )
                     .await;
                     if is_hidden_vector_index_table(&inner.options)
-                        && let Err(e) = split_overflow_cell_after_compaction(
-                            Arc::clone(inner),
-                            &new_entries[0],
-                        )
-                        .await
+                        && let Err(e) =
+                            split_overflow_cell_after_compaction(Arc::clone(inner), &new_entries[0])
+                                .await
                     {
                         tracing::warn!(
                             "supertable: hidden cell split after compaction failed: {e}"

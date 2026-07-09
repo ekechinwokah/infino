@@ -392,7 +392,11 @@ mod tests {
             async fn get_range(&self, uri: &str, _r: Range<u64>) -> Result<Bytes, StorageError> {
                 Err(unimplemented_err(uri))
             }
-            async fn put_atomic(&self, uri: &str, _b: Bytes) -> Result<Option<String>, StorageError> {
+            async fn put_atomic(
+                &self,
+                uri: &str,
+                _b: Bytes,
+            ) -> Result<Option<String>, StorageError> {
                 Err(unimplemented_err(uri))
             }
             async fn put_if_match(
@@ -474,7 +478,9 @@ mod tests {
         let t = src.range(tail_start, 50).await.expect("tail block read");
         assert_eq!(
             t,
-            inner.blob.slice(tail_start as usize..tail_start as usize + 50)
+            inner
+                .blob
+                .slice(tail_start as usize..tail_start as usize + 50)
         );
         assert_eq!(inner.calls(), 2);
         assert_eq!(

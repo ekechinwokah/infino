@@ -124,7 +124,7 @@ use crate::{
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
             reader::VectorReader,
-            spill::{CellRowAccumulator},
+            spill::CellRowAccumulator,
         },
     },
     supertable::{
@@ -1643,19 +1643,13 @@ fn vector_open_ranges_multi_cell(blob: &[u8], off: u64) -> Option<Vec<(u64, u64)
             return None;
         }
         let sub = blob.get(subsection_off..subsection_off + subsection_len)?;
-        let per_cluster_blocks_off = read_u64_le(
-            sub.get(
-                sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF
-                    ..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES,
-            )?,
-        ) as usize;
+        let per_cluster_blocks_off = read_u64_le(sub.get(
+            sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES,
+        )?) as usize;
         if per_cluster_blocks_off < SUB_HEADER_SIZE || per_cluster_blocks_off > subsection_len {
             return None;
         }
-        ranges.push((
-            off + subsection_off as u64,
-            per_cluster_blocks_off as u64,
-        ));
+        ranges.push((off + subsection_off as u64, per_cluster_blocks_off as u64));
     }
     Some(merge_ranges(ranges))
 }
@@ -1956,23 +1950,24 @@ fn prepare_user_superfile_batch_in_scope(
     outputs: Vec<ShardOutput>,
     hints: Vec<Option<u32>>,
 ) -> Result<SuperfilePublishBatch, BuildError> {
-    let prepared: Vec<PreparedSuperfile> =
-        outputs
-            .into_par_iter()
-            .zip(hints.into_par_iter())
-            .filter_map(|(shard, hint)| match prepare_superfile(inner, shard) {
-                Ok(Some(p)) => Some(finish_superfile_entry(p.entry, hint).map(|entry| {
-                    PreparedSuperfile {
+    let prepared: Vec<PreparedSuperfile> = outputs
+        .into_par_iter()
+        .zip(hints.into_par_iter())
+        .filter_map(|(shard, hint)| match prepare_superfile(inner, shard) {
+            Ok(Some(p)) => {
+                Some(
+                    finish_superfile_entry(p.entry, hint).map(|entry| PreparedSuperfile {
                         entry,
                         bytes_for_store: p.bytes_for_store,
                         bytes_for_storage: p.bytes_for_storage,
                         bytes_for_cache: p.bytes_for_cache,
-                    }
-                })),
-                Ok(None) => None,
-                Err(e) => Some(Err(e)),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                    }),
+                )
+            }
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     collect_prepared_superfiles(inner, prepared)
 }
 
@@ -2477,12 +2472,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             let replica_extra_budget = drain_replica_extra_budget(all_rows.len(), replica_target);
             if replica_extra_budget == 0 && assign_skip {
                 for row in &all_rows {
-                    accumulate_row_to_cell(
-                        &mut cell_rows,
-                        &mut added_per_cell,
-                        row.cluster,
-                        row,
-                    )?;
+                    accumulate_row_to_cell(&mut cell_rows, &mut added_per_cell, row.cluster, row)?;
                 }
             } else {
                 let clusters_ref = &running_clusters;
@@ -2614,12 +2604,23 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .sum();
         let n_puts = publish_batch.pending_storage_writes.len();
         let publish_t0 = std::time::Instant::now();
+        let mut pending_writes = publish_batch.pending_storage_writes;
+        let mut pending_replaces: Vec<(SuperfileUri, Bytes)> = Vec::new();
+        write_superfile_list_with_threshold(
+            &storage,
+            &hidden_inner.options,
+            DRAIN_PUT_MULTIPART_THRESHOLD_BYTES,
+            &mut pending_writes,
+            &mut pending_replaces,
+        )
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
         let new_manifest = persist_commit_async(
             &hidden_inner,
             Arc::clone(&storage),
             publish_batch.new_entries,
             &no_removals,
-            publish_batch.pending_storage_writes,
+            Vec::new(),
             Vec::new(),
         )
         .await
@@ -2709,9 +2710,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             let publish = collect_prepared_superfiles(&hidden_inner, prepared_wave)?;
             let mut pending_writes = publish.pending_storage_writes;
             let mut pending_replaces: Vec<(SuperfileUri, Bytes)> = Vec::new();
-            write_superfile_list(
+            write_superfile_list_with_threshold(
                 &storage,
                 &hidden_inner.options,
+                DRAIN_PUT_MULTIPART_THRESHOLD_BYTES,
                 &mut pending_writes,
                 &mut pending_replaces,
             )
@@ -3622,6 +3624,10 @@ fn commit_write_concurrency() -> usize {
 /// from stampeding a single S3 prefix. An explicit env override is not clamped.
 const DRAIN_READ_CONCURRENCY_CAP: usize = 64;
 
+/// Drain upload threshold: disable multipart so every drain superfile is
+/// written through a single create-only `put_atomic`.
+const DRAIN_PUT_MULTIPART_THRESHOLD_BYTES: u64 = u64::MAX;
+
 /// Read fan-out for the drain's superfile opens — bulk S3 reads off the
 /// query-critical path. Ideal sizing tracks network bandwidth; vCPU count is the
 /// portable runtime proxy for it (a cloud instance's NIC scales with its size).
@@ -3648,6 +3654,23 @@ fn drain_read_concurrency() -> usize {
 pub async fn write_superfile_list(
     storage: &Arc<dyn StorageProvider>,
     opts: &Arc<SupertableOptions>,
+    pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
+    pending_storage_replaces: &mut Vec<(SuperfileUri, Bytes)>,
+) -> Result<(), SupertableCommitError> {
+    write_superfile_list_with_threshold(
+        storage,
+        opts,
+        opts.put_multipart_threshold_bytes,
+        pending_storage_writes,
+        pending_storage_replaces,
+    )
+    .await
+}
+
+async fn write_superfile_list_with_threshold(
+    storage: &Arc<dyn StorageProvider>,
+    _opts: &Arc<SupertableOptions>,
+    put_multipart_threshold_bytes: u64,
     pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
     pending_storage_replaces: &mut Vec<(SuperfileUri, Bytes)>,
 ) -> Result<(), SupertableCommitError> {
@@ -3696,7 +3719,7 @@ pub async fn write_superfile_list(
         return Err(e);
     }
 
-    let multipart_threshold = opts.put_multipart_threshold_bytes;
+    let multipart_threshold = put_multipart_threshold_bytes;
     let put_futs = pending_storage_writes
         .iter()
         .enumerate()

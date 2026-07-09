@@ -383,11 +383,10 @@ impl ExecutionPlan for VectorSearchExec {
                 }
             }
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            let hits = crate::supertable::query::vector::user_placement_for_scalar_resolve(
-                &reader, &hits,
-            )
-            .await
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            let hits =
+                crate::supertable::query::vector::user_placement_for_scalar_resolve(&reader, &hits)
+                    .await
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             resolve_hits(
                 &reader,
                 &hits,

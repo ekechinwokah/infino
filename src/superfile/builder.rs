@@ -303,14 +303,16 @@ impl BuilderOptions {
                     .next()
                     .expect("multi-cell reader has at least one cell ColumnReader");
                 (
-                    vec![VectorConfig::new(
-                        v.name.clone(),
-                        v.dim,
-                        v.n_cent as usize,
-                        v.rot_seed,
-                        v.metric,
-                    )
-                    .with_rerank_codec(v.rerank_codec)],
+                    vec![
+                        VectorConfig::new(
+                            v.name.clone(),
+                            v.dim,
+                            v.n_cent as usize,
+                            v.rot_seed,
+                            v.metric,
+                        )
+                        .with_rerank_codec(v.rerank_codec),
+                    ],
                     VectorLayout::MultiCellIvf,
                 )
             } else {
@@ -919,11 +921,9 @@ impl SuperfileBuilder {
         let id_array = Decimal128Array::from_iter_values(all_stable_ids.iter().copied())
             .with_precision_and_scale(38, 0)
             .map_err(|_| BuildError::BatchSchemaMismatch)?;
-        let id_batch = RecordBatch::try_new(
-            scalar_schema,
-            vec![Arc::new(id_array) as Arc<dyn Array>],
-        )
-        .map_err(|_| BuildError::BatchSchemaMismatch)?;
+        let id_batch =
+            RecordBatch::try_new(scalar_schema, vec![Arc::new(id_array) as Arc<dyn Array>])
+                .map_err(|_| BuildError::BatchSchemaMismatch)?;
         superfile_builder.add_batch_ids_only(&id_batch)?;
         superfile_builder.set_prebuilt_multi_cell_ivfs(packed_cells)?;
         let bytes = superfile_builder.finish()?;
@@ -1168,7 +1168,12 @@ fn finish_index_blobs(
     } else {
         Vec::new()
     };
-    match (fts_builder, vec_builder, cell_posting_builder, vec_blob.is_empty()) {
+    match (
+        fts_builder,
+        vec_builder,
+        cell_posting_builder,
+        vec_blob.is_empty(),
+    ) {
         (Some(fb), Some(vb), None, true) => {
             let (fts, vec) = rayon::join(|| fb.finish(), || vb.finish());
             Ok((fts?, vec?))
@@ -2950,8 +2955,9 @@ mod tests {
         let id_array = Decimal128Array::from_iter_values(ids.iter().copied())
             .with_precision_and_scale(38, 0)
             .expect("decimal");
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(id_array) as Arc<dyn Array>])
-            .expect("batch");
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(id_array) as Arc<dyn Array>])
+                .expect("batch");
         let opts = BuilderOptions::new(schema, "doc_id", vec![], vec![cfg], None)
             .with_vector_layout(VectorLayout::MultiCellIvf);
         let mut b = SuperfileBuilder::new(opts).expect("builder");
@@ -2997,11 +3003,9 @@ mod tests {
         assert_eq!(a.vec().expect("vec").packed_cell_ids(), &[0, 1]);
         assert_eq!(a.n_docs(), 5);
 
-        let (merged_bytes, stats) = SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[
-            (a, None),
-            (b, None),
-        ])
-        .expect("merge");
+        let (merged_bytes, stats) =
+            SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(a, None), (b, None)])
+                .expect("merge");
         assert_eq!(stats.n_docs, 10);
 
         let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged");
@@ -3024,11 +3028,9 @@ mod tests {
         deny.insert(1);
         deny.insert(3);
 
-        let (merged_bytes, _stats) = SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(
-            a,
-            Some(Arc::new(deny)),
-        )])
-        .expect("merge with tombstones");
+        let (merged_bytes, _stats) =
+            SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(a, Some(Arc::new(deny)))])
+                .expect("merge with tombstones");
 
         let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open");
         assert_eq!(merged.n_docs(), 3);

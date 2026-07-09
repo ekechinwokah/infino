@@ -58,7 +58,10 @@ use xxhash_rust::xxh3::xxh3_64;
 use super::options::SupertableOptions;
 use crate::{
     storage::{StorageError, StorageProvider},
-    superfile::vector::{distance::{Metric, distance}, layout::VectorLayout},
+    superfile::vector::{
+        distance::{Metric, distance},
+        layout::VectorLayout,
+    },
     supertable::{
         CommitError,
         error::ManifestError,
@@ -3035,8 +3038,7 @@ mod tests {
         assert!(manifest.slow_vector_state_blob().is_none());
 
         let hash = ContentHash([3u8; 32]);
-        let stamped =
-            manifest.with_slow_vector_state("slow-vector-state/state-x.bin".into(), hash);
+        let stamped = manifest.with_slow_vector_state("slow-vector-state/state-x.bin".into(), hash);
         let (uri, got_hash) = stamped.slow_vector_state_blob().expect("ref stamped");
         assert_eq!(uri, "slow-vector-state/state-x.bin");
         assert_eq!(got_hash, hash);
@@ -3049,8 +3051,7 @@ mod tests {
 
         // A deleted-ids stamp (list-only churn: the user-delete path) must
         // NOT disturb the slow-state ref — this is the residency invariant.
-        let deleted_stamped =
-            stamped.with_deleted_user_ids(Vec::new());
+        let deleted_stamped = stamped.with_deleted_user_ids(Vec::new());
         assert!(
             deleted_stamped.slow_vector_state_blob().is_some(),
             "deleted-ids stamp must preserve the slow-state ref"
@@ -3138,10 +3139,7 @@ mod tests {
         storage: &Arc<dyn StorageProvider>,
         slow_ref: Option<(String, ContentHash)>,
     ) -> Vec<Arc<SuperfileEntry>> {
-        let entries = vec![
-            make_superfile_entry(100),
-            make_superfile_entry(50),
-        ];
+        let entries = vec![make_superfile_entry(100), make_superfile_entry(50)];
         let part = ManifestPart {
             format_version: part::FORMAT_VERSION.into(),
             part_id: PartId::new_v4(),
@@ -3208,10 +3206,7 @@ mod tests {
     async fn load_hydrates_flat_view_from_slow_state_blob() {
         let opts = make_opts();
         let (_dir, storage) = local_storage();
-        let entries = vec![
-            make_superfile_entry(100),
-            make_superfile_entry(50),
-        ];
+        let entries = vec![make_superfile_entry(100), make_superfile_entry(50)];
         let (blob_uri, blob_hash) = slow_vector_state::write_state(storage.as_ref(), &entries)
             .await
             .expect("write blob");
@@ -3248,10 +3243,7 @@ mod tests {
     async fn refresh_with_unchanged_slow_ref_reuses_entries() {
         let opts = make_opts();
         let (_dir, storage) = local_storage();
-        let entries = vec![
-            make_superfile_entry(100),
-            make_superfile_entry(50),
-        ];
+        let entries = vec![make_superfile_entry(100), make_superfile_entry(50)];
         let (blob_uri, blob_hash) = slow_vector_state::write_state(storage.as_ref(), &entries)
             .await
             .expect("write blob");
@@ -3628,7 +3620,10 @@ mod tests {
             .iter()
             .find(|e| e.part_id == pw_a_latest.part_id)
             .expect("untouched part_1 must survive the removal unchanged");
-        assert_eq!(b_after_removal.uri, pw_a_latest.uri, "part_1 uri after removal");
+        assert_eq!(
+            b_after_removal.uri, pw_a_latest.uri,
+            "part_1 uri after removal"
+        );
         assert_eq!(
             b_after_removal.content_hash, pw_a_latest.content_hash,
             "part_1 content_hash after removal",
@@ -4148,7 +4143,11 @@ mod tests {
         assert_eq!(docs_last, 330);
 
         // Total docs across the lineage: 100 (carried) + 330 (rewritten) = 430.
-        let total_docs: u64 = new_manifest.get_all_superfiles().iter().map(|s| s.n_docs).sum();
+        let total_docs: u64 = new_manifest
+            .get_all_superfiles()
+            .iter()
+            .map(|s| s.n_docs)
+            .sum();
         assert_eq!(total_docs, 430);
     }
 
@@ -5237,7 +5236,6 @@ mod tests {
         // Both parts rewritten: the fix applies the removal set to every part in
         // the partition, so the latest is also rewritten (no match, same content)
         assert_eq!(parts_to_write.len(), 1);
-
 
         // sf_a_old_keep and sf_a_latest survive; sf_a_old_remove is absent
         let all_ids: Vec<_> = parts_to_write

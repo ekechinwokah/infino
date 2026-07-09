@@ -228,10 +228,8 @@ fn open_metadata_cost_is_fixed_and_reads_check_pointer_once_per_window() {
 
     // Producer: two commits so multiple parts/entries exist.
     {
-        let st = Supertable::create(
-            default_supertable_options().with_storage(Arc::clone(&local)),
-        )
-        .expect("create");
+        let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&local)))
+            .expect("create");
         for text in ["alpha bravo", "charlie delta"] {
             let mut w = st.writer().expect("writer");
             w.append(&build_title_batch(&[text])).expect("append");

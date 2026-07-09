@@ -52,8 +52,7 @@ use tempfile::TempDir;
 
 use crate::{
     corpus::DIM,
-    cost,
-    cpu,
+    cost, cpu,
     ingest::supertable::{self, Modality, modality_label},
     markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
     report::{Better, Block, Cell, Report, Section, metric, text},
@@ -198,7 +197,8 @@ fn run_child_shape(key: &str) {
     // measured window covers the engine only.
     let corpus = supertable::prepare_corpus(modality);
     let sampler = PeakSampler::start_default();
-    let (built, wall, ingest_cpu_s) = cpu::timed(|| supertable::build_on_storage(modality, &corpus));
+    let (built, wall, ingest_cpu_s) =
+        cpu::timed(|| supertable::build_on_storage(modality, &corpus));
     let rss = sampler.stop_stats();
 
     // This child wrote its own unique prefix; delete it before exiting so the

@@ -2459,11 +2459,7 @@ mod tests {
         }
         st.drain_vectors_to_cells_sync().expect("drain");
 
-        let hidden = st
-            .reader()
-            .vector_index_table()
-            .expect("hidden")
-            .clone();
+        let hidden = st.reader().vector_index_table().expect("hidden").clone();
         let hidden_reader = hidden.reader();
         let manifest = hidden_reader.manifest();
         let n_objects = manifest.superfiles.len();
@@ -2490,7 +2486,11 @@ mod tests {
                 "packed shard missing cluster summary"
             );
         }
-        assert_eq!(hints.len(), n_objects, "each shard object has a distinct hint");
+        assert_eq!(
+            hints.len(),
+            n_objects,
+            "each shard object has a distinct hint"
+        );
     }
 
     /// Bounded-batch drain: `drain_batch_superfiles` is a memory bound and must

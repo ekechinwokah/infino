@@ -1298,9 +1298,9 @@ impl VectorReader {
         header_bytes: Bytes,
         blob_size: usize,
     ) -> Result<Self, VectorError> {
-        let n_cells = read_u32_le(
-            &header_bytes[outer_hdr::N_CELLS_OFF..outer_hdr::N_CELLS_OFF + U32_BYTES],
-        ) as usize;
+        let n_cells =
+            read_u32_le(&header_bytes[outer_hdr::N_CELLS_OFF..outer_hdr::N_CELLS_OFF + U32_BYTES])
+                as usize;
         let dir_offset = read_u64_le(
             &header_bytes[outer_hdr::DIR_OFFSET_OFF..outer_hdr::DIR_OFFSET_OFF + U64_BYTES],
         ) as usize;
@@ -1466,7 +1466,11 @@ impl VectorReader {
                 ..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES],
         ) as usize;
 
-        if dim == 0 || !cluster_idx_off.saturating_sub(centroids_off).is_multiple_of(dim * 4) {
+        if dim == 0
+            || !cluster_idx_off
+                .saturating_sub(centroids_off)
+                .is_multiple_of(dim * 4)
+        {
             return Err(VectorError::Read(ReadError::MalformedVersion(
                 "cell subsection centroids region not divisible by dim*4".into(),
             )));
@@ -1485,8 +1489,9 @@ impl VectorReader {
             codec_meta_off + codec_meta_size
         };
         let sub_crc_pos = subsection_len - format::CRC_BYTES;
-        let stable_ids_region_bytes =
-            per_cluster_blocks_off.checked_sub(preceding_end).ok_or_else(|| {
+        let stable_ids_region_bytes = per_cluster_blocks_off
+            .checked_sub(preceding_end)
+            .ok_or_else(|| {
                 VectorError::Read(ReadError::MalformedVersion(
                     "cell subsection regions overrun per_cluster_blocks_off".into(),
                 ))
@@ -1636,7 +1641,9 @@ impl VectorReader {
             let mut acc = vec![0.0f64; dim];
             let mut total_docs = 0u64;
             for col in &self.columns {
-                let sub = self.source.try_get_range_sync(col.subsection_range.clone())?;
+                let sub = self
+                    .source
+                    .try_get_range_sync(col.subsection_range.clone())?;
                 let mut cell_summary = vec![0f32; dim];
                 decode_f32_le_into(
                     &sub[col.summary_off..col.summary_off + dim * 4],
@@ -1689,7 +1696,9 @@ impl VectorReader {
             let mut centroids = Vec::new();
             let mut counts = Vec::new();
             for col in &self.columns {
-                let sub = self.source.try_get_range_sync(col.subsection_range.clone())?;
+                let sub = self
+                    .source
+                    .try_get_range_sync(col.subsection_range.clone())?;
                 let n_cent = col.n_cent as usize;
                 let stride = dim * 4;
                 for c in 0..n_cent {
@@ -1697,8 +1706,9 @@ impl VectorReader {
                     let mut buf = vec![0f32; dim];
                     decode_f32_le_into(&sub[base..base + stride], &mut buf);
                     centroids.extend_from_slice(&buf);
-                    let b =
-                        col.cluster_idx_off + c * CLUSTER_IDX_ENTRY_BYTES + CLUSTER_IDX_COUNT_OFFSET;
+                    let b = col.cluster_idx_off
+                        + c * CLUSTER_IDX_ENTRY_BYTES
+                        + CLUSTER_IDX_COUNT_OFFSET;
                     counts.push(u32::from_le_bytes([
                         sub[b],
                         sub[b + 1],
@@ -2722,8 +2732,7 @@ impl VectorReader {
             }
             let base = doc_base[cell_idx];
             // Allow/deny are file-local; each cell IVF checks cell-local ids.
-            let cell_allow =
-                self.cell_local_filter_bitmap(allow.as_deref(), cell_idx, base);
+            let cell_allow = self.cell_local_filter_bitmap(allow.as_deref(), cell_idx, base);
             let cell_deny = self.cell_local_filter_bitmap(deny.as_deref(), cell_idx, base);
             let sub_start = col.subsection_range.start;
             let idx_start = sub_start + col.cluster_idx_off;
@@ -7405,13 +7414,8 @@ mod tests {
         // shortlist (k·rerank_mult ≥ PARALLEL_SCAN_MIN) on an Sq8 column.
         let n_docs = 3000u32;
         let n_cent = 4usize;
-        let (blob, json, all) = build_large_corpus(
-            16,
-            n_cent,
-            n_docs,
-            RerankCodec::Sq8Residual,
-            Metric::L2Sq,
-        );
+        let (blob, json, all) =
+            build_large_corpus(16, n_cent, n_docs, RerankCodec::Sq8Residual, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
         let hits = r
             .search("v", &all[2001], 64, n_cent, 40)

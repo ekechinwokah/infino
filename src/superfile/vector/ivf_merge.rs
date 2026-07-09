@@ -507,9 +507,7 @@ pub(crate) fn splice_fragments_into_cell(
                 let rowb = full_at + i * inp.per_vec_bytes;
                 let full_off = blk.rerank_base + i * per_vec_bytes;
                 bytes[full_off..full_off + dim * 2].copy_from_slice(&inp.sub[rowb..rowb + dim * 2]);
-                if store_norm
-                    && let Some(norms_off) = sq8_norms_block_off
-                {
+                if store_norm && let Some(norms_off) = sq8_norms_block_off {
                     let n_sq = sq8_residual_norm_sq(
                         scale_c,
                         offset_c,

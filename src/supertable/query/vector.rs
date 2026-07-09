@@ -644,7 +644,11 @@ impl SupertableReader {
         // and a flat nprobe when unfiltered.
         let scaled_budget = nprobe.saturating_mul(n_eligible.max(1)).max(nprobe);
         let default_budget = if is_hidden_vector_index_table(&manifest.options) {
-            let hidden_default = if filtered { scaled_budget } else { nprobe.max(1) };
+            let hidden_default = if filtered {
+                scaled_budget
+            } else {
+                nprobe.max(1)
+            };
             std::env::var("INFINO_HIDDEN_INNER_BUDGET")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
@@ -964,8 +968,7 @@ impl SupertableReader {
                 continue;
             }
             let locals: Vec<u32> = bm.iter().collect();
-            let ids =
-                read_ids_for_locals(manifest, &entry, &locals, id_column, false).await?;
+            let ids = read_ids_for_locals(manifest, &entry, &locals, id_column, false).await?;
             out.extend(ids);
         }
         Ok(out.into_iter().collect())
@@ -1081,12 +1084,9 @@ impl SupertableReader {
                         let allow_for_cell = Arc::clone(&allow_for_cell);
                         let manifest_for_ids = Arc::clone(&manifest_for_ids);
                         async move {
-                            let stable_ids = stable_ids_by_local_for_routing(
-                                &manifest_for_ids,
-                                &entry,
-                                &r,
-                            )
-                            .await?;
+                            let stable_ids =
+                                stable_ids_by_local_for_routing(&manifest_for_ids, &entry, &r)
+                                    .await?;
                             let mut local = RoaringBitmap::new();
                             for (local_doc_id, stable_id) in stable_ids.into_iter().enumerate() {
                                 if let Ok(global_id) = u32::try_from(stable_id)
@@ -1154,7 +1154,8 @@ impl SupertableReader {
         &self,
         allow_stable_ids: Arc<Vec<i128>>,
     ) -> Result<PreparedGlobalAllow, QueryError> {
-        self.prepare_vector_stable_allow_inner(allow_stable_ids).await
+        self.prepare_vector_stable_allow_inner(allow_stable_ids)
+            .await
     }
 
     #[cfg(not(feature = "test-helpers"))]
@@ -1162,7 +1163,8 @@ impl SupertableReader {
         &self,
         allow_stable_ids: Arc<Vec<i128>>,
     ) -> Result<PreparedGlobalAllow, QueryError> {
-        self.prepare_vector_stable_allow_inner(allow_stable_ids).await
+        self.prepare_vector_stable_allow_inner(allow_stable_ids)
+            .await
     }
 
     async fn prepare_vector_stable_allow_inner(
@@ -1192,12 +1194,9 @@ impl SupertableReader {
                         let allow_for_cell = Arc::clone(&allow_for_cell);
                         let manifest_for_ids = Arc::clone(&manifest_for_ids);
                         async move {
-                            let stable_ids = stable_ids_by_local_for_routing(
-                                &manifest_for_ids,
-                                &entry,
-                                &r,
-                            )
-                            .await?;
+                            let stable_ids =
+                                stable_ids_by_local_for_routing(&manifest_for_ids, &entry, &r)
+                                    .await?;
                             let mut local = RoaringBitmap::new();
                             for (local_doc_id, stable_id) in stable_ids.into_iter().enumerate() {
                                 if allow_for_cell.contains(&stable_id) {
