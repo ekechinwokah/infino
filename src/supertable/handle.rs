@@ -40,7 +40,7 @@ use crate::{
     storage::StorageError,
     supertable::{
         ManifestLoadError, SuperfileUri, SupertableStats,
-        manifest::commit::read_pointer,
+        manifest::commit::{PointerProbe, probe_pointer, read_pointer},
         options::Consistency,
         reader_cache::disk::{DiskCacheError, skip_background_fill},
         stats::process_rss_bytes,
@@ -138,6 +138,14 @@ pub(super) struct SupertableInner {
     /// Unused for [`Consistency::Strong`] (always checks) and
     /// [`Consistency::Snapshot`] (never checks).
     pub(super) last_pointer_check: Mutex<Option<Instant>>,
+    /// Etag of the manifest pointer from this handle's last storage
+    /// probe. Powers the conditional (`If-None-Match`) freshness
+    /// probe in [`Supertable::refresh`]: an unchanged pointer answers
+    /// as a bodyless 304 instead of a full read. `None` until the
+    /// first probe, and stale right after this process's own commits
+    /// (which rewrite the pointer without capturing its new etag) —
+    /// the next probe then takes the full-read path and re-seeds it.
+    pub(super) last_pointer_etag: Mutex<Option<String>>,
 }
 
 impl SupertableInner {
@@ -272,6 +280,7 @@ impl Supertable {
             tombstone_cache,
             handle_id,
             last_pointer_check: Mutex::new(None),
+            last_pointer_etag: Mutex::new(None),
         });
         install_disk_cache_pinning(&inner);
         let st = Self { inner };
@@ -370,6 +379,7 @@ impl Supertable {
             tombstone_cache,
             handle_id,
             last_pointer_check: Mutex::new(None),
+            last_pointer_etag: Mutex::new(None),
         });
         install_disk_cache_pinning(&inner);
         debug!(
@@ -427,10 +437,43 @@ impl Supertable {
             })?
             .clone();
 
+        // Conditional pointer probe: with the last-seen etag in hand,
+        // an unchanged pointer answers as a bodyless 304 — the
+        // steady-state cost of the consistency check is one
+        // roundtrip, no transfer, no parse.
+        let prev_etag = self
+            .inner
+            .last_pointer_etag
+            .lock()
+            .expect("last_pointer_etag mutex poisoned")
+            .clone();
+        let probe = probe_pointer(storage.as_ref(), prev_etag.as_deref())
+            .await
+            .map_err(OpenError::ManifestLoadError)?;
+        let (pointer, meta) = match probe {
+            PointerProbe::Absent | PointerProbe::NotModified => return Ok(false),
+            PointerProbe::Read(pointer, meta) => (pointer, meta),
+        };
+        *self
+            .inner
+            .last_pointer_etag
+            .lock()
+            .expect("last_pointer_etag mutex poisoned") = meta.etag.clone();
+
         let current = self.inner.manifest.load_full();
-        let manifest = match ManifestSnapshot::load(Some(current), storage, None).await {
+        let manifest = match ManifestSnapshot::load_with_pointer(
+            Some(current),
+            storage,
+            None,
+            pointer,
+        )
+        .await
+        {
             Ok(manifest) => manifest,
-            Err(ManifestLoadError::PointerNotFound) => return Ok(false),
+            // Pointer changed but our in-memory state already
+            // covers it (e.g. this process's own commit rewrote
+            // the pointer) — nothing newer to load, and the etag
+            // captured above makes the next probe a 304.
             Err(ManifestLoadError::AlreadyLoaded) => return Ok(false),
             Err(err) => return Err(OpenError::ManifestLoadError(err)),
         };

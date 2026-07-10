@@ -394,7 +394,19 @@ impl ManifestSnapshot {
             Some(p) => p,
             None => return Err(ManifestLoadError::PointerNotFound),
         };
+        Self::load_with_pointer(current_manifest, storage, options, pointer).await
+    }
 
+    /// [`Self::load`] with the pointer already in hand. Split out so
+    /// the refresh path can read the pointer itself (conditionally,
+    /// via [`probe_pointer`]) and still share the list + parts
+    /// loading below.
+    pub(crate) async fn load_with_pointer(
+        current_manifest: Option<Arc<Self>>,
+        storage: Arc<dyn StorageProvider>,
+        options: Option<Arc<SupertableOptions>>,
+        pointer: PointerFile,
+    ) -> Result<Arc<Self>, ManifestLoadError> {
         if let Some(current_manifest) = &current_manifest
             && current_manifest.superfile_list.manifest_id >= pointer.manifest_id
         {
