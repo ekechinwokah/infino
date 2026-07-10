@@ -82,9 +82,15 @@ const SHAPES: [(&str, &str, Modality); 4] = [
 pub struct ShapeMetrics {
     pub wall_ns: f64,
     pub n_superfiles: usize,
+    /// Peak total VmRSS — what the cost model's RAM-hold leg bills.
     pub peak_rss_bytes: u64,
     pub median_rss_bytes: u64,
     pub p90_rss_bytes: u64,
+    /// Peak anonymous (heap) RSS over the ingest window — diagnostic only;
+    /// not used for $.
+    pub peak_anon_rss_bytes: u64,
+    /// Peak file-backed RSS (`total − anon`) — diagnostic only.
+    pub peak_file_rss_bytes: u64,
     /// Index bytes written to object storage during ingest. The
     /// supertable's "upload bandwidth" is this over the wall time —
     /// the bytes-to-object-store rate, the analogue of the superfile
@@ -95,7 +101,7 @@ pub struct ShapeMetrics {
     pub corpus_bytes: u64,
     /// Measured on-CPU seconds over the ingest build window (all-thread
     /// schedstat delta). `None` on a platform without `/proc` sampling ⇒
-    /// the cost model falls back to the wall-clock CPU approximation.
+    /// the cost model reports the phase as NOT METERED.
     pub ingest_cpu_s: Option<f64>,
 }
 
@@ -109,12 +115,14 @@ impl ShapeMetrics {
     /// Render as the single stdout line the parent parses.
     fn to_result_line(&self) -> String {
         format!(
-            "{RESULT_PREFIX}wall_ns={} n_superfiles={} peak={} median={} p90={} index_bytes={} corpus_bytes={} ingest_cpu_ns={}",
+            "{RESULT_PREFIX}wall_ns={} n_superfiles={} peak={} median={} p90={} peak_anon={} peak_file={} index_bytes={} corpus_bytes={} ingest_cpu_ns={}",
             self.wall_ns,
             self.n_superfiles,
             self.peak_rss_bytes,
             self.median_rss_bytes,
             self.p90_rss_bytes,
+            self.peak_anon_rss_bytes,
+            self.peak_file_rss_bytes,
             self.index_bytes,
             self.corpus_bytes,
             self.ingest_cpu_s
@@ -132,6 +140,8 @@ impl ShapeMetrics {
         let mut peak = None;
         let mut median = None;
         let mut p90 = None;
+        let mut peak_anon = None;
+        let mut peak_file = None;
         let mut index_bytes = None;
         let mut corpus_bytes = None;
         // Optional (older/other producers may omit it); `-1` = not measured.
@@ -144,6 +154,8 @@ impl ShapeMetrics {
                 "peak" => peak = v.parse().ok(),
                 "median" => median = v.parse().ok(),
                 "p90" => p90 = v.parse().ok(),
+                "peak_anon" => peak_anon = v.parse().ok(),
+                "peak_file" => peak_file = v.parse().ok(),
                 "index_bytes" => index_bytes = v.parse().ok(),
                 "corpus_bytes" => corpus_bytes = v.parse().ok(),
                 "ingest_cpu_ns" => {
@@ -156,12 +168,15 @@ impl ShapeMetrics {
                 _ => {}
             }
         }
+        // Older child lines omit anon/file; leave them 0 (diagnostic only).
         Some(ShapeMetrics {
             wall_ns: wall_ns?,
             n_superfiles: n_superfiles?,
             peak_rss_bytes: peak?,
             median_rss_bytes: median?,
             p90_rss_bytes: p90?,
+            peak_anon_rss_bytes: peak_anon.unwrap_or(0),
+            peak_file_rss_bytes: peak_file.unwrap_or(0),
             index_bytes: index_bytes?,
             corpus_bytes: corpus_bytes?,
             ingest_cpu_s,
@@ -215,6 +230,8 @@ fn run_child_shape(key: &str) {
         peak_rss_bytes: rss.peak_rss_bytes,
         median_rss_bytes: rss.median_rss_bytes,
         p90_rss_bytes: rss.p90_rss_bytes,
+        peak_anon_rss_bytes: rss.peak_anon_rss_bytes,
+        peak_file_rss_bytes: rss.peak_file_rss_bytes,
         index_bytes: built.total_index_bytes,
         corpus_bytes: corpus.byte_size(),
         ingest_cpu_s,
@@ -294,6 +311,8 @@ pub fn ingest_headers() -> Vec<String> {
         "Stored".into(),
         "Superfiles".into(),
         "Peak RSS".into(),
+        "Peak anon".into(),
+        "Peak file".into(),
         "Median RSS".into(),
         "P90 RSS".into(),
     ]
@@ -335,6 +354,16 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
         metric(
             m.peak_rss_bytes as f64,
             rss::fmt_bytes(m.peak_rss_bytes),
+            Better::Lower,
+        ),
+        metric(
+            m.peak_anon_rss_bytes as f64,
+            rss::fmt_bytes(m.peak_anon_rss_bytes),
+            Better::Lower,
+        ),
+        metric(
+            m.peak_file_rss_bytes as f64,
+            rss::fmt_bytes(m.peak_file_rss_bytes),
             Better::Lower,
         ),
         metric(
@@ -654,6 +683,8 @@ fn build_measured(
         peak_rss_bytes: rss.peak_rss_bytes,
         median_rss_bytes: rss.median_rss_bytes,
         p90_rss_bytes: rss.p90_rss_bytes,
+        peak_anon_rss_bytes: rss.peak_anon_rss_bytes,
+        peak_file_rss_bytes: rss.peak_file_rss_bytes,
         index_bytes: built.total_index_bytes,
         corpus_bytes: corpus.byte_size(),
         ingest_cpu_s,
@@ -1482,17 +1513,21 @@ pub mod vector {
                 let drain_sampler = PeakSampler::start_default();
                 let ((), drain_wall, drain_cpu_s) = cpu::timed(|| drain_hidden_incoming(&consumer));
                 let drain_wall_s = drain_wall.as_secs_f64();
-                let drain_peak_rss = drain_sampler.stop_stats().peak_rss_bytes;
+                let drain_rss = drain_sampler.stop_stats();
+                let drain_peak_rss = drain_rss.peak_rss_bytes;
                 let drain_io = consumer_meter.snapshot().since(&before_drain);
                 eprintln!(
-                    "[supertable_vector] drain object-store I/O: {} PUT ({} up), {} GET ({} down), {} HEAD in {drain_wall_s:.1}s (peak RSS {})",
+                    "[supertable_vector] drain object-store I/O: {} PUT ({} up), {} GET ({} down), {} HEAD in {drain_wall_s:.1}s (peak RSS {} / anon {} / file {})",
                     drain_io.put_count,
                     rss::fmt_bytes(drain_io.put_bytes),
                     drain_io.get_count,
                     rss::fmt_bytes(drain_io.get_bytes),
                     drain_io.head_count,
                     rss::fmt_bytes(drain_peak_rss),
+                    rss::fmt_bytes(drain_rss.peak_anon_rss_bytes),
+                    rss::fmt_bytes(drain_rss.peak_file_rss_bytes),
                 );
+                // Cost RAM leg still bills total peak (not anon).
                 drain_stats = Some((drain_wall_s, drain_io, drain_peak_rss, drain_cpu_s));
 
                 if phases.warm {
@@ -1733,17 +1768,21 @@ pub mod vector {
                         cpu::timed(|| consumer.optimize(&OptimizeOptions::default()));
                     result.expect("optimize (compaction)");
                     let wall_s = wall.as_secs_f64();
-                    let peak_rss = sampler.stop_stats().peak_rss_bytes;
+                    let rss_stats = sampler.stop_stats();
+                    let peak_rss = rss_stats.peak_rss_bytes;
                     let io = consumer_meter.snapshot().since(&before);
                     eprintln!(
-                        "[supertable_vector] compaction object-store I/O: {} PUT ({} up), {} GET ({} down) in {wall_s:.1}s (peak RSS {})",
+                        "[supertable_vector] compaction object-store I/O: {} PUT ({} up), {} GET ({} down) in {wall_s:.1}s (peak RSS {} / anon {} / file {})",
                         io.put_count,
                         rss::fmt_bytes(io.put_bytes),
                         io.get_count,
                         rss::fmt_bytes(io.get_bytes),
                         rss::fmt_bytes(peak_rss),
+                        rss::fmt_bytes(rss_stats.peak_anon_rss_bytes),
+                        rss::fmt_bytes(rss_stats.peak_file_rss_bytes),
                     );
                     log_hidden_stats(&consumer, "after compaction");
+                    // Cost RAM leg still bills total peak (not anon).
                     (wall_s, io, peak_rss, cpu_s)
                 });
 
