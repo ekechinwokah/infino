@@ -1353,7 +1353,7 @@ mod tests {
     use super::*;
     use crate::{
         storage::{LocalFsStorageProvider, StorageProvider},
-        superfile::builder::FtsConfig,
+        superfile::{builder::FtsConfig, vector::layout::VectorLayout},
         supertable::{
             manifest::{SuperfileEntry, SuperfileUri},
             options::Consistency,
@@ -1757,6 +1757,11 @@ mod tests {
                 .get_global_vector_index()
                 .is_some_and(|g| g.grid.n_cent > 0 && g.grid.dim > 0),
             "commit must bootstrap the global cell grid into the user manifest"
+        );
+        assert_eq!(
+            st.reader().manifest().superfiles[0].vector_layout,
+            VectorLayout::MultiCellIvf,
+            "grid commit must emit packed user MultiCellIvf superfiles"
         );
 
         let mut q = vec![0.0f32; dim];

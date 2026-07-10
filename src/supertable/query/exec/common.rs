@@ -238,6 +238,10 @@ fn resolve_ids_arithmetic(
     let mut memo: Vec<(SuperfileUri, i128)> = Vec::new();
     let mut ids: Vec<i128> = Vec::with_capacity(hits.len());
     for hit in hits {
+        if let Some(id) = hit.stable_id {
+            ids.push(id);
+            continue;
+        }
         let base = match memo.iter().find(|(uri, _)| *uri == hit.superfile) {
             Some((_, base)) => *base,
             None => {
@@ -616,7 +620,7 @@ mod tests {
         superfile::{
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
             fts::reader::BoolMode,
-            vector::{distance::Metric, rerank_codec::RerankCodec},
+            vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{
             Supertable, SupertableOptions,
@@ -935,11 +939,53 @@ mod tests {
     // ---- resolve_ids_arithmetic direct: the no-I/O span arithmetic
     //      and its fallback when the span check can't apply ----
 
+    /// FTS-only table (no vector column): commits stay id-ordered, so the
+    /// span-arithmetic fast path applies. Vector commits are cell-packed
+    /// (`MultiCellIvf`, Parquet reordered by cell) and are covered by
+    /// [`resolve_ids_arithmetic_declines_cell_packed_vector_superfiles`].
+    fn demo_fts_only() -> Supertable {
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let opts = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![],
+            Some(tok()),
+        )
+        .expect("valid options")
+        .with_writer_pool(pool);
+        let st = Supertable::create(opts).expect("create");
+        let mut w = st.writer().expect("writer");
+        let titles = LargeStringArray::from(vec![
+            "rust async",
+            "python data",
+            "rust systems",
+            "go routines",
+        ]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(titles) as ArrayRef]).expect("batch");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st
+    }
+
     #[test]
     fn resolve_ids_arithmetic_maps_local_ids_via_manifest_span() {
-        // Single contiguous commit => `id_max - id_min + 1 == n_docs`,
-        // so row `local` resolves to `id_min + local` with no file read.
-        let st = demo(16);
+        // Single contiguous id-ordered commit => `id_max - id_min + 1 ==
+        // n_docs`, so row `local` resolves to `id_min + local` with no file
+        // read.
+        let st = demo_fts_only();
         let reader = st.reader();
         let entry = Arc::clone(&reader.manifest().superfiles[0]);
         let last = (entry.n_docs - 1) as u32;
@@ -970,6 +1016,27 @@ mod tests {
             .expect("decimal id col");
         assert_eq!(ids.value(0), entry.id_min);
         assert_eq!(ids.value(1), entry.id_min + i128::from(last));
+    }
+
+    #[test]
+    fn resolve_ids_arithmetic_declines_cell_packed_vector_superfiles() {
+        // Vector commits write cell-packed MultiCell superfiles whose Parquet
+        // rows are cell-ordered, not id-ordered — span arithmetic must bail
+        // to the id-page read even though the id span looks contiguous.
+        let st = demo(16);
+        let reader = st.reader();
+        let entry = Arc::clone(&reader.manifest().superfiles[0]);
+        assert_eq!(entry.vector_layout, VectorLayout::MultiCellIvf);
+        let hits = vec![SuperfileHit {
+            superfile: entry.uri,
+            local_doc_id: 0,
+            score: 0.0,
+            stable_id: None,
+        }];
+        assert!(
+            resolve_ids_arithmetic(&reader, &hits).is_none(),
+            "cell-packed superfiles must fall back to the id-page read",
+        );
     }
 
     #[test]

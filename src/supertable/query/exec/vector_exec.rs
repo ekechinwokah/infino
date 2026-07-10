@@ -703,26 +703,32 @@ mod tests {
 
     #[test]
     fn vector_search_tvf_emits_id_and_score_in_distance_order() {
+        // 6 docs → 6 one-doc cells, within the default probe budget
+        // (`DEFAULT_NPROBE` = 6), so k = n_docs resolves every doc. Same IVF
+        // semantics as a drained hidden table of this shape; 8 docs would
+        // leave 2 cells unprobed by design (approximate search), which is not
+        // what this test is about.
         let dim = 16;
-        let st = supertable_one_superfile(dim, 8);
+        let n = 6;
+        let st = supertable_one_superfile(dim, n);
         let sql = format!(
-            "SELECT _id, title, score FROM vector_search('emb', '{}', 8)",
+            "SELECT _id, title, score FROM vector_search('emb', '{}', {n})",
             csv_one_hot(dim, 0)
         );
         let batches = st.reader().query_sql(&sql).expect("query_sql");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total, 8, "single superfile, k=8 → all 8 docs resolved");
+        assert_eq!(total, n, "single superfile, k=n → all docs resolved");
 
         let b = &batches[0];
         assert_eq!(b.num_columns(), 3);
         // Doc 0 is the exact one-hot match at dim 0 → nearest. `title`
         // is the deterministic anchor (`_id` is generator-assigned).
         assert_eq!(col_str(b, "title").value(0), "doc 0");
-        // `_id` resolved for every row: 8 distinct, non-null keys.
+        // `_id` resolved for every row: n distinct, non-null keys.
         let ids = col_id(b, "_id");
         assert_eq!(ids.null_count(), 0);
         let unique: HashSet<i128> = (0..ids.len()).map(|i| ids.value(i)).collect();
-        assert_eq!(unique.len(), 8, "each hit resolves to a distinct _id");
+        assert_eq!(unique.len(), n, "each hit resolves to a distinct _id");
         // Native emission order (no ORDER BY) is ascending distance.
         let score = col_f32(b, "score");
         for i in 1..score.len() {

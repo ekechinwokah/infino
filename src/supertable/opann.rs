@@ -157,6 +157,17 @@ pub(crate) fn boundary_assignment_encoded_with_transposed(
     boundary_assignment_decoded(clusters, Some(transposed_centroids), metric, &row_fp)
 }
 
+/// Boundary assignment for an already-decoded fp32 row (commit buffer path).
+/// Uses the same nearest-two + margin logic as the encoded drain wrapper.
+pub(crate) fn boundary_assignment_fp32(
+    clusters: &ClusterCentroids,
+    transposed_centroids: Option<&[f32]>,
+    metric: Metric,
+    row_fp: &[f32],
+) -> BoundaryAssignment {
+    boundary_assignment_decoded(clusters, transposed_centroids, metric, row_fp)
+}
+
 fn boundary_assignment_decoded(
     clusters: &ClusterCentroids,
     transposed_centroids: Option<&[f32]>,

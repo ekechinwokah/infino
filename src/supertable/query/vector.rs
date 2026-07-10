@@ -87,7 +87,7 @@ pub use crate::superfile::reader::VectorSearchOptions;
 use crate::{
     config,
     storage::StorageProvider,
-    superfile::{SuperfileReader, fts::reader::BoolMode},
+    superfile::{SuperfileReader, fts::reader::BoolMode, vector::layout::VectorLayout},
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader, is_hidden_vector_index_table},
@@ -137,12 +137,20 @@ async fn lookup_user_superfile_by_id(
     manifest: &Manifest,
     user_row_id: i128,
 ) -> Result<Arc<SuperfileEntry>, QueryError> {
-    if let Some(entry) = manifest
+    let id_column = manifest.options.id_column.as_str();
+    for entry in manifest
         .superfiles
         .iter()
-        .find(|e| user_row_id >= e.id_min && user_row_id <= e.id_max)
+        .filter(|e| user_row_id >= e.id_min && user_row_id <= e.id_max)
     {
-        return Ok(Arc::clone(entry));
+        if row_id_from_manifest_entry(entry, 0).is_some() {
+            return Ok(Arc::clone(entry));
+        }
+        let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
+        let ids = read_ids_for_locals(manifest, entry, &locals, id_column, false).await?;
+        if ids.iter().any(|&id| id == user_row_id) {
+            return Ok(Arc::clone(entry));
+        }
     }
     let part_entries = manifest.get_all_list_entries();
     if part_entries.is_empty() {
@@ -158,12 +166,19 @@ async fn lookup_user_superfile_by_id(
             .get_part_by_id(part_entry.part_id)
             .await
             .map_err(QueryError::ManifestLoad)?;
-        if let Some(entry) = part
+        for entry in part
             .superfiles
             .iter()
-            .find(|e| user_row_id >= e.id_min && user_row_id <= e.id_max)
+            .filter(|e| user_row_id >= e.id_min && user_row_id <= e.id_max)
         {
-            return Ok(Arc::clone(entry));
+            if row_id_from_manifest_entry(entry, 0).is_some() {
+                return Ok(Arc::clone(entry));
+            }
+            let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
+            let ids = read_ids_for_locals(manifest, entry, &locals, id_column, false).await?;
+            if ids.iter().any(|&id| id == user_row_id) {
+                return Ok(Arc::clone(entry));
+            }
         }
     }
     Err(QueryError::Execute(format!(
@@ -188,6 +203,9 @@ pub(crate) fn row_id_from_manifest_entry(
     entry: &SuperfileEntry,
     local_doc_id: u32,
 ) -> Option<i128> {
+    if entry.vector_layout == VectorLayout::MultiCellIvf {
+        return None;
+    }
     let n_docs = i128::from(entry.n_docs);
     let span = entry.id_max.checked_sub(entry.id_min)?.checked_add(1)?;
     if n_docs == 0 || span != n_docs {
@@ -246,14 +264,13 @@ async fn read_ids_for_locals(
     id_column: &str,
     allow_inline_region: bool,
 ) -> Result<Vec<i128>, QueryError> {
-    let storage = manifest
-        .options
-        .storage
-        .as_ref()
-        .ok_or_else(|| QueryError::Execute("id remap needs a storage backend".into()))?;
+    // Storage is optional: store-only tables (no object-store backend) serve
+    // the superfile bytes from the in-memory reader cache. Cell-ordered
+    // MultiCell user commits resolve `_id` through here even without storage.
+    let storage = manifest.options.storage.as_ref();
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.as_ref();
-    let reader = dispatch::open_reader(&store, disk_cache, Some(storage), entry).await?;
+    let reader = dispatch::open_reader(&store, disk_cache, storage, entry).await?;
     if allow_inline_region {
         // Hidden cell superfiles inline the stable `_id` in the IVF blob — resolve
         // straight from it (resident; no scalar `_id` column read) when available.
@@ -279,6 +296,10 @@ async fn read_ids_for_locals(
             .map_err(|e| QueryError::Execute(e.to_string()))?;
         return id_values_from_batch(&batch);
     }
+    // A lazy (non-resident) reader implies an object-store backend; store-only
+    // tables always resolve through the resident paths above.
+    let storage = storage
+        .ok_or_else(|| QueryError::Execute("id remap on a lazy reader needs storage".into()))?;
     let batch = read_ids_batch_object_store(entry, local_ids, id_column, storage, &reader).await?;
     id_values_from_batch(&batch)
 }
@@ -450,14 +471,16 @@ pub(crate) async fn user_placement_for_scalar_resolve(
     let mut out: Vec<Option<SuperfileHit>> = vec![None; hits.len()];
     let mut gapped: HashMap<SuperfileUri, Vec<(usize, i128)>> = HashMap::new();
     for (i, hit) in hits.iter().enumerate() {
-        if user_manifest
+        if let Some(user_entry) = user_manifest
             .lookup_superfile_entry(hit.superfile)
             .await
             .map_err(QueryError::ManifestLoad)?
-            .is_some()
         {
-            out[i] = Some(*hit);
-            continue;
+            if !(user_entry.vector_layout == VectorLayout::MultiCellIvf && hit.stable_id.is_some())
+            {
+                out[i] = Some(*hit);
+                continue;
+            }
         }
         let user_row_id = if let Some(id) = hit.stable_id {
             id
@@ -506,9 +529,12 @@ pub(crate) async fn user_placement_for_scalar_resolve(
         let id_col =
             read_ids_for_locals(user_manifest, &user_entry, &all_locals, id_column, false).await?;
         for &(i, user_row_id) in &entries {
-            let pos = id_col.binary_search(&user_row_id).map_err(|_| {
-                QueryError::Execute(format!("no row with id {user_row_id} in user superfile"))
-            })?;
+            let pos = id_col
+                .iter()
+                .position(|&id| id == user_row_id)
+                .ok_or_else(|| {
+                    QueryError::Execute(format!("no row with id {user_row_id} in user superfile"))
+                })?;
             out[i] = Some(SuperfileHit {
                 superfile: uri,
                 local_doc_id: pos as u32,
@@ -2358,5 +2384,128 @@ mod tests {
                 "post-drain filtered hits must not come from user superfiles"
             );
         }
+    }
+
+    /// Commit writes user superfiles in the cell-packed (MultiCellIvf) layout,
+    /// and boundary replicas are vector-only stubs: every ingested row is a
+    /// Parquet primary exactly once, so the total Parquet row count across the
+    /// user superfiles equals the number of ingested rows — no duplicate SQL
+    /// rows even when boundary replication adds neighbor-cell postings.
+    #[test]
+    fn commit_user_superfiles_cell_packed_no_duplicate_parquet_rows() {
+        use crate::superfile::vector::layout::VectorLayout;
+
+        let dim = 16;
+        let st = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
+        let mut w = st.writer().expect("writer");
+        let schema = st.options().schema.clone();
+        let n = 200usize;
+        w.append(&build_vector_batch(0, n, dim, schema))
+            .expect("append");
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        let manifest = r.manifest();
+        assert!(
+            !manifest.superfiles.is_empty(),
+            "commit must publish user superfiles"
+        );
+        let mut total_primary_rows = 0u64;
+        for entry in manifest.superfiles.iter() {
+            assert_eq!(
+                entry.vector_layout,
+                VectorLayout::MultiCellIvf,
+                "commit must write cell-packed MultiCellIvf user superfiles, got {:?}",
+                entry.vector_layout
+            );
+            total_primary_rows += entry.n_docs;
+        }
+        assert_eq!(
+            total_primary_rows, n as u64,
+            "each ingested row is a Parquet primary exactly once; boundary stubs \
+             must not add Parquet rows (got {total_primary_rows}, expected {n})"
+        );
+    }
+
+    /// A search over cell-packed user superfiles returns distinct rows and
+    /// resolves their scalar columns, even though a row's vector can be found
+    /// via both its primary cell and a boundary stub in a neighbor cell: the
+    /// stub carries the primary's real `_id`, so dedup collapses the pair and
+    /// scalar resolve maps back to the one row that owns the Parquet data.
+    #[test]
+    fn vector_search_dedups_and_resolves_with_stub_boundaries() {
+        use crate::superfile::vector::rerank_codec::RerankCodec;
+        use arrow_array::Decimal128Array;
+
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let opts = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(tok()),
+        )
+        .expect("valid options")
+        .with_writer_pool(pool);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(storage)).expect("create");
+        let mut w = st.writer().expect("writer");
+        let n = 200usize;
+        w.append(&build_vector_batch(0, n, dim, schema))
+            .expect("append");
+        w.commit().expect("commit");
+
+        let r = st.reader();
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let k = 20usize;
+        let batches = r
+            .vector_search(
+                "emb",
+                &q,
+                k,
+                VectorSearchOptions::new().with_nprobe(4),
+                None,
+                Some(&["_id"]),
+            )
+            .expect("vector_search");
+
+        let mut seen: HashSet<i128> = HashSet::new();
+        let mut total = 0usize;
+        for b in &batches {
+            let ids = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("_id column is Decimal128");
+            for i in 0..ids.len() {
+                total += 1;
+                assert!(
+                    seen.insert(ids.value(i)),
+                    "duplicate _id {} in results — a boundary stub was not deduped \
+                     against its primary",
+                    ids.value(i)
+                );
+            }
+        }
+        assert_eq!(total, k, "search must return k distinct rows, got {total}");
     }
 }

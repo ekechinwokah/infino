@@ -151,7 +151,19 @@ pub(crate) fn apply_tombstone_filter(
     if bitmap.is_empty() {
         return Ok(());
     }
-    hits.retain(|h| !bitmap.contains(h.local_doc_id));
+    hits.retain(|h| {
+        let Some(local) = h.stable_id.map_or(Some(h.local_doc_id), |id| {
+            let span = entry.id_max.checked_sub(entry.id_min)?.checked_add(1)?;
+            if span == i128::from(entry.n_docs) {
+                u32::try_from(id - entry.id_min).ok()
+            } else {
+                None
+            }
+        }) else {
+            return true;
+        };
+        !bitmap.contains(local)
+    });
     Ok(())
 }
 
@@ -160,20 +172,45 @@ pub(crate) fn apply_tombstone_filter(
 /// cells), then the scalar `_id` column (INCOMING staging superfiles).
 /// `None` when the bytes are not yet mmap'd (cold lazy); the remap step
 /// falls back to a manifest-backed read.
-fn stable_ids_for_tagged_hits(reader: &SuperfileReader, locals: &[u32]) -> Option<Vec<i128>> {
+async fn stable_ids_for_tagged_hits(
+    reader: &SuperfileReader,
+    locals: &[u32],
+) -> Result<Option<Vec<i128>>, QueryError> {
     if locals.is_empty() {
-        return Some(Vec::new());
+        return Ok(Some(Vec::new()));
     }
     if let Some(v) = reader.vec()
         && let Some(ids) = v.inline_stable_ids_for_locals(locals)
     {
-        return Some(ids);
+        return Ok(Some(ids));
     }
-    reader.parquet_bytes()?;
+    if let Some(v) = reader.vec()
+        && let Some(ids) = v
+            .inline_stable_ids_for_locals_async(locals)
+            .await
+            .map_err(|e| QueryError::Execute(e.to_string()))?
+    {
+        return Ok(Some(ids));
+    }
+    if locals
+        .iter()
+        .any(|&local| u64::from(local) >= reader.n_docs())
+    {
+        return Ok(None);
+    }
+    if reader.parquet_bytes().is_none() {
+        return Ok(None);
+    }
     let id_column = reader.id_column();
-    let batch = reader.take_by_local_doc_ids(locals, &[id_column]).ok()?;
-    let array = batch.column(0).as_any().downcast_ref::<Decimal128Array>()?;
-    Some(array.values().to_vec())
+    let batch = reader
+        .take_by_local_doc_ids(locals, &[id_column])
+        .map_err(|e| QueryError::Execute(e.to_string()))?;
+    let array = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| QueryError::Execute("_id column missing".into()))?;
+    Ok(Some(array.values().to_vec()))
 }
 
 /// Fan a per-superfile async kernel out across `units`, returning each
@@ -216,7 +253,6 @@ where
                 let reader_for_ids = Arc::clone(&r);
                 let hits = kernel(r, params).await?;
                 let mut tagged = tag_hits(&entry, hits);
-                apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
                 // Piggyback the hidden→user `_id` resolve onto the search.
                 // Materialized hidden cells: inline `_id` region (prefetched
                 // on cold, resident on warm). INCOMING staging superfiles:
@@ -224,12 +260,13 @@ where
                 // resident bytes — both skip the trailing remap GET.
                 if !tagged.is_empty() {
                     let locals: Vec<u32> = tagged.iter().map(|h| h.local_doc_id).collect();
-                    if let Some(ids) = stable_ids_for_tagged_hits(&reader_for_ids, &locals) {
+                    if let Some(ids) = stable_ids_for_tagged_hits(&reader_for_ids, &locals).await? {
                         for (h, id) in tagged.iter_mut().zip(ids) {
                             h.stable_id = Some(id);
                         }
                     }
                 }
+                apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
                 Ok::<Vec<SuperfileHit>, QueryError>(tagged)
             }
         },
@@ -262,7 +299,7 @@ where
                 let mut tagged = tag_hits(&entry, hits);
                 if !tagged.is_empty() {
                     let locals: Vec<u32> = tagged.iter().map(|h| h.local_doc_id).collect();
-                    if let Some(ids) = stable_ids_for_tagged_hits(&reader_for_ids, &locals) {
+                    if let Some(ids) = stable_ids_for_tagged_hits(&reader_for_ids, &locals).await? {
                         for (h, id) in tagged.iter_mut().zip(ids) {
                             h.stable_id = Some(id);
                         }

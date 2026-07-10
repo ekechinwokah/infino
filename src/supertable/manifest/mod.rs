@@ -1118,7 +1118,20 @@ impl Manifest {
             }
             let new_for_part = std::mem::take(&mut pending_new);
             let combined_n = entry.n_superfiles + new_for_part.len() as u64;
-            if combined_n > self.superfile_list.options.target_superfiles_per_part {
+            // Freeze the latest part once it reaches either soft cap — the
+            // superfile-count target or the compressed-size threshold. Absorbing
+            // appends into an already-fat part re-encodes and re-PUTs its whole
+            // payload every commit (O(part bytes) commit cost, plus an orphaned
+            // part object per commit); splitting keeps prior parts immutable,
+            // which is the point of the part scheme. Size matters independently
+            // of count for vector tables: cell-packed entries carry fine
+            // centroids, so a handful of entries can outweigh thousands of
+            // scalar-only ones.
+            let latest_at_size_cap = entry.size_bytes_compressed
+                >= self.superfile_list.options.part_size_threshold_bytes;
+            if combined_n > self.superfile_list.options.target_superfiles_per_part
+                || latest_at_size_cap
+            {
                 // Split: keep the existing part, emit a fresh part for the new
                 // superfiles.
                 out_list_entries.push(entry.clone());
@@ -3862,6 +3875,117 @@ mod tests {
         assert_eq!(part.part.superfiles.len(), 2);
         let total_docs: u64 = part.part.superfiles.iter().map(|s| s.n_docs).sum();
         assert_eq!(total_docs, 155); // 75 + 80
+    }
+
+    /// A latest part at/over `part_size_threshold_bytes` is frozen: the next
+    /// commit emits a fresh part instead of rewriting (re-encoding + re-PUT)
+    /// the fat one. Count stays under target here, so the split is driven by
+    /// size alone — the guard that bounds per-commit manifest work when
+    /// entries are large (cell-packed vector summaries).
+    #[tokio::test]
+    async fn update_split_partition_exceeds_size_threshold() {
+        let mut base_opts =
+            SupertableOptions::new(simple_schema(), vec![], vec![], None).expect("valid options");
+        base_opts.target_superfiles_per_part = 10_000;
+        // Any real encoded part is bigger than 1 byte, so the latest part is
+        // always considered at-cap.
+        base_opts.part_size_threshold_bytes = 1;
+        let opts = Arc::new(base_opts);
+
+        let (_dir, storage) = local_storage();
+
+        let sf1 = make_superfile_entry(100);
+        let sf2 = make_superfile_entry(150);
+
+        let existing_part = ManifestPart {
+            format_version: part::FORMAT_VERSION.into(),
+            part_id: PartId::new_v4(),
+            superfiles: vec![sf1.clone(), sf2.clone()],
+        };
+        let pw = write_manifest_part(storage.as_ref(), &existing_part, MANIFEST_ZSTD_LEVEL)
+            .await
+            .expect("write part");
+
+        let list = ManifestList {
+            drained_ranges: Default::default(),
+            global_vector_index: None,
+            format_version: list::FORMAT_VERSION.into(),
+            manifest_id: 0,
+            options_hash: ContentHash([0u8; 32]),
+            schema: vec![],
+            id_column: "_id".into(),
+            fts_columns: vec![],
+            vector_columns: vec![],
+            partition_strategy: PartitionStrategy::Hash {
+                column: "_id".into(),
+                n_buckets: 1,
+            },
+            vector_index_storage_prefix: None,
+            deleted_user_ids_inline: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
+            parts: vec![ManifestPartEntry {
+                part_id: pw.part_id,
+                uri: pw.uri.clone(),
+                content_hash: pw.content_hash,
+                size_bytes_compressed: pw.size_bytes_compressed,
+                size_bytes_uncompressed: pw.size_bytes_uncompressed,
+                n_superfiles: 2,
+                id_range: (0, 149),
+                scalar_stats_agg: Default::default(),
+                fts_summary_agg: Default::default(),
+            }],
+        };
+        let frozen_part_id = pw.part_id;
+        let frozen_hash = pw.content_hash;
+        let loader = ManifestPartLoader::new(storage, &list);
+
+        let parts = DashMap::new();
+        parts.insert(
+            pw.part_id,
+            Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
+        );
+        let old_manifest = Arc::new(Manifest {
+            superfile_list: SuperfileList {
+                manifest_id: 0,
+                options: opts.clone(),
+                superfiles: vec![sf1, sf2],
+                vector_index_storage_prefix: None,
+            },
+            list: Some(list),
+            parts,
+            loader: Some(Arc::new(loader)),
+            stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
+        });
+
+        // 2 + 1 = 3 superfiles — far under the 10_000 count target, so only
+        // the size cap can force the split.
+        let new_entries = vec![make_superfile_entry(75)];
+        let (new_manifest, parts) = old_manifest
+            .update(&new_entries, &[])
+            .await
+            .expect("update");
+        let list_entries = new_manifest.get_all_list_entries();
+
+        assert_eq!(
+            list_entries.len(),
+            2,
+            "size-capped latest part must freeze; new entries go to a fresh part"
+        );
+        assert_eq!(parts.len(), 1, "only the fresh part is encoded + written");
+
+        // The frozen part carries over byte-identical: same id, same hash —
+        // no re-encode, no re-PUT.
+        assert_eq!(list_entries[0].part_id, frozen_part_id);
+        assert_eq!(list_entries[0].content_hash, frozen_hash);
+        assert_eq!(list_entries[0].n_superfiles, 2);
+
+        // The fresh part holds exactly the new superfile.
+        assert_eq!(list_entries[1].n_superfiles, 1);
+        assert_eq!(parts[0].part.superfiles.len(), 1);
+        assert_eq!(parts[0].part.superfiles[0].n_docs, 75);
     }
 
     fn make_superfile_entry_hinted(docs: u64, hint: u32) -> Arc<SuperfileEntry> {
