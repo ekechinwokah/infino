@@ -32,7 +32,7 @@
 //! descending for BM25 relevance) stays with each caller; this layer
 //! returns the per-unit tagged+filtered hit lists.
 
-use std::{future::Future, sync::Arc, time::Instant};
+use std::{collections::HashSet, future::Future, sync::Arc, time::Instant};
 
 use arrow_array::Decimal128Array;
 use futures::future::try_join_all;
@@ -41,12 +41,12 @@ use uuid::Uuid;
 use super::SuperfileHit;
 use crate::{
     storage::StorageProvider,
-    superfile::SuperfileReader,
+    superfile::{SuperfileReader, vector::layout::VectorLayout},
     supertable::{
         error::QueryError,
         handle::SupertableReader,
         manifest::SuperfileEntry,
-        query::superfile_reader::superfile_reader,
+        query::{exec::common::take_rows_object_store, superfile_reader::superfile_reader},
         reader_cache::{DiskCacheStore, SuperfileReaderCache},
         tombstones::SidecarCache,
     },
@@ -151,19 +151,72 @@ pub(crate) fn apply_tombstone_filter(
     if bitmap.is_empty() {
         return Ok(());
     }
-    hits.retain(|h| {
-        let Some(local) = h.stable_id.map_or(Some(h.local_doc_id), |id| {
-            let span = entry.id_max.checked_sub(entry.id_min)?.checked_add(1)?;
-            if span == i128::from(entry.n_docs) {
-                u32::try_from(id - entry.id_min).ok()
-            } else {
-                None
-            }
-        }) else {
-            return true;
-        };
-        !bitmap.contains(local)
-    });
+    hits.retain(|h| !bitmap.contains(h.local_doc_id));
+    Ok(())
+}
+
+/// MultiCell IVF locals include boundary stubs and do not address Parquet
+/// rows. Resolve the tombstone bitmap's Parquet locals to stable `_id`s, then
+/// filter tagged IVF hits by identity. Non-MultiCell files keep the trusted
+/// local-id fast path above.
+async fn apply_resolved_tombstone_filter(
+    reader: &SuperfileReader,
+    storage: Option<&Arc<dyn StorageProvider>>,
+    cache: Option<&Arc<SidecarCache>>,
+    entry: &SuperfileEntry,
+    hits: &mut Vec<SuperfileHit>,
+    now: Instant,
+) -> Result<(), QueryError> {
+    if entry.vector_layout != VectorLayout::MultiCellIvf {
+        return apply_tombstone_filter(cache, entry, hits, now);
+    }
+    let Some(cache) = cache else {
+        return Ok(());
+    };
+    let bitmap = cache
+        .bitmap_for(entry.superfile_id, now)
+        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+    if bitmap.is_empty() {
+        return Ok(());
+    }
+    let locals: Vec<u32> = bitmap.iter().collect();
+    let id_column = reader.id_column();
+    let batch = if reader.parquet_bytes().is_some() {
+        reader
+            .take_by_local_doc_ids(&locals, &[id_column])
+            .map_err(|e| QueryError::Execute(e.to_string()))?
+    } else {
+        let storage = storage.ok_or_else(|| {
+            QueryError::Execute(
+                "MultiCell tombstone resolve needs resident bytes or storage".into(),
+            )
+        })?;
+        let (object_store, path) = storage
+            .object_store_handle(&entry.uri.storage_path())
+            .ok_or_else(|| QueryError::Execute("no object_store handle for superfile".into()))?;
+        let file_size = entry
+            .subsection_offsets
+            .as_ref()
+            .map(|offsets| offsets.total_size);
+        take_rows_object_store(
+            object_store,
+            path,
+            file_size,
+            reader.schema(),
+            reader.n_docs(),
+            &locals,
+            &[id_column],
+        )
+        .await
+        .map_err(|e| QueryError::Execute(e.to_string()))?
+    };
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| QueryError::Execute("_id column missing".into()))?;
+    let deleted: HashSet<i128> = ids.values().iter().copied().collect();
+    hits.retain(|hit| hit.stable_id.is_none_or(|id| !deleted.contains(&id)));
     Ok(())
 }
 
@@ -243,12 +296,14 @@ where
     K: Fn(Arc<SuperfileReader>, P) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<Vec<(u32, f32)>, QueryError>> + Send + 'static,
 {
+    let storage = reader.manifest().options.storage.as_ref().map(Arc::clone);
     fanout_with(
         reader,
         units,
         true,
         move |r, entry, tombstone_cache, now, params| {
             let kernel = kernel.clone();
+            let storage = storage.clone();
             async move {
                 let reader_for_ids = Arc::clone(&r);
                 let hits = kernel(r, params).await?;
@@ -266,7 +321,15 @@ where
                         }
                     }
                 }
-                apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
+                apply_resolved_tombstone_filter(
+                    &reader_for_ids,
+                    storage.as_ref(),
+                    tombstone_cache.as_ref(),
+                    &entry,
+                    &mut tagged,
+                    now,
+                )
+                .await?;
                 Ok::<Vec<SuperfileHit>, QueryError>(tagged)
             }
         },

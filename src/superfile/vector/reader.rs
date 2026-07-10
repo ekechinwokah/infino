@@ -2212,7 +2212,7 @@ impl VectorReader {
             for (_cell_id, rows) in cells {
                 let n = rows.len() as u32;
                 for mut row in rows {
-                    row.local_doc_id = file_doc_base + row.local_doc_id;
+                    row.local_doc_id += file_doc_base;
                     out.push(row);
                 }
                 file_doc_base = file_doc_base.saturating_add(n);

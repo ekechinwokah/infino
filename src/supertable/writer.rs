@@ -129,7 +129,7 @@ use crate::{
             ivf_merge::{MergedIvfSubsection, route_clusters_into_cells},
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
-            reader::{VectorColumnConfig, VectorReader},
+            reader::VectorReader,
             rerank_codec::RerankCodec,
             spill::CellRowAccumulator,
         },
@@ -1464,14 +1464,6 @@ pub(crate) fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffset
         (Some(o), Some(l)) if l > 0 => Some((o, l)),
         _ => None,
     };
-    // Vector dim from `inf.vec.columns` — the multi-cell open-range walker
-    // needs it to size each cell's cluster_idx (v1 reads n_cent from its
-    // directory entries instead). Cell packs are single-column, so the first
-    // entry's dim applies.
-    let vec_dim: Option<usize> = kvs
-        .get(kv::VEC_COLUMNS)
-        .and_then(|json| serde_json::from_str::<Vec<VectorColumnConfig>>(json).ok())
-        .and_then(|cols| cols.first().map(|c| c.dim));
     let fts = match (get(kv::FTS_OFFSET), get(kv::FTS_LENGTH)) {
         (Some(o), Some(l)) if l > 0 => Some((o, l)),
         _ => None,
@@ -1500,7 +1492,7 @@ pub(crate) fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffset
         });
     }
     let vec_open_ranges = vec
-        .and_then(|(off, len)| vector_open_ranges(bytes, off, len, vec_dim))
+        .and_then(|(off, len)| vector_open_ranges(bytes, off, len))
         .unwrap_or_default();
     let fts_open_ranges = fts
         .and_then(|(off, len)| fts_open_ranges(bytes, off, len))
@@ -1567,12 +1559,7 @@ fn build_open_blob(
     blob
 }
 
-fn vector_open_ranges(
-    bytes: &Bytes,
-    off: u64,
-    len: u64,
-    vec_dim: Option<usize>,
-) -> Option<Vec<(u64, u64)>> {
+fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
     let start = off as usize;
     let end = start.checked_add(len as usize)?;
     let blob = bytes.get(start..end)?;
@@ -1582,7 +1569,7 @@ fn vector_open_ranges(
     let version =
         read_u32_le(blob.get(outer_hdr::VERSION_OFF..outer_hdr::VERSION_OFF + U32_BYTES)?);
     if version == crate::superfile::format::vec::VERSION_MULTI_CELL {
-        return vector_open_ranges_multi_cell(blob, off, vec_dim?);
+        return vector_open_ranges_multi_cell(blob, off);
     }
     let n_columns =
         read_u32_le(blob.get(outer_hdr::N_COLUMNS_OFF..outer_hdr::N_COLUMNS_OFF + U32_BYTES)?)
@@ -1661,15 +1648,10 @@ fn vector_open_ranges(
 }
 
 /// Open-time ranges for a v2 multi-cell vector blob: outer header, cell
-/// directory, and per cell the sub-header + cluster_idx — the same policy as
-/// the v1 walker above. The fp32 centroids and Sq8 codec_meta between them
-/// scale with `n_cent` and stay out of the manifest open_blob; the reader's
-/// Sq8 meta goes through its lazy range-GET fallback exactly as v1 files do.
-fn vector_open_ranges_multi_cell(blob: &[u8], off: u64, dim: usize) -> Option<Vec<(u64, u64)>> {
+/// directory, and each cell's open-time region (sub-header through
+/// `per_cluster_blocks_off`).
+fn vector_open_ranges_multi_cell(blob: &[u8], off: u64) -> Option<Vec<(u64, u64)>> {
     use crate::superfile::format::vec::U64_BYTES;
-    if dim == 0 {
-        return None;
-    }
     let n_cells =
         read_u32_le(blob.get(outer_hdr::N_CELLS_OFF..outer_hdr::N_CELLS_OFF + U32_BYTES)?) as usize;
     let dir_offset =
@@ -1701,27 +1683,13 @@ fn vector_open_ranges_multi_cell(blob: &[u8], off: u64, dim: usize) -> Option<Ve
             return None;
         }
         let sub = blob.get(subsection_off..subsection_off + subsection_len)?;
-        let centroids_off = read_u64_le(
-            sub.get(sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES)?,
-        ) as usize;
-        let cluster_idx_off = read_u64_le(
-            sub.get(sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES)?,
-        ) as usize;
-        let centroids_span = cluster_idx_off.checked_sub(centroids_off)?;
-        if centroids_off < SUB_HEADER_SIZE || !centroids_span.is_multiple_of(dim * 4) {
+        let per_cluster_blocks_off = read_u64_le(sub.get(
+            sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES,
+        )?) as usize;
+        if per_cluster_blocks_off < SUB_HEADER_SIZE || per_cluster_blocks_off > subsection_len {
             return None;
         }
-        let n_cent = centroids_span / (dim * 4);
-        let cluster_idx_end =
-            cluster_idx_off.checked_add(n_cent.checked_mul(CLUSTER_IDX_ENTRY_BYTES)?)?;
-        if cluster_idx_end > subsection_len {
-            return None;
-        }
-        ranges.push((off + subsection_off as u64, SUB_HEADER_SIZE as u64));
-        ranges.push((
-            off + subsection_off as u64 + cluster_idx_off as u64,
-            (cluster_idx_end - cluster_idx_off) as u64,
-        ));
+        ranges.push((off + subsection_off as u64, per_cluster_blocks_off as u64));
     }
     Some(merge_ranges(ranges))
 }
@@ -2141,20 +2109,6 @@ const DRAIN_BUILD_GROUP_BYTES: u64 = 4 * (1 << 30);
 /// variable payload closely enough for the 4 GiB wave budget.
 const DRAIN_MEMORY_ROW_BYTES_ESTIMATE: u64 = 29 + 128 + 2 * 1024;
 
-/// Sentinel cell id for flat (pre-assign) row accumulation across drain
-/// batches. Assignment + replica budget run once at the end via
-/// [`assign_cells`]; the accumulator only bounds peak RAM.
-const DRAIN_FLAT_ACCUM_CELL: u32 = 0;
-
-/// Append one materialized row to the flat drain accumulator (no cell
-/// assignment yet).
-fn accumulate_row_flat(
-    cells: &mut CellRowAccumulator,
-    row: &MaterializedIvfRow,
-) -> Result<(), BuildError> {
-    Ok(cells.append(DRAIN_FLAT_ACCUM_CELL, row)?)
-}
-
 /// Drain replica factor at or below which no boundary replicas are added.
 const DEFAULT_DRAIN_REPLICA_TARGET_FACTOR: f32 = 1.0;
 
@@ -2186,9 +2140,9 @@ async fn materialized_user_rows_for_drain(
     stable_ids: &[i128],
     tombstones: Option<&roaring::RoaringBitmap>,
 ) -> Result<Vec<MaterializedIvfRow>, BuildError> {
-    let vec_reader = reader.vec().ok_or_else(|| {
-        BuildError::Store("user superfile missing vector index".into())
-    })?;
+    let vec_reader = reader
+        .vec()
+        .ok_or_else(|| BuildError::Store("user superfile missing vector index".into()))?;
     if vec_reader.is_multi_cell() {
         let cells = vec_reader
             .materialized_cells_rows_async(None)
@@ -2277,7 +2231,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // Batch size is `vector.drain_batch_superfiles`: `0` = skip, `-1` =
     // unbounded single merge.
     let user_manifest = user_inner.manifest.load_full();
-    let sources: Vec<Arc<SuperfileEntry>> = user_manifest.get_all_superfiles().to_vec();
+    // A cold-open user manifest is parts-backed and may have an empty flat
+    // view. Drain must hydrate the authoritative user parts; reading only
+    // `get_all_superfiles()` silently turns drain into a no-op after reopen.
+    let sources = user_manifest
+        .get_all_superfiles_loaded()
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
     if sources.is_empty() {
         return Ok(());
     }
@@ -2378,12 +2338,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // are immutable (owned by the user manifest), so each batch's
     // `apply_cell_updates` builds on the prior batches' running totals.
     let mut running_clusters = clusters;
-    // kmeans mode decouples the batch budget (a memory bound on how many user
-    // superfiles are materialized at once) from the published layout: every
-    // batch flat-accumulates rows (no cell assign yet), then
-    // `assign_cells` + shard-stage pack/publish run once after the last batch.
-    // A single-batch drain keeps rows in RAM; multi-batch drains spill to
-    // scratch so peak RAM stays O(batch).
+    // Keep the trusted drain semantics: every bounded materialize batch gets
+    // its own assignment + boundary-replica budget, then its assigned rows are
+    // accumulated by cell. Packing/publish still happens once after the final
+    // batch. A single batch stays in RAM; multi-batch drains spill to scratch.
     let prefer_memory_accum = !is_splice && n_batches <= 1;
     let drain_scratch = if is_splice || prefer_memory_accum {
         None
@@ -2400,6 +2358,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     } else {
         CellRowAccumulator::memory()
     };
+    let mut added_per_cell: HashMap<u32, u32> = HashMap::new();
 
     for (batch_idx, (batch_versions, batch_sources)) in batches.iter().enumerate() {
         let batch_t0 = std::time::Instant::now();
@@ -2563,9 +2522,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 n_objects,
             );
         } else {
-            // kmeans: materialize THIS batch's rows into the flat accumulator.
-            // Boundary assign + replica budget + cell IVF pack run once after
-            // all batches via `assign_cells` + shard-stage pack (same core as commit).
+            // kmeans: materialize THIS batch, assign with the shared core, then
+            // accumulate the assigned (primary + replica) postings by cell.
             let column_for_mat = column_name.clone();
             let tombstone_cache = user_inner.tombstone_cache.clone();
             let now = time::Instant::now();
@@ -2602,8 +2560,28 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             let n_batch_rows = all_rows.len();
             // Batch boundary: reset disk writers' Arc-pointer dedup (no-op in RAM).
             cell_rows.begin_batch();
-            for row in &all_rows {
-                accumulate_row_flat(&mut cell_rows, row)?;
+            let replica_target = drain_replica_target_factor();
+            let assigned_groups = hidden_inner.options.writer_pool.install(|| {
+                let row_refs: Vec<PackRow<'_>> =
+                    all_rows.iter().map(PackRow::Materialized).collect();
+                assign_cells(
+                    &row_refs,
+                    &running_clusters,
+                    metric,
+                    assign_skip,
+                    replica_target,
+                )
+            })?;
+            for group in assigned_groups {
+                let added = u32::try_from(group.members.len()).unwrap_or(u32::MAX);
+                let count = added_per_cell.entry(group.cell_id).or_insert(0);
+                *count = count.saturating_add(added);
+                for (_, _, row) in group.members {
+                    let PackRow::Materialized(row) = row else {
+                        unreachable!("drain assignment contains only materialized rows");
+                    };
+                    cell_rows.append(group.cell_id, row)?;
+                }
             }
             let t_accum = batch_t0.elapsed().as_secs_f64() * 1e3;
             let accum_label = if cell_rows.prefer_memory() {
@@ -2612,7 +2590,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 "spill"
             };
             eprintln!(
-                "[supertable drain] batch {}/{} ({} sf, kmeans): materialize {:.1}ms + flat-accum {:.1}ms, {} batch row(s) -> {} {} store(s)",
+                "[supertable drain] batch {}/{} ({} sf, kmeans): materialize {:.1}ms + assign+accum {:.1}ms, {} batch row(s) -> {} {} cell store(s)",
                 batch_idx + 1,
                 n_batches,
                 batch_sources.len(),
@@ -2718,17 +2696,14 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         }
     }
 
-    // kmeans: flat-accumulated rows → assign (global replica budget) → pack
-    // inside the shard par_iter (same core as commit). Waves bound peak RAM.
+    // kmeans: rows were assigned per bounded batch above (trusted drain
+    // semantics). Pack their per-cell accumulators in memory-bounded waves.
     if !cell_rows.is_empty() {
         let build_t0 = time::Instant::now();
-        let flat_rows: Vec<MaterializedIvfRow> = cell_rows
-            .into_cell_rows()?
-            .into_iter()
-            .flat_map(|(_, rows)| rows)
-            .collect();
-        let total_rows = flat_rows.len() as u64;
-        let replica_target = drain_replica_target_factor();
+        let mut cell_subs = cell_rows.into_cell_rows()?;
+        cell_subs.sort_unstable_by_key(|(cell_id, _)| *cell_id);
+        let total_rows: u64 = cell_subs.iter().map(|(_, rows)| rows.len() as u64).sum();
+        let n_cells_total = cell_subs.len();
         let vc = hidden_inner
             .options
             .vector_columns
@@ -2737,41 +2712,14 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .ok_or_else(|| BuildError::Store("drain pack requires a vector column".into()))?;
 
         crate::superfile::vector::builder::build_phase_timers::reset();
-        // Assign only over the full row set (global replica budget). IVF pack
-        // runs inside the shard-stage par_iter below — not serially here.
-        let assigned_groups = hidden_inner.options.writer_pool.install(|| {
-            let row_refs: Vec<PackRow<'_>> =
-                flat_rows.iter().map(PackRow::Materialized).collect();
-            assign_cells(
-                &row_refs,
-                &running_clusters,
-                metric,
-                assign_skip,
-                replica_target,
-            )
-        })?;
-        // Members borrow `flat_rows`; keep it alive through pack+publish waves.
-        let mut added_per_cell: HashMap<u32, u32> = HashMap::new();
-        for group in &assigned_groups {
-            let n = group.members.len() as u32;
-            let entry = added_per_cell.entry(group.cell_id).or_insert(0);
-            *entry = entry.saturating_add(n);
-        }
-        let n_cells_total = assigned_groups.len();
-        let mut cell_subs: Vec<(u32, AssignedCellGroup<'_>)> = assigned_groups
-            .into_iter()
-            .map(|group| (group.cell_id, group))
-            .collect();
-        cell_subs.sort_unstable_by_key(|(cell_id, _)| *cell_id);
-
         let mut new_entries: Vec<Arc<SuperfileEntry>> = Vec::with_capacity(n_cells_total);
-        let mut wave: Vec<(u32, AssignedCellGroup<'_>)> = Vec::new();
+        let mut wave: Vec<(u32, Vec<MaterializedIvfRow>)> = Vec::new();
         let mut wave_bytes = 0u64;
         let mut n_waves = 0usize;
         let mut cells_iter = cell_subs.into_iter().peekable();
-        while let Some((cell_id, group)) = cells_iter.next() {
-            wave_bytes += group.members.len() as u64 * DRAIN_MEMORY_ROW_BYTES_ESTIMATE;
-            wave.push((cell_id, group));
+        while let Some((cell_id, rows)) = cells_iter.next() {
+            wave_bytes += rows.len() as u64 * DRAIN_MEMORY_ROW_BYTES_ESTIMATE;
+            wave.push((cell_id, rows));
             let flush = wave_bytes >= DRAIN_BUILD_GROUP_BYTES || cells_iter.peek().is_none();
             if !flush {
                 continue;
@@ -2788,8 +2736,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         .map(|(shard_id, cells)| {
                             let packed: Vec<(u32, MergedIvfSubsection, Vec<i128>)> = cells
                                 .into_iter()
-                                .map(|(_, group)| {
-                                    drain_pack_assigned_cell(group, &vc)
+                                .map(|(cell_id, rows)| {
+                                    drain_pack_materialized_cell(cell_id, rows, &vc)
                                         .map(|p| p.into_hidden_triple())
                                 })
                                 .collect::<Result<Vec<_>, BuildError>>()?;
@@ -2811,8 +2759,6 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .map_err(|e| BuildError::Store(e.to_string()))?;
             new_entries.extend(publish.new_entries);
         }
-        drop(flat_rows);
-
         let mut cell_updates: HashMap<u32, u32> = HashMap::new();
         for (cell, added) in &added_per_cell {
             let base = running_clusters
@@ -2968,7 +2914,7 @@ async fn load_materialized_rows_from_ivf_superfile(
     materialized_ivf_rows_in_doc_order(vec_reader, column, &stable_ids, bitmap.as_deref()).await
 }
 
-//// Per-cell doc counts from a packed (or legacy) entry. Legacy returns one
+/// Per-cell doc counts from a packed (or legacy) entry. Legacy returns one
 /// `(partition_hint_or_0, n_docs)` pair.
 async fn cell_doc_counts_for_entry(
     inner: &SupertableInner,
@@ -3203,6 +3149,30 @@ fn assign_cells<'a>(
 /// [`build_merged_subsection_from_fp32`] (commit fp32 / in-memory stream) or
 /// [`build_merged_subsection_from_materialized`] (hidden drain Sq8 rows).
 /// No commit-local IVF logic. Returns buffers only (no S3 / no superfile write).
+fn drain_pack_materialized_cell(
+    cell_id: u32,
+    mut rows: Vec<MaterializedIvfRow>,
+    cfg: &VectorConfig,
+) -> Result<PackedCellGroup, BuildError> {
+    if rows.is_empty() {
+        return Err(BuildError::Store(format!(
+            "cell {cell_id}: drain pack received no rows"
+        )));
+    }
+    rows.sort_by_key(|row| row.stable_id);
+    for (local, row) in rows.iter_mut().enumerate() {
+        row.local_doc_id = local as u32;
+    }
+    let stable_ids: Vec<i128> = rows.iter().map(|row| row.stable_id).collect();
+    let cell_cfg = cfg.clone().with_rerank_codec(RerankCodec::Sq8Residual);
+    let subsection = build_merged_subsection_from_materialized(cell_cfg, rows)?;
+    Ok(PackedCellGroup {
+        cell_id,
+        subsection,
+        stable_ids,
+    })
+}
+
 fn drain_pack_assigned_cell(
     group: AssignedCellGroup<'_>,
     cfg: &VectorConfig,
@@ -3218,18 +3188,14 @@ fn drain_pack_assigned_cell(
     let stable_ids: Vec<i128> = members.iter().map(|(stable_id, _, _)| *stable_id).collect();
     let subsection = match members[0].2 {
         PackRow::Materialized(_) => {
-            let mut materialized: Vec<MaterializedIvfRow> = members
+            let materialized: Vec<MaterializedIvfRow> = members
                 .iter()
                 .map(|(_, _, row)| match *row {
                     PackRow::Materialized(row) => row.clone(),
                     PackRow::Fp32 { .. } => unreachable!("mixed pack row kinds"),
                 })
                 .collect();
-            for (local, row) in materialized.iter_mut().enumerate() {
-                row.local_doc_id = local as u32;
-            }
-            // Drain's Sq8 cell pack (sampled fine k-means + encode).
-            build_merged_subsection_from_materialized(cell_cfg, materialized)?
+            return drain_pack_materialized_cell(cell_id, materialized, &cell_cfg);
         }
         PackRow::Fp32 { .. } => {
             let mut corpus = Vec::with_capacity(members.len() * dim);
@@ -3529,7 +3495,16 @@ fn build_shard_parquet_and_fts(
     flat_vectors: &[Vec<f32>],
     ordered_locals: &[u32],
     options: &SupertableOptions,
-) -> Result<(SuperfileBuilder, i128, i128, u64, HashMap<String, ScalarStatsAgg>), BuildError> {
+) -> Result<
+    (
+        SuperfileBuilder,
+        i128,
+        i128,
+        u64,
+        HashMap<String, ScalarStatsAgg>,
+    ),
+    BuildError,
+> {
     let take_indices = UInt32Array::from(ordered_locals.to_vec());
     let columns: Vec<ArrayRef> = source_scalar
         .columns()
@@ -5017,62 +4992,6 @@ mod tests {
             assert_eq!(packed.stable_ids.len(), n_members);
             assert_eq!(packed.subsection.n_docs as usize, n_members);
         }
-    }
-
-    #[test]
-    fn open_blob_omits_fp32_centroids_keeps_cluster_idx() {
-        // `dim` is chosen so the fp32 centroid block (`n_cent * dim * 4`) is
-        // far larger than any structural open range (outer header, directory,
-        // sub-header, cluster_idx), making the exclusion unambiguous.
-        let dim = 64;
-        let st = Supertable::create(options_with_vector(dim)).expect("create");
-        let mut w = st.writer().expect("writer");
-        w.append(&build_vector_batch(0, 8, dim)).expect("append");
-        w.commit().expect("commit");
-
-        let r = st.reader();
-        let seg = &r.manifest().superfiles[0];
-        let vs = seg.vector_summary.get("emb").expect("emb summary");
-        let n_cent = vs.clusters.n_cent as usize;
-        assert!(n_cent >= 1 && vs.clusters.dim as usize == dim);
-
-        let offsets = seg
-            .subsection_offsets
-            .as_ref()
-            .expect("subsection offsets captured at commit");
-        let centroids_bytes = (n_cent * dim * 4) as u64;
-        let cluster_idx_bytes = (n_cent * CLUSTER_IDX_ENTRY_BYTES) as u64;
-
-        // No captured open range is centroid-sized: the fp32 centroids (and
-        // the Sq8 codec_meta, which is 2× their size) are not staged into the
-        // manifest open_blob — the cluster-probe hot path never reads them;
-        // the fallback nprobe path range-GETs them on demand. Multi-cell packs
-        // stage per-cell sub-header + cluster_idx, so the bound holds per
-        // range AND in total.
-        assert!(
-            offsets
-                .vec_open_ranges
-                .iter()
-                .all(|&(_, len)| len < centroids_bytes),
-            "open_blob must not carry fp32 centroids; ranges={:?}, centroids={centroids_bytes} B",
-            offsets.vec_open_ranges,
-        );
-        let staged_total: u64 = offsets.vec_open_ranges.iter().map(|&(_, len)| len).sum();
-        assert!(
-            staged_total < centroids_bytes,
-            "total staged open ranges ({staged_total} B) must stay below one centroid block \
-             ({centroids_bytes} B); ranges={:?}",
-            offsets.vec_open_ranges,
-        );
-        // ...but the cluster_idx entries (8 B per fine cluster, split across
-        // cells for a multi-cell pack) must all be staged so the
-        // cluster-probe path opens zero-GET cold.
-        assert!(
-            staged_total >= cluster_idx_bytes,
-            "open_blob must carry every cluster_idx entry ({cluster_idx_bytes} B total); \
-             ranges={:?}",
-            offsets.vec_open_ranges,
-        );
     }
 
     // ---- rayon-shard parallelism -------------------------------------

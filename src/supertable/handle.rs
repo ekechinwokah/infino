@@ -1696,26 +1696,28 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        let options = SupertableOptions::new(
-            schema.clone(),
-            vec![FtsConfig {
-                column: "title".into(),
-            }],
-            vec![VectorConfig {
-                column: "emb".into(),
-                dim,
-                n_cent: 4,
-                rot_seed: 7,
-                metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Sq8Residual,
-                provided_centroids: None,
-            }],
-            Some(crate::test_helpers::default_tokenizer()),
-        )
-        .expect("valid options")
-        .with_storage(storage)
-        .with_writer_pool(pool);
-        let st = Supertable::create(options).expect("create");
+        let make_options = || {
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                }],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim,
+                    n_cent: 4,
+                    rot_seed: 7,
+                    metric: Metric::Cosine,
+                    rerank_codec: RerankCodec::Sq8Residual,
+                    provided_centroids: None,
+                }],
+                Some(crate::test_helpers::default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(Arc::clone(&storage))
+            .with_writer_pool(Arc::clone(&pool))
+        };
+        let st = Supertable::create(make_options()).expect("create");
         assert!(
             st.reader().vector_index_table().is_some(),
             "vector columns + storage must create hidden index sibling"
@@ -1725,7 +1727,7 @@ mod tests {
         let flat = Float32Array::from(vec![1.0f32; 3 * dim]);
         let fsl = FixedSizeListArray::new(item_field, dim as i32, Arc::new(flat), None);
         let batch = arrow_array::RecordBatch::try_new(
-            schema,
+            schema.clone(),
             vec![
                 Arc::new(titles) as Arc<dyn Array>,
                 Arc::new(fsl) as Arc<dyn Array>,
@@ -1776,8 +1778,21 @@ mod tests {
             "pre-drain search must fall back to the user superfiles"
         );
 
-        // Drain the user superfiles into the hidden cells; the query is now
-        // served by the hidden cell index.
+        // Reopen before drain: the user flat view is lazy/empty and its
+        // superfile entries live in manifest parts. Drain must hydrate those
+        // authoritative parts rather than treating the table as empty.
+        drop(w);
+        drop(hidden);
+        drop(st);
+        let st = Supertable::open(make_options()).expect("reopen before drain");
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden index after reopen")
+            .clone();
+
+        // Drain the parts-backed user superfiles into hidden cells; the query
+        // is now served by the hidden cell index.
         st.drain_vectors_to_cells_sync().expect("drain to cells");
         assert!(
             hidden.reader().n_superfiles() > 0,

@@ -230,12 +230,16 @@ impl PeakSampler {
     /// peak / median / p90 total VmRSS plus anon/file peaks.
     pub fn stop_stats(mut self) -> RssStats {
         self.stop.store(true, Ordering::Release);
-        let samples = self.handle.take().and_then(|h| h.join().ok()).unwrap_or_else(|| {
-            vec![(
-                current_rss_bytes().unwrap_or(0),
-                anon_rss_bytes_fast().unwrap_or(0),
-            )]
-        });
+        let samples = self
+            .handle
+            .take()
+            .and_then(|h| h.join().ok())
+            .unwrap_or_else(|| {
+                vec![(
+                    current_rss_bytes().unwrap_or(0),
+                    anon_rss_bytes_fast().unwrap_or(0),
+                )]
+            });
         RssStats::from_samples(samples)
     }
 }
@@ -371,8 +375,7 @@ mod tests {
 
     #[test]
     fn rss_stats_use_nearest_rank_percentiles() {
-        let stats =
-            RssStats::from_samples(vec![(50, 5), (10, 1), (40, 30), (20, 2), (30, 3)]);
+        let stats = RssStats::from_samples(vec![(50, 5), (10, 1), (40, 30), (20, 2), (30, 3)]);
         assert_eq!(stats.peak_rss_bytes, 50);
         assert_eq!(stats.median_rss_bytes, 30);
         assert_eq!(stats.p90_rss_bytes, 50);

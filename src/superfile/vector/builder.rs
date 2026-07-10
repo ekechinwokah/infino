@@ -32,9 +32,7 @@ use crate::superfile::{
         },
     },
     vector::{
-        cell_posting::{
-            EncodedCellRow, MaterializedIvfRow, materialize_sq8_residual_row_into_cluster_quant,
-        },
+        cell_posting::{MaterializedIvfRow, materialize_sq8_residual_row_into_cluster_quant},
         distance::{Metric, dequantize_sq8_residual_into, l2_sq, mean_f32_cluster_major},
         ivf_merge::MergedIvfSubsection,
         kmeans::{assign_to_centroids, kmeans},
@@ -1194,9 +1192,10 @@ pub(crate) fn build_merged_subsection_from_materialized(
 
 /// Build one complete cell-IVF subsection from an in-memory fp32 corpus.
 ///
-/// Thin wrapper: convert each row to Sq8+ε [`MaterializedIvfRow`] (plus
-/// RaBitQ estimate codes), then call [`build_merged_subsection_from_materialized`]
-/// — the same pack drain uses. No separate streaming IVF path.
+/// Rows are streamed through the normal in-memory IVF build — the same
+/// reservoir, sampled k-means, assignment, RaBitQ, and Sq8 path as ordinary
+/// ingest. `stable_ids` adds the inline identity region needed by packed user
+/// cells and boundary stubs.
 ///
 /// `vectors` is row-major (`n_docs × dim`); length must be a multiple of `cfg.dim`.
 pub(crate) fn build_merged_subsection_from_fp32(
@@ -1210,7 +1209,7 @@ pub(crate) fn build_merged_subsection_from_fp32(
             "fp32 cell IVF build requires dim > 0".into(),
         ));
     }
-    if vectors.len() % dim != 0 {
+    if !vectors.len().is_multiple_of(dim) {
         return Err(BuildError::VectorSchemaMismatch(format!(
             "fp32 corpus length {} is not a multiple of dim {}",
             vectors.len(),
@@ -1229,68 +1228,36 @@ pub(crate) fn build_merged_subsection_from_fp32(
             stable_ids.len()
         )));
     }
-    if !matches!(cfg.rerank_codec, RerankCodec::Sq8Residual) {
-        return Err(BuildError::VectorSchemaMismatch(
-            "fp32 → materialized pack requires Sq8Residual codec".into(),
-        ));
-    }
-
-    // Corpus-wide Sq8 quantizer so every row shares one (scale, offset) Arc —
-    // same shape drain materialize produces. Fine per-cluster recalibration
-    // happens inside `build_subsection_from_materialized`.
-    let mut min = vec![f32::INFINITY; dim];
-    let mut max = vec![f32::NEG_INFINITY; dim];
+    let sample_size = default_kmeans_sample_size(cfg.n_cent).min(n_docs);
+    let reservoir_seed = cfg.rot_seed ^ RESERVOIR_SEED_XOR_MASK;
+    let mut reservoir = Reservoir::new(sample_size, dim, reservoir_seed);
     for r in 0..n_docs {
-        update_min_max(&vectors[r * dim..(r + 1) * dim], &mut min, &mut max);
+        reservoir.update(&vectors[r * dim..(r + 1) * dim]);
     }
-    let (scale, offset) = derive_sq8_quantizer_from_min_max(&min, &max);
-    let scale: Arc<[f32]> = Arc::from(scale);
-    let offset: Arc<[f32]> = Arc::from(offset);
-    let consts = Sq8EncodeConsts::from_scale_offset(&scale, &offset);
-    let store_norm = matches!(cfg.metric, Metric::L2Sq | Metric::Cosine);
-
-    let rotation = RandomRotation::new(dim, cfg.rot_seed);
-    let quant = BitQuantizer::new(dim);
-    let code_bytes = quant.code_bytes();
-    let mut rotated = vec![0f32; dim];
-    let mut recon = vec![0f32; dim];
-
-    let mut rows = Vec::with_capacity(n_docs);
-    for (local, &stable_id) in stable_ids.iter().enumerate() {
-        let src = &vectors[local * dim..(local + 1) * dim];
-        let mut codes = vec![0u8; dim];
-        let mut residuals = vec![0u8; dim];
-        let norm_sq = encode_sq8_residual_row(
-            src,
-            &consts,
-            &scale,
-            &offset,
-            &mut codes,
-            &mut residuals,
-            &mut recon,
-            store_norm,
-        );
-        rotation.apply(src, &mut rotated);
-        let mut rabitq_code = vec![0u8; code_bytes];
-        quant.encode_rotated_into(&rotated, &mut rabitq_code);
-        rows.push(MaterializedIvfRow {
-            local_doc_id: local as u32,
-            stable_id,
-            // Placeholder: fine-cluster assign runs inside the materialized pack.
-            cluster: 0,
-            rabitq_code,
-            encoded: EncodedCellRow {
-                stable_id,
-                scale: Arc::clone(&scale),
-                offset: Arc::clone(&offset),
-                codes,
-                residuals,
-                norm_sq,
-            },
-        });
-    }
-
-    build_merged_subsection_from_materialized(cfg, rows)
+    // Force the in-memory source: no disk round-trip for commit buffers.
+    let corpus_bytes = vectors.len().saturating_mul(4);
+    let col = ColumnState {
+        config: cfg,
+        n_docs: n_docs as u32,
+        reservoir,
+        pre_spill_buffer: Arc::try_unwrap(vectors).unwrap_or_else(|arc| (*arc).clone()),
+        spill: None,
+        spill_threshold_bytes: corpus_bytes.saturating_add(1),
+        materialized_rows: None,
+        prebuilt_subsection: None,
+        inline_stable_ids: Some(stable_ids.to_vec()),
+    };
+    let mut scratch = ScratchDir::default();
+    let scratch_path = scratch.path()?.to_path_buf();
+    let sub = build_subsection_streaming(0, col, &scratch_path)?;
+    Ok(MergedIvfSubsection {
+        bytes: sub.bytes,
+        n_cent: sub.n_cent,
+        n_docs: n_docs as u32,
+        summary_offset_in_sub: sub.summary_offset_in_sub,
+        codec_meta_offset_in_sub: sub.codec_meta_offset_in_sub,
+        codec_meta_size: sub.codec_meta_size,
+    })
 }
 
 fn build_subsection_streaming(

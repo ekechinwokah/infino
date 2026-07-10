@@ -148,7 +148,7 @@ async fn lookup_user_superfile_by_id(
         }
         let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
         let ids = read_ids_for_locals(manifest, entry, &locals, id_column, false).await?;
-        if ids.iter().any(|&id| id == user_row_id) {
+        if ids.contains(&user_row_id) {
             return Ok(Arc::clone(entry));
         }
     }
@@ -176,7 +176,7 @@ async fn lookup_user_superfile_by_id(
             }
             let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
             let ids = read_ids_for_locals(manifest, entry, &locals, id_column, false).await?;
-            if ids.iter().any(|&id| id == user_row_id) {
+            if ids.contains(&user_row_id) {
                 return Ok(Arc::clone(entry));
             }
         }
@@ -475,12 +475,10 @@ pub(crate) async fn user_placement_for_scalar_resolve(
             .lookup_superfile_entry(hit.superfile)
             .await
             .map_err(QueryError::ManifestLoad)?
+            && !(user_entry.vector_layout == VectorLayout::MultiCellIvf && hit.stable_id.is_some())
         {
-            if !(user_entry.vector_layout == VectorLayout::MultiCellIvf && hit.stable_id.is_some())
-            {
-                out[i] = Some(*hit);
-                continue;
-            }
+            out[i] = Some(*hit);
+            continue;
         }
         let user_row_id = if let Some(id) = hit.stable_id {
             id
