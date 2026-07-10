@@ -80,6 +80,7 @@ use std::{
 };
 
 use arrow::record_batch::RecordBatch;
+use arrow_array::{Array, LargeStringArray};
 use uuid::Uuid;
 
 pub use crate::superfile::fts::reader::BoolMode;
@@ -95,9 +96,10 @@ use crate::{
         manifest::SuperfileEntry,
         query::{
             SuperfileHit, dispatch,
-            exec::common::resolve_hits_named,
+            exec::common::{resolve_hits_named, take_rows_object_store},
             prune::{PruneLeaf, select_superfiles},
         },
+        tombstones::SidecarCache,
     },
 };
 
@@ -607,7 +609,7 @@ impl SupertableReader {
         } else {
             vec![PruneLeaf::TermPresence {
                 column: column.to_owned(),
-                terms: term_strings,
+                terms: term_strings.clone(),
                 mode: BoolMode::And,
             }]
         };
@@ -618,18 +620,89 @@ impl SupertableReader {
         let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
         let column_arc = Arc::new(column.to_owned());
         let value_arc = Arc::new(value.to_owned());
-        let kernel = move |r: Arc<SuperfileReader>, _: ()| {
+        let tokens_arc = Arc::new(term_strings);
+        let storage = manifest.options.storage.clone();
+        let body = move |r: Arc<SuperfileReader>,
+                         entry: Arc<SuperfileEntry>,
+                         tombstone_cache: Option<Arc<SidecarCache>>,
+                         now: Instant,
+                         _: ()| {
             let column_arc = Arc::clone(&column_arc);
             let value_arc = Arc::clone(&value_arc);
+            let tokens_arc = Arc::clone(&tokens_arc);
+            let storage = storage.clone();
             async move {
-                let docs = r
-                    .exact_match(&column_arc, &value_arc)
+                let candidates: Vec<u32> = if tokens_arc.is_empty() {
+                    (0..r.n_docs() as u32).collect()
+                } else {
+                    let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
+                    r.token_match(&column_arc, &refs, BoolMode::And)
+                        .await
+                        .map_err(|e| QueryError::Parquet(e.to_string()))?
+                };
+                if candidates.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let batch = if r.can_take_by_local_doc_ids() {
+                    r.take_by_local_doc_ids(&candidates, &[column_arc.as_str()])
+                        .map_err(|e| QueryError::Parquet(e.to_string()))?
+                } else {
+                    let storage = storage.as_ref().ok_or_else(|| {
+                        QueryError::Execute(
+                            "exact_match lazy verification needs a storage backend".into(),
+                        )
+                    })?;
+                    let (object_store, path) = storage
+                        .object_store_handle(&entry.uri.storage_path())
+                        .ok_or_else(|| {
+                            QueryError::Execute(
+                                "exact_match storage has no object_store handle".into(),
+                            )
+                        })?;
+                    let file_size = entry
+                        .subsection_offsets
+                        .as_ref()
+                        .map(|offsets| offsets.total_size);
+                    take_rows_object_store(
+                        object_store,
+                        path,
+                        file_size,
+                        r.schema(),
+                        r.n_docs(),
+                        &candidates,
+                        &[column_arc.as_str()],
+                    )
                     .await
-                    .map_err(|e| QueryError::Parquet(e.to_string()))?;
-                Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
+                    .map_err(|e| QueryError::Execute(e.to_string()))?
+                };
+                let values = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .ok_or_else(|| {
+                        QueryError::Execute(format!(
+                            "exact_match column '{}' is not LargeUtf8",
+                            column_arc
+                        ))
+                    })?;
+                let mut hits: Vec<SuperfileHit> = candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| {
+                        !values.is_null(*index) && values.value(*index) == value_arc.as_str()
+                    })
+                    .map(|(_, &local_doc_id)| SuperfileHit {
+                        superfile: entry.uri,
+                        local_doc_id,
+                        score: 0.0,
+                        stable_id: None,
+                    })
+                    .collect();
+                dispatch::apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut hits, now)?;
+                Ok(hits)
             }
         };
-        let per_unit = dispatch::fanout(self, units, kernel).await?;
+        let per_unit = dispatch::fanout_with(self, units, true, body).await?;
         Ok(per_unit.into_iter().flatten().collect())
     }
 }

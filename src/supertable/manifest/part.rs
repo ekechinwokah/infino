@@ -759,9 +759,7 @@ mod tests {
     use super::*;
     use crate::supertable::{
         SuperfileEntry, SuperfileUri,
-        manifest::{
-            ClusterCentroids, FtsSummaryAgg, ScalarStatsAgg, VectorSummary, bloom::BloomBuilder,
-        },
+        manifest::{FtsSummaryAgg, ScalarStatsAgg, VectorSummary, bloom::BloomBuilder},
     };
 
     fn fresh_superfile(n_docs: u64) -> Arc<SuperfileEntry> {
@@ -804,7 +802,7 @@ mod tests {
         let centroid: Vec<f32> = (0..dim).map(|i| seed + i as f32 * 0.001).collect();
         VectorSummary {
             centroid,
-            clusters: ClusterCentroids::empty(),
+            cells: Vec::new(),
         }
     }
 

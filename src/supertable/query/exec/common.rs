@@ -384,7 +384,7 @@ async fn resolve_columns(
         .zip(seg_locals.iter())
         .enumerate()
     {
-        if rd.parquet_bytes().is_some() {
+        if rd.can_take_by_local_doc_ids() {
             warm_inputs.push((i, Arc::clone(rd), locals.clone()));
         } else {
             cold_units.push((i, uri, rd, locals.as_slice()));

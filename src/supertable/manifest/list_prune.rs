@@ -200,7 +200,7 @@ mod tests {
     use crate::supertable::{
         FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
         manifest::{
-            ClusterCentroids, aggregates,
+            aggregates,
             bloom::BloomBuilder,
             list::{FORMAT_VERSION, PartitionStrategy},
             part::ContentHash,
@@ -257,7 +257,7 @@ mod tests {
                 "emb".into(),
                 VectorSummary {
                     centroid: c,
-                    clusters: ClusterCentroids::empty(),
+                    cells: Vec::new(),
                 },
             );
         }

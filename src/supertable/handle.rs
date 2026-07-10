@@ -947,16 +947,18 @@ pub(crate) fn train_global_centroids(
         let Some(vs) = entry.vector_summary.get(&vc.column) else {
             continue;
         };
-        let cc = &vs.clusters;
-        if cc.is_empty() {
-            continue;
-        }
-        dim = cc.dim as usize;
-        for c in 0..cc.n_cent as usize {
-            if cc.counts[c] == 0 {
+        for cell in &vs.cells {
+            let clusters = &cell.clusters;
+            if clusters.is_empty() {
                 continue;
             }
-            all_centroids.extend_from_slice(cc.centroid(c));
+            dim = clusters.dim as usize;
+            for c in 0..clusters.n_cent as usize {
+                if clusters.counts[c] == 0 {
+                    continue;
+                }
+                all_centroids.extend_from_slice(clusters.centroid(c));
+            }
         }
     }
     if all_centroids.is_empty() || dim == 0 {
@@ -2501,7 +2503,7 @@ mod tests {
                 !entry
                     .vector_summary
                     .get("emb")
-                    .map(|v| v.clusters.is_empty())
+                    .map(|v| v.cells.iter().all(|cell| cell.clusters.is_empty()))
                     .unwrap_or(true),
                 "packed shard missing cluster summary"
             );
@@ -3099,11 +3101,16 @@ mod tests {
             });
             assert_eq!(vs.centroid.len(), dim, "summary centroid dim");
             assert!(
-                !vs.clusters.is_empty(),
+                vs.cells.iter().any(|cell| !cell.clusters.is_empty()),
                 "drain-built hidden superfile {} has EMPTY cluster centroids",
                 entry.superfile_id
             );
-            assert_eq!(vs.clusters.dim as usize, dim, "cluster centroid dim");
+            assert!(
+                vs.cells
+                    .iter()
+                    .all(|cell| cell.clusters.dim as usize == dim),
+                "cluster centroid dim"
+            );
         }
     }
 

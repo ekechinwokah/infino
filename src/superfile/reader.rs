@@ -496,6 +496,13 @@ impl SuperfileReader {
     pub fn parquet_bytes(&self) -> Option<&Bytes> {
         self.bytes.as_ref()
     }
+
+    /// Whether synchronous targeted row materialization is ready. A cache
+    /// reader can expose resident bytes before its Arrow metadata is installed;
+    /// those readers must stay on the async object-store row path.
+    pub(crate) fn can_take_by_local_doc_ids(&self) -> bool {
+        self.bytes.is_some() && self.arrow_meta.is_some()
+    }
     /// Returns a record batch containing all documents with all columns
     pub fn get_record_batch(
         &self,

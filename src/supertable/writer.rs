@@ -80,8 +80,8 @@ use super::{
     error::BuildError,
     handle::{GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, Supertable, SupertableInner},
     manifest::{
-        FtsSummaryAgg, ScalarStatsAgg, SubsectionOffsets, SuperfileEntry, SuperfileUri,
-        VectorSummary, bloom::BloomBuilder,
+        CellVectorSummary, FtsSummaryAgg, ScalarStatsAgg, SubsectionOffsets, SuperfileEntry,
+        SuperfileUri, VectorSummary, bloom::BloomBuilder,
     },
     mutations::{
         CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
@@ -1881,13 +1881,16 @@ pub(super) fn prepare_superfile_with_uri(
                 // Stage the per-cluster centroids (Sq8) into the
                 // manifest so a query can rank this superfile's clusters
                 // globally without opening the superfile.
-                let clusters = vec_reader
-                    .cluster_centroids(&vc.column)
-                    .map(|(n_cent, dim, fp32, counts)| {
-                        ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts)
+                let cells = vec_reader
+                    .cluster_centroids_by_cell(&vc.column)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(cell_id, n_cent, dim, fp32, counts)| CellVectorSummary {
+                        cell_id,
+                        clusters: ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts),
                     })
-                    .unwrap_or_default();
-                vector_summary.insert(vc.column.clone(), VectorSummary { centroid, clusters });
+                    .collect();
+                vector_summary.insert(vc.column.clone(), VectorSummary { centroid, cells });
             }
         }
     }
@@ -4938,19 +4941,23 @@ mod tests {
         // Per-cluster centroids are staged into the manifest for
         // cross-superfile global cluster selection.
         assert!(
-            !vs.clusters.is_empty(),
+            vs.cells.iter().any(|cell| !cell.clusters.is_empty()),
             "cluster centroids must be populated"
         );
-        assert_eq!(vs.clusters.dim as usize, dim);
-        assert!(vs.clusters.n_cent >= 1);
-        assert_eq!(vs.clusters.counts.len(), vs.clusters.n_cent as usize);
-        assert_eq!(
-            vs.clusters.centroids.len(),
-            vs.clusters.n_cent as usize * dim
-        );
+        assert!(vs.cells.iter().all(|cell| {
+            cell.clusters.dim as usize == dim
+                && cell.clusters.n_cent >= 1
+                && cell.clusters.counts.len() == cell.clusters.n_cent as usize
+                && cell.clusters.centroids.len() == cell.clusters.n_cent as usize * dim
+        }));
         // Every indexed doc lands in exactly one cluster, so the
         // per-cluster counts sum to the superfile's doc count.
-        let total: u64 = vs.clusters.counts.iter().map(|&c| c as u64).sum();
+        let total: u64 = vs
+            .cells
+            .iter()
+            .flat_map(|cell| cell.clusters.counts.iter())
+            .map(|&count| count as u64)
+            .sum();
         assert_eq!(total, seg.n_docs);
     }
 

@@ -1755,6 +1755,56 @@ impl VectorReader {
         Some((col.n_cent, dim as u32, centroids, counts))
     }
 
+    /// Per-cell fine centroids without flattening away global-cell ownership.
+    /// Legacy single-IVF columns return one unscoped (`None`) group.
+    pub(crate) fn cluster_centroids_by_cell(
+        &self,
+        column: &str,
+    ) -> Option<Vec<(Option<u32>, u32, u32, Vec<f32>, Vec<u32>)>> {
+        if !self.column_id_by_name.contains_key(column) {
+            return None;
+        }
+        if !self.is_multi_cell() {
+            let (n_cent, dim, centroids, counts) = self.cluster_centroids(column)?;
+            return Some(vec![(None, n_cent, dim, centroids, counts)]);
+        }
+        let mut out = Vec::with_capacity(self.columns.len());
+        for (index, col) in self.columns.iter().enumerate() {
+            let sub = self
+                .source
+                .try_get_range_sync(col.subsection_range.clone())?;
+            let n_cent = col.n_cent as usize;
+            let dim = col.dim;
+            let stride = dim * 4;
+            let mut centroids = vec![0f32; n_cent * dim];
+            let mut counts = Vec::with_capacity(n_cent);
+            for cluster in 0..n_cent {
+                let base = col.centroids_off + cluster * stride;
+                decode_f32_le_into(
+                    &sub[base..base + stride],
+                    &mut centroids[cluster * dim..(cluster + 1) * dim],
+                );
+                let count_offset = col.cluster_idx_off
+                    + cluster * CLUSTER_IDX_ENTRY_BYTES
+                    + CLUSTER_IDX_COUNT_OFFSET;
+                counts.push(u32::from_le_bytes([
+                    sub[count_offset],
+                    sub[count_offset + 1],
+                    sub[count_offset + 2],
+                    sub[count_offset + 3],
+                ]));
+            }
+            out.push((
+                self.cell_ids.get(index).copied(),
+                col.n_cent,
+                dim as u32,
+                centroids,
+                counts,
+            ));
+        }
+        Some(out)
+    }
+
     /// Map a file-local doc id (parquet / multi-cell search hit space) to
     /// `(cell_column_index, cell_local_doc_id)`. Cells are laid out in
     /// directory order with contiguous `[base, base + n_docs)` spans.

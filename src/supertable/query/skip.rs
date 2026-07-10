@@ -338,8 +338,8 @@ mod tests {
         supertable::{
             SupertableOptions,
             manifest::{
-                ClusterCentroids, FtsSummaryAgg, Manifest, ScalarStatsAgg, SuperfileEntry,
-                SuperfileUri, VectorSummary, bloom::BloomBuilder,
+                FtsSummaryAgg, Manifest, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
+                VectorSummary, bloom::BloomBuilder,
             },
         },
         test_helpers::default_tokenizer,
@@ -441,7 +441,7 @@ mod tests {
             column.to_string(),
             VectorSummary {
                 centroid,
-                clusters: ClusterCentroids::empty(),
+                cells: Vec::new(),
             },
         );
         Arc::new(e)

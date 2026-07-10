@@ -37,6 +37,7 @@ use crate::{
         BuildError, CommitError, SuperfileEntry, SuperfileUri,
         error::CompactionError,
         handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
+        manifest::list::PartitionStrategy,
         query::dispatch::open_compaction_input,
         wal::{
             SealRecord, WalStore,
@@ -194,7 +195,16 @@ impl Supertable {
         cfg: &CompactionSettings,
     ) -> Result<(), CompactionError> {
         Self::compact_one_table(self, cfg).await?;
-        if let Some(hidden) = self.inner().vector_index_table.as_ref() {
+        if matches!(
+            self.inner().manifest.load().get_partition_strategy(),
+            PartitionStrategy::VectorCell { .. }
+        ) {
+            if let Err(e) = refresh_slow_vector_state(self.inner()).await {
+                tracing::warn!(
+                    "supertable: slow vector-state refresh after direct hidden compaction failed: {e}"
+                );
+            }
+        } else if let Some(hidden) = self.inner().vector_index_table.as_ref() {
             Self::compact_one_table(hidden, &hidden_vector_index_compaction_settings()).await?;
             // The hidden pass settled vector membership (merges + finalize +
             // any cell splits); its `update`s cleared the slow-CAS ref, so

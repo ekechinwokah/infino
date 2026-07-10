@@ -71,8 +71,8 @@ use crate::{
         Manifest, SupertableOptions,
         handle::{Supertable, SupertableInner},
         manifest::{
-            ClusterCentroids, FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
-            VectorSummary, bloom::BloomBuilder,
+            CellVectorSummary, ClusterCentroids, FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry,
+            SuperfileUri, VectorSummary, bloom::BloomBuilder,
         },
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::superfile_reader::superfile_reader,
@@ -602,13 +602,16 @@ fn build_vector_summary(
     };
     for vc in &options.vector_columns {
         if let Some(centroid) = vec_reader.summary(&vc.column) {
-            let clusters = vec_reader
-                .cluster_centroids(&vc.column)
-                .map(|(n_cent, dim, fp32, counts)| {
-                    ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts)
+            let cells = vec_reader
+                .cluster_centroids_by_cell(&vc.column)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(cell_id, n_cent, dim, fp32, counts)| CellVectorSummary {
+                    cell_id,
+                    clusters: ClusterCentroids::from_fp32(n_cent, dim, &fp32, counts),
                 })
-                .unwrap_or_default();
-            out.insert(vc.column.clone(), VectorSummary { centroid, clusters });
+                .collect();
+            out.insert(vc.column.clone(), VectorSummary { centroid, cells });
         }
     }
     out

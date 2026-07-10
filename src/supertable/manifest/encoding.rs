@@ -45,7 +45,8 @@ use thiserror::Error;
 
 use crate::superfile::vector::distance::decode_f32_le_vec;
 use crate::supertable::manifest::{
-    ClusterCentroids, FtsSummaryAgg, VectorSummary, bloom::Bloom, list::ScalarStatsAgg,
+    CellVectorSummary, ClusterCentroids, FtsSummaryAgg, VectorSummary, bloom::Bloom,
+    list::ScalarStatsAgg,
 };
 
 /// Wire tag for fp32 manifest cluster centroids (`b"CF32"`).
@@ -456,7 +457,11 @@ pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummaryAgg, DecodeError> {
 // Layout (all LE):
 //   u32 dim
 //   [dim × f32]   (centroid)
-//   cluster-centroid block
+//   u32 n_cells
+//   per cell:
+//     u32 cell_id (`u32::MAX` = unscoped legacy IVF)
+//     u32 cluster_block_len
+//     cluster-centroid block
 // ---------------------------------------------------------
 
 /// fp32 cluster-centroid block: `n_cent, dim, tag, counts[n_cent],
@@ -524,15 +529,18 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, Decode
 
 pub fn encode_vector_summary(s: &VectorSummary) -> Vec<u8> {
     let dim = s.centroid.len();
-    let cl = &s.clusters;
-    let nc = cl.n_cent as usize;
-    let cd = cl.dim as usize;
-    let mut out = Vec::with_capacity(4 + dim * 4 + 12 + nc * 4 + nc * cd * 4);
+    let mut out = Vec::new();
     out.extend_from_slice(&(dim as u32).to_le_bytes());
     for &v in &s.centroid {
         out.extend_from_slice(&v.to_le_bytes());
     }
-    out.extend_from_slice(&encode_cluster_centroids(cl));
+    out.extend_from_slice(&(s.cells.len() as u32).to_le_bytes());
+    for cell in &s.cells {
+        out.extend_from_slice(&cell.cell_id.unwrap_or(u32::MAX).to_le_bytes());
+        let encoded = encode_cluster_centroids(&cell.clusters);
+        out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        out.extend_from_slice(&encoded);
+    }
     out
 }
 
@@ -549,9 +557,18 @@ pub fn decode_vector_summary(bytes: &[u8]) -> Result<VectorSummary, DecodeError>
     }
     let centroid = decode_f32_le_vec(&centroid_bytes);
 
-    let tail = &bytes[c.position() as usize..];
-    let clusters = decode_cluster_centroids(tail)?;
-    Ok(VectorSummary { centroid, clusters })
+    let n_cells = read_u32(&mut c, "vector_summary_n_cells")? as usize;
+    let mut cells = Vec::with_capacity(n_cells);
+    for _ in 0..n_cells {
+        let raw_cell_id = read_u32(&mut c, "vector_summary_cell_id")?;
+        let block_len = read_u32(&mut c, "vector_summary_cluster_block_len")? as usize;
+        let block = read_n(&mut c, block_len, "vector_summary_cluster_block")?;
+        cells.push(CellVectorSummary {
+            cell_id: (raw_cell_id != u32::MAX).then_some(raw_cell_id),
+            clusters: decode_cluster_centroids(&block)?,
+        });
+    }
+    Ok(VectorSummary { centroid, cells })
 }
 
 // ---------------------------------------------------------
@@ -1075,7 +1092,7 @@ mod decode_error_tests {
 #[cfg(test)]
 mod vector_summary_tests {
     use super::{decode_vector_summary, encode_vector_summary};
-    use crate::supertable::manifest::{ClusterCentroids, VectorSummary};
+    use crate::supertable::manifest::{CellVectorSummary, ClusterCentroids, VectorSummary};
 
     #[test]
     fn round_trips_with_cluster_centroids() {
@@ -1092,18 +1109,25 @@ mod vector_summary_tests {
         let clusters = ClusterCentroids::from_fp32(n_cent, dim, &centroids, counts.clone());
         let s = VectorSummary {
             centroid: vec![1.0, 2.0, 3.0, 4.0],
-            clusters,
+            cells: vec![CellVectorSummary {
+                cell_id: Some(7),
+                clusters,
+            }],
         };
 
         let got = decode_vector_summary(&encode_vector_summary(&s)).expect("decode");
         assert_eq!(got.centroid, s.centroid);
-        assert_eq!(got.clusters.n_cent, n_cent);
-        assert_eq!(got.clusters.dim, dim);
-        assert_eq!(got.clusters.counts, counts);
-        assert_eq!(got.clusters.centroids, s.clusters.centroids);
+        assert_eq!(got.cells[0].cell_id, Some(7));
+        assert_eq!(got.cells[0].clusters.n_cent, n_cent);
+        assert_eq!(got.cells[0].clusters.dim, dim);
+        assert_eq!(got.cells[0].clusters.counts, counts);
+        assert_eq!(
+            got.cells[0].clusters.centroids,
+            s.cells[0].clusters.centroids
+        );
 
         // fp32 storage is lossless: decode returns the input centroids verbatim.
-        let roundtrip = got.clusters.to_fp32();
+        let roundtrip = got.cells[0].clusters.to_fp32();
         assert_eq!(roundtrip, centroids);
     }
 
@@ -1111,11 +1135,10 @@ mod vector_summary_tests {
     fn round_trips_with_empty_clusters() {
         let s = VectorSummary {
             centroid: vec![0.5, -0.5],
-            clusters: ClusterCentroids::empty(),
+            cells: Vec::new(),
         };
         let got = decode_vector_summary(&encode_vector_summary(&s)).expect("decode");
         assert_eq!(got.centroid, s.centroid);
-        assert!(got.clusters.is_empty());
-        assert_eq!(got.clusters.n_cent, 0);
+        assert!(got.cells.is_empty());
     }
 }

@@ -61,7 +61,10 @@ use crate::{
     superfile::reader::VectorSearchOptions,
     supertable::{
         handle::{SupertableReader, WeakReader},
-        query::candidate::CandidatePlan,
+        query::{
+            candidate::CandidatePlan,
+            vector::{hits_id_score_batch, user_placement_for_scalar_resolve},
+        },
     },
 };
 
@@ -351,6 +354,21 @@ impl ExecutionPlan for VectorSearchExec {
         let output_schema = Arc::clone(&self.output_schema);
         let projection = self.projection.clone();
         let projected_schema = Arc::clone(&self.projected_schema);
+        let id_idx = output_schema
+            .index_of(reader.options().id_column.as_str())
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        let score_idx = scalar_schema.fields().len();
+        let requested: Vec<usize> = projection
+            .clone()
+            .unwrap_or_else(|| (0..output_schema.fields().len()).collect());
+        let id_score_projection: Option<Vec<usize>> = requested
+            .iter()
+            .map(|idx| match *idx {
+                idx if idx == id_idx => Some(0),
+                idx if idx == score_idx => Some(1),
+                _ => None,
+            })
+            .collect();
 
         let fut = async move {
             // Lower the pushed-down `WHERE` filters to an FTS candidate
@@ -383,10 +401,16 @@ impl ExecutionPlan for VectorSearchExec {
                 }
             }
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            let hits =
-                crate::supertable::query::vector::user_placement_for_scalar_resolve(&reader, &hits)
+            if let Some(indices) = id_score_projection {
+                return hits_id_score_batch(&reader, &hits)
                     .await
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?
+                    .project(&indices)
+                    .map_err(|e| DataFusionError::Execution(e.to_string()));
+            }
+            let hits = user_placement_for_scalar_resolve(&reader, &hits)
+                .await
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             resolve_hits(
                 &reader,
                 &hits,
@@ -523,9 +547,12 @@ mod tests {
             builder::{FtsConfig, VectorConfig},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
-        supertable::{Supertable, SupertableOptions},
+        supertable::{Supertable, SupertableOptions, manifest::Manifest},
         test_helpers::default_tokenizer as tok,
     };
+
+    /// Moves manifest id ranges away from every real generated id.
+    const INVALID_ID_RANGE_OFFSET: i128 = 1_i128 << 100;
 
     // ---- vector-column test harness (mirrors query::vector tests) ----
 
@@ -739,6 +766,63 @@ mod tests {
                 score.value(i)
             );
         }
+    }
+
+    #[test]
+    fn vector_search_tvf_id_only_uses_stable_ids_without_scalar_placement() {
+        let dim = 16;
+        let n = 6;
+        let st = supertable_one_superfile(dim, n);
+        let query = csv_one_hot(dim, 0);
+        let resolved = st
+            .reader()
+            .query_sql(&format!(
+                "SELECT _id, title FROM vector_search('emb', '{query}', {n})"
+            ))
+            .expect("baseline scalar-resolved query");
+        let expected: Vec<i128> = (0..resolved[0].num_rows())
+            .map(|row| col_id(&resolved[0], "_id").value(row))
+            .collect();
+
+        // Make manifest range lookup unable to locate any generated id.
+        // MultiCell vector hits still carry their exact stable ids inline, so
+        // an id-only SQL projection must not enter scalar-placement lookup.
+        let manifest = st.inner().manifest.load_full();
+        let entries = manifest
+            .superfiles
+            .iter()
+            .map(|entry| {
+                let mut shifted = entry.as_ref().clone();
+                shifted.id_min += INVALID_ID_RANGE_OFFSET;
+                shifted.id_max += INVALID_ID_RANGE_OFFSET;
+                Arc::new(shifted)
+            })
+            .collect();
+        let altered = Manifest::new(
+            manifest.manifest_id,
+            Arc::clone(&manifest.options),
+            entries,
+            None,
+            None,
+        )
+        .with_partition_strategy(manifest.get_partition_strategy());
+        let altered = match manifest.get_global_vector_index() {
+            Some(index) => altered.with_global_vector_index(index),
+            None => altered,
+        };
+        drop(manifest);
+        st.inner().manifest.store(Arc::new(altered));
+
+        let batches = st
+            .reader()
+            .query_sql(&format!(
+                "SELECT _id FROM vector_search('emb', '{query}', {n})"
+            ))
+            .expect("id-only query must use inline stable ids");
+        let actual: Vec<i128> = (0..batches[0].num_rows())
+            .map(|row| col_id(&batches[0], "_id").value(row))
+            .collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -2048,10 +2048,15 @@ pub struct VectorSummary {
     /// Cluster centroid; length matches the vector column's `dim`
     /// declared in `SupertableOptions::vector_columns`.
     pub centroid: Vec<f32>,
-    /// Per-cluster IVF centroids (fp32, cluster-major — scored zero-copy by
-    /// [`ClusterCentroids::score_clusters_into`], no dequant) for
-    /// cross-superfile global cluster selection. Empty when the superfile
-    /// has no vector index for this column.
+    /// Fine IVF centroids grouped by their owning global cell. Packed-file
+    /// flat cluster ordinals are derived from prefix sums over this list.
+    pub cells: Vec<CellVectorSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CellVectorSummary {
+    /// `Some(cell)` for MultiCell files; `None` for an unscoped legacy IVF.
+    pub cell_id: Option<u32>,
     pub clusters: ClusterCentroids,
 }
 

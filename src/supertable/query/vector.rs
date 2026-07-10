@@ -91,7 +91,7 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader, is_hidden_vector_index_table},
-        manifest::{Manifest, SuperfileEntry, SuperfileUri},
+        manifest::{Manifest, SuperfileEntry, SuperfileUri, list::PartitionStrategy},
         tombstones::SidecarCache,
     },
 };
@@ -396,7 +396,7 @@ fn projection_is_id_score_only(projection: Option<&[&str]>, id_column: &str) -> 
 /// `_id` + `score` batch from hits. Fan-out stamps the user `_id` on
 /// `stable_id` for hidden-index hits; pre-drain user-table hits resolve
 /// from manifest span arithmetic.
-async fn hits_id_score_batch(
+pub(crate) async fn hits_id_score_batch(
     user_reader: &SupertableReader,
     hits: &[SuperfileHit],
 ) -> Result<RecordBatch, QueryError> {
@@ -591,7 +591,38 @@ impl SupertableReader {
             .map(|vc| vc.metric)
             .ok_or_else(|| QueryError::Execute(format!("unknown vector column `{column}`")))?;
 
-        let mut scored: Vec<(usize, u32, f32)> = Vec::new();
+        let grid = manifest
+            .get_global_vector_index()
+            .filter(|g| {
+                g.column == column && g.grid.n_cent > 0 && g.grid.dim as usize == query.len()
+            })
+            .map(|g| g.grid)
+            .or_else(|| match manifest.get_partition_strategy() {
+                PartitionStrategy::VectorCell {
+                    column: cell_column,
+                    clusters,
+                    ..
+                } if cell_column == column
+                    && clusters.n_cent > 0
+                    && clusters.dim as usize == query.len() =>
+                {
+                    Some(clusters)
+                }
+                _ => None,
+            });
+        let ranked_cells: Option<Vec<u32>> = grid.as_ref().map(|grid| {
+            let mut cells: Vec<(u32, f32)> = (0..grid.n_cent)
+                .map(|cell| (cell, grid.score_one(metric, cell as usize, query)))
+                .collect();
+            cells.sort_unstable_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            cells.into_iter().map(|(cell, _)| cell).collect()
+        });
+
+        let mut candidates: Vec<(usize, u32, f32, Option<u32>, u64)> = Vec::new();
         for (si, entry) in superfiles.iter().enumerate() {
             // Filtered search: a superfile whose predicate matched no row
             // (absent from `allow`) is dropped here — it never scores a
@@ -605,12 +636,38 @@ impl SupertableReader {
             // shipped empty summaries, hiding both the defect and a large
             // per-query metadata re-read behind normal-looking results.
             match entry.vector_summary.get(column) {
-                Some(vs) if !vs.clusters.is_empty() && vs.clusters.dim as usize == query.len() => {
-                    vs.clusters.score_clusters_into(metric, query, |c, score| {
-                        scored.push((si, c, score));
-                    });
+                Some(vs) if !vs.cells.is_empty() => {
+                    let mut flat_base = 0u32;
+                    for cell in &vs.cells {
+                        if cell.clusters.dim as usize != query.len() {
+                            return Err(QueryError::Execute(format!(
+                                "vector summary dim {} for column `{column}` on superfile {} \
+                                 does not match query dim {}",
+                                cell.clusters.dim,
+                                entry.superfile_id,
+                                query.len()
+                            )));
+                        }
+                        cell.clusters
+                            .score_clusters_into(metric, query, |local, score| {
+                                let count =
+                                    cell.clusters
+                                        .counts
+                                        .get(local as usize)
+                                        .copied()
+                                        .unwrap_or(0) as u64;
+                                candidates.push((
+                                    si,
+                                    flat_base + local,
+                                    score,
+                                    cell.cell_id,
+                                    count,
+                                ));
+                            });
+                        flat_base = flat_base.saturating_add(cell.clusters.n_cent);
+                    }
                 }
-                Some(vs) if vs.clusters.is_empty() => {
+                Some(vs) if vs.cells.is_empty() => {
                     return Err(QueryError::Execute(format!(
                         "superfile {} has no cluster centroids in its vector summary for \
                          column `{column}` — malformed build; refusing to degrade to a \
@@ -618,15 +675,7 @@ impl SupertableReader {
                         entry.superfile_id
                     )));
                 }
-                Some(vs) => {
-                    return Err(QueryError::Execute(format!(
-                        "vector summary dim {} for column `{column}` on superfile {} does \
-                         not match query dim {}",
-                        vs.clusters.dim,
-                        entry.superfile_id,
-                        query.len()
-                    )));
-                }
+                Some(_) => unreachable!("non-empty cell summaries handled above"),
                 None => {
                     return Err(QueryError::Execute(format!(
                         "superfile {} has no vector summary for column `{column}` — \
@@ -635,6 +684,51 @@ impl SupertableReader {
                         entry.superfile_id
                     )));
                 }
+            }
+        }
+
+        let candidate_counts: HashMap<(usize, u32), u64> = candidates
+            .iter()
+            .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
+            .collect();
+        let gated_target = (k as f64
+            * f64::from(config::global().vector.drain_replica_target_factor.max(1.0)))
+        .ceil() as u64;
+        let mut gated = Vec::new();
+        let mut scored = Vec::new();
+        match ranked_cells {
+            Some(ranked) if candidates.iter().any(|candidate| candidate.3.is_some()) => {
+                let mut postings_by_cell: HashMap<u32, u64> = HashMap::new();
+                for candidate in &candidates {
+                    if let Some(cell_id) = candidate.3 {
+                        *postings_by_cell.entry(cell_id).or_default() += candidate.4;
+                    }
+                }
+                let mut cutoff = nprobe.max(1).min(ranked.len());
+                let mut covered: u64 = ranked[..cutoff]
+                    .iter()
+                    .map(|cell| postings_by_cell.get(cell).copied().unwrap_or(0))
+                    .sum();
+                while cutoff < ranked.len() && covered < gated_target {
+                    covered += postings_by_cell.get(&ranked[cutoff]).copied().unwrap_or(0);
+                    cutoff += 1;
+                }
+                let selected = &ranked[..cutoff];
+                for (si, cluster, score, cell, _) in candidates {
+                    match cell {
+                        Some(cell) if selected.contains(&cell) => {
+                            gated.push((si, cluster, score));
+                        }
+                        Some(_) => {}
+                        None => scored.push((si, cluster, score)),
+                    }
+                }
+            }
+            _ => {
+                scored = candidates
+                    .into_iter()
+                    .map(|(si, cluster, score, _, _)| (si, cluster, score))
+                    .collect();
             }
         }
 
@@ -647,7 +741,11 @@ impl SupertableReader {
         // scored cluster nor a fallback, so they don't inflate the
         // budget).
         let n_eligible = {
-            let mut segs: Vec<usize> = scored.iter().map(|&(si, _, _)| si).collect();
+            let mut segs: Vec<usize> = scored
+                .iter()
+                .chain(gated.iter())
+                .map(|&(si, _, _)| si)
+                .collect();
             segs.sort_unstable();
             segs.dedup();
             segs.len()
@@ -691,6 +789,10 @@ impl SupertableReader {
             })
             .map(|b| b.max(1))
             .unwrap_or(default_budget);
+        let cluster_count = |&(si, cluster, _): &(usize, u32, f32)| -> u64 {
+            candidate_counts.get(&(si, cluster)).copied().unwrap_or(0)
+        };
+        let gated_postings: u64 = gated.iter().map(cluster_count).sum();
         if scored.len() > budget {
             // Break score ties by the centroid's `(superfile, cluster)` — a
             // unique total order — so the selected set is deterministic. With
@@ -699,15 +801,22 @@ impl SupertableReader {
             // arbitrarily, so the fanned-out clusters, and thus the result
             // set, would vary run to run. Tie order among equal scores is
             // irrelevant to recall.
-            scored.select_nth_unstable_by(budget, |a, b| {
+            scored.sort_unstable_by(|a, b| {
                 a.2.partial_cmp(&b.2)
                     .unwrap_or(Ordering::Equal)
                     .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
             });
-            scored.truncate(budget);
+            let mut kept = budget;
+            let mut postings =
+                gated_postings + scored[..kept].iter().map(cluster_count).sum::<u64>();
+            while kept < scored.len() && postings < k as u64 {
+                postings += cluster_count(&scored[kept]);
+                kept += 1;
+            }
+            scored.truncate(kept);
         }
         let mut per_seg: HashMap<usize, Vec<u32>> = HashMap::new();
-        for (si, c, _) in scored {
+        for (si, c, _) in scored.into_iter().chain(gated) {
             per_seg.entry(si).or_default().push(c);
         }
 
@@ -759,9 +868,14 @@ impl SupertableReader {
                 let column = Arc::clone(&column_arc);
                 let query = Arc::clone(&query_arc);
                 async move {
+                    let replica_overhead = reader
+                        .vec()
+                        .map(|v| (v.n_docs() as usize).saturating_sub(reader.n_docs() as usize))
+                        .unwrap_or(0);
+                    let k_fetch = k.saturating_add(replica_overhead);
                     reader
                         .vector_search_clusters_filtered(
-                            &column, &query, k, &ids, options, bitmap, None,
+                            &column, &query, k_fetch, &ids, options, bitmap, None,
                         )
                         .await
                         .map_err(|e| QueryError::Parquet(e.to_string()))
@@ -1013,49 +1127,42 @@ impl SupertableReader {
         if user_allow.is_empty() {
             return Ok(Vec::new());
         }
-        let hidden_ready = match self.vector_index_table() {
-            Some(vit) => !vit
-                .reader()
-                .manifest()
-                .get_all_superfiles_loaded()
-                .await
-                .map_err(QueryError::ManifestLoad)?
-                .is_empty(),
-            None => false,
+        let drained = self
+            .vector_index_table()
+            .map(|hidden| hidden.reader().manifest().get_drained_ranges())
+            .unwrap_or_default();
+        let undrained_user: Vec<Arc<SuperfileEntry>> = user_superfiles
+            .into_iter()
+            .filter(|entry| !drained.contains(entry.birth_version))
+            .collect();
+        let user_hits = if undrained_user.is_empty() {
+            Vec::new()
+        } else {
+            self.vector_fanout_over_superfiles(
+                undrained_user,
+                column,
+                query,
+                k,
+                options,
+                Some(user_allow.clone()),
+            )
+            .await?
         };
-        if !hidden_ready {
-            return self
-                .vector_fanout_over_superfiles(
-                    user_superfiles,
-                    column,
-                    query,
-                    k,
-                    options,
-                    Some(user_allow),
-                )
-                .await;
-        }
         let stable_ids = self.stable_ids_from_user_allow_async(&user_allow).await?;
-        if stable_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let prepared = self
-            .prepare_vector_stable_allow_async(Arc::new(stable_ids))
-            .await?;
-        if prepared.use_hidden_index {
-            return self
-                .vector_hits_prepared_global_allow_async(column, query, k, options, &prepared)
-                .await;
-        }
-        self.vector_fanout_over_superfiles(
-            user_superfiles,
-            column,
-            query,
-            k,
-            options,
-            Some(user_allow),
-        )
-        .await
+        let hidden_hits = if stable_ids.is_empty() {
+            Vec::new()
+        } else {
+            let prepared = self
+                .prepare_vector_stable_allow_async(Arc::new(stable_ids))
+                .await?;
+            if prepared.use_hidden_index {
+                self.vector_hits_prepared_global_allow_async(column, query, k, options, &prepared)
+                    .await?
+            } else {
+                Vec::new()
+            }
+        };
+        Ok(top_k_ascending(vec![hidden_hits, user_hits], k))
     }
 
     /// Test/bench-only bitmap-filtered vector kNN. `allow_global` uses the
@@ -1445,9 +1552,8 @@ impl SupertableReader {
             .await
     }
 
-    /// Global-index vector kNN over the hidden index. Pre-drain (no cell
-    /// superfiles yet) searches the user table; post-drain ranks every
-    /// resident fine-cluster centroid globally — no coarse cell filter.
+    /// Global fine-centroid ranking over hidden coverage plus undrained user
+    /// deltas, merged by stable identity.
     pub(crate) async fn vector_search_global_index_async(
         &self,
         column: &str,
@@ -1458,21 +1564,40 @@ impl SupertableReader {
         if k == 0 {
             return Ok(Vec::new());
         }
-        if let Some(vit) = self.vector_index_table() {
-            let vit_reader = vit.reader();
-            let selected = vit_reader
-                .manifest()
+        let mut drained = Default::default();
+        let hidden_hits = if let Some(vit) = self.vector_index_table() {
+            let hidden_reader = vit.reader();
+            let hidden_manifest = hidden_reader.manifest();
+            drained = hidden_manifest.get_drained_ranges();
+            let hidden_entries = hidden_manifest
                 .get_all_superfiles_loaded()
                 .await
                 .map_err(QueryError::ManifestLoad)?;
-            if !selected.is_empty() {
-                return vit_reader
-                    .fanout_vector_clusters(&selected, column, query, k, options)
-                    .await;
+            if hidden_entries.is_empty() {
+                Vec::new()
+            } else {
+                hidden_reader
+                    .fanout_vector_clusters(&hidden_entries, column, query, k, options)
+                    .await?
             }
-        }
-        self.vector_search_user_table_async(column, query, k, options)
+        } else {
+            Vec::new()
+        };
+        let user_entries: Vec<Arc<SuperfileEntry>> = self
+            .manifest()
+            .get_all_superfiles_loaded()
             .await
+            .map_err(QueryError::ManifestLoad)?
+            .into_iter()
+            .filter(|entry| !drained.contains(entry.birth_version))
+            .collect();
+        let user_hits = if user_entries.is_empty() {
+            Vec::new()
+        } else {
+            self.fanout_vector_clusters(&user_entries, column, query, k, options)
+                .await?
+        };
+        Ok(top_k_ascending(vec![hidden_hits, user_hits], k))
     }
 
     /// Default async vector kernel — routes through the global hidden index
@@ -2505,5 +2630,52 @@ mod tests {
             }
         }
         assert_eq!(total, k, "search must return k distinct rows, got {total}");
+    }
+
+    #[test]
+    fn global_union_includes_undrained_user_delta() {
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(
+            options_one_superfile_per_commit(dim).with_storage(Arc::clone(&storage)),
+        )
+        .expect("create");
+
+        let mut writer = st.writer().expect("writer");
+        writer
+            .append(&build_vector_batch(0, 8, dim, Arc::clone(&schema)))
+            .expect("append base");
+        writer.commit().expect("commit base");
+        drop(writer);
+        st.drain_vectors_to_cells_sync().expect("drain base");
+
+        let mut writer = st.writer().expect("writer delta");
+        writer
+            .append(&build_vector_batch(15, 1, dim, schema))
+            .expect("append delta");
+        writer.commit().expect("commit delta");
+        drop(writer);
+
+        let reader = st.reader();
+        let hidden = reader.vector_index_table().expect("hidden index");
+        let drained = hidden.reader().manifest().get_drained_ranges();
+        let undrained: Vec<_> = reader
+            .manifest()
+            .superfiles
+            .iter()
+            .filter(|entry| !drained.contains(entry.birth_version))
+            .collect();
+        assert_eq!(undrained.len(), 1);
+
+        let mut query = vec![0.0f32; dim];
+        query[15] = 1.0;
+        let hits = reader
+            .vector_hits("emb", &query, 1, VectorSearchOptions::new(), None)
+            .expect("global union search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].superfile, undrained[0].uri);
     }
 }
