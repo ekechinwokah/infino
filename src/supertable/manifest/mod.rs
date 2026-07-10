@@ -483,7 +483,11 @@ impl Manifest {
         // already-decoded entries with zero I/O. That reuse is what keeps
         // the centroid state memory-resident across manifest versions until
         // the drainer republishes.
-        let expected_n_superfiles: u64 = list.parts.iter().map(|e| e.n_superfiles).sum();
+        let expected_n_superfiles: Option<u64> = if list.slow_vector_state_uri.is_some() {
+            None
+        } else {
+            Some(list.parts.iter().map(|e| e.n_superfiles).sum())
+        };
         // Hydration precedence: (1) slow-ref reuse (zero I/O, zero decode;
         // membership unchanged by construction since every membership
         // `update` clears the ref — this keeps centroid state resident
@@ -500,7 +504,8 @@ impl Manifest {
                     cl.slow_vector_state_uri.as_deref() == Some(uri)
                         && cl.slow_vector_state_content_hash == Some(hash)
                 });
-                let complete = cur.superfile_list.superfiles.len() as u64 == expected_n_superfiles;
+                let complete = expected_n_superfiles
+                    .is_none_or(|expected| cur.superfile_list.superfiles.len() as u64 == expected);
                 (same_ref && complete).then(|| cur.superfile_list.superfiles.clone())
             }),
             _ => None,
@@ -520,10 +525,13 @@ impl Manifest {
                     let entries = slow_vector_state::load_state(storage.as_ref(), uri, &hash)
                         .await
                         .map_err(|e| ManifestLoadError::SlowStateHydration(e.to_string()))?;
-                    if entries.len() as u64 != expected_n_superfiles {
+                    if expected_n_superfiles
+                        .is_some_and(|expected| entries.len() as u64 != expected)
+                    {
                         return Err(ManifestLoadError::SlowStateHydration(format!(
-                            "blob entry count {} != list total {expected_n_superfiles}",
-                            entries.len()
+                            "blob entry count {} != list total {}",
+                            entries.len(),
+                            expected_n_superfiles.expect("checked Some above")
                         )));
                     }
                     Some(entries)
@@ -724,6 +732,9 @@ impl Manifest {
     ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
         match &self.list {
             Some(list) => {
+                if list.slow_vector_state_uri.is_some() {
+                    return Ok(self.superfile_list.superfiles.clone());
+                }
                 // Residency fast path: when the flat view is COMPLETE, the
                 // read path must issue zero metadata GETs — serve the
                 // resident entries and let the per-entry skips downstream
@@ -774,6 +785,9 @@ impl Manifest {
     ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
         match &self.list {
             Some(list) => {
+                if list.slow_vector_state_uri.is_some() {
+                    return Ok(self.superfile_list.superfiles.clone());
+                }
                 // Flat-view fast path: when the resident view is COMPLETE
                 // (eager-loaded, blob-hydrated, or update-derived from a
                 // complete predecessor) it is exactly the parts' content, so
@@ -1105,13 +1119,24 @@ impl Manifest {
         //    tag stays on each entry (routing + zone-map input); it no longer
         //    dictates part boundaries, so a query prunes parts by their
         //    aggregates and filters the surviving entries by tag in memory.
-        let list_entries = self.get_all_list_entries();
-        let latest_idx = list_entries.len().checked_sub(1);
+        // User tables persist membership in manifest parts. Hidden VectorCell
+        // tables persist membership/routing in the slow-CAS blob instead, so
+        // `None` skips part creation/rewrite entirely; the existing drain /
+        // compaction slow-state publication remains the sole hidden store.
+        let list_entries: Option<&[ManifestPartEntry]> =
+            if matches!(&strategy, PartitionStrategy::VectorCell { .. }) {
+                None
+            } else {
+                Some(self.get_all_list_entries())
+            };
+        let latest_idx = list_entries.and_then(|entries| entries.len().checked_sub(1));
         let mut out_list_entries: Vec<ManifestPartEntry> = Vec::new();
         let mut parts_to_write: Vec<EncodedPart> = Vec::new();
-        let mut pending_new = stamped_new_entries.to_vec();
+        let mut pending_new = list_entries
+            .map(|_| stamped_new_entries.to_vec())
+            .unwrap_or_default();
 
-        for (i, entry) in list_entries.iter().enumerate() {
+        for (i, entry) in list_entries.unwrap_or_default().iter().enumerate() {
             if Some(i) != latest_idx || pending_new.is_empty() {
                 out_list_entries.push(entry.clone());
                 continue;

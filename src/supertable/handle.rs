@@ -3257,17 +3257,15 @@ mod tests {
         let n_entries = manifest_after.superfiles.len();
         assert!(n_entries > 0, "hidden flat view populated");
 
-        // (3) Fresh open must hydrate from the blob: delete every hidden
-        // manifest part so nothing else can serve the entries.
+        // (3) Hidden membership never writes manifest parts. Fresh open must
+        // hydrate exclusively from the slow blob.
         let parts = hidden
             .block_on_query(hidden_storage.list_with_prefix(MANIFEST_PARTS_DIR))
             .expect("list hidden parts");
-        assert!(!parts.is_empty(), "hidden parts exist as the audit trail");
-        for p in &parts {
-            hidden
-                .block_on_query(hidden_storage.delete(p))
-                .expect("delete hidden part");
-        }
+        assert!(
+            parts.is_empty(),
+            "hidden table must not write manifest parts"
+        );
         drop(hidden);
         drop(st);
 
