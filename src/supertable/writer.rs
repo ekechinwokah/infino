@@ -68,6 +68,7 @@ use object_store::{PutPayload, UploadPart};
 use rayon::prelude::*;
 use tokio::{runtime::Handle, task::block_in_place, time::sleep};
 use tracing::{debug, error};
+use uuid::Uuid;
 
 use super::{
     build::fanout_shards,
@@ -1736,6 +1737,7 @@ pub(in crate::supertable) fn persist_commit(
     };
 
     inner.manifest.store(Arc::new(new_manifest));
+    inner.reconcile_tombstone_seqs();
     Ok(())
 }
 
@@ -1896,7 +1898,66 @@ async fn refresh_inner_state_async(
         }
     };
     inner.manifest.store(manifest);
+    inner.reconcile_tombstone_seqs();
     Ok(())
+}
+
+/// CAS-publish a successor manifest whose tombstone seq for every
+/// superfile in `touched` is bumped to the successor's `manifest_id`.
+///
+/// This is the mutation pipeline's post-sidecar stamp: it runs after
+/// the tombstone phase's sidecar CAS-PUTs and *before* the WAL flips
+/// to `Complete`, so a crash in between is completed by the recovery
+/// sweep and "WAL complete ⇒ manifest stamped" holds. Readers on
+/// other processes pick the bump up on their next manifest refresh
+/// and refetch exactly the named sidecars — this is what bounds
+/// cross-process delete visibility by the read-consistency window.
+///
+/// No superfile entries or parts change, so each attempt writes only
+/// the list + pointer. OCC discipline matches [`persist_commit`]:
+/// reload on contention, jittered backoff, bounded by
+/// `max_commit_retries`.
+pub(in crate::supertable) async fn stamp_tombstone_seqs(
+    inner: &SupertableInner,
+    touched: &[Uuid],
+) -> Result<(), SupertableCommitError> {
+    let Some(storage) = inner.options.storage.clone() else {
+        return Ok(());
+    };
+    let max_retries = inner.options.max_commit_retries.max(1);
+    for attempt in 0..max_retries {
+        let old = inner.manifest.load_full();
+        let Some(new_manifest) = old.with_tombstone_seqs_bumped(touched) else {
+            // No persisted list ⇒ in-process-only ⇒ nothing to stamp.
+            return Ok(());
+        };
+        let prev_etag = match get_current_manifest_etag(&storage, Arc::clone(&old)).await {
+            Ok(etag) => etag,
+            // Pointer moved past our snapshot — reload and retry.
+            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                refresh_inner_state_async(inner, &storage).await?;
+                sleep(backoff_delay(attempt)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        match new_manifest
+            .write(storage.as_ref(), prev_etag.as_deref(), &[])
+            .await
+        {
+            Ok(()) => {
+                inner.manifest.store(Arc::new(new_manifest));
+                inner.reconcile_tombstone_seqs();
+                return Ok(());
+            }
+            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                refresh_inner_state_async(inner, &storage).await?;
+                sleep(backoff_delay(attempt)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(SupertableCommitError::WriteContentionExhausted)
 }
 
 /// Storage path for a superfile's bytes. Lives under `data/`

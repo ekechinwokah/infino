@@ -84,7 +84,7 @@ use crate::{
             },
             tombstones_codec::TombstonesSidecar,
         },
-        writer::{build_subsection_offsets, persist_commit},
+        writer::{build_subsection_offsets, persist_commit, stamp_tombstone_seqs},
     },
 };
 
@@ -724,6 +724,12 @@ pub enum TombstonePhaseError {
     #[error("failed to scan _id column for target {target_id:?}: {message}")]
     IdLookupFailed { target_id: String, message: String },
 
+    /// The post-sidecar manifest stamp (tombstone seqs) failed. The
+    /// sidecar bits are durable and the WAL stays incomplete, so the
+    /// recovery sweep re-runs the phase and re-attempts the stamp.
+    #[error("tombstone-seq manifest stamp failed: {0}")]
+    ManifestStamp(String),
+
     /// Tombstone codec error from the sidecar layer.
     #[error("tombstone sidecar codec error: {0}")]
     SidecarCodec(#[from] crate::supertable::wal::tombstones_codec::SidecarCodecError),
@@ -879,20 +885,34 @@ async fn do_tombstone_apply(
         wal_cur.tombstone_progress[idx].outcome = outcome;
         wal_cur.tombstone_progress[idx].tombstoned_in_superfile = in_sf;
 
-        // Invalidate this process's tombstone-cache entry for
-        // the touched superfile so the very next query in this
-        // process sees the bit we just landed, without waiting
-        // for the cache's TTL window to close.
-        if let (Some(sf), Some(cache)) = (in_sf, inner.tombstone_cache.as_ref()) {
-            cache.invalidate(sf);
-        }
-
         // Per-target WAL state CAS. We persist after each
         // target so recovery has a fresh cursor and a crash
         // never wastes more than one target's work.
         etag_cur = wal_store
             .update_with_etag(wal_cur.wal_id, &etag_cur, &wal_cur)
             .await?;
+    }
+
+    // Stamp the touched superfiles' tombstone seqs into the manifest
+    // so readers — this process's own cache included — learn the
+    // sidecars changed. Runs before the `Complete` CAS so a crash in
+    // between is re-driven by recovery ("WAL complete ⇒ stamped");
+    // re-stamping on such a replay is harmless (one extra seq bump).
+    let touched: Vec<Uuid> = {
+        let mut ids: Vec<Uuid> = wal_cur
+            .tombstone_progress
+            .iter()
+            .filter(|e| e.outcome == TombstoneOutcome::Tombstoned)
+            .filter_map(|e| e.tombstoned_in_superfile)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+    if !touched.is_empty() {
+        stamp_tombstone_seqs(inner, &touched)
+            .await
+            .map_err(|e| TombstonePhaseError::ManifestStamp(e.to_string()))?;
     }
 
     // Final transition: every entry is non-Pending; flip the
@@ -1832,6 +1852,50 @@ mod tests {
         let (read_back, read_etag) = ws.read(wal.wal_id).await.expect("read back");
         assert_eq!(read_back.state, WalState::Complete);
         assert_eq!(read_etag, etag);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tombstone_phase_replay_after_crash_still_stamps_manifest() {
+        // Crash model: every sidecar CAS-PUT landed (all progress
+        // entries non-Pending) but the process died before the
+        // manifest stamp / `Complete` CAS. Recovery re-runs the
+        // phase: the per-target loop no-ops, and the stamp must
+        // still publish the touched superfile's tombstone seq
+        // before the WAL flips to `Complete` — this is the
+        // "WAL complete ⇒ manifest stamped" invariant.
+        let sf = Uuid::from_u128(0x5F);
+        let progress = vec![TombstoneEntry {
+            target_id: RowId(21),
+            outcome: TombstoneOutcome::Tombstoned,
+            tombstoned_in_superfile: Some(sf),
+        }];
+        let (_dir, st, ws, wal, etag) =
+            tombstone_fixture(OpKind::Delete, WalState::Intent, progress).await;
+        let manifest_id_before = st.inner().manifest.load().manifest_id;
+
+        let (outcome, new_wal, _) = run_tombstone_phase(&st, &ws, &wal, &etag)
+            .await
+            .expect("replay ok");
+        assert_eq!(
+            outcome,
+            TombstonePhaseOutcome::Applied {
+                n_tombstoned: 1,
+                n_not_found: 0,
+            }
+        );
+        assert_eq!(new_wal.state, WalState::Complete);
+
+        let manifest = st.inner().manifest.load();
+        assert!(
+            manifest.manifest_id > manifest_id_before,
+            "stamp publishes a successor manifest"
+        );
+        let seqs = manifest.get_tombstone_seqs().expect("persisted list");
+        assert_eq!(
+            seqs.get(&sf),
+            Some(&manifest.manifest_id),
+            "touched superfile's seq is the stamping manifest's id"
+        );
     }
 
     // ---- count_outcomes property ----------------------------------------

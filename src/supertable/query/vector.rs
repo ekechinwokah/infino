@@ -1723,7 +1723,7 @@ mod tests {
             SuperfileUri,
             manifest::SuperfileEntry,
             query::SuperfileHit,
-            tombstones::{SidecarCache, cache::DEFAULT_REFRESH_TTL},
+            tombstones::{SidecarCache, TombstoneSeqView, cache::DEFAULT_SEAL_TTL},
             wal::{WalStore, tombstones_codec::TombstonesSidecar},
         },
     };
@@ -1753,9 +1753,15 @@ mod tests {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let ws = WalStore::new(Arc::clone(&storage));
-        let cache = Arc::new(SidecarCache::new(ws.clone(), DEFAULT_REFRESH_TTL));
-
         let sf_id = Uuid::from_u128(0xFEEDFACE);
+        let cache = Arc::new(SidecarCache::new(
+            ws.clone(),
+            DEFAULT_SEAL_TTL,
+            Arc::new(TombstoneSeqView {
+                manifest_id: 1,
+                seqs: [(sf_id, 1u64)].into_iter().collect(),
+            }),
+        ));
         // Pre-populate a sidecar with doc-ids 1, 3, 5 set.
         let mut bitmap = RoaringBitmap::new();
         bitmap.insert(1);
@@ -1797,14 +1803,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_tombstone_filter_short_circuits_on_empty_bitmap() {
-        // No sidecar at all → cache populates the "known 404"
-        // sentinel and `bitmap.is_empty()` short-circuits the
-        // filter loop. Hit list is unchanged.
+        // Superfile absent from the seq map → the cache answers
+        // "no tombstones" authoritatively (zero GETs) and
+        // `bitmap.is_empty()` short-circuits the filter loop.
+        // Hit list is unchanged.
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let ws = WalStore::new(Arc::clone(&storage));
-        let cache = Arc::new(SidecarCache::new(ws, DEFAULT_REFRESH_TTL));
+        let cache = Arc::new(SidecarCache::new(
+            ws,
+            DEFAULT_SEAL_TTL,
+            Arc::new(TombstoneSeqView::default()),
+        ));
 
         let entry = synthetic_entry(Uuid::from_u128(0x1111));
         let mut hits: Vec<SuperfileHit> = (0..4u32)

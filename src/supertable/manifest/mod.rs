@@ -271,7 +271,7 @@ impl ManifestSnapshot {
     /// `manifest_id` sequence (the first append still commits `manifest_id 1`).
     pub(crate) fn materialized_empty(options: Arc<SupertableOptions>) -> Self {
         let strategy = options.effective_partition_strategy();
-        let list = Self::build_list(&options, strategy, 0, Vec::new());
+        let list = Self::build_list(&options, strategy, 0, Vec::new(), BTreeMap::new());
         let loader = options.storage.as_ref().map(|storage| {
             Arc::new(ManifestPartLoader::new_with_cache(
                 storage.clone(),
@@ -288,14 +288,16 @@ impl ManifestSnapshot {
     }
 
     /// Build a manifest list from the supertable `options` at `manifest_id`,
-    /// carrying `parts`. Shared by the commit path ([`Self::update`]) and the
-    /// initial empty-manifest materialization ([`Self::materialized_empty`]) so
-    /// the options→list field mapping lives in one place.
+    /// carrying `parts` and the tombstone-seq state. Shared by the commit path
+    /// ([`Self::update`]) and the initial empty-manifest materialization
+    /// ([`Self::materialized_empty`]) so the options→list field mapping lives
+    /// in one place.
     fn build_list(
         options: &SupertableOptions,
         strategy: PartitionStrategy,
         manifest_id: u64,
         parts: Vec<ManifestPartEntry>,
+        tombstone_seqs: BTreeMap<Uuid, u64>,
     ) -> Manifest {
         Manifest {
             format_version: LIST_FORMAT_VERSION.into(),
@@ -323,6 +325,7 @@ impl ManifestSnapshot {
                 .collect(),
             partition_strategy: strategy,
             parts,
+            tombstone_seqs,
         }
     }
 
@@ -678,6 +681,45 @@ impl ManifestSnapshot {
         }
     }
 
+    /// The persisted list's per-superfile tombstone-seq map. `None`
+    /// for in-process-only manifests (no persisted list ⇒ no sidecars
+    /// can exist).
+    pub fn get_tombstone_seqs(&self) -> Option<&BTreeMap<Uuid, u64>> {
+        self.list.as_ref().map(|l| &l.tombstone_seqs)
+    }
+
+    /// Build a successor manifest identical to `self` except that every
+    /// superfile in `touched` has its tombstone seq set to the successor's
+    /// `manifest_id`. This is the mutation pipeline's post-sidecar stamp:
+    /// no superfile entries or parts change, so persisting the successor
+    /// is a list + pointer write only (empty `parts_to_write`).
+    ///
+    /// Returns `None` for in-process-only manifests (no persisted list —
+    /// nothing to stamp, and no cross-process readers to inform).
+    pub(crate) fn with_tombstone_seqs_bumped(&self, touched: &[Uuid]) -> Option<Self> {
+        let list = self.list.as_ref()?;
+        let next_id = self.get_next_manifest_id();
+        let mut new_list = list.clone();
+        new_list.manifest_id = next_id;
+        for id in touched {
+            new_list.tombstone_seqs.insert(*id, next_id);
+        }
+        let mut superfile_list = self.superfile_list.clone();
+        superfile_list.manifest_id = next_id;
+        // Same parts as the predecessor — inherit the loaded-part cache
+        // wholesale so the stamp never forces a part re-fetch.
+        let parts = DashMap::new();
+        for kv in self.parts.iter() {
+            parts.insert(*kv.key(), Arc::clone(kv.value()));
+        }
+        Some(Self {
+            superfile_list,
+            list: Some(new_list),
+            parts,
+            loader: self.loader.clone(),
+        })
+    }
+
     /// Lazy-load entry point for manifest parts.
     ///
     /// Concurrent callers on the same not-yet-loaded `part_id`
@@ -901,17 +943,28 @@ impl ManifestSnapshot {
             out_list_entries_after_removal.push(fresh_entry);
         }
 
+        let ids_to_remove = entries_to_remove
+            .iter()
+            .map(|e| e.superfile_id)
+            .collect::<HashSet<_>>();
+
+        // Carry the tombstone-seq map forward, dropping entries for
+        // superfiles this commit removes — their sidecars leave the
+        // manifest with them.
+        let mut tombstone_seqs = self
+            .list
+            .as_ref()
+            .map(|list| list.tombstone_seqs.clone())
+            .unwrap_or_default();
+        tombstone_seqs.retain(|id, _| !ids_to_remove.contains(id));
+
         let new_list = Self::build_list(
             opts.as_ref(),
             strategy,
             self.get_next_manifest_id(),
             out_list_entries_after_removal,
+            tombstone_seqs,
         );
-
-        let ids_to_remove = entries_to_remove
-            .iter()
-            .map(|e| e.superfile_id)
-            .collect::<HashSet<_>>();
         let mut new_superfile_list = self
             .get_all_superfiles()
             .iter()
@@ -2284,6 +2337,7 @@ mod tests {
 
         fn fresh_list(entries: Vec<ManifestPartEntry>) -> list::Manifest {
             list::Manifest {
+                tombstone_seqs: Default::default(),
                 format_version: LIST_FORMAT_VERSION.into(),
                 manifest_id: 1,
                 options_hash: ContentHash([0u8; 32]),
@@ -2577,6 +2631,7 @@ mod tests {
         use list::PartitionStrategy;
         let entry = part::PartId::new_v4();
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),
@@ -2723,6 +2778,7 @@ mod tests {
         Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList::empty(opts.clone()),
             list: Some(Manifest {
+                tombstone_seqs: Default::default(),
                 format_version: list::FORMAT_VERSION.into(),
                 manifest_id: 0,
                 options_hash: ContentHash([0u8; 32]),
@@ -2816,6 +2872,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -2960,6 +3017,7 @@ mod tests {
         // entry for partition A (the rewrite candidate); A_old is the
         // frozen older entry; B is an untouched partition.
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3166,6 +3224,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3258,6 +3317,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3387,6 +3447,7 @@ mod tests {
         // Old manifest with TWO entries for same partition (result of prior split)
         // Second one is the "latest" for that partition
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3513,6 +3574,7 @@ mod tests {
             .expect("write part_b");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3641,6 +3703,7 @@ mod tests {
             .expect("write part_b");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3790,6 +3853,7 @@ mod tests {
 
         // List order: [a_old, a_latest, b_old, b_latest]
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -3943,6 +4007,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4031,6 +4096,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4135,6 +4201,7 @@ mod tests {
             .expect("write part_b");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4270,6 +4337,7 @@ mod tests {
                 .expect("write part_a_latest");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4395,6 +4463,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4474,6 +4543,7 @@ mod tests {
             .expect("write part");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4574,6 +4644,7 @@ mod tests {
                 .expect("write part_a_latest");
 
         let list = Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -4695,6 +4766,7 @@ mod tests {
             })
             .collect();
         list::Manifest {
+            tombstone_seqs: Default::default(),
             format_version: list::FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: part::ContentHash([0u8; 32]),

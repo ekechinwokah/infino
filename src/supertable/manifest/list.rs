@@ -85,6 +85,18 @@ pub struct Manifest {
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
     pub parts: Vec<ManifestPartEntry>,
+    /// Per-superfile tombstone-sidecar version: `superfile_id →` the
+    /// `manifest_id` of the commit whose tombstone phase last changed
+    /// that superfile's sidecar. The mutation pipeline stamps this map
+    /// (a fresh list + pointer CAS) right after its sidecar CAS-PUTs
+    /// land, so a reader that refreshes the manifest learns *which*
+    /// sidecars changed without polling each one — cross-process
+    /// delete visibility is bounded by the read-consistency window,
+    /// not a sidecar cache TTL. The map is authoritative for sidecar
+    /// *existence* too: a superfile absent from it has no sidecar, so
+    /// readers skip the storage GET entirely. Entries are dropped when
+    /// their superfile leaves the manifest (compaction/removal).
+    pub tombstone_seqs: BTreeMap<Uuid, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -736,6 +748,7 @@ struct ManifestDto {
     vector_columns: Vec<VectorColumnInfoDto>,
     partition_strategy: PartitionStrategyDto,
     parts: Vec<ManifestPartEntryDto>,
+    tombstone_seqs: BTreeMap<String, u64>, // UUID keys
 }
 
 // VectorColumnInfo's `dim`/`n_cent` are `usize` in memory but
@@ -1156,6 +1169,11 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
             .collect(),
         partition_strategy: strategy_to_dto(&l.partition_strategy),
         parts,
+        tombstone_seqs: l
+            .tombstone_seqs
+            .iter()
+            .map(|(id, seq)| (id.to_string(), *seq))
+            .collect(),
     })
 }
 
@@ -1187,6 +1205,15 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
             .collect(),
         partition_strategy: strategy_from_dto(d.partition_strategy)?,
         parts,
+        tombstone_seqs: d
+            .tombstone_seqs
+            .into_iter()
+            .map(|(id, seq)| {
+                Uuid::parse_str(&id)
+                    .map(|u| (u, seq))
+                    .map_err(|_| ListParseError::BadFieldValue("tombstone_seqs", id))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?,
     })
 }
 
@@ -1659,6 +1686,7 @@ mod tests {
 
     fn empty_list() -> Manifest {
         Manifest {
+            tombstone_seqs: Default::default(),
             format_version: FORMAT_VERSION.into(),
             manifest_id: 0,
             options_hash: ContentHash([0u8; 32]),
@@ -1832,6 +1860,16 @@ mod tests {
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");
         assert_lists_equal(&decoded, &list);
+    }
+
+    #[test]
+    fn tombstone_seqs_roundtrip() {
+        let mut list = empty_list();
+        list.tombstone_seqs.insert(Uuid::from_u128(0x42), 7);
+        list.tombstone_seqs.insert(Uuid::from_u128(0x43), 9);
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.tombstone_seqs, list.tombstone_seqs);
     }
 
     #[test]

@@ -44,7 +44,7 @@ use crate::{
         options::Consistency,
         reader_cache::disk::{DiskCacheError, skip_background_fill},
         stats::process_rss_bytes,
-        tombstones::{SidecarCache, cache::DEFAULT_REFRESH_TTL},
+        tombstones::{SidecarCache, TombstoneSeqView, cache::DEFAULT_SEAL_TTL},
         utils::idgen::IdGenerator,
         wal::{
             WalStore, gc,
@@ -147,6 +147,23 @@ impl SupertableInner {
     pub(super) fn query_runtime(&self) -> Arc<Runtime> {
         shared_io_runtime()
     }
+
+    /// Push the current manifest's tombstone-seq view into the
+    /// sidecar cache. Called wherever a newer manifest is swapped
+    /// into `self.manifest` (refresh, commit, mutation stamp) so the
+    /// cache's freshness authority tracks the snapshot readers pin.
+    /// No-op when the cache's view is already at (or past) the
+    /// current manifest — the common every-query case, kept clone-free.
+    pub(crate) fn reconcile_tombstone_seqs(&self) {
+        let Some(cache) = self.tombstone_cache.as_ref() else {
+            return;
+        };
+        let manifest = self.manifest.load();
+        if manifest.manifest_id <= cache.view_manifest_id() {
+            return;
+        }
+        cache.reconcile(tombstone_seq_view(&manifest));
+    }
 }
 
 impl Supertable {
@@ -242,7 +259,7 @@ impl Supertable {
         } else {
             Arc::new(ManifestSnapshot::empty(options.clone()))
         };
-        let tombstone_cache = build_tombstone_cache(&options);
+        let tombstone_cache = build_tombstone_cache(&options, &initial);
         let id_generator = IdGenerator::new();
         let handle_id = SupertableHandleId(id_generator.next_id());
         let inner = Arc::new(SupertableInner {
@@ -334,7 +351,7 @@ impl Supertable {
         let options_arc = Arc::new(options);
 
         let manifest = ManifestSnapshot::load(None, storage, Some(options_arc.clone())).await?;
-        let tombstone_cache = build_tombstone_cache(&options_arc);
+        let tombstone_cache = build_tombstone_cache(&options_arc, &manifest);
         // Fresh generator per open. The 64-bit ms timestamp
         // prefix advances naturally across process restarts, so
         // re-opened supertables never re-mint values that already
@@ -418,6 +435,7 @@ impl Supertable {
             Err(err) => return Err(OpenError::ManifestLoadError(err)),
         };
         self.inner.manifest.store(manifest);
+        self.inner.reconcile_tombstone_seqs();
         debug!(
             manifest_id = self.inner.manifest.load().manifest_id,
             "refreshed manifest"
@@ -764,11 +782,30 @@ fn install_disk_cache_pinning(inner: &Arc<SupertableInner>) {
 /// Build the tombstone-sidecar cache when storage is attached.
 /// Returns `None` for in-memory-only supertables — no sidecars
 /// can exist there, so the query paths skip the filter hook
-/// entirely.
-fn build_tombstone_cache(options: &Arc<SupertableOptions>) -> Option<Arc<SidecarCache>> {
+/// entirely. The cache is born with the seq view of `manifest`
+/// (the snapshot the handle opens with), so it is authoritative
+/// from the first query.
+fn build_tombstone_cache(
+    options: &Arc<SupertableOptions>,
+    manifest: &ManifestSnapshot,
+) -> Option<Arc<SidecarCache>> {
     let storage = options.storage.as_ref()?.clone();
     let wal_store = WalStore::new(storage);
-    Some(Arc::new(SidecarCache::new(wal_store, DEFAULT_REFRESH_TTL)))
+    Some(Arc::new(SidecarCache::new(
+        wal_store,
+        DEFAULT_SEAL_TTL,
+        tombstone_seq_view(manifest),
+    )))
+}
+
+/// The tombstone-seq view of `manifest`, in the shape the sidecar
+/// cache validates against. An in-process-only manifest (no
+/// persisted list) has no sidecars, so its view is empty.
+fn tombstone_seq_view(manifest: &ManifestSnapshot) -> Arc<TombstoneSeqView> {
+    Arc::new(TombstoneSeqView {
+        manifest_id: manifest.manifest_id,
+        seqs: manifest.get_tombstone_seqs().cloned().unwrap_or_default(),
+    })
 }
 
 impl fmt::Debug for Supertable {
