@@ -115,8 +115,9 @@ use crate::{
             fts::{HEADER_SIZE as FTS_HEADER_SIZE, U64_BYTES, hdr},
             kv,
             vec::{
-                CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, OUTER_HEADER_SIZE,
-                SUB_HEADER_SIZE, U32_BYTES, cell_dir_entry, dir_entry, outer_hdr, sub_hdr,
+                CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_ENTRY_BYTES, DIR_ENTRY_SIZE, DOC_ID_BYTES,
+                OUTER_HEADER_SIZE, STABLE_ID_BYTES, SUB_HEADER_SIZE, U32_BYTES, cell_dir_entry,
+                dir_entry, outer_hdr, sub_hdr,
             },
         },
         reader::vector_layout_from_kv,
@@ -149,6 +150,11 @@ use crate::{
         slow_vector_state,
     },
 };
+
+/// Target bytes per fine IVF run inside one global cell. Fine-centroid count
+/// is derived from this target; it is not copied from the outer/global grid or
+/// repeated as a fixed count for every small commit delta.
+const DRAIN_FINE_RUN_TARGET_BYTES: usize = 2 * 1024 * 1024;
 
 pub struct SupertableWriter {
     inner: Arc<SupertableInner>,
@@ -1196,6 +1202,7 @@ impl SupertableWriter {
         // blobs into the superfile and publishes. Drain does not write/S3 on
         // this path. No slow CAS.
         if !self.inner.options.vector_columns.is_empty() {
+            let commit_t0 = time::Instant::now();
             let Some(global) = self.inner.manifest.load().get_global_vector_index() else {
                 return Err(BuildError::Store(
                     "vector columns present but global cell grid missing after Phase A".into(),
@@ -1210,11 +1217,31 @@ impl SupertableWriter {
                 .unwrap_or(Metric::L2Sq);
             let (outputs, cell_hints) =
                 commit_shards_via_drain(buffer, &self.inner, &global.grid, metric)?;
+            let build_elapsed = commit_t0.elapsed();
+            let output_bytes: usize = outputs.iter().map(|output| output.bytes.len()).sum();
             let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
+            let prepare_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
+            let data_put_bytes: usize = user_batch
+                .pending_storage_writes
+                .iter()
+                .map(|(_, bytes)| bytes.len())
+                .sum();
+            let publish_t0 = time::Instant::now();
             bridge_on_runtime(
                 persist_superfile_publish_batch_async(&self.inner, user_batch),
                 &self.inner.query_runtime(),
             )?;
+            if crate::storage::io_counters::timeline_enabled() {
+                eprintln!(
+                    "[supertable commit] build {:.1}ms ({:.1} MiB output) + prepare {:.1}ms + \
+                     publish {:.1}ms ({:.1} MiB data PUT)",
+                    build_elapsed.as_secs_f64() * 1e3,
+                    output_bytes as f64 / (1u64 << 20) as f64,
+                    prepare_elapsed.as_secs_f64() * 1e3,
+                    publish_t0.elapsed().as_secs_f64() * 1e3,
+                    data_put_bytes as f64 / (1u64 << 20) as f64,
+                );
+            }
             if self.inner.options.storage.is_some() {
                 schedule_background_storage_reclaim(Arc::clone(&self.inner));
             }
@@ -3164,13 +3191,34 @@ fn drain_pack_materialized_cell(
         row.local_doc_id = local as u32;
     }
     let stable_ids: Vec<i128> = rows.iter().map(|row| row.stable_id).collect();
-    let cell_cfg = cfg.clone().with_rerank_codec(RerankCodec::Sq8Residual);
+    let cell_cfg = drain_cell_vector_config(cfg, rows.len());
     let subsection = build_merged_subsection_from_materialized(cell_cfg, rows)?;
     Ok(PackedCellGroup {
         cell_id,
         subsection,
         stable_ids,
     })
+}
+
+/// Size one cell's fine IVF so one run is approximately
+/// [`DRAIN_FINE_RUN_TARGET_BYTES`]. The stride counts every per-row byte in
+/// the packed IVF: RaBitQ estimate code, local id, Sq8+epsilon rerank bytes,
+/// inline stable id, and the conservative norm word.
+fn drain_cell_vector_config(cfg: &VectorConfig, n_rows: usize) -> VectorConfig {
+    debug_assert!(n_rows > 0);
+    let dim = cfg.dim;
+    let rabitq_bytes = dim.div_ceil(u8::BITS as usize);
+    let rerank_bytes = RerankCodec::Sq8Residual.per_vector_bytes(dim);
+    let row_stride =
+        rabitq_bytes + DOC_ID_BYTES + rerank_bytes + STABLE_ID_BYTES + mem::size_of::<f32>();
+    let rows_per_run = (DRAIN_FINE_RUN_TARGET_BYTES / row_stride.max(1)).max(1);
+    let n_cent = n_rows.div_ceil(rows_per_run).clamp(1, n_rows);
+    VectorConfig {
+        n_cent,
+        rerank_codec: RerankCodec::Sq8Residual,
+        provided_centroids: None,
+        ..cfg.clone()
+    }
 }
 
 fn drain_pack_assigned_cell(
@@ -3184,7 +3232,7 @@ fn drain_pack_assigned_cell(
         )));
     }
     let dim = cfg.dim;
-    let cell_cfg = cfg.clone().with_rerank_codec(RerankCodec::Sq8Residual);
+    let cell_cfg = drain_cell_vector_config(cfg, members.len());
     let stable_ids: Vec<i128> = members.iter().map(|(stable_id, _, _)| *stable_id).collect();
     let subsection = match members[0].2 {
         PackRow::Materialized(_) => {
@@ -3195,7 +3243,7 @@ fn drain_pack_assigned_cell(
                     PackRow::Fp32 { .. } => unreachable!("mixed pack row kinds"),
                 })
                 .collect();
-            return drain_pack_materialized_cell(cell_id, materialized, &cell_cfg);
+            return drain_pack_materialized_cell(cell_id, materialized, cfg);
         }
         PackRow::Fp32 { .. } => {
             let mut corpus = Vec::with_capacity(members.len() * dim);
@@ -3308,6 +3356,7 @@ fn commit_shards_via_drain(
     clusters: &ClusterCentroids,
     metric: Metric,
 ) -> Result<(Vec<ShardOutput>, Vec<Option<u32>>), BuildError> {
+    let stage_t0 = time::Instant::now();
     let vc = inner
         .options
         .vector_columns
@@ -3368,6 +3417,7 @@ fn commit_shards_via_drain(
         .enumerate()
         .map(|(local, &id)| (id, local as u32))
         .collect();
+    let flatten_elapsed = stage_t0.elapsed();
 
     // One global assign over the batch (drain's core; runs on the writer pool).
     let rows: Vec<PackRow<'_>> = stable_ids
@@ -3386,6 +3436,7 @@ fn commit_shards_via_drain(
         .options
         .writer_pool
         .install(|| assign_cells(&rows, clusters, metric, false, replica_target))?;
+    let assign_elapsed = stage_t0.elapsed().saturating_sub(flatten_elapsed);
     let assigned_cells: Vec<(u32, AssignedCellGroup<'_>)> = assigned
         .into_iter()
         .map(|group| (group.cell_id, group))
@@ -3406,6 +3457,18 @@ fn commit_shards_via_drain(
         )
         .map(|output| output.map(|output| (*shard_id, output)))
     })?;
+    let fanout_elapsed = stage_t0
+        .elapsed()
+        .saturating_sub(flatten_elapsed)
+        .saturating_sub(assign_elapsed);
+    if crate::storage::io_counters::timeline_enabled() {
+        eprintln!(
+            "[supertable commit] flatten {:.1}ms + assign {:.1}ms + shard pack/finish {:.1}ms",
+            flatten_elapsed.as_secs_f64() * 1e3,
+            assign_elapsed.as_secs_f64() * 1e3,
+            fanout_elapsed.as_secs_f64() * 1e3,
+        );
+    }
 
     let mut outputs = Vec::with_capacity(shard_outputs.len());
     let mut cell_hints = Vec::with_capacity(shard_outputs.len());
@@ -4992,6 +5055,33 @@ mod tests {
             assert_eq!(packed.stable_ids.len(), n_members);
             assert_eq!(packed.subsection.n_docs as usize, n_members);
         }
+    }
+
+    #[test]
+    fn drain_fine_centroids_follow_two_mib_run_target() {
+        const DIM: usize = 1024;
+        const COMMIT_CELL_ROWS: usize = 98;
+        const DRAINED_CELL_ROWS: usize = 1_562;
+
+        let cfg = VectorConfig {
+            column: "emb".into(),
+            dim: DIM,
+            n_cent: 64,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        };
+        assert_eq!(
+            drain_cell_vector_config(&cfg, COMMIT_CELL_ROWS).n_cent,
+            1,
+            "a small commit delta fits one ~2 MiB fine run"
+        );
+        assert_eq!(
+            drain_cell_vector_config(&cfg, DRAINED_CELL_ROWS).n_cent,
+            2,
+            "a fully drained cell needs two ~2 MiB fine runs"
+        );
     }
 
     // ---- rayon-shard parallelism -------------------------------------
