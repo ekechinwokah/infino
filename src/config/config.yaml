@@ -67,7 +67,9 @@ supertable:
 # `backend: s3` plus `bucket` / `prefix` to make
 # SupertableOptions::apply_config attach an S3StorageProvider.
 # `backend: azure` attaches an AzureStorageProvider, with `bucket`
-# naming the Azure container.
+# naming the Azure container. `backend: gcs` attaches a
+# GcsStorageProvider, with `bucket` naming the GCS bucket and
+# `storage_options` carrying `google_*` config keys.
 #
 # Env overrides:
 #   INFINO_STORAGE__BACKEND=s3
@@ -80,6 +82,22 @@ storage:
   bucket:
   prefix: ""
 
+  # Object-store credentials and tuning, keyed by object_store's config
+  # strings. Infino reads no credentials from the environment — set them
+  # here (or via ConnectOptions). Empty → ambient cloud identity (IAM
+  # instance role / managed identity). Examples:
+  #   backend: s3
+  #   storage_options:
+  #     aws_access_key_id: ...
+  #     aws_secret_access_key: ...
+  #     aws_region: us-east-1
+  #     # aws_endpoint: http://localhost:9000   # MinIO / R2 / Ceph
+  #   backend: azure   # `bucket` names the container
+  #   storage_options:
+  #     azure_storage_account_name: ...
+  #     azure_storage_account_key: ...
+  storage_options: {}
+
   # When set, storage-backed reads use DiskCacheStore. For S3,
   # lazy_foreground_with_background_fill is the object-store-native
   # cold path: foreground opens/searches with exact range GETs (or zero
@@ -87,6 +105,12 @@ storage:
   # while background fill promotes the full superfile to mmap.
   disk_cache_root:
   disk_budget_bytes: 10737418240
+  # Byte budget for the content-addressed manifest-part cache, held in a
+  # manifest-parts/ subdirectory of disk_cache_root. On a hit the part
+  # loader reads bytes from local disk instead of object storage; parts
+  # are content-addressed, so cached files are never stale and survive
+  # restarts. Independent of disk_budget_bytes. Default 2 GiB.
+  manifest_disk_budget_bytes: 2147483648
   cold_fetch_mode: lazy_foreground_with_background_fill
   cold_fetch_streams: 8
   cold_fetch_chunk_bytes: 4194304
@@ -187,3 +211,21 @@ diagnostics:
 
   # Force the scalar vector-distance path even where AVX2 is available.
   disable_avx2: false
+
+# Per-connection memory budget: a ceiling on the anonymous heap the query
+# and ingest paths allocate (result batches, the vector shortlist, ingest
+# buffers), so one connection can't grow memory until the process is OOM-
+# killed. The memory-mapped superfiles and the disk cache are bounded
+# separately; this bounds heap only.
+#
+# Applies to connections built from this config file. Code that opens a
+# connection programmatically sets the budget on ConnectOptions
+# (with_connection_memory_budget_bytes) instead.
+#
+# Env override:
+#   INFINO_MEMORY__CONNECTION_BUDGET_BYTES=8589934592
+memory:
+  # Bytes. 0 (default) is measure-only: usage is tracked but never refused.
+  # A positive value enforces the ceiling (the engine reserves at 90% of it,
+  # leaving headroom for small untracked allocations).
+  connection_budget_bytes: 0

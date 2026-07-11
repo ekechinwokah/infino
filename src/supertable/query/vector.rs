@@ -33,7 +33,7 @@
 //!
 //! Internally pins a snapshot reader and drives the async
 //! kernel to completion via the sync→async bridge. The reader
-//! holds a pinned `Arc<Manifest>`; for each visible superfile we:
+//! holds a pinned `Arc<ManifestSnapshot>`; for each visible superfile we:
 //!
 //!   1. Fetch the superfile's `SuperfileReader` from the store.
 //!   2. Delegate to `SuperfileReader::vector_search`
@@ -77,6 +77,7 @@ use arrow_array::{Array, Decimal128Array};
 use futures::future::try_join_all;
 use roaring::RoaringBitmap;
 use tokio::join;
+use tracing::debug;
 
 use super::{
     SuperfileHit,
@@ -92,7 +93,7 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader, is_hidden_vector_index_table},
-        manifest::{Manifest, SuperfileEntry, SuperfileUri, list::PartitionStrategy},
+        manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri, list::PartitionStrategy},
         tombstones::SidecarCache,
     },
 };
@@ -142,7 +143,7 @@ pub(crate) struct PreparedGlobalAllow {
 /// entire top-k. The previous per-hit lookup could decode the same full column
 /// twice per hit: once to identify its owner and again to locate its row.
 async fn lookup_user_placements_by_id(
-    manifest: &Manifest,
+    manifest: &ManifestSnapshot,
     user_row_ids: &[i128],
 ) -> Result<Vec<(Arc<SuperfileEntry>, u32)>, QueryError> {
     if user_row_ids.is_empty() {
@@ -261,7 +262,7 @@ pub(crate) fn row_id_from_manifest_entry(
 /// [`hidden_hits_user_ids`]: span arithmetic → resident `take_by_local_doc_ids`
 /// → [`read_ids_for_locals`].
 pub(crate) async fn stable_ids_by_local_for_routing(
-    manifest: &Manifest,
+    manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
     reader: &SuperfileReader,
 ) -> Result<Vec<i128>, QueryError> {
@@ -300,7 +301,7 @@ pub(crate) async fn stable_ids_by_local_for_routing(
 ///   - `false` — never use the inline region; read the scalar `_id` column
 ///     (user superfiles after compaction — inline region is cluster-ordered).
 async fn read_ids_for_locals(
-    manifest: &Manifest,
+    manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
     local_ids: &[u32],
     id_column: &str,
@@ -355,7 +356,7 @@ async fn read_ids_for_locals(
 /// reading only the rows the hits touch — versus the previous per-hit
 /// object-store read that dominated warm latency.
 async fn hidden_hits_user_ids(
-    hidden_manifest: &Manifest,
+    hidden_manifest: &ManifestSnapshot,
     hidden_hits: &[SuperfileHit],
     id_column: &str,
 ) -> Result<Vec<i128>, QueryError> {
@@ -502,12 +503,21 @@ impl SupertableReader {
         query: &[f32],
         k: usize,
         options: VectorSearchOptions,
+        defer_tombstones: bool,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
-        self.vector_fanout_over_superfiles(superfiles.to_vec(), column, query, k, options, None)
-            .await
+        self.vector_fanout_over_superfiles(
+            superfiles.to_vec(),
+            column,
+            query,
+            k,
+            options,
+            None,
+            defer_tombstones,
+        )
+        .await
     }
 
     async fn vector_fanout_over_superfiles(
@@ -518,6 +528,7 @@ impl SupertableReader {
         k: usize,
         options: VectorSearchOptions,
         allow: Option<HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
+        defer_tombstones: bool,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let filtered = allow.is_some();
         let (nprobe, _) = options.resolve(filtered);
@@ -851,20 +862,20 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
 
-        // Fan out through the shared [`query::dispatch::fanout`] (also
-        // used by FTS), but in waves capped by the configured reader
-        // pool width. A cold vector kernel can hold large selected-cluster
-        // `[codes][doc_ids]` prefix blocks while it builds its shortlist;
-        // capping the number of concurrent superfiles keeps that transient
-        // memory bounded by instance configuration instead of table size.
-        // Skipped superfiles issue zero GETs.
+        // The filtered path fans out in waves capped by the reader-pool
+        // width: a cold vector kernel can hold large `[codes][doc_ids]`
+        // cluster blocks while building its shortlist, so capping
+        // concurrent superfiles keeps that transient memory bounded by
+        // config, not table size. Skipped superfiles issue zero GETs.
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
+        let reader_pool = Arc::clone(&manifest.options.reader_pool);
         let kernel =
             move |reader: Arc<SuperfileReader>,
                   (ids, bitmap): (Vec<u32>, Option<Arc<RoaringBitmap>>)| {
                 let column = Arc::clone(&column_arc);
                 let query = Arc::clone(&query_arc);
+                let pool = Some(Arc::clone(&reader_pool));
                 async move {
                     let replica_overhead = reader
                         .vec()
@@ -873,7 +884,7 @@ impl SupertableReader {
                     let k_fetch = k.saturating_add(replica_overhead);
                     reader
                         .vector_search_clusters_filtered(
-                            &column, &query, k_fetch, &ids, options, bitmap, None,
+                            &column, &query, k_fetch, &ids, options, bitmap, None, pool,
                         )
                         .await
                         .map_err(|e| QueryError::Parquet(e.to_string()))
@@ -890,14 +901,14 @@ impl SupertableReader {
             while !units.is_empty() {
                 let n = fanout_width.min(units.len());
                 let wave: Vec<_> = units.drain(..n).collect();
-                collected.extend(if hidden_vector_index {
+                collected.extend(if hidden_vector_index || defer_tombstones {
                     dispatch::fanout_without_tombstones(self, wave, kernel.clone()).await?
                 } else {
                     dispatch::fanout(self, wave, kernel.clone()).await?
                 });
             }
             collected
-        } else if hidden_vector_index {
+        } else if hidden_vector_index || defer_tombstones {
             dispatch::fanout_without_tombstones(self, units, kernel).await?
         } else {
             dispatch::fanout(self, units, kernel).await?
@@ -944,7 +955,7 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
 
-        // Manifest-only leaf survival: part-tier term bloom / range, then
+        // ManifestSnapshot-only leaf survival: part-tier term bloom / range, then
         // per-superfile summaries — no superfile reads. Intersect with the
         // vector centroid prune so `token_match` opens only superfiles that
         // could match the predicate *and* might hold vector-near rows.
@@ -986,7 +997,7 @@ impl SupertableReader {
     /// survival set.
     async fn vector_pruned_superfiles_intersect(
         &self,
-        manifest: &Manifest,
+        manifest: &ManifestSnapshot,
         surviving: &HashSet<u128>,
     ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
         Ok(manifest
@@ -1042,7 +1053,7 @@ impl SupertableReader {
     /// resolved on the user table and kNN runs on the hidden index when
     /// drained (same routing as [`Self::vector_hits_filtered_async`]).
     ///
-    /// Manifest-only leaf survival runs before any superfile opens: bounded
+    /// ManifestSnapshot-only leaf survival runs before any superfile opens: bounded
     /// FTS leaves are lowered to term-bloom prunes and intersected with the
     /// vector centroid prune. The per-superfile allow-set (`plan.evaluate`)
     /// then runs only over that intersection.
@@ -1142,6 +1153,7 @@ impl SupertableReader {
                 k,
                 options,
                 Some(user_allow.clone()),
+                false,
             )
             .await?
         };
@@ -1439,6 +1451,7 @@ impl SupertableReader {
                     k,
                     options,
                     Some(prepared.allow_by_uri.clone()),
+                    false,
                 )
                 .await;
         }
@@ -1457,6 +1470,7 @@ impl SupertableReader {
             k,
             options,
             Some(prepared.allow_by_uri.clone()),
+            false,
         )
         .await
     }
@@ -1545,7 +1559,7 @@ impl SupertableReader {
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
-        self.fanout_vector_clusters(&superfiles, column, query, k, options)
+        self.fanout_vector_clusters(&superfiles, column, query, k, options, false)
             .await
     }
 
@@ -1582,7 +1596,7 @@ impl SupertableReader {
                 Ok(Vec::new())
             } else {
                 hidden_reader
-                    .fanout_vector_clusters(&hidden_entries, column, query, k, options)
+                    .fanout_vector_clusters(&hidden_entries, column, query, k, options, false)
                     .await
             }
         };
@@ -1603,7 +1617,7 @@ impl SupertableReader {
         let mut user_hits = if user_entries.is_empty() {
             Vec::new()
         } else {
-            self.fanout_vector_clusters(&user_entries, column, query, k, options)
+            self.fanout_vector_clusters(&user_entries, column, query, k, options, true)
                 .await?
         };
         let refill_cap = k.saturating_add(deleted.len()).max(k);
@@ -1650,7 +1664,14 @@ impl SupertableReader {
                     Ok(Vec::new())
                 } else {
                     hidden_reader
-                        .fanout_vector_clusters(&hidden_entries, column, query, requested, options)
+                        .fanout_vector_clusters(
+                            &hidden_entries,
+                            column,
+                            query,
+                            requested,
+                            options,
+                            false,
+                        )
                         .await
                 }
             };
@@ -1658,8 +1679,15 @@ impl SupertableReader {
                 if user_entries.is_empty() {
                     Ok(Vec::new())
                 } else {
-                    self.fanout_vector_clusters(&user_entries, column, query, requested, options)
-                        .await
+                    self.fanout_vector_clusters(
+                        &user_entries,
+                        column,
+                        query,
+                        requested,
+                        options,
+                        true,
+                    )
+                    .await
                 }
             };
             let (next_hidden, next_user) = join!(hidden_retry, user_retry);
@@ -1743,13 +1771,10 @@ fn subtract_tombstones(
     tombstone_cache: Option<&SidecarCache>,
     now: Instant,
 ) -> Result<(), QueryError> {
-    if let Some(cache) = tombstone_cache {
-        let deleted = cache
-            .bitmap_for(entry.superfile_id, now)
-            .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
-        if !deleted.is_empty() {
-            *bm -= &*deleted;
-        }
+    if let Some(cache) = tombstone_cache
+        && let Some(deleted) = dispatch::tombstone_deny_set(cache, entry.superfile_id, now)?
+    {
+        *bm -= &*deleted;
     }
     Ok(())
 }
@@ -1888,6 +1913,7 @@ impl Supertable {
         filter: Option<VectorFilter<'_>>,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
+        debug!(column, k, dim = query.len(), "vector_search");
         self.reader()
             .vector_search(column, query, k, options, filter, projection)
             .map_err(crate::InfinoError::from)
@@ -1901,6 +1927,10 @@ mod tests {
     use arrow::array::Array;
     use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::{
+        prelude::{Expr, col, lit},
+        scalar::ScalarValue,
+    };
 
     use super::{VectorFilter, VectorSearchOptions};
     use crate::{
@@ -1908,7 +1938,11 @@ mod tests {
             builder::{FtsConfig, SuperfileBuilder, VectorConfig},
             vector::distance::Metric,
         },
-        supertable::{Supertable, SupertableOptions, error::QueryError},
+        supertable::{
+            Supertable, SupertableOptions,
+            error::QueryError,
+            options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
+        },
         test_helpers::default_tokenizer as tok,
     };
 
@@ -2132,6 +2166,191 @@ mod tests {
             .vector_hits("emb", &q, 7, VectorSearchOptions::new(), None)
             .expect("query");
         assert_eq!(hits.len(), 7);
+    }
+
+    // Deleting the rows nearest a query must not shrink an unfiltered
+    // result below the live count — the delete-then-kNN underflow.
+    //  - one superfile, so a hit's `local_doc_id` is its row index.
+    //  - rank all rows, then tombstone the nearest `d` (well past the
+    //    small-k candidate pool, so survivors fall outside any post-rank
+    //    backfill).
+    //  - `k=1` must return the nearest *live* row, never empty.
+    //  - a full sweep returns exactly the `n - d` live rows.
+    // Pre-fix the filter ran on the already-truncated top-k with no
+    // backfill, so a deleted row in the top-k just vanished.
+    #[test]
+    fn vector_search_returns_k_live_rows_after_deletes() {
+        let dim = 16;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(options_one_superfile_per_commit(dim).with_storage(storage))
+            .expect("create");
+
+        // Spread pseudo-random vectors (integer hash → [0, 1)) give a
+        // strict nearest ordering, unlike one-hot rows that tie.
+        let n = 64usize;
+        let pseudo = |i: usize, d: usize| -> f32 {
+            let mut h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(
+                (d as u64)
+                    .wrapping_add(1)
+                    .wrapping_mul(0x2545_F491_4F6C_DD1D),
+            );
+            h ^= h >> 33;
+            ((h >> 40) & 0xFFFF) as f32 / 65536.0
+        };
+        let schema = st.options().schema.clone();
+        let titles = LargeStringArray::from((0..n).map(|i| format!("doc {i}")).collect::<Vec<_>>());
+        let mut flat = Vec::<f32>::with_capacity(n * dim);
+        for i in 0..n {
+            for d in 0..dim {
+                flat.push(pseudo(i, d));
+            }
+        }
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+            Arc::new(Float32Array::from(flat)) as Arc<dyn Array>,
+            None,
+        )
+        .expect("fsl");
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(titles), Arc::new(fsl)]).expect("batch");
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        let q: Vec<f32> = (0..dim).map(|d| pseudo(0, d)).collect();
+
+        let baseline = st
+            .reader()
+            .vector_hits("emb", &q, n, VectorSearchOptions::new(), None)
+            .expect("baseline");
+        assert_eq!(baseline.len(), n);
+        let d = 56usize;
+        let deleted_ids: HashSet<i128> = baseline[..d]
+            .iter()
+            .map(|hit| hit.stable_id.expect("vector hits carry stable ids"))
+            .collect();
+        let deleted: Vec<Expr> = deleted_ids
+            .iter()
+            .map(|id| {
+                lit(ScalarValue::Decimal128(
+                    Some(*id),
+                    DECIMAL128_PRECISION,
+                    DECIMAL128_SCALE,
+                ))
+            })
+            .collect();
+        let stats = st
+            .delete(col("_id").in_list(deleted, false))
+            .expect("delete");
+        assert_eq!(stats.n_tombstoned(), d);
+
+        // k=1 must return the nearest *live* row, not an empty result.
+        let hits = st
+            .reader()
+            .vector_hits("emb", &q, 1, VectorSearchOptions::new(), None)
+            .expect("search");
+        assert_eq!(hits.len(), 1, "k=1 returned no live row after deletes");
+        assert!(
+            hits[0]
+                .stable_id
+                .is_some_and(|id| !deleted_ids.contains(&id)),
+            "returned a deleted stable id: {:?}",
+            hits[0].stable_id,
+        );
+
+        // And a larger k returns exactly the live remainder.
+        let live = n - d;
+        let many = st
+            .reader()
+            .vector_hits("emb", &q, n, VectorSearchOptions::new(), None)
+            .expect("search many");
+        assert_eq!(many.len(), live, "expected all {live} live rows");
+        assert!(
+            many.iter()
+                .all(|hit| hit.stable_id.is_some_and(|id| !deleted_ids.contains(&id)))
+        );
+    }
+
+    // Late stable-id filtering + conditional refill must hold across the
+    // fan-out, not just within one file.
+    //  - 3 superfiles × 16 one-hot docs; titles repeat per file, so
+    //    `doc 0` names row 0 (the dim-0-active, distance-0 row) in each.
+    //  - query e_0's only distance-0 neighbors are those three `doc 0`s.
+    //  - deleting `doc 0` tombstones all three at once.
+    // k=1 must then return a live distance-1 row from some superfile, not
+    // empty — the global merge backfills past the per-file tombstones.
+    #[test]
+    fn vector_search_after_deletes_holds_across_superfiles() {
+        let dim = 16;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(options_one_superfile_per_commit(dim).with_storage(storage))
+            .expect("create");
+        let schema = st.options().schema.clone();
+        {
+            let mut w = st.writer().expect("writer");
+            for chunk in 0..3u64 {
+                w.append(&build_vector_batch(chunk * 16, 16, dim, schema.clone()))
+                    .expect("append");
+                w.commit().expect("commit");
+            }
+        }
+        assert_eq!(st.reader().n_superfiles(), 3);
+
+        let mut q = vec![0f32; dim];
+        q[0] = 1.0;
+        // The three distance-0 neighbors (one per superfile) all carry the
+        // title `doc 0`; one delete tombstones every one of them.
+        let stats = st
+            .delete(col("title").in_list(vec![lit("doc 0")], false))
+            .expect("delete");
+        assert_eq!(stats.n_tombstoned(), 3);
+
+        let hits = st
+            .reader()
+            .vector_hits("emb", &q, 1, VectorSearchOptions::new(), None)
+            .expect("search");
+        assert_eq!(hits.len(), 1, "k=1 underflowed across the fan-out");
+        // Survivors are orthogonal to e_0 → cosine distance 1, never the
+        // deleted distance-0 rows.
+        assert!(hits[0].score > 0.5, "returned a deleted distance-0 row");
+    }
+
+    // Deleting every row must return empty, not panic or wrap — the deny
+    // set excludes the whole superfile and the heap stays empty.
+    #[test]
+    fn vector_search_all_rows_deleted_returns_empty() {
+        let dim = 16;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(options_one_superfile_per_commit(dim).with_storage(storage))
+            .expect("create");
+        let schema = st.options().schema.clone();
+        let n = 8usize;
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_vector_batch(0, n, dim, schema)).expect("a");
+            w.commit().expect("c");
+        }
+        let titles: Vec<Expr> = (0..n).map(|i| lit(format!("doc {i}"))).collect();
+        let stats = st
+            .delete(col("title").in_list(titles, false))
+            .expect("delete");
+        assert_eq!(stats.n_tombstoned(), n);
+
+        let q = vec![0.1f32; dim];
+        let hits = st
+            .reader()
+            .vector_hits("emb", &q, 5, VectorSearchOptions::new(), None)
+            .expect("search");
+        assert!(hits.is_empty(), "expected no live rows, got {}", hits.len());
     }
 
     #[test]

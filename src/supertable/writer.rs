@@ -74,14 +74,15 @@ use futures::{
 use object_store::{PutPayload, UploadPart};
 use rayon::prelude::*;
 use tokio::time::sleep;
+use tracing::{debug, error};
 
 use super::{
     build::fanout_shards,
     error::BuildError,
     handle::{GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, Supertable, SupertableInner},
     manifest::{
-        CellVectorSummary, FtsSummaryAgg, ScalarStatsAgg, SubsectionOffsets, SuperfileEntry,
-        SuperfileUri, VectorSummary, bloom::BloomBuilder,
+        CellVectorSummary, FtsSummaryAgg, ManifestSnapshot, ScalarStatsAgg, SubsectionOffsets,
+        SuperfileEntry, SuperfileUri, VectorSummary, bloom::BloomBuilder,
     },
     mutations::{
         CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
@@ -140,7 +141,7 @@ use crate::{
         error::ManifestError,
         hidden_deleted::{self, encode_deleted_ids},
         manifest::{
-            ClusterCentroids, Manifest,
+            ClusterCentroids,
             commit::get_current_manifest_etag,
             list::PartitionStrategy,
             part::{self as part_mod, PartId},
@@ -933,6 +934,12 @@ impl SupertableWriter {
                     let remaining: Vec<PendingUpdateEntry> =
                         updates_to_run.split_off(update_cursor + 1);
                     self.pending_updates = remaining;
+                    error!(
+                        committed = outcomes.len(),
+                        total = total_mutations,
+                        error = %cause,
+                        "partial commit: update failed mid-flush"
+                    );
                     // Don't lose the not-yet-attempted deletes
                     // either — they stay where they were on
                     // self.pending_deletes (we hadn't taken
@@ -962,6 +969,12 @@ impl SupertableWriter {
                     let remaining: Vec<PendingDeleteEntry> =
                         deletes_to_run.split_off(delete_cursor + 1);
                     self.pending_deletes = remaining;
+                    error!(
+                        committed = outcomes.len(),
+                        total = total_mutations,
+                        error = %cause,
+                        "partial commit: delete failed mid-flush"
+                    );
                     return Err(CommitError::PartialCommit {
                         committed_wal_ids,
                         committed: outcomes.len(),
@@ -1162,7 +1175,7 @@ impl SupertableWriter {
         // into THIS (the user) table's manifest, which is the source of truth for
         // the grid. Gated on VECTORS being in the input (a vector column), not on
         // any sibling table: the packed user build below and the query both read
-        // the grid from here, and it persists with this commit (`Manifest::update`
+        // the grid from here, and it persists with this commit (`ManifestSnapshot::update`
         // carries `global_vector_index` through). A hidden cell-index sibling, when
         // present, gets the grid as a derived copy at drain time — but its absence
         // must not change how user superfiles are laid out. Idempotent: only
@@ -1332,6 +1345,7 @@ impl SupertableWriter {
                 user_global_centroids.clone(),
             )
         })?;
+        let superfiles = outputs.len();
         let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
         bridge_on_runtime(
             persist_superfile_publish_batch_async(&user_inner, user_batch),
@@ -1340,6 +1354,7 @@ impl SupertableWriter {
         if self.inner.options.storage.is_some() {
             schedule_background_storage_reclaim(Arc::clone(&self.inner));
         }
+        debug!(superfiles, "published appended superfiles");
         Ok(())
     }
 }
@@ -1950,7 +1965,7 @@ pub(super) fn prepare_superfile_with_uri(
 /// `SuperfileEntry` construction) runs in parallel across the
 /// writer pool — for an FTS supertable the bloom build alone is
 /// O(n_terms_distinct) per FTS column per shard, which at 10M
-/// docs × 4 superfiles is the dominant cost. Manifest swap +
+/// docs × 4 superfiles is the dominant cost. ManifestSnapshot swap +
 /// storage write-through stay serial after the join.
 fn finish_superfile_entry(
     entry: Arc<SuperfileEntry>,
@@ -2859,12 +2874,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .unwrap_or_else(|| "?".into()),
     );
     // Membership has settled: publish the slow-CAS entry blob and stamp its
-    // ref (the per-batch `update`s cleared it). Warn-only: the drain itself
-    // is durable, and an unstamped ref just leaves consumers on the
-    // part-loading fallback until the next maintenance pass.
-    if let Err(e) = refresh_slow_vector_state(&hidden_inner).await {
-        tracing::warn!("supertable: slow vector-state refresh after drain failed: {e}");
-    }
+    // ref (the per-batch `update`s cleared it). Hidden tables have no manifest
+    // parts, so publication is required for reopen and cannot degrade to a
+    // warning.
+    refresh_slow_vector_state(&hidden_inner).await?;
     schedule_background_storage_reclaim(Arc::clone(&hidden_inner));
     Ok(())
 }
@@ -3938,8 +3951,8 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 
 /// Storage write-through with OCC retry. Persist the new
 /// superfiles + manifest to storage, returning the new
-/// in-memory `Manifest` with the fresh `ManifestList` +
-/// `ManifestPartLoader` installed.
+/// in-memory `ManifestSnapshot` with the fresh persisted Manifest +
+/// loader installed.
 ///
 /// **OCC retry semantics.** On each iteration:
 ///  1. Reload `inner.manifest` to incorporate any commit a
@@ -3958,7 +3971,7 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 /// statically random, so a retry uses the same URIs as the
 /// prior attempt. The superfile-bytes PUT swallows
 /// `PreconditionFailed` (URI already exists with bit-identical
-/// content from our prior attempt). Manifest parts are
+/// content from our prior attempt). ManifestSnapshot parts are
 /// content-addressed; identical content yields identical URIs
 /// and the part-write path already swallows
 /// `PreconditionFailed`. Only the pointer PUT must win the
@@ -3972,7 +3985,7 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 /// and stamp its ref on the manifest list. Called after a maintenance
 /// sequence settles hidden vector membership (end of drain; end of the
 /// hidden compaction pass, after merges + finalize + any cell splits) —
-/// scoped by call site, never by a table-kind test. `Manifest::update`
+/// scoped by call site, never by a table-kind test. `ManifestSnapshot::update`
 /// cleared the ref when membership changed; this restamps it so consumers'
 /// resident centroid state is invalidated exactly once, by maintenance.
 ///
@@ -4044,10 +4057,6 @@ async fn record_hidden_deleted_ids(
     let max_retries = inner.options.max_commit_retries.max(1);
     for attempt in 0..max_retries {
         let old = inner.manifest.load_full();
-        let has_data = !old.superfiles.is_empty() || old.get_num_parts() > 0;
-        if !has_data {
-            return Ok(());
-        }
         let mut ids = hidden_deleted::deleted_user_ids(&old)
             .map_err(|e| BuildError::Store(e.to_string()))?
             .as_ref()
@@ -4093,7 +4102,7 @@ pub(in crate::supertable) async fn persist_commit_async(
     entries_to_remove: &[Arc<SuperfileEntry>],
     mut pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
     mut pending_storage_replaces: Vec<(SuperfileUri, Bytes)>,
-) -> Result<Manifest, SupertableCommitError> {
+) -> Result<ManifestSnapshot, SupertableCommitError> {
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
     let max_retries = opts.max_commit_retries.max(1);
@@ -4361,7 +4370,7 @@ async fn write_superfile_list_with_threshold(
 /// For each touched partition, the writer finds the latest
 /// existing part (if any), rebuilds it with the union of its
 /// existing superfiles + the new ones, and emits a new
-/// `ManifestListEntry` that replaces the prior one (same
+/// `ManifestPartEntry` that replaces the prior one (same
 /// `partition_key`, new `part_id` + content hash). Untouched
 /// partitions' list entries carry over verbatim — no
 /// re-encode, no PUT. A cold partition (no prior entry) gets
@@ -4382,13 +4391,13 @@ pub(crate) enum NewEntryBirthVersions {
 pub(crate) async fn try_commit_attempt(
     storage: Arc<dyn StorageProvider>,
     opts: Arc<SupertableOptions>,
-    current_manifest: Arc<Manifest>,
+    current_manifest: Arc<ManifestSnapshot>,
     new_entries: &[Arc<SuperfileEntry>],
     entries_to_remove: &[Arc<SuperfileEntry>],
     birth_versions: NewEntryBirthVersions,
     pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
     pending_storage_replaces: &mut Vec<(SuperfileUri, Bytes)>,
-) -> Result<Manifest, SupertableCommitError> {
+) -> Result<ManifestSnapshot, SupertableCommitError> {
     // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(
         &storage,
@@ -4438,9 +4447,9 @@ pub(crate) async fn try_commit_attempt(
 
 /// Re-read the manifest pointer from storage, load any newer
 /// manifest list, inherit unchanged parts from the current
-/// in-memory `Manifest` via content-addressed `Arc::clone`,
+/// in-memory `ManifestSnapshot` via content-addressed `Arc::clone`,
 /// eager-fetch newly-referenced parts, and `ArcSwap` the
-/// refreshed `Manifest` into `inner.manifest`.
+/// refreshed `ManifestSnapshot` into `inner.manifest`.
 ///
 /// Called from the OCC retry loop between attempts so the next
 /// iteration's `inner.manifest.load_full()` sees the winning
@@ -4455,7 +4464,7 @@ pub(in crate::supertable) async fn refresh_inner_state_async(
     storage: &Arc<dyn StorageProvider>,
 ) -> Result<(), SupertableCommitError> {
     let current = inner.manifest.load_full();
-    let manifest = match Manifest::load(Some(current), storage.clone(), None).await {
+    let manifest = match ManifestSnapshot::load(Some(current), storage.clone(), None).await {
         Ok(manifest) => manifest,
         Err(ManifestLoadError::PointerNotFound) => return Ok(()),
         Err(ManifestLoadError::AlreadyLoaded) => return Ok(()),

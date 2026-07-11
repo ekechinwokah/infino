@@ -2846,7 +2846,7 @@ mod tests {
         let reader = VectorReader::open(Bytes::from(blob), &json).expect("open");
         let q = vec![0.0f32; dim];
         let hits = reader
-            .search_clusters_async("emb", &q, 3, &[0, 1, 2, 3], 8, None, None)
+            .search_clusters_async("emb", &q, 3, &[0, 1, 2, 3], 8, None, None, None)
             .await
             .expect("search");
         assert_eq!(hits.len(), 3);
@@ -2923,7 +2923,16 @@ mod tests {
         allow.insert(6);
         let q = vec![0.0f32; dim];
         let hits = reader
-            .search_clusters_async("emb", &q, 3, &[0, 1, 2, 3], 8, Some(Arc::new(allow)), None)
+            .search_clusters_async(
+                "emb",
+                &q,
+                3,
+                &[0, 1, 2, 3],
+                8,
+                Some(Arc::new(allow)),
+                None,
+                None,
+            )
             .await
             .expect("filtered multi-cell search");
         assert_eq!(

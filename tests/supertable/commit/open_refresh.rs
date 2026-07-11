@@ -76,18 +76,20 @@ fn open_sees_writes_made_by_a_different_handle() {
 }
 
 #[test]
-fn open_on_fresh_tempdir_returns_pointer_unreadable() {
-    // The open-or-create trigger: no pointer exists, so
-    // open() must surface a typed error the caller can
-    // pattern-match on for fallback to Supertable::create.
+fn open_on_fresh_tempdir_returns_pointer_not_found() {
+    // The open-or-create trigger: a fresh directory has no pointer, and
+    // `create` (not raw `open`) is what persists the initial one. A raw
+    // `open` on a never-created directory must surface a typed error the
+    // caller can pattern-match on for fallback to `Supertable::create`,
+    // not silently serve an empty table.
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let err = Supertable::open(default_supertable_options().with_storage(storage))
-        .expect_err("must reject fresh dir");
+        .expect_err("fresh dir has no pointer");
     assert!(
         matches!(err, OpenError::ManifestLoadError(_)),
-        "expected PointerUnreadable, got {err:?}"
+        "expected a manifest-load error on a fresh dir, got {err:?}"
     );
 }
 

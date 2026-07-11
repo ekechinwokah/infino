@@ -22,7 +22,7 @@ mod uri;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -30,7 +30,7 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
-use datafusion::{config::Dialect, execution::context::SessionContext};
+use datafusion::{config::Dialect, error::DataFusionError};
 use futures::future::try_join_all;
 pub use index_spec::IndexSpec;
 use manifest::{
@@ -38,14 +38,14 @@ use manifest::{
 };
 pub use options::{ColdFetchMode, ConnectOptions};
 use tokio::runtime::Runtime;
+use tracing::{debug, info};
 use uri::{Backend, parse_uri};
 
 use crate::{
     InfinoError,
-    runtime_bridge::{
-        bridge_on_runtime, bridge_sync_to_async, get_or_init_query_runtime,
-        shutdown_query_runtime_on_drop,
-    },
+    config::DEFAULT_CONNECTION_BUDGET_BYTES,
+    memory::{ConnectionMemoryBudget, budgeted_session_context},
+    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     storage::{StorageError, StorageProvider},
     superfile::{
         builder::FtsConfig,
@@ -63,8 +63,8 @@ use crate::{
 ///
 /// The storage backend is derived from the URI scheme: a bare path or
 /// `file://` → local filesystem, `s3://bucket/prefix` → S3,
-/// `az://container/prefix` → Azure, `memory://` → in-process
-/// (non-persistent). Equivalent to
+/// `az://container/prefix` → Azure, `gs://bucket/prefix` → GCS,
+/// `memory://` → in-process (non-persistent). Equivalent to
 /// [`connect_with`]`(uri, ConnectOptions::default())`.
 ///
 /// ```
@@ -78,6 +78,10 @@ pub fn connect(uri: impl AsRef<str>) -> Result<Connection, InfinoError> {
 
 /// Open (or create) a catalog rooted at `uri` with explicit storage
 /// configuration (credentials / region / endpoint the URI can't carry).
+///
+/// With `ConnectOptions::with_validate(true)`, object-store backends are
+/// probed before returning, so bad credentials fail at connect rather
+/// than on the first table operation.
 ///
 /// ```
 /// use infino::{connect_with, ConnectOptions};
@@ -95,15 +99,30 @@ pub fn connect_with(
         _ => {
             let root = backend_to_provider(&backend, &options)?
                 .expect("non-memory backend yields a storage provider");
+            // Opt-in probe: fail at connect on bad credentials, not first use.
+            if options.validate {
+                bridge_sync_to_async(read_catalog(root.as_ref()))?;
+            }
             CatalogStore::Storage(root)
         }
     };
+
+    // Budget comes from `ConnectOptions`; unset falls back to the engine
+    // default (measure-only today). The `config.yaml` default takes a separate
+    // path (`apply_config`), so `connect` never reads config.
+    let connection_memory_budget = ConnectionMemoryBudget::from_budget_bytes(
+        options
+            .connection_memory_budget_bytes
+            .unwrap_or(DEFAULT_CONNECTION_BUDGET_BYTES),
+    );
+
+    debug!(backend = ?backend, validate = options.validate, "catalog connected");
     Ok(Connection {
         inner: Arc::new(ConnectionInner {
             backend,
             options,
             store,
-            query_runtime: OnceLock::new(),
+            connection_memory_budget,
         }),
     })
 }
@@ -119,22 +138,10 @@ struct ConnectionInner {
     backend: Backend,
     options: ConnectOptions,
     store: CatalogStore,
-    /// Runtime for the table-free `query_sql` fallback — search TVFs name
-    /// their table in an argument, not a `FROM` relation, so no supertable
-    /// runtime is in scope. See [`build_query_runtime`] for why it must be
-    /// multi-thread.
-    query_runtime: OnceLock<Arc<Runtime>>,
-}
-
-impl Drop for ConnectionInner {
-    /// `query_sql` builds `query_runtime` eagerly, and the sync API may be
-    /// called from inside the caller's own runtime — so dropping the last
-    /// `Connection` there must not trip tokio's "cannot drop a runtime from
-    /// within an async context" guard. `shutdown_background` consumes it
-    /// without blocking; `try_unwrap` shuts down only on the last owner.
-    fn drop(&mut self) {
-        shutdown_query_runtime_on_drop(&mut self.query_runtime);
-    }
+    /// Per-connection memory budget, minted once at `connect` and shared
+    /// (cloned `Arc`) into every table's `SupertableOptions`. See
+    /// [`crate::memory`].
+    connection_memory_budget: Arc<ConnectionMemoryBudget>,
 }
 
 /// Where the `name → table` map lives. Durable backends persist it on the
@@ -174,13 +181,21 @@ impl Connection {
 
         match &self.inner.store {
             CatalogStore::Memory(map) => {
-                let opts = build_options(schema, fts_cfg, vec_cfg, tokenizer, None)?;
+                let opts = build_options(
+                    schema,
+                    fts_cfg,
+                    vec_cfg,
+                    tokenizer,
+                    None,
+                    Arc::clone(&self.inner.connection_memory_budget),
+                )?;
                 let handle = Supertable::create(opts)?;
                 let mut map = map.lock().expect("catalog mutex poisoned");
                 if map.contains_key(name) {
                     return Err(InfinoError::AlreadyExists(name.to_string()));
                 }
                 map.insert(name.to_string(), handle.clone());
+                info!(table = name, backend = "memory", "created table");
                 Ok(handle)
             }
             CatalogStore::Storage(root) => {
@@ -221,8 +236,14 @@ impl Connection {
                 // cache directory; superfile keys carry the location, so a
                 // re-created table never reads a dropped generation's bytes.
                 let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)?;
-                let mut opts =
-                    build_options(schema, fts_cfg, vec_cfg, tokenizer, Some(table_storage))?;
+                let mut opts = build_options(
+                    schema,
+                    fts_cfg,
+                    vec_cfg,
+                    tokenizer,
+                    Some(table_storage),
+                    Arc::clone(&self.inner.connection_memory_budget),
+                )?;
                 if let Some(cache) = disk_cache {
                     opts = opts.with_disk_cache(cache);
                 }
@@ -232,14 +253,15 @@ impl Connection {
                 // catalog OCC below decides the single name winner.
                 let handle = Supertable::create(opts)?;
 
-                let name = name.to_string();
+                let name_owned = name.to_string();
                 bridge_sync_to_async(commit_catalog(root.as_ref(), move |body| {
-                    if body.tables.contains_key(&name) {
-                        return Err(InfinoError::AlreadyExists(name.clone()));
+                    if body.tables.contains_key(&name_owned) {
+                        return Err(InfinoError::AlreadyExists(name_owned.clone()));
                     }
-                    body.tables.insert(name.clone(), entry.clone());
+                    body.tables.insert(name_owned.clone(), entry.clone());
                     Ok(())
                 }))?;
+                info!(table = name, location = %location, "created table");
                 Ok(handle)
             }
         }
@@ -260,6 +282,7 @@ impl Connection {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn open_table(&self, name: &str) -> Result<Supertable, InfinoError> {
+        debug!(table = name, "opening table");
         match &self.inner.store {
             CatalogStore::Memory(map) => map
                 .lock()
@@ -302,8 +325,14 @@ impl Connection {
                 // Cache directory is keyed on the stable name, matching
                 // `create_table` (the on-storage subtree is `entry.location`).
                 let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)?;
-                let mut opts =
-                    build_options(schema, fts_cfg, vec_cfg, tokenizer, Some(table_storage))?;
+                let mut opts = build_options(
+                    schema,
+                    fts_cfg,
+                    vec_cfg,
+                    tokenizer,
+                    Some(table_storage),
+                    Arc::clone(&self.inner.connection_memory_budget),
+                )?;
                 if let Some(cache) = disk_cache {
                     opts = opts.with_disk_cache(cache);
                 }
@@ -336,6 +365,7 @@ impl Connection {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn drop_table(&self, name: &str, purge: bool) -> Result<(), InfinoError> {
+        info!(table = name, purge, "dropping table");
         match &self.inner.store {
             CatalogStore::Memory(map) => map
                 .lock()
@@ -424,7 +454,12 @@ impl Connection {
     /// ```
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
         let _foreground = ForegroundQueryGuard::enter();
-        let ctx = SessionContext::new();
+        debug!(sql, "running sql query");
+
+        // Gate SQL heap on the connection budget: DataFusion allocates the
+        // working set (sort / aggregate / join), so its pool is the gate.
+        let ctx = budgeted_session_context(&self.inner.connection_memory_budget)
+            .map_err(|e| InfinoError::Query(e.to_string()))?;
 
         // Resolve the relations the query names and register each that is a
         // catalog table. Unknown names (CTEs, search TVFs, aliases) are
@@ -468,9 +503,7 @@ impl Connection {
                 .sql(&sql)
                 .await
                 .map_err(|e| InfinoError::Query(e.to_string()))?;
-            df.collect()
-                .await
-                .map_err(|e| InfinoError::Query(e.to_string()))
+            df.collect().await.map_err(sql_exec_error)
         };
         // A query that names a `FROM` catalog table drives on that table's
         // runtime; otherwise the connection's own. The fallback still has to
@@ -482,10 +515,9 @@ impl Connection {
         }
     }
 
-    /// Runtime for the table-free `query_sql` fallback (see
-    /// [`ConnectionInner::query_runtime`]).
+    /// Runtime for the table-free `query_sql` fallback.
     fn query_runtime(&self) -> Arc<Runtime> {
-        get_or_init_query_runtime(&self.inner.query_runtime, "catalog-query")
+        shared_io_runtime()
     }
 }
 
@@ -497,12 +529,24 @@ fn build_options(
     vectors: Vec<VectorConfig>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
     storage: Option<Arc<dyn StorageProvider>>,
+    connection_memory_budget: Arc<ConnectionMemoryBudget>,
 ) -> Result<SupertableOptions, InfinoError> {
     let mut opts = SupertableOptions::new(schema, fts, vectors, tokenizer)?;
     if let Some(s) = storage {
         opts = opts.with_storage(s);
     }
+    // Set last so no builder step can reset the shared connection budget.
+    opts.connection_memory_budget = connection_memory_budget;
     Ok(opts)
+}
+
+/// Map a SQL execution error to the public error: a budget exhaustion becomes
+/// [`InfinoError::OverBudget`], anything else a generic query error.
+fn sql_exec_error(e: DataFusionError) -> InfinoError {
+    match e {
+        DataFusionError::ResourcesExhausted(msg) => InfinoError::OverBudget(msg),
+        other => InfinoError::Query(other.to_string()),
+    }
 }
 
 /// The v1 default tokenizer, required iff the spec has FTS columns.
@@ -519,28 +563,26 @@ fn backend_to_provider(
     backend: &Backend,
     options: &ConnectOptions,
 ) -> Result<Option<Arc<dyn StorageProvider>>, InfinoError> {
-    use crate::storage::{AzureStorageProvider, LocalFsStorageProvider, S3StorageProvider};
+    use crate::storage::{
+        AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
+    };
 
     let provider: Option<Arc<dyn StorageProvider>> = match backend {
         Backend::Memory => None,
         Backend::LocalFs { root } => Some(Arc::new(LocalFsStorageProvider::new(root.clone())?)),
-        Backend::S3 { bucket, prefix } => {
-            let p = match options.s3.as_ref() {
-                Some(s3) => S3StorageProvider::new_with_endpoint_and_prefix(
-                    &s3.endpoint,
-                    bucket,
-                    &s3.access_key,
-                    &s3.secret_key,
-                    &s3.region,
-                    prefix,
-                )?,
-                None => S3StorageProvider::new_with_prefix(bucket, prefix)?,
-            };
-            Some(Arc::new(p))
-        }
+        Backend::S3 { bucket, prefix } => Some(Arc::new(S3StorageProvider::new_with_prefix(
+            bucket,
+            prefix,
+            &options.storage_options,
+        )?)),
         Backend::Azure { container, prefix } => Some(Arc::new(
-            AzureStorageProvider::new_with_prefix(container, prefix)?,
+            AzureStorageProvider::new_with_prefix(container, prefix, &options.storage_options)?,
         )),
+        Backend::Gcs { bucket, prefix } => Some(Arc::new(GcsStorageProvider::new_with_prefix(
+            bucket,
+            prefix,
+            &options.storage_options,
+        )?)),
     };
     Ok(provider)
 }
@@ -652,7 +694,7 @@ fn now_unix() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{fs, path::Path, sync::Arc};
 
     use arrow_schema::{DataType, Field, Schema};
 
@@ -693,6 +735,116 @@ mod tests {
         assert!(matches!(
             conn.open_table("docs"),
             Err(InfinoError::NotFound(_))
+        ));
+    }
+
+    /// Regression: on durable storage, `open_table` on a table that was
+    /// created but never appended to must succeed and yield an empty,
+    /// usable table. `create` leaves no pointer file until the first commit,
+    /// so a fresh `open` — any reconnect (another process, a restart) before
+    /// the first append — must treat the missing pointer as an empty table
+    /// rather than failing. Previously it surfaced a "manifest load error",
+    /// and the create handle only worked because it never went through `open`.
+    #[test]
+    fn durable_open_before_first_append_yields_empty_usable_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let conn = connect(&uri).expect("connect");
+
+        // Create, but do NOT append through the returned handle.
+        let _created = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table");
+
+        // Open fresh — the reconnect path. This must not error.
+        let opened = conn
+            .open_table("docs")
+            .expect("open_table before first append");
+
+        // Starts empty.
+        let before = opened
+            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+            .expect("bm25_search on empty table");
+        assert_eq!(n_rows(&before), 0, "freshly opened table starts empty");
+
+        // Fully usable: the first commit lands through the reopened handle,
+        // then the query round-trips.
+        opened
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append via reopened handle");
+        let hits = opened
+            .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+            .expect("bm25_search after append");
+        assert_eq!(n_rows(&hits), 1, "expected one hit for 'fox' after append");
+    }
+
+    #[test]
+    fn connection_memory_budget_is_measured_by_default() {
+        let conn = connect("memory://").expect("connect");
+        assert_eq!(conn.inner.connection_memory_budget.limit(), None);
+    }
+
+    #[test]
+    fn with_connection_memory_budget_bytes_mints_a_bounded_budget_at_the_gate() {
+        let conn = connect_with(
+            "memory://",
+            ConnectOptions::new().with_connection_memory_budget_bytes(1000),
+        )
+        .expect("connect");
+        // 90% headroom gate: 1000 configured -> 900 enforced.
+        assert_eq!(conn.inner.connection_memory_budget.limit(), Some(900));
+    }
+
+    #[test]
+    fn zero_connection_memory_budget_is_measured() {
+        let conn = connect_with(
+            "memory://",
+            ConnectOptions::new().with_connection_memory_budget_bytes(0),
+        )
+        .expect("connect");
+        assert_eq!(conn.inner.connection_memory_budget.limit(), None);
+    }
+
+    #[test]
+    fn all_tables_share_one_connection_memory_budget() {
+        let conn = connect_with(
+            "memory://",
+            ConnectOptions::new().with_connection_memory_budget_bytes(1000),
+        )
+        .expect("connect");
+        let a = conn
+            .create_table("a", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create a");
+        let b = conn
+            .create_table("b", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create b");
+
+        // Every table sees the one budget the connection minted, not a copy.
+        assert!(Arc::ptr_eq(
+            &a.options().connection_memory_budget,
+            &b.options().connection_memory_budget
+        ));
+        assert!(Arc::ptr_eq(
+            &a.options().connection_memory_budget,
+            &conn.inner.connection_memory_budget
+        ));
+    }
+
+    #[test]
+    fn reopened_table_shares_the_connection_memory_budget() {
+        // open_table threads the same shared budget as create_table.
+        let conn = connect_with(
+            "memory://",
+            ConnectOptions::new().with_connection_memory_budget_bytes(1000),
+        )
+        .expect("connect");
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create");
+        let reopened = conn.open_table("docs").expect("open");
+
+        assert!(Arc::ptr_eq(
+            &reopened.options().connection_memory_budget,
+            &conn.inner.connection_memory_budget
         ));
     }
 
@@ -775,6 +927,43 @@ mod tests {
             ),
             0,
             "re-created table must not resurrect the dropped table's rows"
+        );
+    }
+
+    #[test]
+    fn create_without_append_reopens_as_empty_table() {
+        // A table created but never appended to is still durably
+        // registered in the catalog. Reopening it in a fresh connection
+        // (i.e. after a program restart) must succeed and yield an empty
+        // table — not fail because no manifest pointer was ever written.
+        // The pointer is only written on the first commit, so `create`
+        // alone leaves the physical table with a catalog entry but no
+        // `_supertable/current`; open must tolerate that the same way
+        // `create` does when it probes and finds no pointer.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        {
+            let conn = connect(&uri).expect("connect");
+            conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+                .expect("create");
+            // No append/commit: the manifest pointer is never written.
+        }
+
+        // Reopen in a fresh connection, simulating a program restart.
+        let conn = connect(&uri).expect("reconnect");
+        assert_eq!(conn.list_tables().expect("list"), vec!["docs".to_string()]);
+        let docs = conn
+            .open_table("docs")
+            .expect("open a created-but-empty table");
+        assert_eq!(
+            n_rows(
+                &docs
+                    .bm25_search("title", "fox", TOP_K, BoolMode::Or, None)
+                    .expect("search")
+            ),
+            0,
+            "a created-but-empty table has no hits"
         );
     }
 
@@ -865,6 +1054,85 @@ mod tests {
             .map(|b| b.num_rows())
             .sum();
         assert_eq!(rows, 3, "2 from docs + 1 from more");
+    }
+
+    // Many distinct group keys force DataFusion's aggregate to build a real
+    // hash table, so its memory pool (the connection budget) is exercised.
+    fn many_distinct_titles() -> Vec<String> {
+        (0..4000)
+            .map(|i| format!("distinct title number {i} with some filler text"))
+            .collect()
+    }
+
+    fn append_titles(conn: &Connection) -> usize {
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create");
+        let titles = many_distinct_titles();
+        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        docs.append(&build_title_batch(&refs)).expect("append");
+        titles.len()
+    }
+
+    const HEAVY_GROUP_BY: &str = "SELECT title, COUNT(*) AS n FROM docs GROUP BY title";
+
+    #[test]
+    fn query_sql_under_measure_only_default_is_never_refused() {
+        // Default budget only measures, so even a heavy aggregate runs.
+        let conn = connect("memory://").expect("connect");
+        let n = append_titles(&conn);
+        let out = conn
+            .query_sql(HEAVY_GROUP_BY)
+            .expect("measure-only never refuses");
+        assert_eq!(n_rows(&out), n);
+    }
+
+    #[test]
+    fn query_sql_under_a_generous_budget_succeeds() {
+        // 1 GiB is far more than the query needs, so the gate never trips.
+        let conn = connect_with(
+            "memory://",
+            ConnectOptions::new().with_connection_memory_budget_bytes(1 << 30),
+        )
+        .expect("connect");
+        let n = append_titles(&conn);
+        let out = conn.query_sql(HEAVY_GROUP_BY).expect("well under 1 GiB");
+        assert_eq!(n_rows(&out), n);
+    }
+
+    #[test]
+    fn query_sql_over_a_tiny_budget_is_refused_as_over_budget() {
+        // 0-byte gate: the aggregate can't reserve its first byte, and spilling
+        // needs memory it doesn't have, so it's refused as OverBudget.
+        let conn = connect_with(
+            "memory://",
+            ConnectOptions::new().with_connection_memory_budget_bytes(1),
+        )
+        .expect("connect");
+        append_titles(&conn);
+        let err = conn
+            .query_sql(HEAVY_GROUP_BY)
+            .expect_err("a 0-byte gate refuses the aggregate");
+        assert!(
+            matches!(err, InfinoError::OverBudget(_)),
+            "expected OverBudget, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn query_sql_streaming_scan_is_not_refused_under_a_tiny_budget() {
+        // A projection streams (no buffering), so it reserves nothing and runs
+        // even at a 0-byte gate: the budget bounds sort/aggregate/join, not scans.
+        let conn = connect_with(
+            "memory://",
+            ConnectOptions::new().with_connection_memory_budget_bytes(1),
+        )
+        .expect("connect");
+        let n = append_titles(&conn);
+        let out = conn
+            .query_sql("SELECT title FROM docs")
+            .expect("a streaming scan is not gated");
+        assert_eq!(n_rows(&out), n);
     }
 
     #[test]
@@ -1123,6 +1391,20 @@ mod tests {
     fn connect_with_default_options_yields_empty_memory_catalog() {
         let db = connect_with("memory://", ConnectOptions::new()).expect("connect_with");
         assert!(db.list_tables().expect("list").is_empty());
+    }
+
+    #[test]
+    fn connect_does_not_probe_by_default() {
+        // Default (validate off): a bogus bucket builds a provider but the
+        // backend is never touched, so connect succeeds without network.
+        connect("s3://no-such-bucket-xyzzy/prefix").expect("offline connect by default");
+    }
+
+    #[test]
+    fn connect_gcs_uri_builds_offline() {
+        // Provider construction must not dial GCS — connect is offline until
+        // the first table op, exactly like the S3 case.
+        connect("gs://no-such-bucket-xyzzy/prefix").expect("offline gcs connect by default");
     }
 
     #[test]

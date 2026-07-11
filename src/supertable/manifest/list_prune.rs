@@ -3,14 +3,14 @@
 
 //! List-level skip pruning — reader-side.
 //!
-//! Walks a [`ManifestList`]'s `parts` and applies the
-//! aggregate skip tests in [`ManifestListEntry`] to identify
+//! Walks a `Manifest`'s `parts` and applies the
+//! aggregate skip tests in [`ManifestPartEntry`] to identify
 //! candidate parts for a given query shape. Survivors are
 //! the parts the query layer should load (via
-//! [`Manifest::part`]) for per-superfile pruning.
+//! [`ManifestSnapshot::part`]) for per-superfile pruning.
 //!
 //! These functions are standalone — they don't depend on
-//! the in-memory `Manifest` or its `ManifestPartLoader`.
+//! the in-memory `ManifestSnapshot` or its `ManifestPartLoader`.
 //! That keeps them testable in isolation and lets the
 //! query-layer integration choose its own loading shape.
 //!
@@ -27,15 +27,15 @@
 //!   pre-aggregate manifests, or entries where a particular
 //!   column has no info).
 //!
-//! [`Manifest`]: super::Manifest
-//! [`Manifest::part`]: super::Manifest::part
-//! [`ManifestList`]: super::list::ManifestList
-//! [`ManifestListEntry`]: super::list::ManifestListEntry
+//! [`ManifestSnapshot`]: super::ManifestSnapshot
+//! [`ManifestSnapshot::part`]: super::ManifestSnapshot::part
+//! [`Manifest`]: super::list::Manifest
+//! [`ManifestPartEntry`]: super::list::ManifestPartEntry
 
 use crate::{
     superfile::fts::reader::BoolMode,
     supertable::manifest::{
-        list::{ManifestList, ManifestPartEntry},
+        list::{Manifest, ManifestPartEntry},
         part::PartId,
     },
 };
@@ -47,7 +47,7 @@ use crate::{
 /// Parts without an `fts_summary_agg` entry for this column
 /// (no info) survive — same "always-keep" treatment the
 /// list-level pruner gives to missing aggregates.
-pub fn prune_parts_for_fts_prefix(list: &ManifestList, column: &str, prefix: &[u8]) -> Vec<PartId> {
+pub fn prune_parts_for_fts_prefix(list: &Manifest, column: &str, prefix: &[u8]) -> Vec<PartId> {
     let upper = prefix_upper_bound(prefix);
     list.parts
         .iter()
@@ -123,7 +123,7 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 /// overlap on prefix queries) and superfile-level
 /// `fts_bloom_skip` (applied after a part is loaded).
 pub fn prune_parts_for_fts_terms(
-    list: &ManifestList,
+    list: &Manifest,
     column: &str,
     query_terms: &[&str],
     mode: BoolMode,
@@ -169,11 +169,7 @@ fn part_matches_terms(
 /// injected `_id` column), so this is the type-specialized
 /// hot path for `WHERE _id BETWEEN ? AND ?`. For other
 /// scalar columns, use [`prune_parts_for_scalar_min_max_bytes`].
-pub fn prune_parts_for_id_range(
-    list: &ManifestList,
-    query_min: i128,
-    query_max: i128,
-) -> Vec<PartId> {
+pub fn prune_parts_for_id_range(list: &Manifest, query_min: i128, query_max: i128) -> Vec<PartId> {
     list.parts
         .iter()
         .filter_map(|entry| {
@@ -293,8 +289,8 @@ mod tests {
         }
     }
 
-    fn list_with(entries: Vec<ManifestPartEntry>) -> ManifestList {
-        ManifestList {
+    fn list_with(entries: Vec<ManifestPartEntry>) -> Manifest {
+        Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: FORMAT_VERSION.into(),

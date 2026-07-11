@@ -15,7 +15,7 @@
 //!     parts, open populates empty `OnceCell`s only — no
 //!     part bytes fetched. `superfile_list.superfiles` stays
 //!     empty until the hierarchical query path lands.
-//!   - **First `Manifest::part(id).await` lazy-loads
+//!   - **First `ManifestSnapshot::part(id).await` lazy-loads
 //!     one.** Single storage GET for that part; the
 //!     OnceCell stays populated for subsequent calls (no
 //!     re-fetch on the second call).
@@ -134,7 +134,7 @@ fn many_parts_skip_eager_fetch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manifest_part_lazy_loads_on_first_access() {
     // Same setup as above (5 parts, lazy mode). Calling
-    // `Manifest::part(id).await` on a specific part should
+    // `ManifestSnapshot::part(id).await` on a specific part should
     // load exactly that one part. A second call on the
     // same part should be a OnceCell hit (no second
     // storage GET — verifiable by checking the OnceCell is

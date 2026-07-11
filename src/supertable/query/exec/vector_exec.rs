@@ -546,7 +546,7 @@ mod tests {
             builder::{FtsConfig, VectorConfig},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
-        supertable::{Supertable, SupertableOptions, manifest::Manifest},
+        supertable::{Supertable, SupertableOptions, manifest::ManifestSnapshot},
         test_helpers::default_tokenizer as tok,
     };
 
@@ -797,7 +797,7 @@ mod tests {
                 Arc::new(shifted)
             })
             .collect();
-        let altered = Manifest::new(
+        let altered = ManifestSnapshot::new(
             manifest.manifest_id,
             Arc::clone(&manifest.options),
             entries,

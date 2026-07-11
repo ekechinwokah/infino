@@ -153,7 +153,7 @@ pub enum CommitError {
     #[error("build error during commit")]
     Build(#[from] BuildError),
 
-    /// Manifest error
+    /// ManifestSnapshot error
     #[error("manifest error: {0}")]
     ManifestError(#[from] ManifestError),
 
@@ -197,7 +197,7 @@ pub enum ManifestError {
     /// and committing would silently overwrite that assignment.
     #[error("superfile entry already partitioned: {detail}")]
     EntryAlreadyPartitioned { detail: String },
-    /// Manifest load error
+    /// ManifestSnapshot load error
     #[error("manifest load error: {0}")]
     ManifestLoadError(#[from] ManifestLoadError),
     /// Unknown part id
@@ -221,15 +221,15 @@ pub enum OpenError {
     #[error("pointer file missing or unreadable")]
     PointerUnreadable(#[source] crate::storage::StorageError),
 
-    /// Manifest list parse failed.
+    /// ManifestSnapshot list parse failed.
     #[error("manifest list parse failed")]
     ManifestListParse(String),
 
-    /// Manifest load error.
+    /// ManifestSnapshot load error.
     #[error("manifest load error")]
     ManifestLoadError(#[from] ManifestLoadError),
 
-    /// Manifest part load or parse failed during open or
+    /// ManifestSnapshot part load or parse failed during open or
     /// refresh.
     #[error("manifest part load failed: {part_id}")]
     ManifestPartLoad {
@@ -290,6 +290,8 @@ pub enum OptimizeError {
     Refresh(String),
     #[error("optimize already in progress on this handle")]
     AlreadyRunning,
+    #[error("gc failed during optimize: {0}")]
+    Gc(#[from] GcError),
 }
 
 impl From<CompactionError> for OptimizeError {
@@ -392,11 +394,17 @@ pub enum QueryError {
     #[error("error reading parquet bytes during scan: {0}")]
     Parquet(String),
 
+    #[error("invalid query: {0}")]
+    InvalidQuery(String),
+
     #[error("DataFusion failed to plan the query: {0}")]
     Plan(String),
 
     #[error("DataFusion failed to execute the query: {0}")]
     Execute(String),
+
+    #[error("query exceeded the connection memory budget: {0}")]
+    OverBudget(String),
 
     #[error("manifest load error: {0}")]
     ManifestLoad(ManifestLoadError),

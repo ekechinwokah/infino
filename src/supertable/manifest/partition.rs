@@ -11,6 +11,8 @@
 //! different partitions go into separate parts so a
 //! single-partition commit rewrites exactly one part.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use crate::supertable::{
     error::{CommitError, ManifestError},
     handle::INCOMING_VECTOR_CELL,
@@ -18,7 +20,7 @@ use crate::supertable::{
 };
 
 /// Opaque partition identifier. Encoded into
-/// `SuperfileEntry.partition_key` + `ManifestListEntry.partition_key`
+/// `SuperfileEntry.partition_key` + `ManifestPartEntry.partition_key`
 /// for the manifest layer; the writer uses this typed shape
 /// in-memory to group superfiles before encoding.
 ///
@@ -41,7 +43,7 @@ pub enum PartitionKey {
 }
 
 /// Encode a `PartitionKey` to its on-disk bytes — the shape
-/// `SuperfileEntry.partition_key` and `ManifestListEntry.partition_key`
+/// `SuperfileEntry.partition_key` and `ManifestPartEntry.partition_key`
 /// carry: 8-byte LE u64 for TimeRange, 4-byte LE u32 for
 /// Hash, 2-byte LE u16 for ColumnRange.
 pub fn encode_partition_key(key: &PartitionKey) -> Vec<u8> {
@@ -97,6 +99,15 @@ pub fn decode_partition_key(
                 ))
             })?;
             Ok(PartitionKey::VectorCell(u32::from_le_bytes(arr)))
+        }
+        PartitionStrategy::IngestionTime { .. } => {
+            let arr: [u8; 8] = bytes.try_into().map_err(|_| {
+                CommitError::PointerParse(format!(
+                    "IngestionTime partition_key must be 8 bytes; got {}",
+                    bytes.len()
+                ))
+            })?;
+            Ok(PartitionKey::TimeRange(u64::from_le_bytes(arr)))
         }
     }
 }
@@ -241,6 +252,24 @@ pub fn assign_partition(
                 }
             }
             Ok(PartitionKey::VectorCell(hint))
+        }
+        PartitionStrategy::IngestionTime { granularity_secs } => {
+            if *granularity_secs <= 0 {
+                return Err(ManifestError::SuperfileSpansPartition {
+                    detail: format!(
+                        "IngestionTime granularity_secs must be > 0; got {granularity_secs}"
+                    ),
+                });
+            }
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| ManifestError::SuperfileSpansPartition {
+                    detail: "failed to get current system time".into(),
+                })?
+                .as_secs() as i64;
+            let g = *granularity_secs;
+            let bucket = now.div_euclid(g);
+            Ok(PartitionKey::TimeRange(bucket as u64))
         }
     }
 }

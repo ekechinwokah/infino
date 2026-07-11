@@ -1299,7 +1299,7 @@ pub fn cold_from_timings(cold: &HashMap<&'static str, ColdTiming>) -> Vec<ColdQu
 pub fn warm_from_fts(stats: &[FtsQueryStat]) -> Vec<WarmQueryCost> {
     stats
         .iter()
-        .map(|s| (s.name.to_string(), s.p50.as_secs_f64(), s.cpu_s))
+        .map(|s| (s.name.to_string(), s.warm.p50.as_secs_f64(), s.cpu_s))
         .collect()
 }
 
@@ -1310,7 +1310,7 @@ pub fn warm_from_sql(sets: &QuerySets) -> Vec<WarmQueryCost> {
         .chain(&sets.tvf)
         .chain(&sets.fts_pushdown)
         .chain(&sets.agg_idx)
-        .map(|s| (s.name.to_string(), s.p50.as_secs_f64(), s.cpu_s))
+        .map(|s| (s.name.to_string(), s.warm.p50.as_secs_f64(), s.cpu_s))
         .collect()
 }
 
@@ -1324,7 +1324,7 @@ pub fn warm_from_vector(rows: &[RecallRow]) -> Vec<WarmQueryCost> {
                 } else {
                     format!("{} ({})", r.target, r.params)
                 };
-                (label, w.p50_ns / 1e9, w.cpu_s)
+                (label, w.warm.p50.as_secs_f64(), w.cpu_s)
             })
         })
         .collect()

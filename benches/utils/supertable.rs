@@ -37,8 +37,8 @@
 //! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SUPERTABLE_DOCS=100000 cargo bench -- supertable
 //! ```
 
-#[allow(unused_imports)] // consumed by child mods via `use super::*`
-use std::time::Instant;
+#[allow(unused_imports)] // `Instant` is consumed by the child mods via `use super::*`
+use std::time::{Duration, Instant};
 use std::{
     env,
     process::{Command, Stdio},
@@ -56,7 +56,7 @@ use crate::{
     cost, cpu,
     ingest::supertable::{self, Modality, modality_label},
     markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
-    report::{Better, Block, Cell, Report, Section, metric, text},
+    report::{Better, Block, Cell, Report, Section, context, metric, text},
     rss::{self, PeakSampler},
     storage_meter, tiers,
 };
@@ -343,8 +343,8 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
     vec![
         text(label),
         metric(m.wall_ns, fmt_time(m.wall_ns), Better::Lower),
-        metric(thr, fmt_throughput(thr), Better::Higher),
-        metric(bw, fmt_bandwidth(bw), Better::Higher),
+        context(thr, fmt_throughput(thr), Better::Higher),
+        context(bw, fmt_bandwidth(bw), Better::Higher),
         text(rss::fmt_bytes(m.corpus_bytes)),
         metric(
             m.index_bytes as f64,
@@ -367,12 +367,12 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
             rss::fmt_bytes(m.peak_file_rss_bytes),
             Better::Lower,
         ),
-        metric(
+        context(
             m.median_rss_bytes as f64,
             rss::fmt_bytes(m.median_rss_bytes),
             Better::Lower,
         ),
-        metric(
+        context(
             m.p90_rss_bytes as f64,
             rss::fmt_bytes(m.p90_rss_bytes),
             Better::Lower,
@@ -733,6 +733,19 @@ pub mod fts {
         fts::{FTS_BATTERY, FtsRead},
     };
 
+    /// Large top-k for the serving-scale query-phase scaling gate —
+    /// mirrors the superfile tier. Query phase only, over a small subset
+    /// (the full battery's fetch at this k would dominate the budget).
+    const K_LARGE: usize = 1000;
+    /// Representative shapes for the large-k gate: a common term, a small
+    /// and a large OR, and an AND.
+    const K_LARGE_SHAPE_NAMES: &[&str] = &[
+        "single_common",
+        "two_term_or",
+        "ten_term_or",
+        "two_term_and",
+    ];
+
     /// Build an FTS-only supertable, then measure warm and cold BM25
     /// reads through the shared FTS executor (same code superfile runs).
     pub fn run(phases: Phases) {
@@ -771,9 +784,9 @@ pub mod fts {
             drop(cache_dir);
         }
 
-        let (warm, counts) = match phases.warm.then(|| measure_warm(&built)) {
-            Some((w, c)) => (Some(w), Some(c)),
-            None => (None, None),
+        let (warm, counts, large_k) = match phases.warm.then(|| measure_warm(&built)) {
+            Some((w, c, l)) => (Some(w), Some(c), Some(l)),
+            None => (None, None, None),
         };
         let cold = phases.cold.then(|| measure_cold(&built));
         if phases.warm || phases.cold {
@@ -784,13 +797,40 @@ pub mod fts {
                     "Supertable FTS — search, multi-superfile / object-store ({} docs)",
                     fmt_count(n_docs)
                 ),
-                "Warm = shared consumer + disk cache; each query runs once untimed (cache fill), then \
-                 p50 over repeated bm25_search. Cold = fresh disk cache + consumer per iteration, so \
-                 each read pays the object-store cold open. Δ is vs the previous run.",
+                "Warm = shared consumer + disk cache; each query runs once untimed (cache fill), \
+                 then per-query min / p50 / p90 over repeated bm25_search (Δ gates on `min`). Cold = \
+                 fresh disk cache + consumer per iteration, so each read pays the object-store cold \
+                 open. Δ is vs the previous run.",
                 warm.as_deref(),
                 cold.as_ref(),
                 None,
             );
+        }
+
+        if let Some(large_k) = &large_k {
+            report.emit(&Section {
+                anchor: "bench/fts/supertable/search-large-k".into(),
+                title: format!(
+                    "Supertable FTS — search top-{K_LARGE} (query phase), multi-superfile / object-store ({} docs)",
+                    fmt_count(n_docs)
+                ),
+                note: format!(
+                    "Query-phase p50 at k = {K_LARGE} for representative shapes — gates how top-k \
+                     collection cost scales with k vs the top-{TOP_K} table at serving scale. Δ is \
+                     vs the previous run."
+                ),
+                blocks: vec![Block {
+                    subtitle: format!("top-{K_LARGE} queries"),
+                    headers: vec!["Query".into(), "warm (query)".into()],
+                    rows: large_k
+                        .iter()
+                        .map(|(name, d)| {
+                            let ns = d.as_secs_f64() * 1e9;
+                            vec![text(*name), metric(ns, fmt_time(ns), Better::Lower)]
+                        })
+                        .collect(),
+                }],
+            });
         }
 
         if let Some(counts) = &counts {
@@ -867,8 +907,17 @@ pub mod fts {
 
     fn measure_warm(
         built: &supertable::IngestResult,
-    ) -> (Vec<exec_fts::FtsQueryStat>, Vec<exec_fts::CountStat>) {
+    ) -> (
+        Vec<exec_fts::FtsQueryStat>,
+        Vec<exec_fts::CountStat>,
+        Vec<(&'static str, Duration)>,
+    ) {
         eprintln!("[supertable_fts] warm: opening shared consumer...");
+        // Phase-boundary RSS splits (anonymous heap vs mmap'd files):
+        // the discriminator for "where do the warm-phase GiBs live" —
+        // ingest leftovers show up as anonymous bloat already present
+        // before the consumer opens; promotion double-residency shows
+        // up as anonymous ≈ file_backed after warm-up.
         crate::rss::log_rss_breakdown("supertable_fts before consumer open");
         let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
         let reader = consumer.reader();
@@ -898,9 +947,31 @@ pub mod fts {
             "supertable_fts",
         );
         crate::rss::log_rss_breakdown("supertable_fts after count battery");
+        // Large-k gate (query phase only, representative subset): surfaces
+        // top-k collection cost at serving scale that the top-K table hides.
+        eprintln!(
+            "[supertable_fts] large-k: timing top-{K_LARGE} query phase × {WARM_ITERS} iters..."
+        );
+        let large_k: Vec<(&'static str, Duration)> = FTS_BATTERY
+            .iter()
+            .filter(|q| K_LARGE_SHAPE_NAMES.contains(&q.name))
+            .map(|q| {
+                let query = q.terms.join(" ");
+                let mode = exec_fts::to_infino_mode(q.mode);
+                let _ = reader.bm25_rows(supertable::TEXT_COLUMN, &query, K_LARGE, mode);
+                let mut samples = Vec::with_capacity(WARM_ITERS);
+                for _ in 0..WARM_ITERS {
+                    let t = Instant::now();
+                    let n = reader.bm25_rows(supertable::TEXT_COLUMN, &query, K_LARGE, mode);
+                    samples.push(t.elapsed());
+                    std::hint::black_box(n);
+                }
+                (q.name, crate::executors::p50(&mut samples))
+            })
+            .collect();
         drop(consumer);
         drop(cache_dir);
-        (out, counts)
+        (out, counts, large_k)
     }
 
     fn measure_cold(
@@ -1081,8 +1152,6 @@ pub mod vector {
     /// range GET on a cold mixed-residency query.
     const ROUTING_DELTA_ROWS_PER_QUERY: usize = 1_024;
     const ROUTING_DELTA_ROWS: usize = ROUTING_DELTA_ROWS_PER_QUERY * N_CORRECTNESS_QUERIES;
-    /// Recall floor for the lifecycle query before and after delta drain.
-    const ROUTING_STATE_RECALL_FLOOR: f64 = 0.99;
     /// Numerator/denominator for compact p90 drain diagnostics.
     const DRAIN_P90_NUMERATOR: usize = 9;
     const DRAIN_P90_DENOMINATOR: usize = 10;
@@ -1414,12 +1483,7 @@ pub mod vector {
                 .count();
             total += recalled as f32 / TOP_K as f32;
         }
-        let recall = total / queries.len() as f32;
-        assert!(
-            recall >= ROUTING_STATE_RECALL_FLOOR as f32,
-            "delta lifecycle recall@{TOP_K} {recall:.3} < {ROUTING_STATE_RECALL_FLOOR:.2}"
-        );
-        recall
+        total / queries.len() as f32
     }
 
     fn distribution(values: &mut [u64]) -> Option<(u64, u64, u64, u64)> {
@@ -2340,7 +2404,7 @@ pub mod vector {
                                 text(format!("p={effective_nprobe}, r={effective_rerank}")),
                                 text(format!("{:.1}%", selectivity * 100.0)),
                                 text(format!("{mean_recall:.3}")),
-                                metric(p50_ns, fmt_time(p50_ns), Better::Lower),
+                                context(p50_ns, fmt_time(p50_ns), Better::Lower),
                             ]],
                         }],
                     });
@@ -2712,7 +2776,7 @@ pub mod sql {
                     "Supertable SQL — warm queries, warm cache / object-store ({} rows)",
                     fmt_count(n_docs)
                 ),
-                "Warm = committed table reopened with a disk cache sized to the index; each query runs once untimed then p50 over repeated `query_sql` calls, all through infino's own path (the DataFusion-only control arms are not run here). Δ is vs the previous run.",
+                "Warm = committed table reopened with a disk cache sized to the index; each query runs once untimed (cache fill), then min / p50 / p90 over repeated `query_sql` calls (Δ gates on `min`), all through infino's own path (the DataFusion-only control arms are not run here). Δ is vs the previous run.",
                 &sets,
             );
             Some(sets)

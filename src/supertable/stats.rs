@@ -15,7 +15,7 @@
 //!
 //! ## Scope
 //!
-//! - Manifest-side counters: pinned version, live superfile
+//! - ManifestSnapshot-side counters: pinned version, live superfile
 //!   count, manifest-part counts (referenced + hydrated).
 //! - Process-level memory: OS-reported RSS.
 //! - Disk-cache aggregates (when a cache is attached): mmap
@@ -33,7 +33,7 @@
 /// Returned by-value; callers can clone or destructure freely.
 #[derive(Debug, Clone, Default)]
 pub struct SupertableStats {
-    // ---- Manifest-side observables ---------------------------------
+    // ---- ManifestSnapshot-side observables ---------------------------------
     /// Current pinned `manifest_id`. Monotonically increasing
     /// across commits; `0` for a freshly `create`'d supertable
     /// with no commits.
@@ -45,7 +45,7 @@ pub struct SupertableStats {
     pub n_superfiles: usize,
 
     /// Number of manifest parts referenced in the currently
-    /// pinned [`crate::supertable::manifest::list::ManifestList`].
+    /// pinned persisted Manifest.
     pub n_manifest_parts: usize,
 
     /// Number of manifest parts that have been hydrated in
