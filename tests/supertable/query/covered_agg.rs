@@ -160,8 +160,14 @@ fn aligned_range_aggregates_use_covered_residual_and_stay_exact() {
         "avg {got_avg} vs {expected_avg}"
     );
 
-    // The rewrite fired: plans aggregate the residual partials.
-    for sql in [&count_sql, &sum_sql, &min_sql, &max_sql, &avg_sql] {
+    // Exact low-cardinality counts fold all the way to a literal. The other
+    // aggregate kinds use the covered/residual plan.
+    let count_plan = explain(&st, &count_sql);
+    assert!(
+        !count_plan.contains("DataSourceExec") && !count_plan.contains("Parquet"),
+        "count should fold without a scan; plan was:\n{count_plan}"
+    );
+    for sql in [&sum_sql, &min_sql, &max_sql, &avg_sql] {
         let plan = explain(&st, sql);
         assert!(
             plan.contains("__resid_0"),
@@ -230,8 +236,13 @@ fn boundary_cutting_range_mixes_covered_and_residual_exactly() {
 
     let plan = explain(&st, &count_sql);
     assert!(
-        plan.contains("__resid_0"),
-        "boundary-cutting range should still rewrite (covered middle); plan was:\n{plan}"
+        !plan.contains("DataSourceExec") && !plan.contains("Parquet"),
+        "exact count frequencies should eliminate the boundary scan; plan was:\n{plan}"
+    );
+    let sum_plan = explain(&st, &sum_sql);
+    assert!(
+        sum_plan.contains("__resid_0"),
+        "SUM still needs the covered/residual boundary scan; plan was:\n{sum_plan}"
     );
 }
 

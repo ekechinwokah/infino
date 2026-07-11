@@ -4,9 +4,10 @@
 //! Covered/residual evaluation for filter-aligned aggregates over the
 //! manifest-statistics "aggregation tree".
 //!
-//! For an ungrouped aggregate whose `WHERE` clause is a single-column
-//! range, the manifest already knows each segment's bounds for that
-//! column. Segments fall into three classes:
+//! Exact low-cardinality frequencies answer `COUNT(*)` over a
+//! single-column equality/range and `GROUP BY column, COUNT(*)` directly.
+//! Other ungrouped aggregates whose `WHERE` clause is a single-column range
+//! use the manifest's segment bounds. Segments fall into three classes:
 //!
 //!   * **disjoint** — bounds outside the range: contribute nothing;
 //!   * **covered** — bounds fully inside the range AND tombstone-free
@@ -39,7 +40,8 @@
 //!     boundary;
 //!   * a covered segment missing a required stat demotes to boundary;
 //!   * only `COUNT(*)`, `SUM`, `MIN`, `MAX`, `AVG` over bare columns,
-//!     no DISTINCT / FILTER / ORDER BY, no GROUP BY;
+//!     no DISTINCT / FILTER / ORDER BY; the sole grouped shape is one
+//!     low-cardinality column plus `COUNT(*)`;
 //!   * a provider already restricted to a segment subset is the
 //!     rewrite's own residual — never rewritten again (idempotency).
 
@@ -54,14 +56,16 @@ use datafusion::{
     error::{DataFusionError, Result as DfResult},
     functions::core::expr_fn::{coalesce, greatest, least},
     functions_aggregate::expr_fn::{count, max, min, sum},
-    logical_expr::{Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, TableScan, lit},
+    logical_expr::{
+        Aggregate, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, TableScan, lit,
+    },
     optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder},
     prelude::{cast, col},
 };
 use uuid::Uuid;
 
 use crate::supertable::{
-    manifest::{SuperfileEntry, add_sum_arrays},
+    manifest::{SuperfileEntry, add_sum_arrays, list::ScalarValueCounts},
     options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
     query::provider::SupertableProvider,
 };
@@ -130,6 +134,9 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     let LogicalPlan::Aggregate(agg) = plan else {
         return Ok(None);
     };
+    if let Some(rewritten) = rewrite_grouped_count_from_value_counts(agg)? {
+        return Ok(Some(rewritten));
+    }
     if !agg.group_expr.is_empty() {
         return Ok(None);
     }
@@ -216,6 +223,21 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         return Ok(None);
     };
     let id_column = manifest.options.id_column.as_str();
+
+    if matches!(kinds.as_slice(), [AggKind::CountStar])
+        && superfiles
+            .iter()
+            .all(|entry| provider.entry_is_clean(entry))
+        && let Some(value_counts) = provider.exact_value_counts(&range.column)
+        && let Some(count) = count_range_from_value_counts(&value_counts, &range)
+    {
+        let name = agg.schema.field(0).name().clone();
+        return Ok(Some(
+            LogicalPlanBuilder::empty(true)
+                .project(vec![lit(count).alias(name)])?
+                .build()?,
+        ));
+    }
 
     // Classify every segment.
     let mut covered: Vec<&Arc<SuperfileEntry>> = Vec::new();
@@ -333,6 +355,94 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
 
     let rewritten = builder.project(final_exprs)?.build()?;
     Ok(Some(rewritten))
+}
+
+fn rewrite_grouped_count_from_value_counts(aggregate: &Aggregate) -> DfResult<Option<LogicalPlan>> {
+    let [Expr::Column(group_column)] = aggregate.group_expr.as_slice() else {
+        return Ok(None);
+    };
+    let Some(kinds) = parse_aggregates(&aggregate.aggr_expr) else {
+        return Ok(None);
+    };
+    if !matches!(kinds.as_slice(), [AggKind::CountStar]) {
+        return Ok(None);
+    }
+    let Some(scan) = peel_unfiltered_scan(aggregate.input.as_ref()) else {
+        return Ok(None);
+    };
+    let Some(provider) = provider_of(scan) else {
+        return Ok(None);
+    };
+    if provider.is_segment_restricted() {
+        return Ok(None);
+    }
+    let Some(superfiles) = provider.manifest().complete_flat_superfiles() else {
+        return Ok(None);
+    };
+    if !superfiles.iter().all(|entry| {
+        provider.entry_is_clean(entry)
+            && entry
+                .scalar_stats
+                .get(&group_column.name)
+                .is_some_and(|stats| stats.null_count == Some(0))
+    }) {
+        return Ok(None);
+    }
+
+    let Some(value_counts) = provider.exact_value_counts(&group_column.name) else {
+        return Ok(None);
+    };
+    let mut rows = Vec::with_capacity(value_counts.entries().len());
+    for (value, count) in value_counts.entries() {
+        let Ok(count) = i64::try_from(*count) else {
+            return Ok(None);
+        };
+        rows.push(vec![lit(value.clone()), lit(count)]);
+    }
+    let aliases: Vec<Expr> = aggregate
+        .schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| col(format!("column{}", index + 1)).alias(field.name()))
+        .collect();
+    Ok(Some(
+        LogicalPlanBuilder::values_with_schema(rows, &aggregate.schema)?
+            .project(aliases)?
+            .alias(scan.table_name.clone())?
+            .build()?,
+    ))
+}
+
+fn count_range_from_value_counts(
+    value_counts: &ScalarValueCounts,
+    range: &RangeFilter,
+) -> Option<i64> {
+    let mut total = 0u64;
+    for (value, count) in value_counts.entries() {
+        if value_matches_range(value, range)? {
+            total = total.checked_add(*count)?;
+        }
+    }
+    i64::try_from(total).ok()
+}
+
+fn value_matches_range(value: &ScalarValue, range: &RangeFilter) -> Option<bool> {
+    if let Some(lo) = &range.lo {
+        let bound = lo.value.cast_to(&value.data_type()).ok()?;
+        let ordering = value.partial_cmp(&bound)?;
+        if ordering == Ordering::Less || (ordering == Ordering::Equal && !lo.inclusive) {
+            return Some(false);
+        }
+    }
+    if let Some(hi) = &range.hi {
+        let bound = hi.value.cast_to(&value.data_type()).ok()?;
+        let ordering = value.partial_cmp(&bound)?;
+        if ordering == Ordering::Greater || (ordering == Ordering::Equal && !hi.inclusive) {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 /// Covered-side partial state per aggregate output.

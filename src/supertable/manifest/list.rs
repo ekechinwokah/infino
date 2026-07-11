@@ -15,12 +15,18 @@
 //!
 //! [`ManifestPart`]: super::part::ManifestPart
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, HashMap},
+};
 
 use arrow::compute::concat;
-use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
+use arrow_array::{
+    Array, ArrayRef, Int64Array, LargeStringArray, RecordBatch, StringArray, UInt64Array,
+};
 use arrow_schema::{DataType, Schema};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use datafusion::scalar::ScalarValue;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -31,7 +37,7 @@ use crate::supertable::manifest::{
     column_hll, column_min_max, column_sum,
     encoding::{
         DecodeError, EncodeError, decode_cluster_centroids, decode_length1_array,
-        encode_cluster_centroids, encode_length1_array,
+        decode_value_counts, encode_cluster_centroids, encode_length1_array, encode_value_counts,
     },
     hll::HllSketch,
     merge_min_max_arrays,
@@ -48,6 +54,10 @@ use crate::supertable::manifest::{
 pub const FORMAT_VERSION: &str = "1.0";
 /// Reserved list-aggregate key carrying each part's superfile birth range.
 pub(crate) const BIRTH_VERSION_AGGREGATE_COLUMN: &str = "__infino_birth_version";
+/// Maximum distinct values retained as an exact per-column frequency table.
+/// Columns crossing the cap carry no table, so high-cardinality data has
+/// bounded manifest cost.
+const MAX_EXACT_VALUE_COUNTS: usize = 256;
 
 /// Default nearest cells always probed by the hidden VectorCell index — the
 /// recall floor before the distance-ratio threshold widens the probe set.
@@ -339,11 +349,11 @@ impl ManifestPartEntry {
     }
 }
 
-/// Aggregate scalar stats across a part's superfiles. Min/max
-/// (and the exact sum) are held as length-1 [`ArrayRef`]s of the
-/// column's Arrow type — the same in-memory shape the per-superfile
-/// `SuperfileEntry.scalar_stats` map uses. They are decoded once when the
-/// manifest list is loaded, so the list-level scalar prune
+/// Aggregate scalar stats across a part's superfiles. Min/max and exact sums
+/// use Arrow arrays; low-cardinality columns may additionally carry a capped
+/// exact value-frequency table. This is the same in-memory shape the
+/// per-superfile `SuperfileEntry.scalar_stats` map uses. Stats are decoded once
+/// when the manifest list is loaded, so the list-level scalar prune
 /// ([`crate::supertable::query::prune`]) compares against them
 /// without a per-query Arrow-IPC decode. The JSON wire form still
 /// stores them as base64 Arrow-IPC bytes (see [`ScalarStatsAggDto`]).
@@ -361,6 +371,161 @@ pub struct ScalarStatsAgg {
     /// Merged HLL distinct sketch (raw registers); `None` when any
     /// segment lacks one.
     pub hll: Option<Vec<u8>>,
+    /// Exact non-null value frequencies when the column has at most
+    /// [`MAX_EXACT_VALUE_COUNTS`] distinct values.
+    pub(crate) value_counts: Option<ScalarValueCounts>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScalarValueCounts {
+    entries: Vec<(ScalarValue, u64)>,
+}
+
+impl ScalarValueCounts {
+    fn from_column(column: &ArrayRef) -> Option<Self> {
+        if !exact_value_counts_type(column.data_type()) {
+            return None;
+        }
+        match column.data_type() {
+            DataType::Int64 => {
+                let array = column.as_any().downcast_ref::<Int64Array>()?;
+                return Self::from_int64(array);
+            }
+            DataType::Utf8 => {
+                let array = column.as_any().downcast_ref::<StringArray>()?;
+                return Self::from_strings(
+                    (0..array.len()).map(|row| (!array.is_null(row)).then(|| array.value(row))),
+                    ScalarValue::Utf8,
+                );
+            }
+            DataType::LargeUtf8 => {
+                let array = column.as_any().downcast_ref::<LargeStringArray>()?;
+                return Self::from_strings(
+                    (0..array.len()).map(|row| (!array.is_null(row)).then(|| array.value(row))),
+                    ScalarValue::LargeUtf8,
+                );
+            }
+            _ => {}
+        }
+        let mut counts: HashMap<ScalarValue, u64> = HashMap::new();
+        for row in 0..column.len() {
+            if column.is_null(row) {
+                continue;
+            }
+            let value = ScalarValue::try_from_array(column, row).ok()?;
+            if !counts.contains_key(&value) && counts.len() >= MAX_EXACT_VALUE_COUNTS {
+                return None;
+            }
+            let count = counts.entry(value).or_default();
+            *count = count.checked_add(1)?;
+        }
+        Self::from_entries(counts.into_iter().collect())
+    }
+
+    fn from_int64(column: &Int64Array) -> Option<Self> {
+        let mut counts: HashMap<i64, u64> = HashMap::new();
+        for row in 0..column.len() {
+            if column.is_null(row) {
+                continue;
+            }
+            let value = column.value(row);
+            if !counts.contains_key(&value) && counts.len() >= MAX_EXACT_VALUE_COUNTS {
+                return None;
+            }
+            let count = counts.entry(value).or_default();
+            *count = count.checked_add(1)?;
+        }
+        Self::from_entries(
+            counts
+                .into_iter()
+                .map(|(value, count)| (ScalarValue::Int64(Some(value)), count))
+                .collect(),
+        )
+    }
+
+    fn from_strings<'a>(
+        values: impl IntoIterator<Item = Option<&'a str>>,
+        wrap: fn(Option<String>) -> ScalarValue,
+    ) -> Option<Self> {
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for value in values.into_iter().flatten() {
+            if let Some(count) = counts.get_mut(value) {
+                *count = count.checked_add(1)?;
+                continue;
+            }
+            if counts.len() >= MAX_EXACT_VALUE_COUNTS {
+                return None;
+            }
+            counts.insert(value.to_string(), 1);
+        }
+        Self::from_entries(
+            counts
+                .into_iter()
+                .map(|(value, count)| (wrap(Some(value)), count))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn from_entries(entries: Vec<(ScalarValue, u64)>) -> Option<Self> {
+        if entries.is_empty() || entries.len() > MAX_EXACT_VALUE_COUNTS {
+            return None;
+        }
+        if !exact_value_counts_type(&entries[0].0.data_type()) {
+            return None;
+        }
+        let mut merged: HashMap<ScalarValue, u64> = HashMap::with_capacity(entries.len());
+        for (value, count) in entries {
+            if value.is_null() || count == 0 {
+                return None;
+            }
+            let total = merged.entry(value).or_default();
+            *total = total.checked_add(count)?;
+            if merged.len() > MAX_EXACT_VALUE_COUNTS {
+                return None;
+            }
+        }
+        let mut entries: Vec<(ScalarValue, u64)> = merged.into_iter().collect();
+        if entries
+            .iter()
+            .any(|(value, _)| value.data_type() != entries[0].0.data_type())
+        {
+            return None;
+        }
+        entries.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
+        if entries
+            .windows(2)
+            .any(|pair| pair[0].0.partial_cmp(&pair[1].0).is_none())
+        {
+            return None;
+        }
+        Some(Self { entries })
+    }
+
+    pub(crate) fn merged_with(&self, other: &Self) -> Option<Self> {
+        Self::from_entries(self.entries.iter().chain(&other.entries).cloned().collect())
+    }
+
+    pub(crate) fn entries(&self) -> &[(ScalarValue, u64)] {
+        &self.entries
+    }
+}
+
+fn exact_value_counts_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Decimal128(_, _)
+    )
 }
 
 impl PartialEq for ScalarStatsAgg {
@@ -380,6 +545,7 @@ impl PartialEq for ScalarStatsAgg {
             && self.null_count == other.null_count
             && sum_eq
             && self.hll == other.hll
+            && self.value_counts == other.value_counts
     }
 }
 
@@ -390,7 +556,8 @@ impl ScalarStatsAgg {
     /// other than integer / float / boolean / utf8 / decimal) — those carry
     /// no min/max, so there's nothing to prune on. When present, every
     /// companion stat (null count, exact sum, HLL sketch) is computed in the
-    /// same pass; sum/hll stay `None` for types that don't support them.
+    /// same pass; sum/HLL/value counts stay `None` for unsupported types or
+    /// when the exact-value cardinality cap is exceeded.
     pub fn from_column(column: &ArrayRef) -> Option<ScalarStatsAgg> {
         let (min, max) = column_min_max(column)?;
         let null_count = u64::try_from(column.null_count()).ok();
@@ -401,6 +568,7 @@ impl ScalarStatsAgg {
             null_count,
             sum: column_sum(column),
             hll: column_hll(column).map(|s| s.as_bytes().to_vec()),
+            value_counts: ScalarValueCounts::from_column(column),
         })
     }
 
@@ -498,6 +666,10 @@ impl ScalarStatsAgg {
             },
             _ => None,
         };
+        self.value_counts = match (&self.value_counts, &other.value_counts) {
+            (Some(left), Some(right)) => left.merged_with(right),
+            _ => None,
+        };
         Ok(())
     }
 
@@ -539,6 +711,7 @@ impl ScalarStatsAgg {
             null_count: None,
             sum: None,
             hll: None,
+            value_counts: None,
         }
     }
 }
@@ -933,6 +1106,8 @@ struct ScalarStatsAggDto {
     sum: Option<String>, // base64
     #[serde(default)]
     hll: Option<String>, // base64
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    value_counts: Option<String>, // base64 Arrow IPC
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1013,6 +1188,17 @@ fn entry_to_dto(e: &ManifestPartEntry) -> Result<ManifestPartEntryDto, ListEncod
                 null_count: v.null_count,
                 sum,
                 hll: v.hll.as_deref().map(encode_b64),
+                value_counts: v
+                    .value_counts
+                    .as_ref()
+                    .map(encode_value_counts)
+                    .transpose()
+                    .map_err(|source| ListEncodeError::ScalarStats {
+                        field: "scalar_stats_agg.value_counts",
+                        source,
+                    })?
+                    .as_deref()
+                    .map(encode_b64),
             },
         );
     }
@@ -1089,6 +1275,17 @@ fn entry_from_dto(d: ManifestPartEntryDto) -> Result<ManifestPartEntry, ListPars
                     .hll
                     .as_deref()
                     .map(|s| decode_b64(s, "scalar_stats_agg.hll"))
+                    .transpose()?,
+                value_counts: v
+                    .value_counts
+                    .as_deref()
+                    .map(|encoded| {
+                        decode_value_counts(&decode_b64(encoded, "scalar_stats_agg.value_counts")?)
+                            .map_err(|source| ListParseError::ScalarStats {
+                                field: "scalar_stats_agg.value_counts",
+                                source,
+                            })
+                    })
                     .transpose()?,
             },
         );
@@ -1407,6 +1604,49 @@ mod tests {
         assert_eq!(agg.null_count, Some(1));
         assert_eq!(i64_at0(agg.sum.as_ref().expect("sum")), 11); // 3 + 7 + 1
         assert!(agg.hll.is_some());
+        assert_eq!(
+            agg.value_counts
+                .as_ref()
+                .expect("low-cardinality counts")
+                .entries(),
+            &[
+                (ScalarValue::Int64(Some(1)), 1),
+                (ScalarValue::Int64(Some(3)), 1),
+                (ScalarValue::Int64(Some(7)), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn scalar_value_counts_are_exact_and_capped() {
+        let repeated: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("rust"),
+            Some("go"),
+            Some("rust"),
+            None,
+        ]));
+        let counts = ScalarStatsAgg::from_column(&repeated)
+            .expect("utf8 stats")
+            .value_counts
+            .expect("under cap");
+        assert_eq!(
+            counts.entries(),
+            &[
+                (ScalarValue::Utf8(Some("go".into())), 1),
+                (ScalarValue::Utf8(Some("rust".into())), 2),
+            ]
+        );
+
+        let high_cardinality: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            0..=MAX_EXACT_VALUE_COUNTS as i64,
+        ));
+        assert!(
+            ScalarStatsAgg::from_column(&high_cardinality)
+                .expect("int stats")
+                .value_counts
+                .is_none(),
+            "the 257th distinct value must drop the exact table"
+        );
     }
 
     #[test]
@@ -1463,6 +1703,28 @@ mod tests {
         assert_eq!(i64_at0(a.sum.as_ref().expect("sum")), 95); // 60 + 35
         assert_eq!(a.null_count, Some(0));
         assert!(a.hll.is_some());
+        assert_eq!(
+            a.value_counts
+                .as_ref()
+                .expect("merged counts")
+                .entries()
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn scalar_agg_merge_drops_value_counts_above_cap() {
+        let left: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            0..=(MAX_EXACT_VALUE_COUNTS / 2) as i64,
+        ));
+        let right: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            (MAX_EXACT_VALUE_COUNTS / 2 + 1) as i64..=MAX_EXACT_VALUE_COUNTS as i64,
+        ));
+        let mut left = ScalarStatsAgg::from_column(&left).expect("left stats");
+        let right = ScalarStatsAgg::from_column(&right).expect("right stats");
+        left.merge_with(&right).expect("same type");
+        assert!(left.value_counts.is_none());
     }
 
     #[test]
@@ -1473,6 +1735,7 @@ mod tests {
         b.sum = None;
         b.null_count = None;
         b.hll = None;
+        b.value_counts = None;
         a.merge_with(&b).expect("same type merges");
         // min/max still merge (union semantics over the bounds).
         assert_eq!(i64_at0(&a.min), 1);
@@ -1481,6 +1744,7 @@ mod tests {
         assert!(a.sum.is_none());
         assert!(a.null_count.is_none());
         assert!(a.hll.is_none());
+        assert!(a.value_counts.is_none());
     }
 
     #[test]
@@ -1824,6 +2088,10 @@ mod tests {
                     null_count: Some(u64::from(seed)),
                     sum: Some(Arc::new(Int64Array::from(vec![i64::from(seed) * 7])) as ArrayRef),
                     hll: Some(vec![seed; 4]),
+                    value_counts: ScalarValueCounts::from_entries(vec![(
+                        ScalarValue::Int64(Some(i64::from(seed))),
+                        1,
+                    )]),
                 },
             );
         }

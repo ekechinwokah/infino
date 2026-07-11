@@ -86,6 +86,7 @@ pub fn compute(
             null_count: None,
             sum: None,
             hll: None,
+            value_counts: None,
         },
     );
     let mut fts_summary_agg = fts_summary_agg(superfiles);

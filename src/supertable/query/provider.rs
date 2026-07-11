@@ -100,7 +100,7 @@ use crate::{
     superfile::{SuperfileReader, fts::reader::BoolMode},
     supertable::{
         SuperfileEntry,
-        manifest::{Manifest, add_sum_arrays, hll::HllSketch},
+        manifest::{Manifest, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts},
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
             candidate::CandidatePlan,
@@ -216,6 +216,9 @@ pub(crate) struct SupertableProvider {
     scan_store: Arc<SuperfileObjectStore>,
     /// Open-time Parquet metadata shared by every scan and residual provider.
     scan_metas: Arc<DashMap<ObjPath, Arc<ParquetMetaData>>>,
+    /// Exact table-level low-cardinality frequencies, merged lazily per
+    /// column from this provider's immutable manifest snapshot.
+    scalar_value_counts: Arc<DashMap<String, Option<Arc<ScalarValueCounts>>>>,
 }
 
 /// Manual `Debug` (required by `TableProvider`): the cache /
@@ -257,6 +260,7 @@ impl SupertableProvider {
             prepared_scan_files: Arc::new(DashMap::new()),
             scan_store: Arc::new(SuperfileObjectStore::new()),
             scan_metas: Arc::new(DashMap::new()),
+            scalar_value_counts: Arc::new(DashMap::new()),
         }
     }
 
@@ -276,6 +280,7 @@ impl SupertableProvider {
         restricted.prepared_scan_files = Arc::clone(&self.prepared_scan_files);
         restricted.scan_store = Arc::clone(&self.scan_store);
         restricted.scan_metas = Arc::clone(&self.scan_metas);
+        restricted.scalar_value_counts = Arc::clone(&self.scalar_value_counts);
         restricted
     }
 
@@ -301,6 +306,31 @@ impl SupertableProvider {
                 .map(|bitmap| bitmap.is_empty())
                 .unwrap_or(false),
         }
+    }
+
+    /// Exact table-wide frequencies for one low-cardinality column. Merged
+    /// once per immutable provider snapshot and cached for later statements.
+    pub(crate) fn exact_value_counts(&self, column: &str) -> Option<Arc<ScalarValueCounts>> {
+        if let Some(cached) = self.scalar_value_counts.get(column) {
+            return cached.value().clone();
+        }
+        let merged = self
+            .manifest
+            .complete_flat_superfiles()
+            .and_then(|entries| {
+                let mut merged: Option<ScalarValueCounts> = None;
+                for entry in entries {
+                    let counts = entry.scalar_stats.get(column)?.value_counts.as_ref()?;
+                    merged = Some(match merged {
+                        None => counts.clone(),
+                        Some(current) => current.merged_with(counts)?,
+                    });
+                }
+                merged.map(Arc::new)
+            });
+        self.scalar_value_counts
+            .insert(column.to_string(), merged.clone());
+        merged
     }
 
     /// Lower scalar predicates to prune leaves. Each predicate yields a

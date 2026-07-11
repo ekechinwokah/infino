@@ -67,6 +67,7 @@ use crate::supertable::{
         },
         provider::{SupertableProvider, TABLE_NAME},
     },
+    reader_cache::disk::ForegroundQueryGuard,
 };
 
 /// Maximum distinct scalar SQL statements cached per manifest snapshot.
@@ -150,6 +151,7 @@ impl SupertableReader {
     // public entry point. Reachable from tests/benches via `test-helpers`.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
+        let _foreground = ForegroundQueryGuard::enter();
         // Read-consistency was applied when `Supertable::reader()` created
         // this pinned reader. SQL therefore observes the same snapshot as
         // `bm25_search` and `vector_search` on this handle.
@@ -287,6 +289,7 @@ impl SupertableReader {
     /// captured-at-call semantics match SQL `UPDATE WHERE` /
     /// `DELETE WHERE`.
     pub(crate) fn scan_ids_matching(&self, expr: Expr) -> Result<Vec<i128>, QueryError> {
+        let _foreground = ForegroundQueryGuard::enter();
         // Resolve against this reader's pinned snapshot. Callers that need
         // current-state semantics create a fresh reader immediately before
         // invoking this helper.
@@ -393,6 +396,9 @@ mod tests {
         test_helpers::default_tokenizer as tok,
     };
 
+    /// One more than the manifest's exact-value cardinality cap.
+    const HIGH_CARDINALITY_ROWS: usize = 257;
+
     /// Schema with id + scalar + FTS column. No vector; query_sql
     /// is scalar-only by design.
     fn schema_id_cat_title() -> Arc<Schema> {
@@ -435,6 +441,32 @@ mod tests {
             vec![Arc::new(cat_arr), Arc::new(title_arr)],
         )
         .expect("build batch")
+    }
+
+    fn rating_table(ratings: &[i64]) -> Supertable {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "rating",
+            DataType::Int64,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("rayon pool"),
+        );
+        let options = SupertableOptions::new(schema.clone(), vec![], vec![], None)
+            .expect("rating options")
+            .with_writer_pool(pool);
+        let table = Supertable::create(options).expect("create rating table");
+        let mut writer = table.writer().expect("rating writer");
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(ratings.to_vec()))])
+                .expect("rating batch");
+        writer.append(&batch).expect("append ratings");
+        writer.commit().expect("commit ratings");
+        drop(writer);
+        table
     }
 
     /// Convenience: run a query and pull a single `Int64` aggregate
@@ -566,6 +598,38 @@ mod tests {
     }
 
     #[test]
+    fn query_sql_range_count_uses_exact_value_frequencies() {
+        let table = rating_table(&[0, 5, 9, 10, 10, 20, 99]);
+        assert_eq!(
+            run_count(&table, "SELECT COUNT(*) FROM supertable WHERE rating < 10"),
+            3
+        );
+        assert_eq!(
+            run_count(
+                &table,
+                "SELECT COUNT(*) FROM supertable WHERE rating BETWEEN 10 AND 20"
+            ),
+            3
+        );
+        assert_eq!(
+            run_count(&table, "SELECT COUNT(*) FROM supertable WHERE rating > 100"),
+            0
+        );
+    }
+
+    #[test]
+    fn query_sql_range_count_falls_back_above_value_count_cap() {
+        let ratings: Vec<i64> = (0..HIGH_CARDINALITY_ROWS)
+            .map(|value| value as i64)
+            .collect();
+        let table = rating_table(&ratings);
+        assert_eq!(
+            run_count(&table, "SELECT COUNT(*) FROM supertable WHERE rating < 10"),
+            10
+        );
+    }
+
+    #[test]
     fn query_sql_group_by_returns_correct_per_category_counts() {
         let st = Supertable::create(options_id_cat_title()).expect("create");
         let mut w = st.writer().expect("writer");
@@ -618,6 +682,45 @@ mod tests {
                 ("rust".to_string(), 3),
             ]
         );
+    }
+
+    #[test]
+    fn query_sql_group_by_with_nulls_falls_back_and_keeps_null_group() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "category",
+            DataType::LargeUtf8,
+            true,
+        )]));
+        let options = SupertableOptions::new(schema.clone(), vec![], vec![], None)
+            .expect("nullable category options");
+        let table = Supertable::create(options).expect("create");
+        let mut writer = table.writer().expect("writer");
+        let categories = LargeStringArray::from(vec![Some("rust"), None, Some("rust")]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(categories)]).expect("batch");
+        writer.append(&batch).expect("append");
+        writer.commit().expect("commit");
+
+        let batches = table
+            .reader()
+            .query_sql(
+                "SELECT category, COUNT(*) AS n FROM supertable \
+                 GROUP BY category ORDER BY category NULLS FIRST",
+            )
+            .expect("group by nullable category");
+        let categories = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("large utf8 category");
+        let counts = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 count");
+        assert!(categories.is_null(0));
+        assert_eq!(counts.value(0), 1);
+        assert_eq!(categories.value(1), "rust");
+        assert_eq!(counts.value(1), 2);
     }
 
     #[test]

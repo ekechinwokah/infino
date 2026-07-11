@@ -41,13 +41,15 @@ use std::{collections::HashMap, io::Cursor, sync::Arc};
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::scalar::ScalarValue;
 use thiserror::Error;
 
 use crate::{
     superfile::vector::distance::decode_f32_le_vec,
     supertable::manifest::{
-        CellVectorSummary, ClusterCentroids, FtsSummaryAgg, VectorSummary, bloom::Bloom,
-        list::ScalarStatsAgg,
+        CellVectorSummary, ClusterCentroids, FtsSummaryAgg, VectorSummary,
+        bloom::Bloom,
+        list::{ScalarStatsAgg, ScalarValueCounts},
     },
 };
 
@@ -121,8 +123,9 @@ pub enum EncodeError {
 // One RecordBatch carries every column's stats as length-1
 // columns named by suffix: `<col>__min` / `<col>__max`
 // (always, paired), plus optional `<col>__nulls` (UInt64),
-// `<col>__sum` (the column's SUM result type) and
-// `<col>__hll` (Binary, raw HLL registers). The logical
+// `<col>__sum` (the column's SUM result type),
+// `<col>__hll` (Binary, raw HLL registers), and
+// `<col>__value_counts` (Binary, nested Arrow IPC). The logical
 // schema is reconstructed at decode time by stripping the
 // suffixes; data types are preserved by the IPC format
 // itself. Decoding tolerates absent optional stats (segments
@@ -133,6 +136,9 @@ const MAX_SUFFIX: &str = "__max";
 const NULLS_SUFFIX: &str = "__nulls";
 const SUM_SUFFIX: &str = "__sum";
 const HLL_SUFFIX: &str = "__hll";
+const VALUE_COUNTS_SUFFIX: &str = "__value_counts";
+const VALUE_COUNTS_VALUE_FIELD: &str = "value";
+const VALUE_COUNTS_COUNT_FIELD: &str = "count";
 
 pub fn encode_scalar_stats(stats: &HashMap<String, ScalarStatsAgg>) -> Vec<u8> {
     if stats.is_empty() {
@@ -186,6 +192,16 @@ pub fn encode_scalar_stats(stats: &HashMap<String, ScalarStatsAgg>) -> Vec<u8> {
             ));
             arrays.push(Arc::new(BinaryArray::from(vec![sketch.as_slice()])) as ArrayRef);
         }
+        if let Some(value_counts) = &agg.value_counts {
+            let encoded = encode_value_counts(value_counts)
+                .expect("value counts built from Arrow values must encode");
+            fields.push(Field::new(
+                format!("{key}{VALUE_COUNTS_SUFFIX}"),
+                DataType::Binary,
+                true,
+            ));
+            arrays.push(Arc::new(BinaryArray::from(vec![encoded.as_slice()])) as ArrayRef);
+        }
     }
     let schema = Arc::new(Schema::new(fields));
     let batch =
@@ -223,6 +239,7 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
     let mut null_counts: HashMap<String, u64> = HashMap::new();
     let mut sums: HashMap<String, ArrayRef> = HashMap::new();
     let mut hlls: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut value_counts: HashMap<String, ScalarValueCounts> = HashMap::new();
     for (i, field) in schema.fields().iter().enumerate() {
         let name = field.name();
         let column = batch.column(i);
@@ -252,6 +269,16 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
             if !arr.is_empty() && !arr.is_null(0) {
                 hlls.insert(base.to_string(), arr.value(0).to_vec());
             }
+        } else if let Some(base) = name.strip_suffix(VALUE_COUNTS_SUFFIX) {
+            let arr = column
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| {
+                    DecodeError::ArrowIpc(format!("{name}: __value_counts column is not Binary"))
+                })?;
+            if !arr.is_empty() && !arr.is_null(0) {
+                value_counts.insert(base.to_string(), decode_value_counts(arr.value(0))?);
+            }
         } else {
             return Err(DecodeError::ArrowIpc(format!(
                 "unrecognized stats column suffix: {name}"
@@ -273,6 +300,7 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
         let null_count = null_counts.remove(&base);
         let sum = sums.remove(&base);
         let hll = hlls.remove(&base);
+        let value_counts = value_counts.remove(&base);
         stats.insert(
             base,
             ScalarStatsAgg {
@@ -281,6 +309,7 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
                 null_count,
                 sum,
                 hll,
+                value_counts,
             },
         );
     }
@@ -294,6 +323,7 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
         .keys()
         .chain(sums.keys())
         .chain(hlls.keys())
+        .chain(value_counts.keys())
         .next()
     {
         return Err(DecodeError::ArrowIpc(format!(
@@ -301,6 +331,80 @@ pub fn decode_scalar_stats(bytes: &[u8]) -> Result<HashMap<String, ScalarStatsAg
         )));
     }
     Ok(stats)
+}
+
+pub(crate) fn encode_value_counts(
+    value_counts: &ScalarValueCounts,
+) -> Result<Vec<u8>, EncodeError> {
+    let values = ScalarValue::iter_to_array(
+        value_counts
+            .entries()
+            .iter()
+            .map(|(value, _)| value.clone()),
+    )
+    .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
+    let counts = Arc::new(UInt64Array::from_iter_values(
+        value_counts.entries().iter().map(|(_, count)| *count),
+    )) as ArrayRef;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(VALUE_COUNTS_VALUE_FIELD, values.data_type().clone(), false),
+        Field::new(VALUE_COUNTS_COUNT_FIELD, DataType::UInt64, false),
+    ]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![values, counts])
+        .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
+    let mut bytes = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut bytes, &schema)
+            .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
+        writer
+            .write(&batch)
+            .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
+        writer
+            .finish()
+            .map_err(|error| EncodeError::ArrowIpc(error.to_string()))?;
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn decode_value_counts(bytes: &[u8]) -> Result<ScalarValueCounts, DecodeError> {
+    let reader = StreamReader::try_new(Cursor::new(bytes), None)
+        .map_err(|error| DecodeError::ArrowIpc(error.to_string()))?;
+    let batches: Vec<RecordBatch> = reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| DecodeError::ArrowIpc(error.to_string()))?;
+    if batches.len() != 1 {
+        return Err(DecodeError::UnexpectedBatchCount(batches.len()));
+    }
+    let batch = &batches[0];
+    if batch.num_columns() != 2 {
+        return Err(DecodeError::ArrowIpc(format!(
+            "value counts expected 2 columns, got {}",
+            batch.num_columns()
+        )));
+    }
+    let counts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| DecodeError::ArrowIpc("value counts count column is not UInt64".into()))?;
+    if batch.column(0).len() != counts.len() {
+        return Err(DecodeError::ArrowIpc(
+            "value counts value/count lengths differ".into(),
+        ));
+    }
+    let mut entries = Vec::with_capacity(counts.len());
+    for row in 0..counts.len() {
+        if batch.column(0).is_null(row) || counts.is_null(row) {
+            return Err(DecodeError::ArrowIpc(
+                "value counts cannot contain nulls".into(),
+            ));
+        }
+        let value = ScalarValue::try_from_array(batch.column(0), row)
+            .map_err(|error| DecodeError::ArrowIpc(error.to_string()))?;
+        entries.push((value, counts.value(row)));
+    }
+    ScalarValueCounts::from_entries(entries)
+        .ok_or_else(|| DecodeError::ArrowIpc("invalid exact value counts".into()))
 }
 
 /// Encode a single length-1 [`ArrayRef`] as Arrow-IPC stream bytes —
@@ -688,8 +792,8 @@ mod decode_error_tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        DecodeError, ScalarStatsAgg, decode_fts_summary, decode_fts_summary_map,
-        decode_length1_array, decode_scalar_stats, decode_vector_summary,
+        DecodeError, ScalarStatsAgg, ScalarValue, ScalarValueCounts, decode_fts_summary,
+        decode_fts_summary_map, decode_length1_array, decode_scalar_stats, decode_vector_summary,
         decode_vector_summary_map, encode_length1_array, encode_scalar_stats, read_n, read_u32,
     };
 
@@ -751,6 +855,10 @@ mod decode_error_tests {
                 null_count: Some(7),
                 sum: Some(i64_arr(5050)),
                 hll: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+                value_counts: ScalarValueCounts::from_entries(vec![
+                    (ScalarValue::Int64(Some(1)), 2),
+                    (ScalarValue::Int64(Some(100)), 3),
+                ]),
             },
         );
         // Min/max only (the `from_min_max` shape).
@@ -767,6 +875,7 @@ mod decode_error_tests {
                 null_count: Some(2),
                 sum: None,
                 hll: None,
+                value_counts: None,
             },
         );
 
