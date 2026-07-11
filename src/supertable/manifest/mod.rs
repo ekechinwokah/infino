@@ -381,6 +381,26 @@ impl Manifest {
         self.list.is_none()
     }
 
+    /// Return the resident flat membership only when it is known complete.
+    ///
+    /// In-process manifests are always flat. Part-backed user manifests are
+    /// complete when the resident entry count equals the sum recorded in the
+    /// list. A loaded slow-state blob is authoritative by construction:
+    /// [`Manifest::load`] either hydrates it completely or fails.
+    pub(crate) fn complete_flat_superfiles(&self) -> Option<&[Arc<SuperfileEntry>]> {
+        match self.list.as_ref() {
+            None => Some(&self.superfile_list.superfiles),
+            Some(list) if list.slow_vector_state_uri.is_some() => {
+                Some(&self.superfile_list.superfiles)
+            }
+            Some(list) => {
+                let expected: u64 = list.parts.iter().map(|entry| entry.n_superfiles).sum();
+                (self.superfile_list.superfiles.len() as u64 == expected)
+                    .then_some(self.superfile_list.superfiles.as_slice())
+            }
+        }
+    }
+
     pub(crate) fn vector_index_storage_prefix(&self) -> Option<&str> {
         if let Some(list) = self.list.as_ref()
             && let Some(prefix) = list.vector_index_storage_prefix.as_deref()
@@ -5546,6 +5566,26 @@ mod tests {
         assert_eq!(empty.get_num_parts(), 0);
         assert!(empty.get_all_list_entries().is_empty());
         assert!(empty.is_in_process_only());
+    }
+
+    #[test]
+    fn complete_flat_superfiles_rejects_partial_part_view() {
+        let mut list = list_with_parts(1);
+        list.parts[0].n_superfiles = 1;
+        let mut manifest = manifest_with_list(list);
+        assert!(
+            manifest.complete_flat_superfiles().is_none(),
+            "empty resident view cannot represent one listed superfile"
+        );
+
+        manifest
+            .superfile_list
+            .superfiles
+            .push(seg_entry(Uuid::new_v4(), 4));
+        let complete = manifest
+            .complete_flat_superfiles()
+            .expect("resident count now matches list");
+        assert_eq!(complete.len(), 1);
     }
 
     /// `get_cached_part_by_id` / `get_cached_part_by_list_idx` return

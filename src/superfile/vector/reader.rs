@@ -20,6 +20,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures::future::try_join_all;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use serde::Deserialize;
@@ -1854,10 +1855,18 @@ impl VectorReader {
     pub(crate) fn inline_stable_ids_for_locals(&self, locals: &[u32]) -> Option<Vec<i128>> {
         if self.is_multi_cell() {
             // Per-cell regions; do not use `cold_stable_id_region` (that stash
-            // holds at most one cell from the last probe wave).
-            let mut out = Vec::with_capacity(locals.len());
-            for &file_local in locals {
+            // holds at most one cell from the last probe wave). Group first so
+            // each cell region is resolved once, not once per requested row.
+            let mut grouped: Vec<Vec<(usize, u32)>> = vec![Vec::new(); self.columns.len()];
+            for (output_idx, &file_local) in locals.iter().enumerate() {
                 let (cell_idx, cell_local) = self.file_local_to_cell(file_local)?;
+                grouped[cell_idx].push((output_idx, cell_local));
+            }
+            let mut out = vec![0i128; locals.len()];
+            for (cell_idx, positions) in grouped.into_iter().enumerate() {
+                if positions.is_empty() {
+                    continue;
+                }
                 let col = &self.columns[cell_idx];
                 if !col.has_inline_stable_ids() {
                     return None;
@@ -1865,13 +1874,15 @@ impl VectorReader {
                 let region = self
                     .source
                     .try_get_range_sync(col.stable_ids_region_range()?)?;
-                let p = (cell_local as usize) * format::vec::STABLE_ID_BYTES;
-                let end = p + format::vec::STABLE_ID_BYTES;
-                if end > region.len() {
-                    return None;
+                for (output_idx, cell_local) in positions {
+                    let p = (cell_local as usize) * format::vec::STABLE_ID_BYTES;
+                    let end = p + format::vec::STABLE_ID_BYTES;
+                    if end > region.len() {
+                        return None;
+                    }
+                    let arr: [u8; format::vec::STABLE_ID_BYTES] = region[p..end].try_into().ok()?;
+                    out[output_idx] = i128::from_le_bytes(arr);
                 }
-                let arr: [u8; format::vec::STABLE_ID_BYTES] = region[p..end].try_into().ok()?;
-                out.push(i128::from_le_bytes(arr));
             }
             return Some(out);
         }
@@ -1922,8 +1933,8 @@ impl VectorReader {
             if !self.columns.iter().any(|c| c.has_inline_stable_ids()) {
                 return Ok(None);
             }
-            let mut out = Vec::with_capacity(locals.len());
-            for &file_local in locals {
+            let mut grouped: Vec<Vec<(usize, u32)>> = vec![Vec::new(); self.columns.len()];
+            for (output_idx, &file_local) in locals.iter().enumerate() {
                 let Some((cell_idx, cell_local)) = self.file_local_to_cell(file_local) else {
                     return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                         "inline stable_id region: file-local {file_local} out of range \
@@ -1931,31 +1942,50 @@ impl VectorReader {
                         self.n_docs
                     ))));
                 };
+                grouped[cell_idx].push((output_idx, cell_local));
+            }
+            let mut requests = Vec::new();
+            for (cell_idx, positions) in grouped.into_iter().enumerate() {
+                if positions.is_empty() {
+                    continue;
+                }
                 let col = &self.columns[cell_idx];
                 let Some(range) = col.stable_ids_region_range() else {
                     return Ok(None);
                 };
-                let region = self
-                    .source
-                    .range_async(range)
-                    .await
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
-                let p = (cell_local as usize) * format::vec::STABLE_ID_BYTES;
-                let end = p + format::vec::STABLE_ID_BYTES;
-                if end > region.len() {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                        "inline stable_id region: cell-local {cell_local} out of range \
-                         ({} bytes, cell_idx={cell_idx})",
-                        region.len()
-                    ))));
+                requests.push((cell_idx, range, positions));
+            }
+            let fetched = try_join_all(requests.into_iter().map(
+                |(cell_idx, range, positions)| async move {
+                    let region = self
+                        .source
+                        .range_async(range)
+                        .await
+                        .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                    Ok::<_, VectorError>((cell_idx, positions, region))
+                },
+            ))
+            .await?;
+            let mut out = vec![0i128; locals.len()];
+            for (cell_idx, positions, region) in fetched {
+                for (output_idx, cell_local) in positions {
+                    let p = (cell_local as usize) * format::vec::STABLE_ID_BYTES;
+                    let end = p + format::vec::STABLE_ID_BYTES;
+                    if end > region.len() {
+                        return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                            "inline stable_id region: cell-local {cell_local} out of range \
+                             ({} bytes, cell_idx={cell_idx})",
+                            region.len()
+                        ))));
+                    }
+                    let arr: [u8; format::vec::STABLE_ID_BYTES] =
+                        region[p..end].try_into().map_err(|_| {
+                            VectorError::Read(ReadError::MalformedVersion(
+                                "inline stable_id region slice".into(),
+                            ))
+                        })?;
+                    out[output_idx] = i128::from_le_bytes(arr);
                 }
-                let arr: [u8; format::vec::STABLE_ID_BYTES] =
-                    region[p..end].try_into().map_err(|_| {
-                        VectorError::Read(ReadError::MalformedVersion(
-                            "inline stable_id region slice".into(),
-                        ))
-                    })?;
-                out.push(i128::from_le_bytes(arr));
             }
             return Ok(Some(out));
         }

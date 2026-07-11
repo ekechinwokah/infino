@@ -46,11 +46,15 @@
 //! of each superfile was written with this same scalar schema, so
 //! round-trip shape matches without projection or rewrite.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
-use datafusion::{execution::context::SessionContext, prelude::Expr};
+use datafusion::{
+    datasource::DefaultTableSource,
+    execution::context::SessionContext,
+    logical_expr::{Expr, LogicalPlan},
+};
 
 use crate::supertable::{
     error::QueryError,
@@ -65,7 +69,69 @@ use crate::supertable::{
     },
 };
 
+/// Maximum distinct scalar SQL statements cached per manifest snapshot.
+const SQL_LOGICAL_PLAN_CACHE_ENTRIES: usize = 64;
+
+/// Cache only plans whose table scans all use [`SupertableProvider`].
+///
+/// Search TVF providers hold a live reader in their logical plan. Caching
+/// those plans on `SupertableInner` would create a reference cycle; scalar
+/// providers own only the pinned manifest and storage/cache handles.
+fn cacheable_scalar_plan(plan: &LogicalPlan) -> bool {
+    fn visit(plan: &LogicalPlan, found_scan: &mut bool) -> bool {
+        if let LogicalPlan::TableScan(scan) = plan {
+            let Some(source) = scan.source.as_any().downcast_ref::<DefaultTableSource>() else {
+                return false;
+            };
+            if source
+                .table_provider
+                .as_any()
+                .downcast_ref::<SupertableProvider>()
+                .is_none()
+            {
+                return false;
+            }
+            *found_scan = true;
+        }
+        plan.inputs()
+            .into_iter()
+            .all(|input| visit(input, found_scan))
+    }
+
+    let mut found_scan = false;
+    visit(plan, &mut found_scan) && found_scan
+}
+
 impl SupertableReader {
+    fn cached_sql_logical_plan(&self, sql: &str) -> Option<LogicalPlan> {
+        let guard = self
+            .sql_logical_plan_cache()
+            .lock()
+            .expect("sql logical-plan cache mutex poisoned");
+        let (manifest, plans) = guard.as_ref()?;
+        Arc::ptr_eq(manifest, self.manifest())
+            .then(|| plans.get(sql).cloned())
+            .flatten()
+    }
+
+    fn cache_sql_logical_plan(&self, sql: String, plan: LogicalPlan) {
+        let mut guard = self
+            .sql_logical_plan_cache()
+            .lock()
+            .expect("sql logical-plan cache mutex poisoned");
+        if guard
+            .as_ref()
+            .is_none_or(|(manifest, _)| !Arc::ptr_eq(manifest, self.manifest()))
+        {
+            *guard = Some((Arc::clone(self.manifest()), Default::default()));
+        }
+        let (_, plans) = guard.as_mut().expect("cache initialized above");
+        if plans.len() >= SQL_LOGICAL_PLAN_CACHE_ENTRIES && !plans.contains_key(&sql) {
+            plans.clear();
+        }
+        plans.insert(sql, plan);
+    }
+
     /// Run a SQL query against this reader's pinned snapshot.
     ///
     /// The snapshot is captured at `query_sql` entry — concurrent
@@ -92,13 +158,41 @@ impl SupertableReader {
         // snapshot — the pushdown-aware SupertableProvider plus the
         // search TVFs. See [`SupertableReader::sql_session_context`].
         let ctx = self.sql_session_context()?;
+        let tombstone_prefetch = self.tombstone_cache.as_ref().and_then(|cache| {
+            let entries = self.manifest().complete_flat_superfiles()?;
+            let ids: Vec<_> = entries.iter().map(|entry| entry.superfile_id).collect();
+            Some((Arc::clone(cache), ids))
+        });
+        let cached_plan = self.cached_sql_logical_plan(sql);
+        let cache_reader = self.clone();
 
         let sql = sql.to_owned();
         let drive = async move {
-            let df = ctx
-                .sql(&sql)
-                .await
-                .map_err(|e| QueryError::Plan(e.to_string()))?;
+            // Exact manifest statistics can eliminate an unfiltered aggregate
+            // before `TableProvider::scan` runs, but only after every
+            // superfile's delete view is known. The ordinary scan performs the
+            // same prefetch; doing it before planning lets repeated aggregate
+            // queries avoid constructing a Parquet plan altogether.
+            if let Some((cache, ids)) = tombstone_prefetch {
+                cache.prefetch(&ids, Instant::now()).await;
+            }
+            let df = match cached_plan {
+                Some(plan) => ctx
+                    .execute_logical_plan(plan)
+                    .await
+                    .map_err(|e| QueryError::Plan(e.to_string()))?,
+                None => {
+                    let df = ctx
+                        .sql(&sql)
+                        .await
+                        .map_err(|e| QueryError::Plan(e.to_string()))?;
+                    let plan = df.logical_plan().clone();
+                    if cacheable_scalar_plan(&plan) {
+                        cache_reader.cache_sql_logical_plan(sql.clone(), plan);
+                    }
+                    df
+                }
+            };
             df.collect()
                 .await
                 .map_err(|e| QueryError::Execute(e.to_string()))
@@ -377,6 +471,44 @@ mod tests {
 
         let n = run_count(&st, "SELECT COUNT(*) FROM supertable");
         assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn query_sql_caches_scalar_plan_but_not_search_tvf_plan() {
+        let st = Supertable::create(options_id_cat_title()).expect("create");
+        let mut writer = st.writer().expect("writer");
+        writer
+            .append(&build_cat_batch(0, &["rust"], &["searchable"]))
+            .expect("append");
+        writer.commit().expect("commit");
+        let reader = st.reader();
+        let scalar_sql = "SELECT COUNT(*) FROM supertable";
+
+        reader.query_sql(scalar_sql).expect("first scalar query");
+        reader.query_sql(scalar_sql).expect("cached scalar query");
+        {
+            let guard = reader
+                .sql_logical_plan_cache()
+                .lock()
+                .expect("plan cache lock");
+            let (_, plans) = guard.as_ref().expect("scalar plan cached");
+            assert_eq!(plans.len(), 1);
+            assert!(plans.contains_key(scalar_sql));
+        }
+
+        reader
+            .query_sql("SELECT _id FROM bm25_search('title', 'searchable', 10)")
+            .expect("search TVF query");
+        let guard = reader
+            .sql_logical_plan_cache()
+            .lock()
+            .expect("plan cache lock");
+        let (_, plans) = guard.as_ref().expect("scalar plan remains cached");
+        assert_eq!(
+            plans.len(),
+            1,
+            "search TVF plans hold readers and must not enter the inner cache"
+        );
     }
 
     /// Regression test for the cold-reopen consumer leak. Running

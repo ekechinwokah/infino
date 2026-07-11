@@ -25,7 +25,7 @@ use std::{
 use arc_swap::ArcSwap;
 use arrow_schema::SchemaRef;
 use chrono::Utc;
-use datafusion::execution::context::SessionContext;
+use datafusion::{execution::context::SessionContext, logical_expr::LogicalPlan};
 use tokio::runtime::Runtime;
 
 use super::{
@@ -125,6 +125,10 @@ pub(super) struct SupertableInner {
     /// `query_sql` the `Arc::ptr_eq` check fails and the cache
     /// is rebuilt against the fresh snapshot.
     pub(super) sql_session_cache: Mutex<Option<(Arc<Manifest>, SessionContext)>>,
+    /// Deterministic scalar SQL logical plans keyed by statement text and
+    /// manifest identity. Physical plans are intentionally rebuilt so fresh
+    /// tombstone overlays and query-stable functions retain their semantics.
+    pub(super) sql_logical_plan_cache: Mutex<Option<(Arc<Manifest>, HashMap<String, LogicalPlan>)>>,
     /// Per-process reader-side cache of per-superfile tombstone
     /// bitmaps. `Some` when storage is attached (the cache
     /// fetches sidecars from `superfiles/<id>.tombstones`);
@@ -1110,6 +1114,7 @@ async fn build_handle(
         id_generator: Mutex::new(id_generator),
         query_runtime: OnceLock::new(),
         sql_session_cache: Mutex::new(None),
+        sql_logical_plan_cache: Mutex::new(None),
         tombstone_cache,
         handle_id,
         vector_index_table,
@@ -1318,6 +1323,13 @@ impl SupertableReader {
     /// [`SupertableReader::query_sql`] across queries on this snapshot.
     pub(crate) fn sql_session_cache(&self) -> &Mutex<Option<(Arc<Manifest>, SessionContext)>> {
         &self.inner.sql_session_cache
+    }
+
+    /// Cached deterministic scalar SQL plans for this reader's manifest.
+    pub(crate) fn sql_logical_plan_cache(
+        &self,
+    ) -> &Mutex<Option<(Arc<Manifest>, HashMap<String, LogicalPlan>)>> {
+        &self.inner.sql_logical_plan_cache
     }
 
     pub(crate) fn vector_index_table(&self) -> Option<&Arc<Supertable>> {

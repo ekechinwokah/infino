@@ -74,6 +74,7 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
+use futures::future::try_join_all;
 use roaring::RoaringBitmap;
 use tokio::join;
 
@@ -134,59 +135,97 @@ pub(crate) struct PreparedGlobalAllow {
     allow_by_uri: HashMap<SuperfileUri, Arc<RoaringBitmap>>,
 }
 
-/// Resolve the user-table superfile that owns `user_row_id` (flat view
-/// first, then list parts — same source as query fan-out).
-async fn lookup_user_superfile_by_id(
+/// Resolve stable user ids to their Parquet `(superfile, local_doc_id)`.
+///
+/// Contiguous id-ordered files use arithmetic. Cell-packed/gapped files are
+/// read concurrently and each `_id` column is decoded at most once for the
+/// entire top-k. The previous per-hit lookup could decode the same full column
+/// twice per hit: once to identify its owner and again to locate its row.
+async fn lookup_user_placements_by_id(
     manifest: &Manifest,
-    user_row_id: i128,
-) -> Result<Arc<SuperfileEntry>, QueryError> {
+    user_row_ids: &[i128],
+) -> Result<Vec<(Arc<SuperfileEntry>, u32)>, QueryError> {
+    if user_row_ids.is_empty() {
+        return Ok(Vec::new());
+    }
     let id_column = manifest.options.id_column.as_str();
-    for entry in manifest
-        .superfiles
-        .iter()
-        .filter(|e| user_row_id >= e.id_min && user_row_id <= e.id_max)
-    {
-        if row_id_from_manifest_entry(entry, 0).is_some() {
-            return Ok(Arc::clone(entry));
-        }
-        let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
-        let ids = read_ids_for_locals(manifest, entry, &locals, id_column, false).await?;
-        if ids.contains(&user_row_id) {
-            return Ok(Arc::clone(entry));
-        }
-    }
-    let part_entries = manifest.get_all_list_entries();
-    if part_entries.is_empty() {
-        return Err(QueryError::Execute(format!(
-            "no user superfile owns id {user_row_id}"
-        )));
-    }
-    for part_entry in part_entries {
-        if user_row_id < part_entry.id_range.0 || user_row_id > part_entry.id_range.1 {
+    let entries = manifest
+        .get_all_superfiles_loaded()
+        .await
+        .map_err(QueryError::ManifestLoad)?;
+    let mut placements: Vec<Option<(Arc<SuperfileEntry>, u32)>> = vec![None; user_row_ids.len()];
+    let mut gapped = Vec::new();
+
+    for entry in entries {
+        let matching: Vec<usize> = user_row_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &id)| {
+                (placements[index].is_none() && id >= entry.id_min && id <= entry.id_max)
+                    .then_some(index)
+            })
+            .collect();
+        if matching.is_empty() {
             continue;
         }
-        let part = manifest
-            .get_part_by_id(part_entry.part_id)
-            .await
-            .map_err(QueryError::ManifestLoad)?;
-        for entry in part
-            .superfiles
-            .iter()
-            .filter(|e| user_row_id >= e.id_min && user_row_id <= e.id_max)
-        {
-            if row_id_from_manifest_entry(entry, 0).is_some() {
-                return Ok(Arc::clone(entry));
+        if row_id_from_manifest_entry(&entry, 0).is_some() {
+            for index in matching {
+                let local = u32::try_from(user_row_ids[index] - entry.id_min).map_err(|_| {
+                    QueryError::Execute(format!(
+                        "local_doc_id out of range for id {}",
+                        user_row_ids[index]
+                    ))
+                })?;
+                placements[index] = Some((Arc::clone(&entry), local));
             }
-            let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
-            let ids = read_ids_for_locals(manifest, entry, &locals, id_column, false).await?;
-            if ids.contains(&user_row_id) {
-                return Ok(Arc::clone(entry));
+        } else {
+            gapped.push(entry);
+        }
+    }
+
+    let decoded = try_join_all(gapped.into_iter().map(|entry| async move {
+        let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
+        // Cell-packed user files carry stable ids inline in Parquet row order.
+        // Read each compact cell region once instead of decoding the full
+        // Parquet `_id` column to place a top-k scalar projection.
+        let ids = read_ids_for_locals(manifest, &entry, &locals, id_column, true).await?;
+        Ok::<_, QueryError>((entry, ids))
+    }))
+    .await?;
+    let mut requested: HashMap<i128, Vec<usize>> = HashMap::new();
+    for (index, &id) in user_row_ids.iter().enumerate() {
+        if placements[index].is_none() {
+            requested.entry(id).or_default().push(index);
+        }
+    }
+    for (entry, ids) in decoded {
+        for (local, id) in ids.into_iter().enumerate() {
+            let Some(indexes) = requested.get(&id) else {
+                continue;
+            };
+            let local = u32::try_from(local).map_err(|_| {
+                QueryError::Execute(format!(
+                    "local_doc_id out of range in user superfile {:?}",
+                    entry.uri
+                ))
+            })?;
+            for &index in indexes {
+                if placements[index].is_none() {
+                    placements[index] = Some((Arc::clone(&entry), local));
+                }
             }
         }
     }
-    Err(QueryError::Execute(format!(
-        "no user superfile owns id {user_row_id}"
-    )))
+
+    placements
+        .into_iter()
+        .enumerate()
+        .map(|(index, placement)| {
+            placement.ok_or_else(|| {
+                QueryError::Execute(format!("no user superfile owns id {}", user_row_ids[index]))
+            })
+        })
+        .collect()
 }
 
 /// Extract the `_id` column (column 0, Decimal128) of `batch` as `Vec<i128>`.
@@ -409,7 +448,7 @@ pub(crate) async fn user_placement_for_scalar_resolve(
         .vector_index_table()
         .and_then(|vit| vit.pinned_reader().hidden_deleted_ids().ok());
     let mut out: Vec<Option<SuperfileHit>> = vec![None; hits.len()];
-    let mut gapped: HashMap<SuperfileUri, Vec<(usize, i128)>> = HashMap::new();
+    let mut placement_requests: Vec<(usize, i128)> = Vec::new();
     for (i, hit) in hits.iter().enumerate() {
         if let Some(user_entry) = user_manifest
             .lookup_superfile_entry(hit.superfile)
@@ -436,50 +475,19 @@ pub(crate) async fn user_placement_for_scalar_resolve(
         {
             continue;
         }
-        let user_entry = lookup_user_superfile_by_id(user_manifest, user_row_id).await?;
-        if row_id_from_manifest_entry(&user_entry, 0).is_some() {
-            let local = u32::try_from(user_row_id - user_entry.id_min).map_err(|_| {
-                QueryError::Execute(format!("local_doc_id out of range for id {user_row_id}"))
-            })?;
-            out[i] = Some(SuperfileHit {
-                superfile: user_entry.uri,
-                local_doc_id: local,
-                score: hit.score,
-                stable_id: Some(user_row_id),
-            });
-        } else {
-            gapped
-                .entry(user_entry.uri)
-                .or_default()
-                .push((i, user_row_id));
-        }
+        placement_requests.push((i, user_row_id));
     }
-    for (uri, entries) in gapped {
-        let user_entry = user_manifest
-            .lookup_superfile_entry(uri)
-            .await
-            .map_err(QueryError::ManifestLoad)?
-            .ok_or_else(|| {
-                QueryError::Execute(format!("user superfile {uri:?} missing from manifest"))
-            })?;
-        let n = user_entry.n_docs as usize;
-        let all_locals: Vec<u32> = (0..n as u32).collect();
-        let id_col =
-            read_ids_for_locals(user_manifest, &user_entry, &all_locals, id_column, false).await?;
-        for &(i, user_row_id) in &entries {
-            let pos = id_col
-                .iter()
-                .position(|&id| id == user_row_id)
-                .ok_or_else(|| {
-                    QueryError::Execute(format!("no row with id {user_row_id} in user superfile"))
-                })?;
-            out[i] = Some(SuperfileHit {
-                superfile: uri,
-                local_doc_id: pos as u32,
-                score: hits[i].score,
-                stable_id: Some(user_row_id),
-            });
-        }
+    let requested_ids: Vec<i128> = placement_requests.iter().map(|(_, id)| *id).collect();
+    let placements = lookup_user_placements_by_id(user_manifest, &requested_ids).await?;
+    for ((index, stable_id), (entry, local_doc_id)) in
+        placement_requests.into_iter().zip(placements)
+    {
+        out[index] = Some(SuperfileHit {
+            superfile: entry.uri,
+            local_doc_id,
+            score: hits[index].score,
+            stable_id: Some(stable_id),
+        });
     }
     Ok(out.into_iter().flatten().collect())
 }
@@ -655,40 +663,46 @@ impl SupertableReader {
                 }
                 let selected_cells = &ranked[..cutoff];
                 let selected: HashSet<u32> = selected_cells.iter().copied().collect();
-                let mut fine = Vec::new();
+                let mut fine_by_fragment: HashMap<(u32, usize), Vec<(u32, f32, u64)>> =
+                    HashMap::new();
                 for (si, cluster, score, cell, count) in candidates {
                     match cell {
-                        Some(cell) if selected.contains(&cell) => {
-                            fine.push((si, cluster, score, count));
-                        }
+                        Some(cell) if selected.contains(&cell) => fine_by_fragment
+                            .entry((cell, si))
+                            .or_default()
+                            .push((cluster, score, count)),
                         Some(_) => {}
                         None => scored.push((si, cluster, score)),
                     }
                 }
-                fine.sort_unstable_by(|a, b| {
-                    a.2.partial_cmp(&b.2)
-                        .unwrap_or(Ordering::Equal)
-                        .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
-                });
-                let mut keep = nprobe.max(1).min(fine.len());
-                // Equal-distance centroids in separate immutable fragments
-                // represent the same part of the routed cells. Keep the whole
-                // tie at the cutoff instead of discarding fragments by URI
-                // order; real-valued centroids rarely tie, while repeated
-                // exact vectors remain reachable across commits.
-                if keep < fine.len() {
-                    let cutoff_score = fine[keep - 1].2;
-                    while keep < fine.len()
-                        && fine[keep].2.total_cmp(&cutoff_score) == Ordering::Equal
-                    {
-                        keep += 1;
+                let mut remaining = Vec::new();
+                for &cell in selected_cells {
+                    let mut fragment_ids: Vec<usize> = fine_by_fragment
+                        .keys()
+                        .filter_map(|(candidate_cell, si)| (*candidate_cell == cell).then_some(*si))
+                        .collect();
+                    fragment_ids.sort_unstable();
+                    for si in fragment_ids {
+                        let Some(mut fine) = fine_by_fragment.remove(&(cell, si)) else {
+                            continue;
+                        };
+                        fine.sort_unstable_by(|a, b| {
+                            a.1.partial_cmp(&b.1)
+                                .unwrap_or(Ordering::Equal)
+                                .then_with(|| a.0.cmp(&b.0))
+                        });
+                        let keep = nprobe.max(1).min(fine.len());
+                        let tail = fine.split_off(keep);
+                        gated.extend(
+                            fine.into_iter()
+                                .map(|(cluster, score, _)| (si, cluster, score)),
+                        );
+                        remaining.extend(
+                            tail.into_iter()
+                                .map(|(cluster, score, count)| (si, cluster, score, count)),
+                        );
                     }
                 }
-                let mut remaining = fine.split_off(keep);
-                gated.extend(
-                    fine.into_iter()
-                        .map(|(si, cluster, score, _)| (si, cluster, score)),
-                );
                 let mut postings: u64 = gated
                     .iter()
                     .map(|(si, cluster, _)| {
@@ -719,7 +733,7 @@ impl SupertableReader {
         }
 
         // Cell-tagged candidates above keep the closest `nprobe` fine
-        // centroids across all selected coarse cells and their fragments.
+        // centroids per immutable fragment inside each selected coarse cell.
         // Untagged legacy candidates still use the global fallback budget.
         let n_eligible = {
             let mut segs: Vec<usize> = scored
@@ -2563,8 +2577,9 @@ mod tests {
     /// scalar resolve maps back to the one row that owns the Parquet data.
     #[test]
     fn vector_search_dedups_and_resolves_with_stub_boundaries() {
-        use crate::superfile::vector::rerank_codec::RerankCodec;
         use arrow_array::Decimal128Array;
+
+        use crate::superfile::vector::rerank_codec::RerankCodec;
 
         let dim = 16usize;
         let schema = schema_with_vector(dim);
@@ -2613,7 +2628,7 @@ mod tests {
                 k,
                 VectorSearchOptions::new().with_nprobe(4),
                 None,
-                Some(&["_id"]),
+                Some(&["_id", "title"]),
             )
             .expect("vector_search");
 
@@ -2625,8 +2640,15 @@ mod tests {
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
                 .expect("_id column is Decimal128");
+            let titles = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("title column is LargeString");
+            assert_eq!(titles.len(), ids.len());
             for i in 0..ids.len() {
                 total += 1;
+                assert!(!titles.value(i).is_empty());
                 assert!(
                     seen.insert(ids.value(i)),
                     "duplicate _id {} in results — a boundary stub was not deduped \

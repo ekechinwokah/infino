@@ -137,6 +137,59 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         return Ok(None);
     };
 
+    // Unfiltered aggregate over a complete, clean snapshot: every segment is
+    // covered, so emit one literal row directly. This handles SUM/AVG as well
+    // as COUNT/MIN/MAX and avoids invoking the provider's Parquet scan at all.
+    if let Some(scan) = peel_unfiltered_scan(agg.input.as_ref()) {
+        let Some(provider) = provider_of(scan) else {
+            return Ok(None);
+        };
+        if provider.is_segment_restricted() {
+            return Ok(None);
+        }
+        let Some(superfiles) = provider.manifest().complete_flat_superfiles() else {
+            return Ok(None);
+        };
+        if !superfiles
+            .iter()
+            .all(|entry| provider.entry_is_clean(entry) && has_required_stats(entry, &kinds))
+        {
+            return Ok(None);
+        }
+        let covered: Vec<&Arc<SuperfileEntry>> = superfiles.iter().collect();
+        let mut partials = Vec::with_capacity(kinds.len());
+        for kind in &kinds {
+            let Some(partial) = accumulate_partial(kind, &covered) else {
+                return Ok(None);
+            };
+            partials.push(partial);
+        }
+        let out_names: Vec<String> = agg
+            .schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        let mut expressions = Vec::with_capacity(kinds.len());
+        for ((kind, partial), name) in kinds.iter().zip(&partials).zip(out_names) {
+            let expression = match (kind, partial) {
+                (AggKind::CountStar, Partial::Count(count)) => lit(*count),
+                (AggKind::Sum(_), Partial::Sum(value))
+                | (AggKind::Min(_), Partial::Bound(value))
+                | (AggKind::Max(_), Partial::Bound(value)) => lit(value.clone()),
+                (AggKind::Avg(_), Partial::Avg { sum, count }) => {
+                    cast(lit(sum.clone()), DataType::Float64) / cast(lit(*count), DataType::Float64)
+                }
+                _ => return Ok(None),
+            };
+            expressions.push(expression.alias(name));
+        }
+        let rewritten = LogicalPlanBuilder::empty(true)
+            .project(expressions)?
+            .build()?;
+        return Ok(Some(rewritten));
+    }
+
     // Input shape: Filter over TableScan (a pure-column Projection in
     // between is looked through).
     let (predicate, scan) = match peel_input(agg.input.as_ref()) {
@@ -154,18 +207,20 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         return Ok(None);
     };
 
-    // Hierarchical manifests keep segments in lazily-loaded parts; the
-    // flat view may be partial, so classification would be unsound.
     let manifest = provider.manifest();
-    if !manifest.is_in_process_only() {
+    // Hierarchical manifests may expose a partial flat view. Rewrite only
+    // when the resident entries are provably complete; eagerly hydrated
+    // persisted tables then receive the same no-scan aggregate path as
+    // in-process tables, while genuinely lazy views decline safely.
+    let Some(superfiles) = manifest.complete_flat_superfiles() else {
         return Ok(None);
-    }
+    };
     let id_column = manifest.options.id_column.as_str();
 
     // Classify every segment.
     let mut covered: Vec<&Arc<SuperfileEntry>> = Vec::new();
     let mut boundary: HashSet<Uuid> = HashSet::new();
-    for entry in &manifest.superfiles {
+    for entry in superfiles {
         let class = classify(entry, id_column, &range);
         match class {
             Class::Disjoint => {}
@@ -448,6 +503,26 @@ fn peel_input(input: &LogicalPlan) -> Option<(Expr, &TableScan)> {
         return None;
     };
     Some((predicate.clone(), scan))
+}
+
+/// Peel an unfiltered aggregate input down to its table scan, looking through
+/// the same pure-column projection admitted by [`peel_input`].
+fn peel_unfiltered_scan(input: &LogicalPlan) -> Option<&TableScan> {
+    let mut node = input;
+    if let LogicalPlan::Projection(projection) = node {
+        if !projection
+            .expr
+            .iter()
+            .all(|expr| matches!(expr, Expr::Column(_)))
+        {
+            return None;
+        }
+        node = projection.input.as_ref();
+    }
+    match node {
+        LogicalPlan::TableScan(scan) => Some(scan),
+        _ => None,
+    }
 }
 
 /// The provider behind a scan, when it is ours.

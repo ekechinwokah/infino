@@ -17,10 +17,8 @@
 
 use std::{ops::Range, sync::Arc};
 
-use arrow::compute::{concat_batches, take};
-use arrow_array::{
-    ArrayRef, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions, UInt32Array,
-};
+use arrow::compute::{concat_batches, interleave_record_batch, take};
+use arrow_array::{ArrayRef, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use datafusion::{
@@ -390,13 +388,27 @@ async fn resolve_columns(
     let disk_cache = manifest.options.disk_cache.as_ref();
     let storage = manifest.options.storage.as_ref();
 
-    let opened = try_join_all(
-        seg_order
-            .iter()
-            .map(|uri| superfile_reader(store, disk_cache, storage, uri, None)),
-    )
-    .await
-    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    let opened = try_join_all(seg_order.iter().map(|&uri| async move {
+        let entry = manifest
+            .lookup_superfile_entry(uri)
+            .await
+            .map_err(|error| DataFusionError::Execution(error.to_string()))?
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "resolve_hits: superfile {uri:?} missing from manifest"
+                ))
+            })?;
+        superfile_reader(
+            store,
+            disk_cache,
+            storage,
+            &entry.uri,
+            entry.subsection_offsets.as_ref(),
+        )
+        .await
+        .map_err(|error| DataFusionError::Execution(error.to_string()))
+    }))
+    .await?;
 
     // Materialize each superfile's projected hit rows, split by tier:
     //
@@ -470,28 +482,13 @@ async fn resolve_columns(
         .into_iter()
         .map(|s| s.expect("invariant: every superfile resolved by exactly one wave"))
         .collect();
-    // Concatenate, then reorder rows into global rank order.
-    let cat_schema = per_superfile[0].schema();
-    let combined = concat_batches(&cat_schema, &per_superfile)
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-
-    let mut offsets: Vec<u32> = Vec::with_capacity(per_superfile.len());
-    let mut acc: u32 = 0;
-    for batch in &per_superfile {
-        offsets.push(acc);
-        acc += batch.num_rows() as u32;
-    }
-    let reorder =
-        UInt32Array::from_iter_values(placement.iter().map(|(s, r)| offsets[*s] + *r as u32));
-
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(combined.num_columns());
-    for column in combined.columns() {
-        columns.push(
-            take(column, &reorder, None).map_err(|e| DataFusionError::Execution(e.to_string()))?,
-        );
-    }
-    RecordBatch::try_new(combined.schema(), columns)
-        .map_err(|e| DataFusionError::Execution(e.to_string()))
+    // Assemble directly into global rank order. `interleave_record_batch`
+    // gathers from the per-superfile arrays in one pass; the old
+    // concatenate-then-take path allocated and copied every projected column
+    // twice before producing the same top-k-sized output.
+    let batches: Vec<&RecordBatch> = per_superfile.iter().collect();
+    interleave_record_batch(&batches, &placement)
+        .map_err(|error| DataFusionError::Execution(error.to_string()))
 }
 
 /// Parquet async reader backed by the `SuperfileReader`'s existing byte source.

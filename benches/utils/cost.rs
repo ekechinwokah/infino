@@ -973,11 +973,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     if query_states.is_empty()
         && let Some(q) = anchor_cold
     {
-        let open_label = if c.cold_open_amortized {
-            format!("Open — {}", q.name)
-        } else {
-            format!("Open — {}", q.name)
-        };
+        let open_label = format!("Open — {}", q.name);
         // Table open is compute-bound (manifest parse + reader CRC: measured
         // cpu ≈ wall), so it's priced from its MEASURED on-CPU seconds. NOT
         // METERED (never latency × share) when unsampled.
