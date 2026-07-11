@@ -1718,7 +1718,7 @@ mod tests {
             "overall superfile count must have decreased from original 20"
         );
 
-        // Manifest consistency: per-entry doc counts sum to 40.
+        // ManifestSnapshot consistency: per-entry doc counts sum to 40.
         let sfs = &r.manifest().superfiles;
         let total_from_manifest: u64 = sfs.iter().map(|s| s.n_docs).sum();
         assert_eq!(total_from_manifest, 40);
@@ -1808,7 +1808,7 @@ mod tests {
             "overall superfile count must have decreased from original 30"
         );
 
-        // Manifest consistency: per-entry doc counts sum to 245760.
+        // ManifestSnapshot consistency: per-entry doc counts sum to 245760.
         let sfs = &r.manifest().superfiles;
         let total_from_manifest: u64 = sfs.iter().map(|s| s.n_docs).sum();
         assert_eq!(total_from_manifest, 245760);

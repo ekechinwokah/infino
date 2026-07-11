@@ -322,23 +322,23 @@ pub struct SupertableOptions {
     /// [`Supertable::open`] time. When the manifest list
     /// references this many parts or fewer, open parallel-
     /// fetches all parts up front + populates the
-    /// `Manifest.parts` cache. Above the threshold, parts are
+    /// `ManifestSnapshot.parts` cache. Above the threshold, parts are
     /// left in empty `OnceCell`s — the first
-    /// `Manifest::part(id).await` lazy-loads on demand.
+    /// `ManifestSnapshot::part(id).await` lazy-loads on demand.
     ///
     /// Default `4`. Set to
     /// `0` to force lazy-load even for tiny manifests
     /// (useful for tests that want to verify the lazy path).
     ///
-    /// **Eager mode** populates `Manifest.superfile_list.superfiles`
+    /// **Eager mode** populates `ManifestSnapshot.superfile_list.superfiles`
     /// with the flat union of all loaded parts' superfiles —
     /// the legacy query paths (`bm25_search`,
     /// `vector_search`, `query_sql`) iterate this flat view.
     ///
-    /// **Lazy mode** leaves `Manifest.superfile_list.superfiles`
+    /// **Lazy mode** leaves `ManifestSnapshot.superfile_list.superfiles`
     /// empty until the hierarchical query path lands.
     /// Until then, callers using lazy mode must drive
-    /// `Manifest::part(id).await` directly; legacy
+    /// `ManifestSnapshot::part(id).await` directly; legacy
     /// flat-iteration queries return empty results.
     pub eager_load_threshold_parts: u32,
     /// Max OCC retry attempts before `writer.commit()` surfaces

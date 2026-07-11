@@ -3022,7 +3022,7 @@ mod tests {
         pack_cells_superfile(id_base, &[(0, 3, 2), (1, 2, 2)])
     }
 
-    /// Manifest / prepare path must publish the concatenated flat centroid
+    /// ManifestSnapshot / prepare path must publish the concatenated flat centroid
     /// directory (sum of per-cell `n_cent`), not only the first packed cell.
     /// Otherwise global nprobe only ever scores one cell per shard.
     #[test]

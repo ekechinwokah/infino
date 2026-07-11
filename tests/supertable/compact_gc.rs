@@ -82,7 +82,7 @@ fn compact_then_gc_removes_stale_files_and_preserves_queries() {
 
     let n_commits = markers.len();
     let data_dir = dir.path().join("data");
-    let lists_dir = dir.path().join("manifest-lists");
+    let lists_dir = dir.path().join("manifest");
 
     assert_eq!(
         count_dir(&data_dir),

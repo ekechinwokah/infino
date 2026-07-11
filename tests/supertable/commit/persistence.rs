@@ -9,7 +9,7 @@
 //! - A commit on a storage-backed supertable writes:
 //!   - each new superfile's bytes to `data/seg-<uuid>.sf.parquet`
 //!   - one manifest part to `manifests/part-<hash>.avro.zst`
-//!   - the manifest list to `manifest-lists/list-NNNNNN.json`
+//!   - the manifest list to `manifest/manifest-NNNNNN.json`
 //!   - the pointer to `_supertable/current`
 //! - The pointer is readable after commit; manifest_id
 //!   increments per commit.
@@ -58,13 +58,13 @@ fn commit_persists_pointer_list_part_and_superfile() {
     assert_eq!(pointer.get_manifest_id(), 1);
     assert!(
         pointer
-            .manifest_list_uri
-            .starts_with("manifest-lists/list-")
+            .manifest_uri
+            .starts_with("manifest/manifest-")
     );
 
-    // Manifest list file exists and is non-empty.
+    // ManifestSnapshot list file exists and is non-empty.
     let (list_bytes, _) =
-        futures::executor::block_on(storage.get(&pointer.manifest_list_uri)).expect("get list");
+        futures::executor::block_on(storage.get(&pointer.manifest_uri)).expect("get list");
     assert!(!list_bytes.is_empty());
 
     // At least one manifest part exists in manifests/.
@@ -126,14 +126,14 @@ fn two_successive_commits_both_publish() {
     );
 
     // Both manifest list versions persist (immutable per id).
-    let lists_dir = dir.path().join("manifest-lists");
+    let lists_dir = dir.path().join("manifest");
     let n_lists = std::fs::read_dir(&lists_dir)
         .expect("readdir")
         .filter_map(|e| e.ok())
         .count();
     assert_eq!(n_lists, 2, "two list files (manifest_id 1 + 2)");
 
-    // Manifest part count = 2 (each commit writes a fresh part
+    // ManifestSnapshot part count = 2 (each commit writes a fresh part
     // under content-addressed URI; single-partition mode
     // means a fresh part per commit, no reuse).
     let manifest_parts_dir = dir.path().join("manifest-parts");

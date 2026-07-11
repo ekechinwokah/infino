@@ -9,7 +9,7 @@
 //! carried only by the parts is re-fetched whenever anything changes. This
 //! blob gives the drain-owned slow state (per-superfile fp32 centroids +
 //! offsets inside each [`SuperfileEntry`]) its own identity: drain / hidden
-//! compaction publish it after membership settles, `Manifest::update` clears
+//! compaction publish it after membership settles, `ManifestSnapshot::update` clears
 //! the reference on any membership change, and every other manifest
 //! transition (deleted-id stamps, user commits) preserves it — so a loaded
 //! consumer keeps its decoded entries in memory until the drainer actually
@@ -20,7 +20,7 @@
 //! Same logical entries produce byte-identical blobs and therefore the same
 //! content-addressed URI, so republishing unchanged state is a no-op PUT.
 //! This module owns only the storage format and fetch/verify discipline; the
-//! decoded entries live in the hydrated `Manifest` (there is deliberately no
+//! decoded entries live in the hydrated `ManifestSnapshot` (there is deliberately no
 //! separate cache).
 
 use std::sync::Arc;

@@ -180,9 +180,9 @@ impl StorageProvider for CrashStorage {
 fn kill_point_config(kp: &str) -> (&'static str, usize, usize) {
     match kp {
         KP_SEG_FIRST => ("data/", 1, 1),
-        KP_LIST_FIRST => ("manifest-lists/", 1, 1),
+        KP_LIST_FIRST => ("manifest/", 1, 1),
         KP_SEG_SECOND => ("data/", 2, 2),
-        KP_LIST_SECOND => ("manifest-lists/", 2, 2),
+        KP_LIST_SECOND => ("manifest/", 2, 2),
         KP_POINTER_SECOND => ("_supertable/current", 2, 2),
         other => panic!("unknown kill point {other}"),
     }
@@ -326,7 +326,7 @@ fn crash_post_list_no_prior_commit_yields_pointer_unreadable() {
     );
 
     // The orphan manifest list is on disk but unreferenced.
-    let lists_dir = dir.join("manifest-lists");
+    let lists_dir = dir.join("manifest");
     let n_orphan_lists = std::fs::read_dir(&lists_dir)
         .map(|rd| rd.count())
         .unwrap_or(0);
@@ -374,7 +374,7 @@ fn crash_post_list_on_second_commit_yields_v1() {
 
     // Orphan v2 manifest list and v2 part are on disk —
     // tolerated here; compaction GCs them later.
-    let lists_dir = dir.join("manifest-lists");
+    let lists_dir = dir.join("manifest");
     let n_lists = std::fs::read_dir(&lists_dir)
         .map(|rd| rd.count())
         .unwrap_or(0);

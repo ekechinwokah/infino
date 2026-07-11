@@ -33,7 +33,7 @@
 //!
 //! Internally pins a snapshot reader and drives the async
 //! kernel to completion via the sync→async bridge. The reader
-//! holds a pinned `Arc<Manifest>`; for each visible superfile we:
+//! holds a pinned `Arc<ManifestSnapshot>`; for each visible superfile we:
 //!
 //!   1. Fetch the superfile's `SuperfileReader` from the store.
 //!   2. Delegate to `SuperfileReader::vector_search`
@@ -92,7 +92,7 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader, is_hidden_vector_index_table},
-        manifest::{Manifest, SuperfileEntry, SuperfileUri, list::PartitionStrategy},
+        manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri, list::PartitionStrategy},
         tombstones::SidecarCache,
     },
 };
@@ -138,7 +138,7 @@ pub(crate) struct PreparedGlobalAllow {
 /// Resolve the user-table superfile that owns `user_row_id` (flat view
 /// first, then list parts — same source as query fan-out).
 async fn lookup_user_superfile_by_id(
-    manifest: &Manifest,
+    manifest: &ManifestSnapshot,
     user_row_id: i128,
 ) -> Result<Arc<SuperfileEntry>, QueryError> {
     let id_column = manifest.options.id_column.as_str();
@@ -223,7 +223,7 @@ pub(crate) fn row_id_from_manifest_entry(
 /// [`hidden_hits_user_ids`]: span arithmetic → resident `take_by_local_doc_ids`
 /// → [`read_ids_for_locals`].
 pub(crate) async fn stable_ids_by_local_for_routing(
-    manifest: &Manifest,
+    manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
     reader: &SuperfileReader,
 ) -> Result<Vec<i128>, QueryError> {
@@ -262,7 +262,7 @@ pub(crate) async fn stable_ids_by_local_for_routing(
 ///   - `false` — never use the inline region; read the scalar `_id` column
 ///     (user superfiles after compaction — inline region is cluster-ordered).
 async fn read_ids_for_locals(
-    manifest: &Manifest,
+    manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
     local_ids: &[u32],
     id_column: &str,
@@ -347,7 +347,7 @@ async fn read_ids_batch_object_store(
 /// reading only the rows the hits touch — versus the previous per-hit
 /// object-store read that dominated warm latency.
 async fn hidden_hits_user_ids(
-    hidden_manifest: &Manifest,
+    hidden_manifest: &ManifestSnapshot,
     hidden_hits: &[SuperfileHit],
     id_column: &str,
 ) -> Result<Vec<i128>, QueryError> {
@@ -998,7 +998,7 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
 
-        // Manifest-only leaf survival: part-tier term bloom / range, then
+        // ManifestSnapshot-only leaf survival: part-tier term bloom / range, then
         // per-superfile summaries — no superfile reads. Intersect with the
         // vector centroid prune so `token_match` opens only superfiles that
         // could match the predicate *and* might hold vector-near rows.
@@ -1040,7 +1040,7 @@ impl SupertableReader {
     /// survival set.
     async fn vector_pruned_superfiles_intersect(
         &self,
-        manifest: &Manifest,
+        manifest: &ManifestSnapshot,
         surviving: &HashSet<u128>,
     ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
         Ok(manifest
@@ -1096,7 +1096,7 @@ impl SupertableReader {
     /// resolved on the user table and kNN runs on the hidden index when
     /// drained (same routing as [`Self::vector_hits_filtered_async`]).
     ///
-    /// Manifest-only leaf survival runs before any superfile opens: bounded
+    /// ManifestSnapshot-only leaf survival runs before any superfile opens: bounded
     /// FTS leaves are lowered to term-bloom prunes and intersected with the
     /// vector centroid prune. The per-superfile allow-set (`plan.evaluate`)
     /// then runs only over that intersection.

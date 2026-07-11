@@ -419,12 +419,12 @@ mod tests {
     async fn put_atomic_rejects_existing() {
         let (_dir, p) = provider();
         let payload = Bytes::from_static(b"first writer wins");
-        p.put_atomic("manifest-lists/list-1.json", payload.clone())
+        p.put_atomic("manifest/manifest-1.json", payload.clone())
             .await
             .expect("first put");
 
         let err = p
-            .put_atomic("manifest-lists/list-1.json", Bytes::from_static(b"second"))
+            .put_atomic("manifest/manifest-1.json", Bytes::from_static(b"second"))
             .await
             .expect_err("second put must fail");
         assert!(
@@ -433,7 +433,7 @@ mod tests {
         );
 
         let (got, _) = p
-            .get("manifest-lists/list-1.json")
+            .get("manifest/manifest-1.json")
             .await
             .expect("get after losing put");
         assert_eq!(got, payload);

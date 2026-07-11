@@ -140,7 +140,7 @@ use crate::{
         error::ManifestError,
         hidden_deleted::{self, encode_deleted_ids},
         manifest::{
-            ClusterCentroids, Manifest,
+            ClusterCentroids, ManifestSnapshot,
             commit::get_current_manifest_etag,
             list::PartitionStrategy,
             part::{self as part_mod, PartId},
@@ -1162,7 +1162,7 @@ impl SupertableWriter {
         // into THIS (the user) table's manifest, which is the source of truth for
         // the grid. Gated on VECTORS being in the input (a vector column), not on
         // any sibling table: the packed user build below and the query both read
-        // the grid from here, and it persists with this commit (`Manifest::update`
+        // the grid from here, and it persists with this commit (`ManifestSnapshot::update`
         // carries `global_vector_index` through). A hidden cell-index sibling, when
         // present, gets the grid as a derived copy at drain time — but its absence
         // must not change how user superfiles are laid out. Idempotent: only
@@ -1950,7 +1950,7 @@ pub(super) fn prepare_superfile_with_uri(
 /// `SuperfileEntry` construction) runs in parallel across the
 /// writer pool — for an FTS supertable the bloom build alone is
 /// O(n_terms_distinct) per FTS column per shard, which at 10M
-/// docs × 4 superfiles is the dominant cost. Manifest swap +
+/// docs × 4 superfiles is the dominant cost. ManifestSnapshot swap +
 /// storage write-through stay serial after the join.
 fn finish_superfile_entry(
     entry: Arc<SuperfileEntry>,
@@ -3938,7 +3938,7 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 
 /// Storage write-through with OCC retry. Persist the new
 /// superfiles + manifest to storage, returning the new
-/// in-memory `Manifest` with the fresh `ManifestList` +
+/// in-memory `ManifestSnapshot` with the fresh `Manifest` +
 /// `ManifestPartLoader` installed.
 ///
 /// **OCC retry semantics.** On each iteration:
@@ -3958,7 +3958,7 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 /// statically random, so a retry uses the same URIs as the
 /// prior attempt. The superfile-bytes PUT swallows
 /// `PreconditionFailed` (URI already exists with bit-identical
-/// content from our prior attempt). Manifest parts are
+/// content from our prior attempt). ManifestSnapshot parts are
 /// content-addressed; identical content yields identical URIs
 /// and the part-write path already swallows
 /// `PreconditionFailed`. Only the pointer PUT must win the
@@ -3972,7 +3972,7 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 /// and stamp its ref on the manifest list. Called after a maintenance
 /// sequence settles hidden vector membership (end of drain; end of the
 /// hidden compaction pass, after merges + finalize + any cell splits) —
-/// scoped by call site, never by a table-kind test. `Manifest::update`
+/// scoped by call site, never by a table-kind test. `ManifestSnapshot::update`
 /// cleared the ref when membership changed; this restamps it so consumers'
 /// resident centroid state is invalidated exactly once, by maintenance.
 ///
@@ -4093,7 +4093,7 @@ pub(in crate::supertable) async fn persist_commit_async(
     entries_to_remove: &[Arc<SuperfileEntry>],
     mut pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
     mut pending_storage_replaces: Vec<(SuperfileUri, Bytes)>,
-) -> Result<Manifest, SupertableCommitError> {
+) -> Result<ManifestSnapshot, SupertableCommitError> {
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
     let max_retries = opts.max_commit_retries.max(1);
@@ -4382,13 +4382,13 @@ pub(crate) enum NewEntryBirthVersions {
 pub(crate) async fn try_commit_attempt(
     storage: Arc<dyn StorageProvider>,
     opts: Arc<SupertableOptions>,
-    current_manifest: Arc<Manifest>,
+    current_manifest: Arc<ManifestSnapshot>,
     new_entries: &[Arc<SuperfileEntry>],
     entries_to_remove: &[Arc<SuperfileEntry>],
     birth_versions: NewEntryBirthVersions,
     pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
     pending_storage_replaces: &mut Vec<(SuperfileUri, Bytes)>,
-) -> Result<Manifest, SupertableCommitError> {
+) -> Result<ManifestSnapshot, SupertableCommitError> {
     // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(
         &storage,
@@ -4438,9 +4438,9 @@ pub(crate) async fn try_commit_attempt(
 
 /// Re-read the manifest pointer from storage, load any newer
 /// manifest list, inherit unchanged parts from the current
-/// in-memory `Manifest` via content-addressed `Arc::clone`,
+/// in-memory `ManifestSnapshot` via content-addressed `Arc::clone`,
 /// eager-fetch newly-referenced parts, and `ArcSwap` the
-/// refreshed `Manifest` into `inner.manifest`.
+/// refreshed `ManifestSnapshot` into `inner.manifest`.
 ///
 /// Called from the OCC retry loop between attempts so the next
 /// iteration's `inner.manifest.load_full()` sees the winning
@@ -4455,7 +4455,7 @@ pub(in crate::supertable) async fn refresh_inner_state_async(
     storage: &Arc<dyn StorageProvider>,
 ) -> Result<(), SupertableCommitError> {
     let current = inner.manifest.load_full();
-    let manifest = match Manifest::load(Some(current), storage.clone(), None).await {
+    let manifest = match ManifestSnapshot::load(Some(current), storage.clone(), None).await {
         Ok(manifest) => manifest,
         Err(ManifestLoadError::PointerNotFound) => return Ok(()),
         Err(ManifestLoadError::AlreadyLoaded) => return Ok(()),

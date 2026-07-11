@@ -68,7 +68,7 @@ use crate::{
     storage::StorageError,
     superfile::{ReadError, SuperfileReader, builder::SuperfileBuilder},
     supertable::{
-        Manifest, SupertableOptions,
+        ManifestSnapshot, SupertableOptions,
         handle::{Supertable, SupertableInner},
         manifest::{
             CellVectorSummary, ClusterCentroids, FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry,
@@ -263,7 +263,7 @@ pub async fn run_append_phase(
 /// matching `superfile_id`. O(N) in the number of live
 /// superfiles; called once per append-phase invocation, so the
 /// linear scan is fine at the supertable sizes we target.
-fn manifest_contains(manifest: &Manifest, superfile_id: Uuid) -> bool {
+fn manifest_contains(manifest: &ManifestSnapshot, superfile_id: Uuid) -> bool {
     manifest
         .get_all_superfiles()
         .iter()
@@ -409,7 +409,7 @@ async fn do_apply(
 
     let uri = SuperfileUri(preallocated_superfile_id);
     let entry = Arc::new(SuperfileEntry {
-        // Stamped to the winning commit version later, in `Manifest::update`.
+        // Stamped to the winning commit version later, in `ManifestSnapshot::update`.
         birth_version: 0,
         superfile_id: preallocated_superfile_id,
         uri,
@@ -439,7 +439,7 @@ async fn do_apply(
     // The writer's `persist_commit` handles the actual PUT of
     // the superfile bytes (via `pending_storage_writes`), the
     // OCC retry on the pointer file, and the partition-aware
-    // part rewrite. It returns the new in-memory `Manifest`
+    // part rewrite. It returns the new in-memory `ManifestSnapshot`
     // that reflects the persisted state, but it does NOT swap
     // `inner.manifest` itself — the caller owns that final
     // visibility barrier, mirroring how the synchronous
@@ -1047,7 +1047,7 @@ async fn cas_tombstone_bit(
 /// of candidates per target.
 fn resolve_target_id_in_manifest(
     inner: &Arc<SupertableInner>,
-    manifest: &Manifest,
+    manifest: &ManifestSnapshot,
     target_id: RowId,
 ) -> Result<Option<(Uuid, u32)>, TombstonePhaseError> {
     let target = target_id.0;
@@ -1273,7 +1273,7 @@ mod tests {
     async fn manifest_contains_returns_true_for_matching_uuid() {
         let (_dir, _st, _ws, _wal, _etag) = fixture().await;
         let opts = Arc::new(default_supertable_options());
-        let empty = Manifest::empty(Arc::clone(&opts));
+        let empty = ManifestSnapshot::empty(Arc::clone(&opts));
         assert!(!manifest_contains(&empty, Uuid::nil()));
     }
 
@@ -1364,7 +1364,7 @@ mod tests {
         assert_eq!(new_wal.state, WalState::Appended);
         assert_ne!(new_etag, etag, "etag must advance after the state change");
 
-        // Manifest now contains the preallocated superfile.
+        // ManifestSnapshot now contains the preallocated superfile.
         let manifest = st.inner().manifest.load_full();
         assert!(
             manifest_contains(&manifest, pre_uuid),

@@ -443,9 +443,9 @@ mod tests {
     #[test]
     fn path_parses_nested_uri() {
         let p = test_provider()
-            .path("manifest-lists/list-000042.json")
+            .path("manifest/manifest-000042.json")
             .expect("parse");
-        assert_eq!(p.to_string(), "manifest-lists/list-000042.json");
+        assert_eq!(p.to_string(), "manifest/manifest-000042.json");
     }
 
     #[test]

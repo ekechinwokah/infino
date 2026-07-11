@@ -10,12 +10,12 @@ use crate::{
     Supertable,
     runtime_bridge::bridge_on_runtime,
     supertable::{
-        Manifest,
+        ManifestSnapshot,
         error::GcError,
         handle::SupertableInner,
         manifest::{
             SUPERFILE_DATA_DIR,
-            commit::{MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, list_uri},
+            commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
         },
         slow_vector_state::STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX,
     },
@@ -36,10 +36,10 @@ pub struct GcReport {
     pub delete_errors: u64,
 }
 
-fn build_live_set(manifest: &Manifest) -> HashSet<String> {
+fn build_live_set(manifest: &ManifestSnapshot) -> HashSet<String> {
     let mut live = HashSet::new();
     live.insert(POINTER_PATH.to_string());
-    live.insert(list_uri(manifest.manifest_id));
+    live.insert(manifest_uri(manifest.manifest_id));
     for entry in manifest.get_all_list_entries() {
         live.insert(entry.uri.clone());
     }
@@ -82,7 +82,7 @@ pub(super) async fn gc_storage_sweep_for_inner(
     let mut report = GcReport::default();
 
     for prefix in [
-        MANIFEST_LISTS_DIR,
+        MANIFEST_DIR,
         MANIFEST_PARTS_DIR,
         SUPERFILE_DATA_DIR,
         SLOW_VECTOR_STATE_STORAGE_PREFIX,
@@ -125,8 +125,8 @@ mod tests {
         supertable::{
             SupertableOptions,
             manifest::{
-                Manifest, SuperfileEntry, SuperfileUri,
-                list::{FORMAT_VERSION, ManifestList, PartitionStrategy},
+                ManifestSnapshot, SuperfileEntry, SuperfileUri,
+                list::{FORMAT_VERSION, Manifest, PartitionStrategy},
                 part::ContentHash,
             },
             slow_vector_state,
@@ -137,7 +137,7 @@ mod tests {
     /// Bucket count for a minimal hash-partitioned manifest list fixture.
     const TEST_HASH_BUCKETS: u32 = 1;
 
-    /// Manifest id for a single-list live-set fixture.
+    /// ManifestSnapshot id for a single-list live-set fixture.
     const TEST_MANIFEST_ID: u64 = 0;
 
     fn opts() -> Arc<SupertableOptions> {
@@ -164,16 +164,16 @@ mod tests {
 
     #[test]
     fn build_live_set_contains_pointer_and_list_uri() {
-        let manifest = Manifest::empty(opts());
+        let manifest = ManifestSnapshot::empty(opts());
         let live = build_live_set(&manifest);
         assert!(live.contains(POINTER_PATH));
-        assert!(live.contains(&list_uri(manifest.manifest_id)));
+        assert!(live.contains(&manifest_uri(manifest.manifest_id)));
     }
 
     #[test]
     fn build_live_set_contains_superfile_uris() {
         let uri = SuperfileUri::new_v4();
-        let manifest = Manifest::empty(opts()).with_appended(vec![sf_entry(uri)]);
+        let manifest = ManifestSnapshot::empty(opts()).with_appended(vec![sf_entry(uri)]);
         let live = build_live_set(&manifest);
         assert!(live.contains(&uri.storage_path()));
     }
@@ -181,11 +181,11 @@ mod tests {
     #[test]
     fn build_live_set_does_not_contain_older_list_uris() {
         let uri = SuperfileUri::new_v4();
-        let manifest = Manifest::empty(opts()).with_appended(vec![sf_entry(uri)]);
+        let manifest = ManifestSnapshot::empty(opts()).with_appended(vec![sf_entry(uri)]);
         assert_eq!(manifest.manifest_id, 1);
         let live = build_live_set(&manifest);
-        assert!(!live.contains(&list_uri(0)));
-        assert!(!live.contains(&list_uri(2)));
+        assert!(!live.contains(&manifest_uri(0)));
+        assert!(!live.contains(&manifest_uri(2)));
     }
 
     /// The slow-CAS entry blob referenced from the list is live; anything
@@ -200,12 +200,12 @@ mod tests {
         let hash = ContentHash::of(b"slow state");
         let uri = slow_vector_state::storage_path(&hash);
         let orphan = slow_vector_state::storage_path(&ContentHash::of(b"orphan"));
-        let manifest = Manifest::new(
+        let manifest = ManifestSnapshot::new(
             TEST_MANIFEST_ID,
             opts(),
             Vec::new(),
             Some(storage),
-            Some(ManifestList {
+            Some(Manifest {
                 format_version: FORMAT_VERSION.into(),
                 manifest_id: TEST_MANIFEST_ID,
                 options_hash: ContentHash::of(b"options"),
@@ -234,7 +234,7 @@ mod tests {
         );
 
         // A manifest without a ref keeps nothing under the prefix live.
-        let bare = Manifest::empty(opts());
+        let bare = ManifestSnapshot::empty(opts());
         let live = build_live_set(&bare);
         assert!(!live.contains(&uri));
     }

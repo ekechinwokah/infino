@@ -19,7 +19,7 @@
 //!
 //! At `query_sql` time we:
 //!
-//!   1. Use the reader's already-pinned `Arc<Manifest>`.
+//!   1. Use the reader's already-pinned `Arc<ManifestSnapshot>`.
 //!   2. Register a [`SupertableProvider`] as `supertable` in a
 //!      fresh `SessionContext`.
 //!   3. `ctx.sql(sql).await.collect().await`.

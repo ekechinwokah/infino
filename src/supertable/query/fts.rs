@@ -32,7 +32,7 @@
 //!
 //! Internally pins a snapshot reader and drives the async
 //! kernel to completion via the sync→async bridge. The reader
-//! holds a pinned `Arc<Manifest>`; for each visible superfile we:
+//! holds a pinned `Arc<ManifestSnapshot>`; for each visible superfile we:
 //!
 //!   1. Fetch the superfile's `SuperfileReader` from the store.
 //!   2. Delegate to `SuperfileReader::bm25_search` /
@@ -60,7 +60,7 @@
 //! within the set wiggles. Oracle tests assert set membership at
 //! `k = 10` against a single-superfile ground truth.
 //!
-//! Manifest-level skip pruning is wired in: each call computes a
+//! ManifestSnapshot-level skip pruning is wired in: each call computes a
 //! per-superfile keep/prune mask from the FTS bloom (exact-term
 //! mode) or the lex term range (prefix mode) before issuing
 //! per-superfile work, so pruned superfiles never trigger a
@@ -385,7 +385,7 @@ impl SupertableReader {
         let column_owned = column.to_owned();
         let prefix_owned = prefix.to_owned();
 
-        // Manifest-level term-range skip uses the same
+        // ManifestSnapshot-level term-range skip uses the same
         // lowercased prefix bytes the v1 tokenizer +
         // FST-expansion path use, so the skip's
         // lex-range overlap test exactly matches the
