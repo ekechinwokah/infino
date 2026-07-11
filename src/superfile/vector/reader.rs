@@ -38,7 +38,7 @@ use crate::superfile::{
         },
         {self},
     },
-    lazy_source::{LazyByteSource, LazyByteSourceError, PrefetchedSource},
+    lazy_source::{LazyByteSource, LazyByteSourceError, PrefetchedSource, RangeCoalescePlan},
     vector::{
         cell_posting::{EncodedCellRow, MaterializedIvfRow, sq8_residual_norm_sq},
         distance::{
@@ -4169,70 +4169,6 @@ fn lazy_sq8_meta_range(col: &ColumnReader) -> Option<Range<usize>> {
     Some(*scale_abs_off..*scale_abs_off + scale_offset_bytes + norm_bytes)
 }
 
-/// Coalescing plan for a set of cluster-block ranges. Computed once
-/// and applied to either a sync ([`Source::get_ranges_parallel`]) or
-/// async ([`Source::get_ranges_parallel_async`]) batch fetch — the
-/// byte selection is identical regardless of which path executes it,
-/// so the sync and async vector kernels return bit-identical results.
-struct CoalescePlan {
-    /// Merged ranges to actually GET (adjacent / near-adjacent
-    /// cluster blocks fused into one request to cut the GET count).
-    fetch_ranges: Vec<Range<usize>>,
-    /// Per original input range, in input order: `(fetch_idx,
-    /// offset_in_fetch, len)` — how to slice the requested range
-    /// back out of its merged fetch block.
-    scatter: Vec<(usize, usize, usize)>,
-}
-
-/// Group `ranges` into coalesced fetch spans (same gap/overfetch rule
-/// the per-cluster cold fan-out has always used) and record how to
-/// slice each original range back out. Pure; no I/O.
-fn plan_cluster_coalesce(ranges: &[Range<usize>]) -> CoalescePlan {
-    let mut sorted: Vec<(usize, Range<usize>)> = ranges.iter().cloned().enumerate().collect();
-    sorted.sort_unstable_by_key(|(_, r)| (r.start, r.end));
-
-    // groups: (merged_range, payload_len, members[(orig_idx, range)])
-    let mut groups: Vec<(Range<usize>, usize, Vec<(usize, Range<usize>)>)> = Vec::new();
-    for (idx, range) in sorted {
-        if let Some((merged, payload_len, members)) = groups.last_mut() {
-            let gap = range.start.saturating_sub(merged.end);
-            let merged_end = merged.end.max(range.end);
-            let new_payload_len = *payload_len + range.len();
-            let new_overfetch = (merged_end - merged.start).saturating_sub(new_payload_len);
-            if range.start <= merged.end
-                || (gap <= CLUSTER_RANGE_COALESCE_MAX_GAP
-                    && new_overfetch <= CLUSTER_RANGE_COALESCE_MAX_OVERFETCH)
-            {
-                merged.end = merged_end;
-                *payload_len = new_payload_len;
-                members.push((idx, range));
-                continue;
-            }
-        }
-        groups.push((range.clone(), range.len(), vec![(idx, range)]));
-    }
-
-    let fetch_ranges: Vec<Range<usize>> = groups.iter().map(|(r, _, _)| r.clone()).collect();
-    let mut scatter: Vec<(usize, usize, usize)> = vec![(0, 0, 0); ranges.len()];
-    for (gi, (merged_range, _, members)) in groups.iter().enumerate() {
-        for (idx, range) in members {
-            scatter[*idx] = (gi, range.start - merged_range.start, range.len());
-        }
-    }
-    CoalescePlan {
-        fetch_ranges,
-        scatter,
-    }
-}
-
-/// Slice the requested ranges back out of the fetched merged blocks.
-fn apply_coalesce(plan: &CoalescePlan, fetched: &[Bytes]) -> Vec<Bytes> {
-    plan.scatter
-        .iter()
-        .map(|&(gi, off, len)| fetched[gi].slice(off..off + len))
-        .collect()
-}
-
 fn get_cluster_ranges_coalesced_with_extra(
     source: &Source,
     ranges: &[Range<usize>],
@@ -4241,12 +4177,16 @@ fn get_cluster_ranges_coalesced_with_extra(
     let Some(extra) = extra else {
         return Ok((get_cluster_ranges_coalesced(source, ranges)?, None));
     };
-    let plan = plan_cluster_coalesce(ranges);
-    let mut fetch = plan.fetch_ranges.clone();
+    let plan = RangeCoalescePlan::new(
+        ranges,
+        CLUSTER_RANGE_COALESCE_MAX_GAP,
+        CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
+    );
+    let mut fetch = plan.fetch_ranges().to_vec();
     fetch.push(extra);
     let mut fetched = source.get_ranges_parallel(&fetch)?;
     let extra_bytes = fetched.pop();
-    Ok((apply_coalesce(&plan, &fetched), extra_bytes))
+    Ok((plan.restore(&fetched), extra_bytes))
 }
 
 /// Async sibling of [`get_cluster_ranges_coalesced_with_extra`]. Same
@@ -4263,12 +4203,16 @@ async fn get_cluster_ranges_coalesced_with_extra_async(
             None,
         ));
     };
-    let plan = plan_cluster_coalesce(ranges);
-    let mut fetch = plan.fetch_ranges.clone();
+    let plan = RangeCoalescePlan::new(
+        ranges,
+        CLUSTER_RANGE_COALESCE_MAX_GAP,
+        CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
+    );
+    let mut fetch = plan.fetch_ranges().to_vec();
     fetch.push(extra);
     let mut fetched = source.get_ranges_parallel_async(&fetch).await?;
     let extra_bytes = fetched.pop();
-    Ok((apply_coalesce(&plan, &fetched), extra_bytes))
+    Ok((plan.restore(&fetched), extra_bytes))
 }
 
 fn get_cluster_ranges_coalesced(
@@ -4281,9 +4225,13 @@ fn get_cluster_ranges_coalesced(
     if ranges.len() == 1 {
         return source.get_ranges_parallel(ranges);
     }
-    let plan = plan_cluster_coalesce(ranges);
-    let fetched = source.get_ranges_parallel(&plan.fetch_ranges)?;
-    Ok(apply_coalesce(&plan, &fetched))
+    let plan = RangeCoalescePlan::new(
+        ranges,
+        CLUSTER_RANGE_COALESCE_MAX_GAP,
+        CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
+    );
+    let fetched = source.get_ranges_parallel(plan.fetch_ranges())?;
+    Ok(plan.restore(&fetched))
 }
 
 /// Async sibling of [`get_cluster_ranges_coalesced`].
@@ -4297,9 +4245,15 @@ async fn get_cluster_ranges_coalesced_async(
     if ranges.len() == 1 {
         return source.get_ranges_parallel_async(ranges).await;
     }
-    let plan = plan_cluster_coalesce(ranges);
-    let fetched = source.get_ranges_parallel_async(&plan.fetch_ranges).await?;
-    Ok(apply_coalesce(&plan, &fetched))
+    let plan = RangeCoalescePlan::new(
+        ranges,
+        CLUSTER_RANGE_COALESCE_MAX_GAP,
+        CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
+    );
+    let fetched = source
+        .get_ranges_parallel_async(plan.fetch_ranges())
+        .await?;
+    Ok(plan.restore(&fetched))
 }
 
 /// Best-effort sync byte fetch with a typed error. Used throughout
@@ -8196,23 +8150,27 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // plan_cluster_coalesce / apply_coalesce
+    // RangeCoalescePlan
     // -----------------------------------------------------------------
 
     /// Far-apart ranges (gap beyond the coalesce window) stay as
-    /// separate fetches; `apply_coalesce` slices each requested range
+    /// separate fetches; `restore` slices each requested range
     /// back out byte-for-byte and preserves input order.
     #[test]
     fn plan_cluster_coalesce_keeps_distant_ranges_separate() {
         let ranges = vec![0..4, 1_000_000..1_000_008];
-        let plan = plan_cluster_coalesce(&ranges);
+        let plan = RangeCoalescePlan::new(
+            &ranges,
+            CLUSTER_RANGE_COALESCE_MAX_GAP,
+            CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
+        );
         assert_eq!(
-            plan.fetch_ranges.len(),
+            plan.fetch_ranges().len(),
             2,
             "ranges past the coalesce gap are not merged"
         );
 
-        // Build a synthetic blob and confirm apply_coalesce recovers the
+        // Build a synthetic blob and confirm restore recovers the
         // exact requested bytes in input order.
         let mut blob = vec![0u8; 1_000_016];
         for (i, byte) in blob.iter_mut().enumerate() {
@@ -8220,11 +8178,11 @@ mod tests {
         }
         let bytes = Bytes::from(blob);
         let fetched: Vec<Bytes> = plan
-            .fetch_ranges
+            .fetch_ranges()
             .iter()
             .map(|r| bytes.slice(r.clone()))
             .collect();
-        let out = apply_coalesce(&plan, &fetched);
+        let out = plan.restore(&fetched);
         assert_eq!(out.len(), ranges.len());
         for (o, r) in out.iter().zip(ranges.iter()) {
             assert_eq!(o.as_ref(), &bytes[r.clone()]);
@@ -8232,19 +8190,23 @@ mod tests {
     }
 
     /// Adjacent / near-adjacent ranges fuse into one fetch span, and
-    /// `apply_coalesce` still slices each original range out correctly —
+    /// `restore` still slices each original range out correctly —
     /// including when the input order is not sorted by start offset.
     #[test]
     fn plan_cluster_coalesce_merges_adjacent_and_slices_back() {
         // Two adjacent ranges plus one within the gap window → all fused.
         let ranges = vec![100..120, 80..100, 130..150];
-        let plan = plan_cluster_coalesce(&ranges);
+        let plan = RangeCoalescePlan::new(
+            &ranges,
+            CLUSTER_RANGE_COALESCE_MAX_GAP,
+            CLUSTER_RANGE_COALESCE_MAX_OVERFETCH,
+        );
         assert_eq!(
-            plan.fetch_ranges.len(),
+            plan.fetch_ranges().len(),
             1,
             "near-adjacent ranges fuse into a single fetch"
         );
-        let merged = &plan.fetch_ranges[0];
+        let merged = &plan.fetch_ranges()[0];
         assert_eq!(merged.start, 80);
         assert_eq!(merged.end, 150);
 
@@ -8254,11 +8216,11 @@ mod tests {
         }
         let bytes = Bytes::from(blob);
         let fetched: Vec<Bytes> = plan
-            .fetch_ranges
+            .fetch_ranges()
             .iter()
             .map(|r| bytes.slice(r.clone()))
             .collect();
-        let out = apply_coalesce(&plan, &fetched);
+        let out = plan.restore(&fetched);
         // Output order matches input order, not sorted order.
         assert_eq!(out[0].as_ref(), &bytes[100..120]);
         assert_eq!(out[1].as_ref(), &bytes[80..100]);

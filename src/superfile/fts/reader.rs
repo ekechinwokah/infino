@@ -44,8 +44,14 @@ use crate::superfile::{
         posting::{BLOCK_LEN, decode_block},
         tokenize::{AsciiLowerTokenizer, Tokenizer as _},
     },
-    lazy_source::{LazyByteSource, PrefetchedSource, Source},
+    lazy_source::{LazyByteSource, PrefetchedSource, RangeCoalescePlan, Source},
 };
+
+/// Largest gap worth overfetching when adjacent term posting bodies can share
+/// one object-store request.
+const TERM_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
+/// Aggregate non-posting bytes tolerated inside one merged term fetch.
+const TERM_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
 
 /// Boolean-mode for multi-term queries.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -560,14 +566,21 @@ impl FtsReader {
             }
             ranges.push(base + m..base + m + postings_length);
         }
-        self.source
-            .get_ranges_parallel_async(&ranges)
+        let plan = RangeCoalescePlan::new(
+            &ranges,
+            TERM_RANGE_COALESCE_MAX_GAP,
+            TERM_RANGE_COALESCE_MAX_OVERFETCH,
+        );
+        let fetched = self
+            .source
+            .get_ranges_parallel_async(plan.fetch_ranges())
             .await
             .map_err(|e| {
                 FtsError::Read(ReadError::MalformedVersion(format!(
                     "fts/postings term body range fetch failed: {e}"
                 )))
-            })
+            })?;
+        Ok(plan.restore(&fetched))
     }
 
     /// Resolve a column name to its dense column_id, or
