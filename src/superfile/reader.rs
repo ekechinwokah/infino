@@ -20,7 +20,7 @@
 //! single-superfile SuperfileReader does no I/O after `open()`; a
 //! storage layer can layer cold-fetch heuristics on top.
 
-use std::{collections::HashMap, fmt, io, str, sync::Arc};
+use std::{collections::HashMap, fmt, io, ops::Range, str, sync::Arc};
 
 use arrow::compute::{concat_batches, take};
 use arrow_array::{
@@ -28,6 +28,7 @@ use arrow_array::{
 };
 use arrow_schema::{Field, Schema};
 use bytes::Bytes;
+use futures::{FutureExt, future::BoxFuture};
 use parquet::{
     arrow::{
         ProjectionMask,
@@ -35,11 +36,14 @@ use parquet::{
             ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
             RowSelector,
         },
+        async_reader::MetadataFetch,
         parquet_to_arrow_schema,
     },
-    file::metadata::{PageIndexPolicy, ParquetMetaData},
+    errors::{ParquetError, Result as ParquetResult},
+    file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader},
 };
 use roaring::RoaringBitmap;
+use tokio::sync::OnceCell;
 
 use crate::{
     superfile::{
@@ -113,6 +117,10 @@ pub struct SuperfileReader {
     /// row-group counts and DataFusion's parquet opener from one
     /// per-open parse instead of re-reading footers on every query.
     parquet_meta: Arc<ParquetMetaData>,
+    /// Lazy-reader metadata upgraded with Parquet offset indexes on the first
+    /// targeted scalar read. Offset-index bytes flow through the same
+    /// block-cached source and are decoded once per reader.
+    page_index_meta: OnceCell<Arc<ParquetMetaData>>,
     /// The lazy byte source the reader was opened over, retained only
     /// on the [`open_lazy`] path. `None` on the eager [`open`] path
     /// (resident bytes already cover every range). Lets
@@ -127,6 +135,26 @@ pub struct SuperfileReader {
     n_docs: u64,
     fts: Option<FtsReader>,
     vec: Option<VectorReader>,
+}
+
+struct LazyMetadataFetch {
+    source: Arc<dyn LazyByteSource>,
+}
+
+impl MetadataFetch for &mut LazyMetadataFetch {
+    fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
+        let source = Arc::clone(&self.source);
+        async move {
+            let len = range.end.checked_sub(range.start).ok_or_else(|| {
+                ParquetError::General(format!("invalid metadata range {range:?}"))
+            })?;
+            source
+                .range(range.start, len)
+                .await
+                .map_err(|error| ParquetError::General(error.to_string()))
+        }
+        .boxed()
+    }
 }
 
 impl fmt::Debug for SuperfileReader {
@@ -312,6 +340,7 @@ impl SuperfileReader {
             bytes: None,
             arrow_meta: None,
             parquet_meta,
+            page_index_meta: OnceCell::new(),
             source: Some(source),
             schema,
             id_column,
@@ -422,6 +451,7 @@ impl SuperfileReader {
         Ok(Self {
             bytes: Some(bytes),
             parquet_meta: Arc::clone(arrow_meta.metadata()),
+            page_index_meta: OnceCell::new_with(Some(Arc::clone(arrow_meta.metadata()))),
             arrow_meta: Some(arrow_meta),
             source: None,
             schema,
@@ -438,6 +468,43 @@ impl SuperfileReader {
     /// from this instead of re-reading the footer per query.
     pub fn parquet_metadata(&self) -> &Arc<ParquetMetaData> {
         &self.parquet_meta
+    }
+
+    /// Parquet metadata with offset indexes loaded when available.
+    ///
+    /// Eager readers return their open-time metadata. Lazy readers fetch only
+    /// the page-index metadata range through their existing byte source; a
+    /// [`OnceCell`] coalesces concurrent first callers and keeps all later
+    /// targeted row reads local.
+    pub(crate) async fn parquet_metadata_with_page_index(
+        &self,
+    ) -> Result<Arc<ParquetMetaData>, ReadError> {
+        if self.parquet_meta.offset_index().is_some() {
+            return Ok(Arc::clone(&self.parquet_meta));
+        }
+        let source = self.source.as_ref().map(Arc::clone);
+        let metadata = self
+            .page_index_meta
+            .get_or_try_init(|| async move {
+                let Some(source) = source else {
+                    return Ok::<Arc<ParquetMetaData>, ReadError>(Arc::clone(&self.parquet_meta));
+                };
+                let mut fetch = LazyMetadataFetch { source };
+                let mut loader =
+                    ParquetMetaDataReader::new_with_metadata((*self.parquet_meta).clone())
+                        .with_column_index_policy(PageIndexPolicy::Skip)
+                        .with_offset_index_policy(PageIndexPolicy::Optional);
+                loader
+                    .load_page_index(&mut fetch)
+                    .await
+                    .map_err(|error| ReadError::Footer(footer::FooterError::Parquet(error)))?;
+                let metadata = loader
+                    .finish()
+                    .map_err(|error| ReadError::Footer(footer::FooterError::Parquet(error)))?;
+                Ok(Arc::new(metadata))
+            })
+            .await?;
+        Ok(Arc::clone(metadata))
     }
 
     /// Arrow schema of the user-visible columns (Parquet rows).
@@ -1801,6 +1868,31 @@ mod tests {
         let meta = r.parquet_metadata();
         let total: i64 = meta.row_groups().iter().map(|rg| rg.num_rows()).sum();
         assert_eq!(total, 4);
+    }
+
+    #[tokio::test]
+    async fn lazy_parquet_metadata_loads_offset_index_once() {
+        let bytes = build_simple_fts_only_superfile();
+        let source: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
+        let reader = SuperfileReader::open_lazy(source).await.expect("lazy open");
+        assert!(
+            reader.parquet_metadata().offset_index().is_none(),
+            "footer-only lazy open should not preload page indexes"
+        );
+
+        let first = reader
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("load offset index");
+        assert!(
+            first.offset_index().is_some(),
+            "targeted row reads require the Parquet offset index"
+        );
+        let second = reader
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("reuse offset index");
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]

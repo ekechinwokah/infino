@@ -553,9 +553,13 @@ pub(crate) async fn take_rows_byte_source(
     local_doc_ids: &[u32],
     names: &[&str],
 ) -> DfResult<RecordBatch> {
+    let metadata = reader
+        .parquet_metadata_with_page_index()
+        .await
+        .map_err(|error| DataFusionError::Execution(error.to_string()))?;
     let input = ByteSourceAsyncReader {
         source: reader.byte_source(),
-        metadata: Arc::clone(reader.parquet_metadata()),
+        metadata,
     };
     take_rows_async(
         input,
@@ -581,7 +585,7 @@ pub(crate) async fn take_rows_object_store(
     local_doc_ids: &[u32],
     names: &[&str],
 ) -> DfResult<RecordBatch> {
-    let mut object_reader = ParquetObjectReader::new(store, path);
+    let mut object_reader = ParquetObjectReader::new(store, path).with_preload_offset_index(true);
     if let Some(size) = file_size.filter(|&s| s > 0) {
         // Skip the size-discovery HEAD when the manifest already knows it.
         object_reader = object_reader.with_file_size(size);
