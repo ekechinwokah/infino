@@ -662,65 +662,13 @@ impl SupertableReader {
                     cutoff += 1;
                 }
                 let selected_cells = &ranked[..cutoff];
-                let selected: HashSet<u32> = selected_cells.iter().copied().collect();
-                let mut fine_by_fragment: HashMap<(u32, usize), Vec<(u32, f32, u64)>> =
-                    HashMap::new();
-                for (si, cluster, score, cell, count) in candidates {
+                for (si, cluster, score, cell, _) in candidates {
                     match cell {
-                        Some(cell) if selected.contains(&cell) => fine_by_fragment
-                            .entry((cell, si))
-                            .or_default()
-                            .push((cluster, score, count)),
+                        Some(cell) if selected_cells.contains(&cell) => {
+                            gated.push((si, cluster, score));
+                        }
                         Some(_) => {}
                         None => scored.push((si, cluster, score)),
-                    }
-                }
-                let mut remaining = Vec::new();
-                for &cell in selected_cells {
-                    let mut fragment_ids: Vec<usize> = fine_by_fragment
-                        .keys()
-                        .filter_map(|(candidate_cell, si)| (*candidate_cell == cell).then_some(*si))
-                        .collect();
-                    fragment_ids.sort_unstable();
-                    for si in fragment_ids {
-                        let Some(mut fine) = fine_by_fragment.remove(&(cell, si)) else {
-                            continue;
-                        };
-                        fine.sort_unstable_by(|a, b| {
-                            a.1.partial_cmp(&b.1)
-                                .unwrap_or(Ordering::Equal)
-                                .then_with(|| a.0.cmp(&b.0))
-                        });
-                        let keep = nprobe.max(1).min(fine.len());
-                        let tail = fine.split_off(keep);
-                        gated.extend(
-                            fine.into_iter()
-                                .map(|(cluster, score, _)| (si, cluster, score)),
-                        );
-                        remaining.extend(
-                            tail.into_iter()
-                                .map(|(cluster, score, count)| (si, cluster, score, count)),
-                        );
-                    }
-                }
-                let mut postings: u64 = gated
-                    .iter()
-                    .map(|(si, cluster, _)| {
-                        candidate_counts.get(&(*si, *cluster)).copied().unwrap_or(0)
-                    })
-                    .sum();
-                if postings < gated_target {
-                    remaining.sort_unstable_by(|a, b| {
-                        a.2.partial_cmp(&b.2)
-                            .unwrap_or(Ordering::Equal)
-                            .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
-                    });
-                    for (si, cluster, score, count) in remaining {
-                        gated.push((si, cluster, score));
-                        postings += count;
-                        if postings >= gated_target {
-                            break;
-                        }
                     }
                 }
             }
@@ -732,8 +680,10 @@ impl SupertableReader {
             }
         }
 
-        // Cell-tagged candidates above keep the closest `nprobe` fine
-        // centroids per immutable fragment inside each selected coarse cell.
+        // Cell-tagged candidates keep the complete fine runs inside the
+        // selected coarse cells. Their adjacent cluster ranges coalesce into
+        // one fetch per fragment; sparse fine-centroid pruning here previously
+        // inflated a 6-GET hidden query to 24-28 GETs.
         // Untagged legacy candidates still use the global fallback budget.
         let n_eligible = {
             let mut segs: Vec<usize> = scored
