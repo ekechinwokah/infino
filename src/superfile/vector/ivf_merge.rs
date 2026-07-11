@@ -7,9 +7,10 @@
 //! and Sq8-transcodes rerank rows only when a source cluster's quantizer
 //! differs from the destination — no fp32 corpus buffer and no re-kmeans.
 
+use std::collections::HashMap;
+
 use bytemuck::cast_slice;
 use rayon::prelude::*;
-use std::collections::HashMap;
 
 use crate::superfile::{
     BuildError,
