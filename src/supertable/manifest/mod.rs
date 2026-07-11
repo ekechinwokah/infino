@@ -806,6 +806,49 @@ impl Manifest {
         }
     }
 
+    /// User superfiles whose logical birth version is not covered by the
+    /// hidden drain watermark. Part-level birth ranges prune fully drained
+    /// lazy parts before any object-store read.
+    pub(crate) async fn get_undrained_superfiles_loaded(
+        &self,
+        drained: &list::DrainedVersionRanges,
+    ) -> Result<Vec<Arc<SuperfileEntry>>, ManifestLoadError> {
+        let Some(list) = &self.list else {
+            return Ok(self
+                .superfile_list
+                .superfiles
+                .iter()
+                .filter(|entry| !drained.contains(entry.birth_version))
+                .cloned()
+                .collect());
+        };
+        let expected: u64 = list.parts.iter().map(|entry| entry.n_superfiles).sum();
+        if self.superfile_list.superfiles.len() as u64 == expected {
+            return Ok(self
+                .superfile_list
+                .superfiles
+                .iter()
+                .filter(|entry| !drained.contains(entry.birth_version))
+                .cloned()
+                .collect());
+        }
+        let part_ids: Vec<PartId> = list
+            .parts
+            .iter()
+            .filter(|entry| {
+                entry
+                    .birth_version_range()
+                    .is_none_or(|(lo, hi)| !drained.covers(lo, hi))
+            })
+            .map(|entry| entry.part_id)
+            .collect();
+        let entries = hierarchical_iter::load_and_flatten(self, &part_ids).await?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| !drained.contains(entry.birth_version))
+            .collect())
+    }
+
     pub fn get_all_list_entries(&self) -> &[ManifestPartEntry] {
         match &self.list {
             Some(list) => &list.parts,
@@ -1058,6 +1101,29 @@ impl Manifest {
         new_entries: &[Arc<SuperfileEntry>],
         entries_to_remove: &[Arc<SuperfileEntry>],
     ) -> Result<(Manifest, Vec<EncodedPart>), ManifestError> {
+        self.update_inner(new_entries, entries_to_remove, false)
+            .await
+    }
+
+    /// Compaction replaces physical files without changing the logical user
+    /// commits already represented by those files. Preserve each replacement
+    /// entry's inherited `birth_version` so the hidden drain watermark keeps
+    /// recognizing that data as drained.
+    pub(crate) async fn update_preserving_birth_versions(
+        &self,
+        new_entries: &[Arc<SuperfileEntry>],
+        entries_to_remove: &[Arc<SuperfileEntry>],
+    ) -> Result<(Manifest, Vec<EncodedPart>), ManifestError> {
+        self.update_inner(new_entries, entries_to_remove, true)
+            .await
+    }
+
+    async fn update_inner(
+        &self,
+        new_entries: &[Arc<SuperfileEntry>],
+        entries_to_remove: &[Arc<SuperfileEntry>],
+        preserve_birth_versions: bool,
+    ) -> Result<(Manifest, Vec<EncodedPart>), ManifestError> {
         // 1. Resolve the effective partition strategy. Locked at
         //    first commit: read from the existing manifest list
         //    if present, else use the options default.
@@ -1082,14 +1148,10 @@ impl Manifest {
         //    overwrite that assignment (e.g. shifting an IngestionTime entry to
         //    the current day), so reject it instead.
         //
-        //    Also stamp each new entry's `birth_version` to the version this
-        //    commit will publish (`get_next_manifest_id`). Re-derived on every
-        //    OCC attempt, so a CAS conflict that bumps the version re-stamps —
-        //    the published manifest always has `manifest_id == new entries'
-        //    birth_version`. Carried-over entries (below) keep their original
-        //    birth_version. Stamp ONCE so both the parts and the flat
-        //    `superfiles` view (which the drain reads via `get_all_superfiles`)
-        //    carry the same partition_key + birth_version.
+        //    Fresh writes stamp each new entry's `birth_version` to this
+        //    commit's version. Compaction instead preserves the oldest input
+        //    version inherited by its replacement: changing physical files
+        //    does not make already-drained logical data undrained.
         let birth_version = self.get_next_manifest_id();
         let stamped_new_entries: Vec<Arc<SuperfileEntry>> = new_entries
             .iter()
@@ -1103,9 +1165,14 @@ impl Manifest {
                     });
                 }
                 let pk = assign_partition(e, &strategy)?;
+                let entry_birth_version = if preserve_birth_versions {
+                    e.birth_version
+                } else {
+                    birth_version
+                };
                 Ok(Arc::new(SuperfileEntry {
                     partition_key: encode_partition_key(&pk),
-                    birth_version,
+                    birth_version: entry_birth_version,
                     ..(**e).clone()
                 }))
             })

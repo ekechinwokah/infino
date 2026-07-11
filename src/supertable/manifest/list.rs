@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use arrow::compute::concat;
-use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Schema};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,8 @@ use crate::supertable::manifest::{
 /// shape as the [`super::part::FORMAT_VERSION`] policy for
 /// manifest parts).
 pub const FORMAT_VERSION: &str = "1.0";
+/// Reserved list-aggregate key carrying each part's superfile birth range.
+pub(crate) const BIRTH_VERSION_AGGREGATE_COLUMN: &str = "__infino_birth_version";
 
 /// Default nearest cells always probed by the hidden VectorCell index — the
 /// recall floor before the distance-ratio threshold widens the probe set.
@@ -189,6 +191,13 @@ impl DrainedVersionRanges {
             .any(|&(lo, hi)| lo <= version && version <= hi)
     }
 
+    /// Is every version in inclusive `[lo, hi]` covered by one drained run?
+    pub fn covers(&self, lo: u64, hi: u64) -> bool {
+        self.ranges
+            .iter()
+            .any(|&(drained_lo, drained_hi)| drained_lo <= lo && hi <= drained_hi)
+    }
+
     /// End of the maximal contiguous drained run anchored at genesis (0), or
     /// `None` if version 0 isn't covered (no genesis-anchored prefix yet). The
     /// drain uses this to extend the prefix over **vacuous version gaps** —
@@ -318,6 +327,16 @@ pub struct ManifestPartEntry {
     /// Per-FTS-column aggregate bloom-union + range-union.
     /// Empty → always-keep.
     pub fts_summary_agg: BTreeMap<String, FtsSummaryAgg>,
+}
+
+impl ManifestPartEntry {
+    /// Inclusive birth-version range for list-level drain pruning.
+    pub(crate) fn birth_version_range(&self) -> Option<(u64, u64)> {
+        let aggregate = self.scalar_stats_agg.get(BIRTH_VERSION_AGGREGATE_COLUMN)?;
+        let min = aggregate.min.as_any().downcast_ref::<UInt64Array>()?;
+        let max = aggregate.max.as_any().downcast_ref::<UInt64Array>()?;
+        Some((min.value(0), max.value(0)))
+    }
 }
 
 /// Aggregate scalar stats across a part's superfiles. Min/max
@@ -2099,6 +2118,14 @@ mod tests {
         let decoded = decode(&bytes).expect("decode");
         assert_eq!(decoded.drained_ranges, list.drained_ranges);
         assert!(empty_list().drained_ranges.is_empty());
+    }
+
+    #[test]
+    fn drained_ranges_cover_only_complete_intervals() {
+        let ranges = DrainedVersionRanges::from_intervals(vec![(1, 4), (7, 9)]);
+        assert!(ranges.covers(2, 4));
+        assert!(!ranges.covers(3, 7));
+        assert!(!ranges.covers(5, 6));
     }
 
     #[test]

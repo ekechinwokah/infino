@@ -419,6 +419,15 @@ impl Supertable {
     /// No-op for an in-memory supertable and under `Snapshot`.
     fn reader(&self) -> SupertableReader {
         self.ensure_fresh();
+        self.pinned_reader()
+    }
+    }
+
+    test_visible! {
+    /// Pin the current in-memory manifest without a storage freshness check.
+    /// Hidden vector queries use this for slow-state residency while their
+    /// fast delete/watermark refresh runs concurrently with data I/O.
+    fn pinned_reader(&self) -> SupertableReader {
         SupertableReader {
             manifest: self.inner.manifest.load_full(),
             tombstone_cache: self.inner.tombstone_cache.clone(),
@@ -1346,7 +1355,10 @@ impl fmt::Debug for SupertableReader {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    };
 
     use arrow_schema::{DataType, Field, Schema};
     use tempfile::TempDir;
@@ -1807,6 +1819,55 @@ mod tests {
         assert!(
             !hits2.is_empty(),
             "post-drain search must hit the hidden cells"
+        );
+
+        let user_uris: HashSet<_> = st
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|entry| entry.uri)
+            .collect();
+        let in_process_drained = hidden.reader().manifest().get_drained_ranges();
+        assert!(
+            st.reader()
+                .manifest()
+                .superfiles
+                .iter()
+                .all(|entry| in_process_drained.contains(entry.birth_version)),
+            "drain must cover every in-process user birth version"
+        );
+
+        // A fresh consumer must recover the same drained watermark. Otherwise
+        // the tiered query misclassifies fully-drained user files as deltas and
+        // reads both user and hidden vector data.
+        drop(hidden);
+        drop(st);
+        let reopened = Supertable::open(make_options()).expect("reopen after drain");
+        let reopened_hidden = reopened
+            .reader()
+            .vector_index_table()
+            .expect("hidden index after drained reopen")
+            .clone();
+        let reopened_drained = reopened_hidden.reader().manifest().get_drained_ranges();
+        assert!(
+            reopened
+                .reader()
+                .manifest()
+                .superfiles
+                .iter()
+                .all(|entry| reopened_drained.contains(entry.birth_version)),
+            "cold reopen must retain every drained user birth version"
+        );
+        let cold_hits = reopened
+            .reader()
+            .vector_hits("emb", &q, 3, VectorSearchOptions::new(), None)
+            .expect("cold post-drain vector search");
+        assert!(
+            cold_hits
+                .iter()
+                .all(|hit| !user_uris.contains(&hit.superfile)),
+            "cold post-drain search must not read user superfiles"
         );
     }
 

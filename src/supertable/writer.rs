@@ -4109,6 +4109,7 @@ pub(in crate::supertable) async fn persist_commit_async(
                 Arc::clone(&old),
                 &new_entries,
                 entries_to_remove,
+                NewEntryBirthVersions::StampCommit,
                 pending_writes,
                 pending_replaces,
             )
@@ -4369,12 +4370,22 @@ async fn write_superfile_list_with_threshold(
 /// regardless of how many other partitions exist — the
 /// load-bearing property the part-reuse optimization relies
 /// on.
+#[derive(Clone, Copy)]
+pub(crate) enum NewEntryBirthVersions {
+    /// User append/update data is born in the manifest commit publishing it.
+    StampCommit,
+    /// Compaction changes physical residency but preserves logical lineage.
+    Preserve,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_commit_attempt(
     storage: Arc<dyn StorageProvider>,
     opts: Arc<SupertableOptions>,
     current_manifest: Arc<Manifest>,
     new_entries: &[Arc<SuperfileEntry>],
     entries_to_remove: &[Arc<SuperfileEntry>],
+    birth_versions: NewEntryBirthVersions,
     pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
     pending_storage_replaces: &mut Vec<(SuperfileUri, Bytes)>,
 ) -> Result<Manifest, SupertableCommitError> {
@@ -4388,9 +4399,18 @@ pub(crate) async fn try_commit_attempt(
     .await?;
 
     // 2. update the manifest for the commit.
-    let (new_manifest, parts_to_write) = current_manifest
-        .update(new_entries, entries_to_remove)
-        .await?;
+    let (new_manifest, parts_to_write) = match birth_versions {
+        NewEntryBirthVersions::StampCommit => {
+            current_manifest
+                .update(new_entries, entries_to_remove)
+                .await?
+        }
+        NewEntryBirthVersions::Preserve => {
+            current_manifest
+                .update_preserving_birth_versions(new_entries, entries_to_remove)
+                .await?
+        }
+    };
 
     // 3. Read the prior pointer's etag for the CAS. Fresh
     //    supertable → no pointer yet → None etag (initial

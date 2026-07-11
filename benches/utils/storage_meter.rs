@@ -158,6 +158,11 @@ impl ObjectStoreMeter {
         self.head_count + self.get_count
     }
 
+    /// GET count/bytes for one table + namespace class.
+    pub fn class_io(&self, class: UriClass) -> ClassIo {
+        self.get_by_class[class.index()]
+    }
+
     /// "user data 40 GET (30.1 MiB) · hidden data 24 GET (6.9 MiB)" —
     /// non-zero classes only; "0 GET" when the window saw none.
     pub fn fmt_get_class_breakdown(&self) -> String {

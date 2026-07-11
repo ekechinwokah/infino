@@ -28,9 +28,11 @@ use std::{
     sync::Arc,
 };
 
+use arrow_array::{ArrayRef, UInt64Array};
+
 use crate::supertable::manifest::{
     SuperfileEntry,
-    list::{FtsSummaryAgg, ManifestPartEntry, ScalarStatsAgg},
+    list::{BIRTH_VERSION_AGGREGATE_COLUMN, FtsSummaryAgg, ManifestPartEntry, ScalarStatsAgg},
 };
 
 /// All three aggregate buckets for one [`ManifestListEntry`].
@@ -66,6 +68,26 @@ pub fn compute(
     let mut id_min = superfiles.iter().map(|s| s.id_min).min().unwrap_or(0);
     let mut id_max = superfiles.iter().map(|s| s.id_max).max().unwrap_or(0);
     let mut scalar_stats_agg = scalar_stats_agg(superfiles);
+    let birth_min = superfiles
+        .iter()
+        .map(|entry| entry.birth_version)
+        .min()
+        .unwrap_or(0);
+    let birth_max = superfiles
+        .iter()
+        .map(|entry| entry.birth_version)
+        .max()
+        .unwrap_or(0);
+    scalar_stats_agg.insert(
+        BIRTH_VERSION_AGGREGATE_COLUMN.into(),
+        ScalarStatsAgg {
+            min: Arc::new(UInt64Array::from(vec![birth_min])) as ArrayRef,
+            max: Arc::new(UInt64Array::from(vec![birth_max])) as ArrayRef,
+            null_count: None,
+            sum: None,
+            hll: None,
+        },
+    );
     let mut fts_summary_agg = fts_summary_agg(superfiles);
 
     if let Some(base_part) = base_part {
@@ -162,6 +184,30 @@ mod tests {
             ScalarStatsAgg::from_column(&arr).expect("i64 is orderable"),
         );
         m
+    }
+
+    #[test]
+    fn compute_stamps_part_birth_version_range() {
+        let mut first = (*seg_with_string_minmax("title", "a", "b", false)).clone();
+        first.birth_version = 3;
+        let mut second = (*seg_with_string_minmax("title", "c", "d", false)).clone();
+        second.birth_version = 9;
+        let aggregate = compute(&[Arc::new(first), Arc::new(second)], None);
+        let birth = aggregate
+            .scalar_stats_agg
+            .get(BIRTH_VERSION_AGGREGATE_COLUMN)
+            .expect("birth aggregate");
+        let min = birth
+            .min
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("u64 min");
+        let max = birth
+            .max
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("u64 max");
+        assert_eq!((min.value(0), max.value(0)), (3, 9));
     }
 
     fn seg_with_string_minmax(col: &str, min: &str, max: &str, large: bool) -> Arc<SuperfileEntry> {

@@ -75,6 +75,7 @@ use std::{
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
 use roaring::RoaringBitmap;
+use tokio::join;
 
 use super::{
     SuperfileHit,
@@ -95,6 +96,9 @@ use crate::{
         tombstones::SidecarCache,
     },
 };
+
+/// Per-tier candidate overfetch before final combined delete filtering.
+const COMBINED_DELETE_OVERFETCH_FACTOR: usize = 2;
 
 /// An optional text-predicate filter for vector kNN search. When
 /// supplied, kNN is ranked only among rows matching the predicate
@@ -404,10 +408,10 @@ pub(crate) async fn hits_id_score_batch(
     let id_column = user_reader.options().id_column.as_str();
     let hidden_manifest = user_reader
         .vector_index_table()
-        .map(|vit| Arc::clone(vit.reader().manifest()));
+        .map(|vit| Arc::clone(vit.pinned_reader().manifest()));
     let deleted = user_reader
         .vector_index_table()
-        .and_then(|vit| vit.reader().hidden_deleted_ids().ok());
+        .and_then(|vit| vit.pinned_reader().hidden_deleted_ids().ok());
     let mut ids = Vec::with_capacity(hits.len());
     let mut scores = Vec::with_capacity(hits.len());
     for hit in hits {
@@ -464,10 +468,10 @@ pub(crate) async fn user_placement_for_scalar_resolve(
     let id_column = user_reader.options().id_column.as_str();
     let hidden_manifest = user_reader
         .vector_index_table()
-        .map(|vit| Arc::clone(vit.reader().manifest()));
+        .map(|vit| Arc::clone(vit.pinned_reader().manifest()));
     let deleted = user_reader
         .vector_index_table()
-        .and_then(|vit| vit.reader().hidden_deleted_ids().ok());
+        .and_then(|vit| vit.pinned_reader().hidden_deleted_ids().ok());
     let mut out: Vec<Option<SuperfileHit>> = vec![None; hits.len()];
     let mut gapped: HashMap<SuperfileUri, Vec<(usize, i128)>> = HashMap::new();
     for (i, hit) in hits.iter().enumerate() {
@@ -700,8 +704,8 @@ impl SupertableReader {
             Some(ranked) if candidates.iter().any(|candidate| candidate.3.is_some()) => {
                 let mut postings_by_cell: HashMap<u32, u64> = HashMap::new();
                 for candidate in &candidates {
-                    if let Some(cell_id) = candidate.3 {
-                        *postings_by_cell.entry(cell_id).or_default() += candidate.4;
+                    if let Some(cell) = candidate.3 {
+                        *postings_by_cell.entry(cell).or_default() += candidate.4;
                     }
                 }
                 let mut cutoff = nprobe.max(1).min(ranked.len());
@@ -713,14 +717,66 @@ impl SupertableReader {
                     covered += postings_by_cell.get(&ranked[cutoff]).copied().unwrap_or(0);
                     cutoff += 1;
                 }
-                let selected = &ranked[..cutoff];
-                for (si, cluster, score, cell, _) in candidates {
+                let selected_cells = &ranked[..cutoff];
+                let selected: HashSet<u32> = selected_cells.iter().copied().collect();
+                let mut fine_by_fragment: HashMap<(u32, usize), Vec<(u32, f32, u64)>> =
+                    HashMap::new();
+                for (si, cluster, score, cell, count) in candidates {
                     match cell {
-                        Some(cell) if selected.contains(&cell) => {
-                            gated.push((si, cluster, score));
-                        }
+                        Some(cell) if selected.contains(&cell) => fine_by_fragment
+                            .entry((cell, si))
+                            .or_default()
+                            .push((cluster, score, count)),
                         Some(_) => {}
                         None => scored.push((si, cluster, score)),
+                    }
+                }
+                let mut remaining = Vec::new();
+                for &cell in selected_cells {
+                    let mut fragment_ids: Vec<usize> = fine_by_fragment
+                        .keys()
+                        .filter_map(|(candidate_cell, si)| (*candidate_cell == cell).then_some(*si))
+                        .collect();
+                    fragment_ids.sort_unstable();
+                    for si in fragment_ids {
+                        let Some(mut fine) = fine_by_fragment.remove(&(cell, si)) else {
+                            continue;
+                        };
+                        fine.sort_unstable_by(|a, b| {
+                            a.1.partial_cmp(&b.1)
+                                .unwrap_or(Ordering::Equal)
+                                .then_with(|| a.0.cmp(&b.0))
+                        });
+                        let keep = nprobe.max(1).min(fine.len());
+                        let tail = fine.split_off(keep);
+                        gated.extend(
+                            fine.into_iter()
+                                .map(|(cluster, score, _)| (si, cluster, score)),
+                        );
+                        remaining.extend(
+                            tail.into_iter()
+                                .map(|(cluster, score, count)| (si, cluster, score, count)),
+                        );
+                    }
+                }
+                let mut postings: u64 = gated
+                    .iter()
+                    .map(|(si, cluster, _)| {
+                        candidate_counts.get(&(*si, *cluster)).copied().unwrap_or(0)
+                    })
+                    .sum();
+                if postings < gated_target {
+                    remaining.sort_unstable_by(|a, b| {
+                        a.2.partial_cmp(&b.2)
+                            .unwrap_or(Ordering::Equal)
+                            .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
+                    });
+                    for (si, cluster, score, count) in remaining {
+                        gated.push((si, cluster, score));
+                        postings += count;
+                        if postings >= gated_target {
+                            break;
+                        }
                     }
                 }
             }
@@ -732,14 +788,9 @@ impl SupertableReader {
             }
         }
 
-        // Global probe budget: the closest `nprobe × (eligible superfiles)`
-        // clusters — the same total probe count as the old per-superfile
-        // `nprobe`, but selected globally, so near superfiles get more
-        // probes and far superfiles are skipped entirely. (Stage-4 recall
-        // tuning may lower this.) Eligible = superfiles that actually
-        // scored a cluster (filtered-out superfiles produce neither a
-        // scored cluster nor a fallback, so they don't inflate the
-        // budget).
+        // Cell-tagged candidates above keep the closest `nprobe` fine
+        // centroids per immutable fragment inside each selected coarse cell.
+        // Untagged legacy candidates still use the global fallback budget.
         let n_eligible = {
             let mut segs: Vec<usize> = scored
                 .iter()
@@ -1129,7 +1180,7 @@ impl SupertableReader {
         }
         let drained = self
             .vector_index_table()
-            .map(|hidden| hidden.reader().manifest().get_drained_ranges())
+            .map(|hidden| hidden.pinned_reader().manifest().get_drained_ranges())
             .unwrap_or_default();
         let undrained_user: Vec<Arc<SuperfileEntry>> = user_superfiles
             .into_iter()
@@ -1201,7 +1252,7 @@ impl SupertableReader {
             });
         }
         if let Some(vit) = self.vector_index_table() {
-            let hidden_reader = vit.reader();
+            let hidden_reader = vit.pinned_reader();
             let hidden_manifest = Arc::clone(hidden_reader.manifest());
             let superfiles = hidden_manifest
                 .get_all_superfiles_loaded()
@@ -1311,7 +1362,7 @@ impl SupertableReader {
         let allow_set: Arc<HashSet<i128>> =
             Arc::new(allow_stable_ids.iter().copied().collect::<HashSet<i128>>());
         if let Some(vit) = self.vector_index_table() {
-            let hidden_reader = vit.reader();
+            let hidden_reader = vit.pinned_reader();
             let hidden_manifest = Arc::clone(hidden_reader.manifest());
             let superfiles = hidden_manifest
                 .get_all_superfiles_loaded()
@@ -1425,7 +1476,7 @@ impl SupertableReader {
             let vit = self.vector_index_table().ok_or_else(|| {
                 QueryError::Execute("prepared hidden allow-set but no hidden index table".into())
             })?;
-            let hidden_reader = vit.reader();
+            let hidden_reader = vit.pinned_reader();
             let superfiles = hidden_reader
                 .manifest()
                 .get_all_superfiles_loaded()
@@ -1564,40 +1615,59 @@ impl SupertableReader {
         if k == 0 {
             return Ok(Vec::new());
         }
-        let mut drained = Default::default();
-        let hidden_hits = if let Some(vit) = self.vector_index_table() {
-            let hidden_reader = vit.reader();
-            let hidden_manifest = hidden_reader.manifest();
-            drained = hidden_manifest.get_drained_ranges();
-            let hidden_entries = hidden_manifest
-                .get_all_superfiles_loaded()
-                .await
-                .map_err(QueryError::ManifestLoad)?;
-            if hidden_entries.is_empty() {
-                Vec::new()
-            } else {
-                hidden_reader
-                    .fanout_vector_clusters(&hidden_entries, column, query, k, options)
-                    .await?
-            }
-        } else {
-            Vec::new()
+        let candidate_k = k.saturating_mul(COMBINED_DELETE_OVERFETCH_FACTOR).max(k);
+        let Some(vit) = self.vector_index_table() else {
+            return self
+                .vector_search_user_table_async(column, query, k, options)
+                .await;
         };
-        let user_entries: Vec<Arc<SuperfileEntry>> = self
-            .manifest()
+
+        // Wave 1: search the pinned hidden slow state while refreshing only the
+        // fast delete state and loading any user parts known to be newer than
+        // this exact hidden residency watermark.
+        let hidden_reader = vit.pinned_reader();
+        let hidden_manifest = Arc::clone(hidden_reader.manifest());
+        let drained = hidden_manifest.get_drained_ranges();
+        let hidden_entries = hidden_manifest
             .get_all_superfiles_loaded()
             .await
-            .map_err(QueryError::ManifestLoad)?
-            .into_iter()
-            .filter(|entry| !drained.contains(entry.birth_version))
-            .collect();
+            .map_err(QueryError::ManifestLoad)?;
+        let hidden_search = async {
+            if hidden_entries.is_empty() {
+                Ok(Vec::new())
+            } else {
+                hidden_reader
+                    .fanout_vector_clusters(&hidden_entries, column, query, candidate_k, options)
+                    .await
+            }
+        };
+        let fast_state = async {
+            let _ = vit.refresh().await;
+            vit.pinned_reader()
+                .hidden_deleted_ids()
+                .map_err(|error| QueryError::Execute(error.to_string()))
+        };
+        let user_parts = self.manifest().get_undrained_superfiles_loaded(&drained);
+        let (hidden_hits, deleted, user_entries) = join!(hidden_search, fast_state, user_parts);
+        let hidden_hits = hidden_hits?;
+        let deleted = deleted?;
+        let user_entries = user_entries.map_err(QueryError::ManifestLoad)?;
+
+        // Wave 2 only when the resident user list identifies files newer than
+        // the hidden watermark.
         let user_hits = if user_entries.is_empty() {
             Vec::new()
         } else {
-            self.fanout_vector_clusters(&user_entries, column, query, k, options)
+            self.fanout_vector_clusters(&user_entries, column, query, candidate_k, options)
                 .await?
         };
-        Ok(top_k_ascending(vec![hidden_hits, user_hits], k))
+        let mut combined = top_k_ascending(vec![hidden_hits, user_hits], candidate_k);
+        combined.retain(|hit| {
+            hit.stable_id
+                .is_none_or(|id| deleted.binary_search(&id).is_err())
+        });
+        combined.truncate(k);
+        Ok(combined)
     }
 
     /// Default async vector kernel — routes through the global hidden index

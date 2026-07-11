@@ -44,9 +44,9 @@ use crate::{
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
-            PreparedSuperfile, ShardOutput, backoff_delay, finalize_compaction_commit,
-            prepare_superfile, refresh_slow_vector_state, split_overflow_cell_after_compaction,
-            try_commit_attempt,
+            NewEntryBirthVersions, PreparedSuperfile, ShardOutput, backoff_delay,
+            finalize_compaction_commit, prepare_superfile, refresh_slow_vector_state,
+            split_overflow_cell_after_compaction, try_commit_attempt,
         },
     },
 };
@@ -532,6 +532,7 @@ impl Supertable {
                 current,
                 &new_entries,
                 &entries_to_remove,
+                NewEntryBirthVersions::Preserve,
                 &mut pending_storage_writes,
                 &mut pending_storage_replaces,
             )
@@ -1318,6 +1319,13 @@ mod tests {
             .iter()
             .map(|s| s.superfile_id)
             .collect();
+        let expected_birth_version = before
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|s| s.birth_version)
+            .min()
+            .expect("at least one superfile before compaction");
         let expected_docs = before.n_docs_total();
         let expected_id_min = before
             .manifest()
@@ -1353,6 +1361,10 @@ mod tests {
         assert!(
             !sfs.iter().any(|s| input_ids.contains(&s.superfile_id)),
             "original superfile IDs must not appear after compaction"
+        );
+        assert_eq!(
+            sfs[0].birth_version, expected_birth_version,
+            "compaction must preserve the oldest input birth version"
         );
 
         // Doc count preserved across the merge

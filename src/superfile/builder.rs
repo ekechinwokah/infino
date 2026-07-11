@@ -879,34 +879,81 @@ impl SuperfileBuilder {
                 packed_cells.push((cell_id, merged));
             }
         } else {
-            let mut by_cell: HashMap<u32, Vec<Sq8IvfMergeInput>> = HashMap::new();
-            for (reader, _) in readers {
+            // Track each cell fragment's source `(reader, column-slot)` next to
+            // its parsed merge input: fragments that agree on fine `n_cent`
+            // byte-splice, disagreeing ones re-materialize from those sources.
+            let mut by_cell: HashMap<u32, Vec<(usize, usize, Sq8IvfMergeInput)>> = HashMap::new();
+            for (reader_idx, (reader, _)) in readers.iter().enumerate() {
                 let v = reader.vec().ok_or(BuildError::VectorReadError)?;
                 for (ci, &cell_id) in v.packed_cell_ids().iter().enumerate() {
                     let inp = v.sq8_ivf_merge_input_at(ci, 0)?;
-                    by_cell.entry(cell_id).or_default().push(inp);
+                    by_cell
+                        .entry(cell_id)
+                        .or_default()
+                        .push((reader_idx, ci, inp));
                 }
             }
 
             let mut cell_ids: Vec<u32> = by_cell.keys().copied().collect();
             cell_ids.sort_unstable();
             for cell_id in cell_ids {
-                let mut inputs = by_cell.remove(&cell_id).expect("cell present");
-                let mut doc_base = 0u32;
-                for inp in &mut inputs {
-                    inp.doc_id_offset = doc_base;
-                    doc_base = doc_base.saturating_add(inp.n_docs);
+                let sources = by_cell.remove(&cell_id).expect("cell present");
+                let same_shape = sources
+                    .windows(2)
+                    .all(|pair| pair[0].2.n_cent == pair[1].2.n_cent);
+                if same_shape {
+                    let mut inputs: Vec<Sq8IvfMergeInput> =
+                        sources.into_iter().map(|(_, _, inp)| inp).collect();
+                    let mut doc_base = 0u32;
+                    for inp in &mut inputs {
+                        inp.doc_id_offset = doc_base;
+                        doc_base = doc_base.saturating_add(inp.n_docs);
+                    }
+                    let merged = merge_sq8_ivf_subsections_from_parsed(&inputs)?;
+                    let cell_ids_col = stable_ids_in_merged_local_order(&inputs)?;
+                    if cell_ids_col.len() != merged.n_docs as usize {
+                        return Err(BuildError::VectorSchemaMismatch(format!(
+                            "cell {cell_id}: stable_ids len {} != merged n_docs {}",
+                            cell_ids_col.len(),
+                            merged.n_docs
+                        )));
+                    }
+                    all_stable_ids.extend_from_slice(&cell_ids_col);
+                    packed_cells.push((cell_id, merged));
+                    continue;
                 }
-                let merged = merge_sq8_ivf_subsections_from_parsed(&inputs)?;
-                let cell_ids_col = stable_ids_in_merged_local_order(&inputs)?;
-                if cell_ids_col.len() != merged.n_docs as usize {
+                // Same cell, different fine `n_cent` (a small delta drain
+                // merging into a larger base): byte-splice is positional per
+                // cluster, so rebuild this cell from materialized rows at the
+                // widest source width — same path the tombstone branch uses.
+                let n_cent = sources
+                    .iter()
+                    .map(|(_, _, inp)| inp.n_cent)
+                    .max()
+                    .unwrap_or(1);
+                let mut rows: Vec<MaterializedIvfRow> = Vec::new();
+                for (reader_idx, ci, _) in sources {
+                    let v = readers[reader_idx]
+                        .0
+                        .vec()
+                        .ok_or(BuildError::VectorReadError)?;
+                    rows.extend(v.materialized_cell_rows_at(ci)?);
+                }
+                for (i, row) in rows.iter_mut().enumerate() {
+                    row.local_doc_id = i as u32;
+                }
+                let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
+                let mut cfg = vec_cfg.clone();
+                cfg.n_cent = n_cent.max(1);
+                let merged = build_merged_subsection_from_materialized(cfg, rows)?;
+                if stable_ids.len() != merged.n_docs as usize {
                     return Err(BuildError::VectorSchemaMismatch(format!(
                         "cell {cell_id}: stable_ids len {} != merged n_docs {}",
-                        cell_ids_col.len(),
+                        stable_ids.len(),
                         merged.n_docs
                     )));
                 }
-                all_stable_ids.extend_from_slice(&cell_ids_col);
+                all_stable_ids.extend_from_slice(&stable_ids);
                 packed_cells.push((cell_id, merged));
             }
         }
@@ -2894,8 +2941,9 @@ mod tests {
         );
     }
 
-    /// Build one multi-cell packed superfile with two cell IVFs for merge tests.
-    fn pack_two_cell_superfile(id_base: i128) -> Arc<SuperfileReader> {
+    /// Build one multi-cell packed superfile for merge tests; each spec is
+    /// `(cell_id, n_rows, fine n_cent)`.
+    fn pack_cells_superfile(id_base: i128, cells: &[(u32, usize, usize)]) -> Arc<SuperfileReader> {
         use crate::superfile::vector::{
             builder::build_merged_subsection_from_materialized,
             cell_posting::{EncodedCellRow, MaterializedIvfRow},
@@ -2928,24 +2976,24 @@ mod tests {
                 })
                 .collect()
         };
-        let cfg = VectorConfig {
+        let make_cfg = |n_cent: usize| VectorConfig {
             column: "emb".into(),
             dim,
-            n_cent: 2,
+            n_cent,
             rot_seed: 1,
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         };
-        let rows0 = make_rows(0, 3);
-        let rows1 = make_rows(1, 2);
-        let ids: Vec<i128> = rows0
-            .iter()
-            .chain(rows1.iter())
-            .map(|r| r.stable_id)
-            .collect();
-        let sub0 = build_merged_subsection_from_materialized(cfg.clone(), rows0).expect("cell0");
-        let sub1 = build_merged_subsection_from_materialized(cfg.clone(), rows1).expect("cell1");
+        let mut ids: Vec<i128> = Vec::new();
+        let mut packed = Vec::with_capacity(cells.len());
+        for &(cell_id, n_rows, n_cent) in cells {
+            let rows = make_rows(cell_id, n_rows);
+            ids.extend(rows.iter().map(|r| r.stable_id));
+            let sub = build_merged_subsection_from_materialized(make_cfg(n_cent), rows)
+                .expect("cell subsection");
+            packed.push((cell_id, sub));
+        }
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "doc_id",
@@ -2958,14 +3006,20 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(id_array) as Arc<dyn Array>])
                 .expect("batch");
-        let opts = BuilderOptions::new(schema, "doc_id", vec![], vec![cfg], None)
-            .with_vector_layout(VectorLayout::MultiCellIvf);
+        let first_n_cent = cells.first().map(|&(_, _, n)| n).unwrap_or(1);
+        let opts =
+            BuilderOptions::new(schema, "doc_id", vec![], vec![make_cfg(first_n_cent)], None)
+                .with_vector_layout(VectorLayout::MultiCellIvf);
         let mut b = SuperfileBuilder::new(opts).expect("builder");
         b.add_batch_ids_only(&batch).expect("ids");
-        b.set_prebuilt_multi_cell_ivfs(vec![(0, sub0), (1, sub1)])
-            .expect("pack");
+        b.set_prebuilt_multi_cell_ivfs(packed).expect("pack");
         let bytes = b.finish().expect("finish");
         Arc::new(SuperfileReader::open(Bytes::from(bytes)).expect("open"))
+    }
+
+    /// Two cells (3 + 2 rows), both at fine width 2 — the common shape.
+    fn pack_two_cell_superfile(id_base: i128) -> Arc<SuperfileReader> {
+        pack_cells_superfile(id_base, &[(0, 3, 2), (1, 2, 2)])
     }
 
     /// Manifest / prepare path must publish the concatenated flat centroid
@@ -3018,6 +3072,32 @@ mod tests {
         assert_eq!(cols.len(), 2);
         assert_eq!(cols[0].n_docs, 6);
         assert_eq!(cols[1].n_docs, 4);
+    }
+
+    /// Base drain and a small delta drain legitimately pack the same global
+    /// cell at different fine widths (fine `n_cent` is sized by packed bytes).
+    /// The merge must rebuild such cells from materialized rows instead of
+    /// failing the byte-splice `n_cent` equality check.
+    #[test]
+    fn multi_cell_merge_rebuilds_cells_with_mismatched_fine_width() {
+        // Cell 0 disagrees on width (4 vs 1); cell 1 agrees (splice path).
+        let a = pack_cells_superfile(1_000, &[(0, 6, 4), (1, 2, 2)]);
+        let b = pack_cells_superfile(2_000, &[(0, 2, 1), (1, 3, 2)]);
+
+        let (merged_bytes, stats) =
+            SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(a, None), (b, None)])
+                .expect("merge with mismatched fine n_cent");
+        assert_eq!(stats.n_docs, 13);
+
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged");
+        assert_eq!(merged.n_docs(), 13);
+        let v = merged.vec().expect("vec");
+        assert_eq!(v.packed_cell_ids(), &[0, 1]);
+        let cols: Vec<_> = v.vector_columns_config().collect();
+        assert_eq!(cols[0].n_docs, 8); // 6 + 2 rebuilt at the widest width
+        assert_eq!(cols[0].n_cent, 4);
+        assert_eq!(cols[1].n_docs, 5); // 2 + 3 byte-spliced
+        assert_eq!(cols[1].n_cent, 2);
     }
 
     #[test]
