@@ -40,7 +40,7 @@ use bytes::Bytes;
 use infino::{
     storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
     supertable::{
-        CommitError, ManifestSnapshot, ManifestLoadError,
+        CommitError, ManifestLoadError, ManifestSnapshot,
         manifest::{
             commit::{
                 self, MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, PointerFile, manifest_uri,
@@ -55,6 +55,7 @@ use infino::{
     },
     test_helpers::default_supertable_options,
 };
+// Note: Manifest is the persisted data struct; ManifestSnapshot is the wrapper with lazy-loading.
 use tempfile::TempDir;
 use tokio::sync::{Barrier, Mutex};
 use uuid::Uuid;

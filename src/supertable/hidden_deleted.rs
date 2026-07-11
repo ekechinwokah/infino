@@ -78,7 +78,9 @@ pub(crate) fn decode_deleted_ids(bytes: &[u8]) -> Result<Vec<i128>, HiddenDelete
 /// manifest. Returns an empty set when none is stamped. There is deliberately
 /// no storage fallback here: the two-blob contract requires this state to ride
 /// in the hidden manifest fast payload.
-pub(crate) fn deleted_user_ids(manifest: &ManifestSnapshot) -> Result<Arc<Vec<i128>>, HiddenDeletedError> {
+pub(crate) fn deleted_user_ids(
+    manifest: &ManifestSnapshot,
+) -> Result<Arc<Vec<i128>>, HiddenDeletedError> {
     let Some(bytes) = manifest.deleted_user_ids_inline() else {
         return Ok(Arc::new(Vec::new()));
     };

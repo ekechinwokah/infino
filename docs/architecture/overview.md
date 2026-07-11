@@ -64,18 +64,22 @@ under the hood), executes in-process. There is no wire protocol yet, so
 external SQL clients can't attach — SQL is reached through the
 connection's `query_sql`. From that connection you work with tables:
 
-- `connect("s3://bucket/prefix")` (or a local path, or `memory://`)
-  returns a **`Connection`** — a *catalog of tables* persisted at that
-  root. (Distinct from a supertable's *manifest*, which lists the files
-  within one table.)
+- `connect("s3://bucket/prefix")` (or `az://container/prefix`,
+  `gs://bucket/prefix`, a local path, or `memory://`) returns a
+  **`Connection`** — a *catalog of tables* persisted at that root.
+  (Distinct from a supertable's *manifest*, which lists the files within
+  one table.) Credentials are passed as `storage_options` keyed by
+  `object_store`'s `aws_*` / `azure_*` / `google_*` config strings — never
+  read from the environment.
 - From the connection you **create**, **open**, **list**, and **drop**
   tables, and run **SQL across them** (`query_sql`) — joins and
   aggregations span tables in the catalog in one engine.
 - Each table is a **`Supertable`** handle: `append` rows, `update` /
-  `delete`, and search it — `bm25_search` / `vector_search` (full-text
-  and vector kNN, returning Arrow rows), the unranked `token_match` /
-  `exact_match`, and `schema`. The same retrievers are also SQL
-  table-valued functions, so search composes with the rest of a query.
+  `delete`, and search it — `bm25_search` / `vector_search` /
+  `hybrid_search` (full-text, vector kNN, and RRF-fused, returning Arrow
+  rows), the unranked `token_match` / `exact_match`, and `schema`. The
+  same retrievers are also SQL table-valued functions, so search composes
+  with the rest of a query.
 
 The connection is the only entry point; everything below it (manifest,
 storage, cache, query fan-out) is internal.

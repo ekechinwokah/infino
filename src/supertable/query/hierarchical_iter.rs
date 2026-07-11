@@ -97,7 +97,7 @@ pub async fn load_and_flatten(
 /// in-process manifests with no `list` (in-memory-only
 /// supertables, or supertables that haven't persisted yet): just return
 /// the flat `manifest.superfiles`. The eager-mode + lazy-mode hierarchical
-/// path through `load_and_flatten` requires a `Manifest`; this branch
+/// path through `load_and_flatten` requires a persisted Manifest; this branch
 /// covers the no-list case so the query paths remain uniformly callable.
 pub fn fallback_to_flat_superfiles(manifest: &ManifestSnapshot) -> Vec<Arc<SuperfileEntry>> {
     manifest.superfiles.to_vec()

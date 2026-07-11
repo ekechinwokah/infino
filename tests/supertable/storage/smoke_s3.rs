@@ -29,7 +29,7 @@
 //! ## What's verified
 //!
 //! - `Supertable::create + writer.commit` against the S3
-//!   wire path (superfiles + manifest part + manifest list +
+//!   wire path (superfiles + manifest part + manifest +
 //!   pointer all PUT via HTTP).
 //! - `Supertable::open` from a fresh handle recovers the
 //!   pre-commit state (manifest_id, n_superfiles, n_docs_total).
@@ -53,7 +53,7 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -66,10 +66,9 @@ use infino::{
     supertable::{
         Supertable,
         query::VectorSearchOptions,
-        reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
         storage::{S3StorageProvider, StorageProvider},
     },
-    test_helpers::{build_title_batch, default_supertable_options},
+    test_helpers::{build_title_batch, default_disk_cache, default_supertable_options},
 };
 
 /// Single-thread rayon pool for deterministic S3 smoke runs.
@@ -144,26 +143,6 @@ async fn spawn_s3s_fs() -> (SocketAddr, TempDir) {
     (addr, fs_root)
 }
 
-fn make_cache(
-    storage: Arc<dyn StorageProvider>,
-    cache_root: &std::path::Path,
-) -> Arc<DiskCacheStore> {
-    let cfg = DiskCacheConfig {
-        cache_root: cache_root.to_path_buf(),
-        disk_budget_bytes: 1 << 30,
-        cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
-        cold_fetch_streams: 4,
-        cold_fetch_chunk_bytes: 1 << 20,
-        mmap_cold_threshold_secs: 0,
-        mmap_sweep_interval_secs: 0,
-        eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
-        ..Default::default()
-    };
-    let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
-    DiskCacheStore::new(storage, cfg, pinned).expect("cache")
-}
-
 fn fixed_list_f32(dim: usize) -> DataType {
     DataType::FixedSizeList(
         Arc::new(Field::new("item", DataType::Float32, true)),
@@ -202,12 +181,31 @@ fn real_s3_options(dim: usize) -> infino::supertable::SupertableOptions {
     .with_writer_pool(pool)
 }
 
+/// Real-S3 credential options from the AWS environment, for the gated
+/// `INFINO_TEST_REAL_S3` test. Infino's provider no longer reads the
+/// environment; the test passes these as config.
+fn s3_storage_options_from_env() -> std::collections::HashMap<String, String> {
+    // AWS_DEFAULT_REGION before AWS_REGION so the latter wins when both
+    // are set (equal keys, last insert wins).
+    [
+        ("AWS_ACCESS_KEY_ID", "aws_access_key_id"),
+        ("AWS_SECRET_ACCESS_KEY", "aws_secret_access_key"),
+        ("AWS_SESSION_TOKEN", "aws_session_token"),
+        ("AWS_DEFAULT_REGION", "aws_region"),
+        ("AWS_REGION", "aws_region"),
+    ]
+    .iter()
+    .filter_map(|(env, key)| std::env::var(env).ok().map(|v| (key.to_string(), v)))
+    .collect()
+}
+
 fn real_s3_config(bucket: &str, prefix: &str, cache_root: &std::path::Path) -> Config {
     Config {
         supertable: SupertableSettings::default(),
         storage: StorageSettings {
             backend: StorageBackend::S3,
             bucket: Some(bucket.to_string()),
+            storage_options: s3_storage_options_from_env(),
             prefix: prefix.to_string(),
             disk_cache_root: Some(cache_root.to_path_buf()),
             disk_budget_bytes: 1 << 30,
@@ -333,7 +331,7 @@ async fn supertable_smoke_via_s3_wire_protocol() {
         .expect("s3 provider for consumer"),
     );
     let cache_dir = TempDir::new().expect("cache tempdir");
-    let cache = make_cache(Arc::clone(&consumer_storage), cache_dir.path());
+    let cache = default_disk_cache(Arc::clone(&consumer_storage), cache_dir.path());
 
     let consumer = Supertable::open(
         default_supertable_options()
@@ -439,7 +437,7 @@ async fn supertable_s3s_multi_commit_vector_no_hang() {
                 )
                 .map_err(|e| format!("s3 provider: {e}"))?,
             );
-            let cache = make_cache(Arc::clone(&storage), &cache_root);
+            let cache = default_disk_cache(Arc::clone(&storage), &cache_root);
             let dim = EMB_DIM;
             let st = Supertable::create(
                 real_s3_options(dim)
@@ -626,8 +624,9 @@ async fn supertable_real_s3_lazy_vector_and_fts_round_trip() {
         Ok::<Vec<String>, String>(cleanup_keys)
     }
     .await;
-    let cleanup_storage = S3StorageProvider::new_with_prefix(&bucket, &prefix)
-        .expect("real S3 cleanup provider from AWS env");
+    let cleanup_storage =
+        S3StorageProvider::new_with_prefix(&bucket, &prefix, &s3_storage_options_from_env())
+            .expect("real S3 cleanup provider from AWS env");
     if let Ok(keys) = &result {
         for key in keys {
             let _ = cleanup_storage.delete(key).await;
@@ -702,7 +701,7 @@ async fn supertable_tvfs_through_query_sql_via_s3_wire_protocol() {
         .expect("s3 provider for tvf consumer"),
     );
     let cache_dir = TempDir::new().expect("tvf cache tempdir");
-    let cache = make_cache(Arc::clone(&consumer_storage), cache_dir.path());
+    let cache = default_disk_cache(Arc::clone(&consumer_storage), cache_dir.path());
 
     let consumer = Supertable::open(
         real_s3_options(dim)

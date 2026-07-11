@@ -74,14 +74,15 @@ use futures::{
 use object_store::{PutPayload, UploadPart};
 use rayon::prelude::*;
 use tokio::time::sleep;
+use tracing::{debug, error};
 
 use super::{
     build::fanout_shards,
     error::BuildError,
     handle::{GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, Supertable, SupertableInner},
     manifest::{
-        CellVectorSummary, FtsSummaryAgg, ScalarStatsAgg, SubsectionOffsets, SuperfileEntry,
-        SuperfileUri, VectorSummary, bloom::BloomBuilder,
+        CellVectorSummary, FtsSummaryAgg, ManifestSnapshot, ScalarStatsAgg, SubsectionOffsets,
+        SuperfileEntry, SuperfileUri, VectorSummary, bloom::BloomBuilder,
     },
     mutations::{
         CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
@@ -140,7 +141,7 @@ use crate::{
         error::ManifestError,
         hidden_deleted::{self, encode_deleted_ids},
         manifest::{
-            ClusterCentroids, ManifestSnapshot,
+            ClusterCentroids,
             commit::get_current_manifest_etag,
             list::PartitionStrategy,
             part::{self as part_mod, PartId},
@@ -933,6 +934,12 @@ impl SupertableWriter {
                     let remaining: Vec<PendingUpdateEntry> =
                         updates_to_run.split_off(update_cursor + 1);
                     self.pending_updates = remaining;
+                    error!(
+                        committed = outcomes.len(),
+                        total = total_mutations,
+                        error = %cause,
+                        "partial commit: update failed mid-flush"
+                    );
                     // Don't lose the not-yet-attempted deletes
                     // either — they stay where they were on
                     // self.pending_deletes (we hadn't taken
@@ -962,6 +969,12 @@ impl SupertableWriter {
                     let remaining: Vec<PendingDeleteEntry> =
                         deletes_to_run.split_off(delete_cursor + 1);
                     self.pending_deletes = remaining;
+                    error!(
+                        committed = outcomes.len(),
+                        total = total_mutations,
+                        error = %cause,
+                        "partial commit: delete failed mid-flush"
+                    );
                     return Err(CommitError::PartialCommit {
                         committed_wal_ids,
                         committed: outcomes.len(),
@@ -1332,6 +1345,7 @@ impl SupertableWriter {
                 user_global_centroids.clone(),
             )
         })?;
+        let superfiles = outputs.len();
         let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
         bridge_on_runtime(
             persist_superfile_publish_batch_async(&user_inner, user_batch),
@@ -1340,6 +1354,7 @@ impl SupertableWriter {
         if self.inner.options.storage.is_some() {
             schedule_background_storage_reclaim(Arc::clone(&self.inner));
         }
+        debug!(superfiles, "published appended superfiles");
         Ok(())
     }
 }
@@ -3938,8 +3953,8 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 
 /// Storage write-through with OCC retry. Persist the new
 /// superfiles + manifest to storage, returning the new
-/// in-memory `ManifestSnapshot` with the fresh `Manifest` +
-/// `ManifestPartLoader` installed.
+/// in-memory `ManifestSnapshot` with the fresh persisted Manifest +
+/// loader installed.
 ///
 /// **OCC retry semantics.** On each iteration:
 ///  1. Reload `inner.manifest` to incorporate any commit a
@@ -4361,7 +4376,7 @@ async fn write_superfile_list_with_threshold(
 /// For each touched partition, the writer finds the latest
 /// existing part (if any), rebuilds it with the union of its
 /// existing superfiles + the new ones, and emits a new
-/// `ManifestListEntry` that replaces the prior one (same
+/// `ManifestPartEntry` that replaces the prior one (same
 /// `partition_key`, new `part_id` + content hash). Untouched
 /// partitions' list entries carry over verbatim — no
 /// re-encode, no PUT. A cold partition (no prior entry) gets

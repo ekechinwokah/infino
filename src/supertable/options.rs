@@ -38,7 +38,12 @@
 //!
 //! [`utils::vector_split::split_vectors`]: super::utils::vector_split::split_vectors
 
-use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    fmt,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use arrow_schema::{DataType, Field, Schema};
 use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -51,15 +56,19 @@ use super::{
     },
 };
 use crate::{
-    config::{Config, StorageBackend, StorageColdFetchMode},
-    storage::{AzureStorageProvider, LocalFsStorageProvider, S3StorageProvider, StorageProvider},
+    config::{Config, StorageBackend, StorageColdFetchMode, ThreadCount},
+    memory::ConnectionMemoryBudget,
+    storage::{
+        AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
+        StorageProvider,
+    },
     superfile::{
         OpenOptions,
         builder::{BuilderOptions, FtsConfig, VectorConfig},
         fts::tokenize::Tokenizer,
         vector::layout::VectorLayout,
     },
-    supertable::manifest::list::PartitionStrategy,
+    supertable::manifest::{disk_cache::ManifestDiskCache, list::PartitionStrategy},
 };
 
 /// Vector column dim must be in this inclusive range. Mirrors
@@ -88,6 +97,39 @@ fn default_writer_thread_count() -> usize {
 /// across non-pruned superfiles saturates this pool.
 fn default_reader_thread_count() -> usize {
     num_cpus::get().max(1)
+}
+
+/// Process-wide reader pool, shared by every supertable that doesn't
+/// inject its own (via [`SupertableOptions::with_reader_pool`] or a
+/// `Fixed` count in [`Config`]) — M open tables cost N reader threads,
+/// not M×N.
+static SHARED_READER_POOL: OnceLock<Arc<ThreadPool>> = OnceLock::new();
+
+/// Process-wide writer pool; same sharing contract at half the cores.
+static SHARED_WRITER_POOL: OnceLock<Arc<ThreadPool>> = OnceLock::new();
+
+fn shared_reader_pool() -> Arc<ThreadPool> {
+    Arc::clone(SHARED_READER_POOL.get_or_init(|| {
+        Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(default_reader_thread_count())
+                .thread_name(|i| format!("supertable-reader-{i}"))
+                .build()
+                .expect("invariant: rayon pool build only fails on thread-spawn failure"),
+        )
+    }))
+}
+
+fn shared_writer_pool() -> Arc<ThreadPool> {
+    Arc::clone(SHARED_WRITER_POOL.get_or_init(|| {
+        Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(default_writer_thread_count())
+                .thread_name(|i| format!("supertable-writer-{i}"))
+                .build()
+                .expect("invariant: rayon pool build only fails on thread-spawn failure"),
+        )
+    }))
 }
 
 /// Default name of the supertable-injected primary-key column.
@@ -123,6 +165,11 @@ const DEFAULT_PART_SIZE_THRESHOLD_BYTES: u64 = 10 * (1 << 20);
 /// Default: eager-load manifest parts at open when there are at most
 /// this many (open latency vs memory trade-off).
 const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = 4;
+/// Subdirectory under the disk-cache root that holds the
+/// content-addressed manifest-part byte cache. Kept separate from the
+/// superfile cache files so the two budgets and eviction sets don't
+/// interfere.
+const MANIFEST_CACHE_SUBDIR: &str = "manifest-parts";
 /// Default optimistic-commit retry budget under contention.
 const DEFAULT_MAX_COMMIT_RETRIES: u32 = 10;
 /// Default user-superfile batch size for the hidden-index drain. `1` streams
@@ -134,9 +181,6 @@ const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Default object size (100 MiB) above which uploads route through
 /// multipart.
 const DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES: u64 = 100 * (1 << 20);
-/// Default hash-partition bucket count — a single bucket, which is
-/// observationally "no partitioning".
-const DEFAULT_PARTITION_N_BUCKETS: u32 = 1;
 
 /// Read-path freshness policy — how an open handle picks up superfiles
 /// committed (by this or another process) after it opened.
@@ -162,6 +206,11 @@ pub enum Consistency {
     /// other processes' new data requires a fresh `open`. For pure
     /// read replicas / time-bounded scans that never want surprise
     /// pointer reads.
+    ///
+    /// Do not hold a `Snapshot` handle open longer than the GC safety
+    /// gap (default 24 hours). GC removes old manifests once they age
+    /// past that threshold; a handle whose pinned manifest has been
+    /// collected will fail on the next query.
     Snapshot,
 }
 
@@ -247,6 +296,14 @@ pub struct SupertableOptions {
     /// storage is a configuration error caught at
     /// [`Supertable::create`] / [`Supertable::open`] time.
     pub disk_cache: Option<Arc<DiskCacheStore>>,
+    /// On-disk cache for compressed manifest-part bytes. When set,
+    /// [`ManifestPartLoader`](crate::supertable::manifest::ManifestPartLoader)
+    /// reads a part's bytes from local disk on a hit instead of
+    /// round-tripping to object storage. Parts are content-addressed,
+    /// so cached files are never stale and the cache survives process
+    /// restarts. Independent of `disk_cache` (which caches superfile
+    /// content) and uses its own byte budget. `None` disables it.
+    pub manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
     /// Best-effort memory budget for the disk cache's mmap
     /// working set, in bytes. When set together with
     /// `disk_cache`, the supertable triggers
@@ -268,6 +325,13 @@ pub struct SupertableOptions {
     /// idle-threshold madvise sweep on its existing schedule
     /// but does NOT proactively bound the RSS.
     pub memory_budget_bytes: Option<u64>,
+    /// Per-connection heap budget, shared (cloned `Arc`) by every supertable
+    /// the owning connection opens. The query and ingest paths reserve against
+    /// it before allocating; `measured()` by default, so it tracks usage but
+    /// never refuses until a limit is set. Distinct from `memory_budget_bytes`:
+    /// that bounds the mmap resident set, this bounds anonymous heap. See
+    /// [`crate::memory`].
+    pub(crate) connection_memory_budget: Arc<ConnectionMemoryBudget>,
     /// When `true` (default), each commit pre-populates the
     /// attached `disk_cache` with the superfile bytes it just
     /// wrote (so the producer's own next query skips the
@@ -501,22 +565,9 @@ impl SupertableOptions {
             return Err(BuildError::MissingTokenizer);
         }
 
-        // 6. Build default thread pools + store.
-        let reader_pool = Arc::new(
-            ThreadPoolBuilder::new()
-                .num_threads(default_reader_thread_count())
-                .thread_name(|i| format!("supertable-reader-{i}"))
-                .build()
-                .map_err(|e| BuildError::ThreadPoolCreation(e.to_string()))?,
-        );
-        let writer_threads = default_writer_thread_count();
-        let writer_pool = Arc::new(
-            ThreadPoolBuilder::new()
-                .num_threads(writer_threads)
-                .thread_name(|i| format!("supertable-writer-{i}"))
-                .build()
-                .map_err(|e| BuildError::ThreadPoolCreation(e.to_string()))?,
-        );
+        // 6. Shared thread pools + a fresh store.
+        let reader_pool = shared_reader_pool();
+        let writer_pool = shared_writer_pool();
         let store: Arc<dyn SuperfileReaderCache> = Arc::new(InMemoryReaderCache::new());
 
         Ok(Self {
@@ -530,7 +581,12 @@ impl SupertableOptions {
             store,
             storage: None,
             disk_cache: None,
+            manifest_disk_cache: None,
             memory_budget_bytes: None,
+            // Placeholder: standalone options (tests, direct callers) get an unshared measure-only budget.
+            // The catalog's `build_options` overwrites this with the connection's shared budget, and
+            // `apply_config` replaces it from `config.yaml`.
+            connection_memory_budget: ConnectionMemoryBudget::measured(),
             prepopulate_cache_on_commit: true,
             partition_strategy: None,
             vector_layout: VectorLayout::Ivf,
@@ -579,9 +635,8 @@ impl SupertableOptions {
     pub fn effective_partition_strategy(&self) -> PartitionStrategy {
         self.partition_strategy
             .clone()
-            .unwrap_or_else(|| PartitionStrategy::Hash {
-                column: self.id_column.clone(),
-                n_buckets: DEFAULT_PARTITION_N_BUCKETS,
+            .unwrap_or(PartitionStrategy::IngestionTime {
+                granularity_secs: 86_400,
             })
     }
 
@@ -671,6 +726,17 @@ impl SupertableOptions {
     /// resulting `Arc<DiskCacheStore>` here.
     pub fn with_disk_cache(mut self, cache: Arc<DiskCacheStore>) -> Self {
         self.disk_cache = Some(cache);
+        self
+    }
+
+    /// Attach an on-disk cache for compressed manifest-part bytes.
+    /// On a cache hit the part loader reads bytes from local disk
+    /// instead of round-tripping to object storage. Construction stays
+    /// user-managed — build the [`ManifestDiskCache`] with the cache
+    /// root and byte budget that fit the deployment and pass the
+    /// resulting `Arc` here.
+    pub fn with_manifest_disk_cache(mut self, cache: Arc<ManifestDiskCache>) -> Self {
+        self.manifest_disk_cache = Some(cache);
         self
     }
 
@@ -798,32 +864,38 @@ impl SupertableOptions {
     /// a user-schema field — same check as
     /// [`Self::with_id_column`].
     pub fn apply_config(mut self, cfg: &Config) -> Result<Self, BuildError> {
-        let reader_n = cfg
-            .supertable
-            .reader_threads
-            .resolve_or_default(default_reader_thread_count());
-        let writer_n = cfg
-            .supertable
-            .writer_threads
-            .resolve_or_default(default_writer_thread_count());
-
-        self.reader_pool = Arc::new(
-            ThreadPoolBuilder::new()
-                .num_threads(reader_n)
-                .thread_name(|i| format!("supertable-reader-{i}"))
-                .build()
-                .map_err(|e| BuildError::ThreadPoolCreation(e.to_string()))?,
-        );
-        self.writer_pool = Arc::new(
-            ThreadPoolBuilder::new()
-                .num_threads(writer_n)
-                .thread_name(|i| format!("supertable-writer-{i}"))
-                .build()
-                .map_err(|e| BuildError::ThreadPoolCreation(e.to_string()))?,
-        );
+        // `Auto` keeps the shared pool; `Fixed` builds a dedicated one
+        // (the config analogue of `with_reader_pool` / `with_writer_pool`).
+        self.reader_pool = match cfg.supertable.reader_threads {
+            ThreadCount::Auto => shared_reader_pool(),
+            ThreadCount::Fixed(n) => Arc::new(
+                ThreadPoolBuilder::new()
+                    .num_threads(n.max(1))
+                    .thread_name(|i| format!("supertable-reader-{i}"))
+                    .build()
+                    .map_err(|e| BuildError::ThreadPoolCreation(e.to_string()))?,
+            ),
+        };
+        self.writer_pool = match cfg.supertable.writer_threads {
+            ThreadCount::Auto => shared_writer_pool(),
+            ThreadCount::Fixed(n) => Arc::new(
+                ThreadPoolBuilder::new()
+                    .num_threads(n.max(1))
+                    .thread_name(|i| format!("supertable-writer-{i}"))
+                    .build()
+                    .map_err(|e| BuildError::ThreadPoolCreation(e.to_string()))?,
+            ),
+        };
         self.commit_threshold_size_mb = cfg.supertable.commit_threshold_size_mb;
         self.verify_crc_on_open = cfg.supertable.verify_crc_on_open;
         self.drain_batch_superfiles = cfg.vector.drain_batch_superfiles;
+        // The `config.yaml` source for the connection budget; the connect path
+        // uses `ConnectOptions` instead. 0, the shipped default, is measure-only.
+        // Note this replaces the budget outright: don't call `apply_config` on
+        // options that already carry a shared connection budget, or the sharing
+        // is silently dropped.
+        self.connection_memory_budget =
+            ConnectionMemoryBudget::from_budget_bytes(cfg.memory.connection_budget_bytes);
         if cfg.supertable.id_column != self.id_column {
             if self
                 .schema
@@ -857,6 +929,7 @@ impl SupertableOptions {
                 Some(Arc::new(S3StorageProvider::new_with_prefix(
                     bucket,
                     &cfg.storage.prefix,
+                    &cfg.storage.storage_options,
                 )?) as Arc<dyn StorageProvider>)
             }
             StorageBackend::Azure => {
@@ -866,6 +939,17 @@ impl SupertableOptions {
                 Some(Arc::new(AzureStorageProvider::new_with_prefix(
                     container,
                     &cfg.storage.prefix,
+                    &cfg.storage.storage_options,
+                )?) as Arc<dyn StorageProvider>)
+            }
+            StorageBackend::Gcs => {
+                let bucket = cfg.storage.bucket.as_ref().ok_or_else(|| {
+                    BuildError::Store("storage.backend=gcs requires storage.bucket".into())
+                })?;
+                Some(Arc::new(GcsStorageProvider::new_with_prefix(
+                    bucket,
+                    &cfg.storage.prefix,
+                    &cfg.storage.storage_options,
                 )?) as Arc<dyn StorageProvider>)
             }
         };
@@ -897,6 +981,16 @@ impl SupertableOptions {
             let cache = DiskCacheStore::new_unpinned(Arc::clone(&storage), disk_cfg)
                 .map_err(|e| BuildError::Store(format!("disk cache construction: {e}")))?;
             self.disk_cache = Some(cache);
+
+            // Manifest-part bytes get their own content-addressed cache
+            // under a sibling subdirectory, with an independent budget.
+            let manifest_cache_root = cache_root.join(MANIFEST_CACHE_SUBDIR);
+            let manifest_cache =
+                ManifestDiskCache::new(manifest_cache_root, cfg.storage.manifest_disk_budget_bytes)
+                    .map_err(|e| {
+                        BuildError::Store(format!("manifest disk cache construction: {e}"))
+                    })?;
+            self.manifest_disk_cache = Some(manifest_cache);
         }
 
         self.storage = Some(storage);
@@ -1347,6 +1441,29 @@ supertable:
     }
 
     #[test]
+    fn apply_config_sets_connection_memory_budget_from_config() {
+        use figment::{
+            Figment,
+            providers::{Format, Yaml},
+        };
+
+        // A positive config value -> bounded budget, gated at 90%.
+        let yaml = "memory:\n  connection_budget_bytes: 1000\n";
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
+        let opts = plain_opts().apply_config(&cfg).expect("apply_config");
+        assert_eq!(opts.connection_memory_budget.limit(), Some(900));
+    }
+
+    #[test]
+    fn apply_config_default_leaves_connection_memory_budget_measured() {
+        // The shipped default (0) is measure-only.
+        let cfg = Config::defaults().expect("embedded default");
+        let opts = plain_opts().apply_config(&cfg).expect("apply_config");
+        assert_eq!(opts.connection_memory_budget.limit(), None);
+    }
+
+    #[test]
     fn apply_config_auto_resolves_to_num_cpus_defaults() {
         // `auto` is the embedded default; verify resolution clamps
         // ≥ 1 and uses num_cpus-derived defaults.
@@ -1429,14 +1546,13 @@ supertable:
     }
 
     #[test]
-    fn effective_partition_strategy_defaults_to_single_bucket_hash() {
+    fn effective_partition_strategy_defaults_to_ingestion_time() {
         let opts = plain_opts();
         match opts.effective_partition_strategy() {
-            PartitionStrategy::Hash { column, n_buckets } => {
-                assert_eq!(column, "_id");
-                assert_eq!(n_buckets, DEFAULT_PARTITION_N_BUCKETS);
+            PartitionStrategy::IngestionTime { granularity_secs } => {
+                assert_eq!(granularity_secs, 86_400);
             }
-            other => panic!("expected single-bucket Hash, got {other:?}"),
+            other => panic!("expected IngestionTime with 1-day granularity, got {other:?}"),
         }
     }
 

@@ -53,7 +53,7 @@ use crate::{
         fts::reader::BoolMode,
         vector::distance::{Metric, distance},
     },
-    supertable::manifest::{ManifestSnapshot, SuperfileEntry},
+    supertable::manifest::{ManifestSnapshot, ScalarStatsAgg, SuperfileEntry},
 };
 
 /// Bloom-skip mask for an exact-term BM25 search.
@@ -147,7 +147,11 @@ pub fn fts_prefix_skip(
 /// [`superfiles_sorted_by_centroid_distance`] to bias fan-out
 /// order toward likely-close superfiles — that alone gives a
 /// near-cutoff result fast for cache-aware top-k merging.
-pub fn vector_centroid_skip(manifest: &ManifestSnapshot, _column: &str, _query: &[f32]) -> Vec<bool> {
+pub fn vector_centroid_skip(
+    manifest: &ManifestSnapshot,
+    _column: &str,
+    _query: &[f32],
+) -> Vec<bool> {
     vec![true; manifest.superfiles.len()]
 }
 
@@ -254,21 +258,87 @@ pub fn scalar_skip(
         .collect()
 }
 
+/// Keep each superfile whose `column` min/max could hold *any* of
+/// `values` (an `IN` list is a disjunction). Empty `values` keeps all.
+/// The SQL-side sibling of [`scalar_skip`] for the `IN` shape.
+pub fn scalar_value_set_skip(
+    superfiles: &[Arc<SuperfileEntry>],
+    column: &str,
+    values: &[ScalarValue],
+) -> Vec<bool> {
+    if values.is_empty() {
+        return vec![true; superfiles.len()];
+    }
+
+    superfiles
+        .iter()
+        .map(|entry| match superfile_minmax(entry, column) {
+            None => true,
+            Some((min, max)) => values
+                .iter()
+                .any(|v| scalar_value_may_match(&min, &max, ScalarOp::Eq, v)),
+        })
+        .collect()
+}
+
+/// Keep each superfile whose `column` stats could still satisfy
+/// `IS [NOT] NULL`. A missing stat keeps the superfile.
+pub fn null_check_skip(
+    superfiles: &[Arc<SuperfileEntry>],
+    column: &str,
+    want_null: bool,
+) -> Vec<bool> {
+    superfiles
+        .iter()
+        .map(|entry| {
+            entry
+                .scalar_stats
+                .get(column)
+                .is_none_or(|agg| null_check_may_match(agg, want_null))
+        })
+        .collect()
+}
+
+/// Whether a column's stats could still match `IS [NOT] NULL`, shared by
+/// both prune tiers:
+///  - `IS NULL` (`want_null`): keep unless the stats prove zero nulls.
+///  - `IS NOT NULL`: keep unless the column is entirely null.
+pub(crate) fn null_check_may_match(agg: &ScalarStatsAgg, want_null: bool) -> bool {
+    if want_null {
+        agg.null_count != Some(0)
+    } else {
+        !agg_all_null(agg)
+    }
+}
+
+/// All values are null iff the min stat is null — no non-null value fed it.
+fn agg_all_null(agg: &ScalarStatsAgg) -> bool {
+    ScalarValue::try_from_array(agg.min.as_ref(), 0)
+        .map(|v| v.is_null())
+        .unwrap_or(false)
+}
+
 /// Whether `entry` *could* contain a row satisfying `pred`, judged
 /// only from the superfile's persisted min/max. Conservative: any
 /// uncertainty returns `true` (keep).
 fn superfile_may_match(entry: &SuperfileEntry, pred: &ScalarPredicate) -> bool {
-    let Some(agg) = entry.scalar_stats.get(&pred.column) else {
-        // No stats for this column — can't prove irrelevance.
-        return true;
-    };
-    let (Ok(min), Ok(max)) = (
+    match superfile_minmax(entry, &pred.column) {
+        None => true,
+        Some((min, max)) => scalar_value_may_match(&min, &max, pred.op, &pred.value),
+    }
+}
+
+/// The superfile's persisted min/max for `column`, or `None` when the
+/// column has no stats or the bounds don't decode (caller keeps).
+fn superfile_minmax(entry: &SuperfileEntry, column: &str) -> Option<(ScalarValue, ScalarValue)> {
+    let agg = entry.scalar_stats.get(column)?;
+    match (
         ScalarValue::try_from_array(agg.min.as_ref(), 0),
         ScalarValue::try_from_array(agg.max.as_ref(), 0),
-    ) else {
-        return true;
-    };
-    scalar_value_may_match(&min, &max, pred.op, &pred.value)
+    ) {
+        (Ok(min), Ok(max)) => Some((min, max)),
+        _ => None,
+    }
 }
 
 /// Conservative `min`/`max`-vs-`value` comparison core, shared by the
@@ -627,6 +697,75 @@ mod tests {
             seg_with_int_stats("x", 100, 110),
         ];
         assert_eq!(scalar_skip(&segs, &[]), vec![true, true]);
+    }
+
+    #[test]
+    fn scalar_value_set_skip_keeps_superfiles_holding_any_listed_value() {
+        let segs = vec![
+            seg_with_int_stats("x", 0, 10),
+            seg_with_int_stats("x", 100, 110),
+            seg_with_int_stats("x", 200, 210),
+        ];
+        let i = |n| ScalarValue::Int64(Some(n));
+        // IN (5, 205) → A's [0,10] and C's [200,210], not B.
+        assert_eq!(
+            scalar_value_set_skip(&segs, "x", &[i(5), i(205)]),
+            vec![true, false, true]
+        );
+        // IN (50) → matches no range.
+        assert_eq!(
+            scalar_value_set_skip(&segs, "x", &[i(50)]),
+            vec![false, false, false]
+        );
+        // Empty list and unknown column both keep all (conservative).
+        assert_eq!(
+            scalar_value_set_skip(&segs, "x", &[]),
+            vec![true, true, true]
+        );
+        assert_eq!(
+            scalar_value_set_skip(&segs, "missing", &[i(5)]),
+            vec![true, true, true]
+        );
+    }
+
+    #[test]
+    fn null_check_may_match_covers_both_predicates() {
+        let arr = |v: Option<i64>| Arc::new(Int64Array::from(vec![v])) as ArrayRef;
+        let agg = |min: Option<i64>, null_count: Option<u64>| ScalarStatsAgg {
+            min: arr(min),
+            max: arr(min),
+            null_count,
+            sum: None,
+            hll: None,
+        };
+
+        // No nulls: IS NULL drops, IS NOT NULL keeps.
+        let no_null = agg(Some(5), Some(0));
+        assert!(!null_check_may_match(&no_null, true));
+        assert!(null_check_may_match(&no_null, false));
+
+        // All null (min is null): IS NULL keeps, IS NOT NULL drops.
+        let all_null = agg(None, Some(10));
+        assert!(null_check_may_match(&all_null, true));
+        assert!(!null_check_may_match(&all_null, false));
+
+        // Some nulls (min present): both keep.
+        let mixed = agg(Some(5), Some(2));
+        assert!(null_check_may_match(&mixed, true));
+        assert!(null_check_may_match(&mixed, false));
+
+        // Unknown null count (None): can't prove zero nulls, both keep.
+        let unknown = agg(Some(5), None);
+        assert!(null_check_may_match(&unknown, true));
+        assert!(null_check_may_match(&unknown, false));
+    }
+
+    #[test]
+    fn null_check_skip_keeps_on_missing_stat() {
+        let segs = vec![seg_with_int_stats("x", 0, 10)];
+        // Column not in stats → conservative keep for either predicate.
+        assert_eq!(null_check_skip(&segs, "missing", true), vec![true]);
+        assert_eq!(null_check_skip(&segs, "missing", false), vec![true]);
     }
 
     #[test]

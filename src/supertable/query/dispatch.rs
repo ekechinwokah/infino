@@ -36,6 +36,8 @@ use std::{collections::HashSet, future::Future, sync::Arc, time::Instant};
 
 use arrow_array::Decimal128Array;
 use futures::future::try_join_all;
+use roaring::RoaringBitmap;
+use tracing::trace;
 use uuid::Uuid;
 
 use super::SuperfileHit;
@@ -133,9 +135,25 @@ pub(crate) fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<Sup
         .collect()
 }
 
-/// Drop tombstoned `local_doc_id`s from one superfile's hits. After the
-/// orchestrator's batched [`SidecarCache::prefetch`] every lookup here
-/// is an in-memory cache hit, so this is a cheap retain pass.
+/// Resolve a superfile's tombstones to a non-empty deny bitmap, or `None`
+/// when it has none. After the orchestrator's batched
+/// [`SidecarCache::prefetch`] this is an in-memory cache hit. The single
+/// source of the "look up the bitmap, treat empty as absent" step shared
+/// by the post-rank filter here, the allow-set subtraction, and the
+/// unfiltered deny-set pushdown.
+pub(crate) fn tombstone_deny_set(
+    cache: &SidecarCache,
+    superfile_id: Uuid,
+    now: Instant,
+) -> Result<Option<Arc<RoaringBitmap>>, QueryError> {
+    let bitmap = cache
+        .bitmap_for(superfile_id, now)
+        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+    Ok((!bitmap.is_empty()).then_some(bitmap))
+}
+
+/// Drop tombstoned `local_doc_id`s from one superfile's hits — the
+/// post-rank filter for query paths that rank without a deny set (FTS).
 pub(crate) fn apply_tombstone_filter(
     cache: Option<&Arc<SidecarCache>>,
     entry: &SuperfileEntry,
@@ -145,12 +163,9 @@ pub(crate) fn apply_tombstone_filter(
     let Some(cache) = cache else {
         return Ok(());
     };
-    let bitmap = cache
-        .bitmap_for(entry.superfile_id, now)
-        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
-    if bitmap.is_empty() {
+    let Some(bitmap) = tombstone_deny_set(cache, entry.superfile_id, now)? else {
         return Ok(());
-    }
+    };
     hits.retain(|h| !bitmap.contains(h.local_doc_id));
     Ok(())
 }
@@ -307,34 +322,94 @@ where
             async move {
                 let reader_for_ids = Arc::clone(&r);
                 let hits = kernel(r, params).await?;
-                let mut tagged = tag_hits(&entry, hits);
-                // Piggyback the hidden→user `_id` resolve onto the search.
-                // Materialized hidden cells: inline `_id` region (prefetched
-                // on cold, resident on warm). INCOMING staging superfiles:
-                // scalar `_id` column via sync `take_by_local_doc_ids` on
-                // resident bytes — both skip the trailing remap GET.
-                if !tagged.is_empty() {
-                    let locals: Vec<u32> = tagged.iter().map(|h| h.local_doc_id).collect();
-                    if let Some(ids) = stable_ids_for_tagged_hits(&reader_for_ids, &locals).await? {
-                        for (h, id) in tagged.iter_mut().zip(ids) {
-                            h.stable_id = Some(id);
-                        }
-                    }
-                }
-                apply_resolved_tombstone_filter(
+                finalize_user_hits(
                     &reader_for_ids,
                     storage.as_ref(),
                     tombstone_cache.as_ref(),
                     &entry,
-                    &mut tagged,
+                    hits,
                     now,
                 )
-                .await?;
-                Ok::<Vec<SuperfileHit>, QueryError>(tagged)
+                .await
             }
         },
     )
     .await
+}
+
+/// Same fan-out as [`fanout`], but resolves each superfile's tombstone
+/// bitmap *before* the kernel runs and hands it down as a deny set, so
+/// ranking can exclude deleted rows up front. Post-rank filtering alone
+/// underflows `k` when the nearest rows are tombstoned; the vector path
+/// pushes the deny set into the IVF kernel, while FTS keeps [`fanout`]'s
+/// post-rank filter (BM25 has no deny-set pushdown).
+pub(crate) async fn fanout_with_deny<P, K, Fut>(
+    reader: &SupertableReader,
+    units: Vec<(Arc<SuperfileEntry>, P)>,
+    kernel: K,
+) -> Result<Vec<Vec<SuperfileHit>>, QueryError>
+where
+    P: Send + 'static,
+    K: Fn(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>, P) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<Vec<(u32, f32)>, QueryError>> + Send + 'static,
+{
+    let storage = reader.manifest().options.storage.as_ref().map(Arc::clone);
+    fanout_with(
+        reader,
+        units,
+        true,
+        move |r, entry, tombstone_cache, now, params| {
+            let kernel = kernel.clone();
+            let storage = storage.clone();
+            async move {
+                let deny = match tombstone_cache.as_ref() {
+                    Some(cache) => tombstone_deny_set(cache, entry.superfile_id, now)?,
+                    None => None,
+                };
+                let reader_for_ids = Arc::clone(&r);
+                let hits = kernel(r, deny, params).await?;
+                finalize_user_hits(
+                    &reader_for_ids,
+                    storage.as_ref(),
+                    tombstone_cache.as_ref(),
+                    &entry,
+                    hits,
+                    now,
+                )
+                .await
+            }
+        },
+    )
+    .await
+}
+
+/// Shared post-kernel tail for [`fanout`] and [`fanout_with_deny`]: tag
+/// raw `(local_doc_id, score)` hits, piggyback the hidden→user `_id`
+/// resolve onto the search (materialized hidden cells read the inline
+/// `_id` region — prefetched on cold, resident on warm; INCOMING staging
+/// superfiles read the scalar `_id` column via sync
+/// `take_by_local_doc_ids` on resident bytes — both skip the trailing
+/// remap GET), then apply the resolved tombstone filter.
+async fn finalize_user_hits(
+    reader: &Arc<SuperfileReader>,
+    storage: Option<&Arc<dyn StorageProvider>>,
+    tombstone_cache: Option<&Arc<SidecarCache>>,
+    entry: &SuperfileEntry,
+    hits: Vec<(u32, f32)>,
+    now: Instant,
+) -> Result<Vec<SuperfileHit>, QueryError> {
+    let mut tagged = tag_hits(entry, hits);
+    if !tagged.is_empty() {
+        let locals: Vec<u32> = tagged.iter().map(|h| h.local_doc_id).collect();
+        if let Some(ids) = stable_ids_for_tagged_hits(reader, &locals).await? {
+            for (h, id) in tagged.iter_mut().zip(ids) {
+                h.stable_id = Some(id);
+            }
+        }
+    }
+    apply_resolved_tombstone_filter(reader, storage, tombstone_cache, entry, &mut tagged, now)
+        .await?;
+    Ok(tagged)
 }
 
 /// Same fan-out as [`fanout`], but without ordinary per-superfile tombstone
@@ -411,6 +486,7 @@ where
     if units.is_empty() {
         return Ok(Vec::new());
     }
+    trace!(units = units.len(), "fanning query out across superfiles");
     let manifest = reader.manifest();
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
@@ -428,6 +504,19 @@ where
         ids.sort_unstable();
         ids.dedup();
         cache.prefetch(&ids, now).await;
+    }
+
+    // Single unit (the common case for a compacted, single-superfile
+    // table): run the body inline on the current task. `tokio::spawn`
+    // here would only add a thread handoff and a join with nothing to
+    // overlap against — the spawn path's win is concurrency across units,
+    // which doesn't exist at one unit. Semantically identical to the
+    // fan-out below with a one-element result.
+    if units.len() == 1 {
+        let (entry, params) = units.into_iter().next().expect("len == 1");
+        let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry).await?;
+        let out = body(r, entry, tombstone_cache, now, params).await?;
+        return Ok(vec![out]);
     }
 
     let handles = units.into_iter().map(|(entry, params)| {

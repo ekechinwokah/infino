@@ -45,6 +45,7 @@ pub enum Cell {
         raw: f64,
         shown: String,
         better: Better,
+        gate: bool,
     },
 }
 
@@ -53,12 +54,25 @@ pub fn text(s: impl Into<String>) -> Cell {
     Cell::Text(s.into())
 }
 
-/// A tracked metric cell.
+/// A gate metric cell — Δ-tracked and surfaced (min latency, build time,
+/// peak RSS, stored size).
 pub fn metric(raw: f64, shown: impl Into<String>, better: Better) -> Cell {
     Cell::Metric {
         raw,
         shown: shown.into(),
         better,
+        gate: true,
+    }
+}
+
+/// A context metric cell — shown and saved, but not Δ-tracked (spread,
+/// secondary, derived numbers).
+pub fn context(raw: f64, shown: impl Into<String>, better: Better) -> Cell {
+    Cell::Metric {
+        raw,
+        shown: shown.into(),
+        better,
+        gate: false,
     }
 }
 

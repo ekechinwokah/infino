@@ -301,6 +301,9 @@ pub enum PartitionStrategy {
         clusters: super::ClusterCentroids,
         routing: CellRoutingParams,
     },
+    IngestionTime {
+        granularity_secs: i64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -388,7 +391,9 @@ impl ScalarStatsAgg {
     ///
     /// Returns `None` for types without a well-defined ordering (anything
     /// other than integer / float / boolean / utf8 / decimal) — those carry
-    /// no min/max, so there's nothing to prune on. When present, every
+    /// no min/max, so there's nothing to prune on. An all-null column of a
+    /// supported type still returns an aggregate: null min/max plus the
+    /// null count, so `IS [NOT] NULL` can prune on it. When present, every
     /// companion stat (null count, exact sum, HLL sketch) is computed in the
     /// same pass; sum/hll stay `None` for types that don't support them.
     pub fn from_column(column: &ArrayRef) -> Option<ScalarStatsAgg> {
@@ -557,7 +562,7 @@ pub struct ScalarStatsMergeError {
 
 /// FTS skip summary for one column. Used both per-superfile
 /// (`SuperfileEntry.fts_summary`) and as the per-part aggregate
-/// (`ManifestListEntry.fts_summary_agg`) — the per-part value is the
+/// (`ManifestPartEntry.fts_summary_agg`) — the per-part value is the
 /// bloom-union + range-union across the part's superfiles.
 ///
 /// The bloom is held as a decoded [`Bloom`] (cheap `Arc<[u64]>` clone) so
@@ -862,6 +867,9 @@ enum PartitionStrategyDto {
         clusters_b64: String,
         #[serde(default)]
         routing: Option<CellRoutingParamsDto>,
+    },
+    IngestionTime {
+        granularity_secs: i64,
     },
 }
 
@@ -1178,6 +1186,11 @@ fn strategy_to_dto(s: &PartitionStrategy) -> PartitionStrategyDto {
                 routing: Some(CellRoutingParamsDto::from(*routing)),
             }
         }
+        PartitionStrategy::IngestionTime { granularity_secs } => {
+            PartitionStrategyDto::IngestionTime {
+                granularity_secs: *granularity_secs,
+            }
+        }
     }
 }
 
@@ -1217,6 +1230,9 @@ fn strategy_from_dto(d: PartitionStrategyDto) -> Result<PartitionStrategy, ListP
                 clusters,
                 routing: routing.map(CellRoutingParams::from).unwrap_or_default(),
             }
+        }
+        PartitionStrategyDto::IngestionTime { granularity_secs } => {
+            PartitionStrategy::IngestionTime { granularity_secs }
         }
     })
 }

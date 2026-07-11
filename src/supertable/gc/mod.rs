@@ -6,6 +6,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use tracing::{debug, warn};
+
 use crate::{
     Supertable,
     runtime_bridge::bridge_on_runtime,
@@ -102,13 +104,20 @@ pub(super) async fn gc_storage_sweep_for_inner(
                     report.objects_deleted += 1;
                     report.bytes_freed += meta.size;
                 }
-                Err(_) => {
+                Err(e) => {
+                    warn!(object = %key, error = %e, "gc: failed to delete orphan object");
                     report.delete_errors += 1;
                 }
             }
         }
     }
 
+    debug!(
+        deleted = report.objects_deleted,
+        bytes_freed = report.bytes_freed,
+        delete_errors = report.delete_errors,
+        "gc sweep complete"
+    );
     Ok(report)
 }
 
@@ -163,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn build_live_set_contains_pointer_and_list_uri() {
+    fn build_live_set_contains_pointer_and_manifest_uri() {
         let manifest = ManifestSnapshot::empty(opts());
         let live = build_live_set(&manifest);
         assert!(live.contains(POINTER_PATH));
@@ -179,7 +188,7 @@ mod tests {
     }
 
     #[test]
-    fn build_live_set_does_not_contain_older_list_uris() {
+    fn build_live_set_does_not_contain_older_manifest_uris() {
         let uri = SuperfileUri::new_v4();
         let manifest = ManifestSnapshot::empty(opts()).with_appended(vec![sf_entry(uri)]);
         assert_eq!(manifest.manifest_id, 1);

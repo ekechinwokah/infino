@@ -70,9 +70,9 @@ const PARTITION_KEY_BYTES: usize = 8;
 use tempfile::TempDir;
 
 #[test]
-fn default_strategy_is_single_bucket_hash_observationally_equivalent_to_pre_m15a() {
-    // Default = Hash{id_column, n_buckets: 1}. Three
-    // commits → manifest list has exactly one entry with
+fn default_strategy_is_ingestion_time_with_one_day_granularity() {
+    // Default = IngestionTime{granularity_secs: 86_400}. Three
+    // commits within the same day → manifest list has exactly one entry with
     // accumulated superfiles.
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
@@ -92,20 +92,20 @@ fn default_strategy_is_single_bucket_hash_observationally_equivalent_to_pre_m15a
     assert_eq!(
         list_entries.len(),
         1,
-        "single-bucket default → one list entry; got {} entries",
+        "ingestion-time default within same day → one list entry; got {} entries",
         list_entries.len()
     );
     assert_eq!(
         list_entries[0].n_superfiles, 3,
         "after 3 single-superfile commits the part should hold 3 superfiles"
     );
-    // partition_key is the 4-byte LE encoding of bucket 0. The tag
-    // lives on each superfile entry (stamped by the manifest's
-    // `update()` at commit); parts no longer carry a key of their own.
+    // partition_key is the 8-byte LE encoding of the ingestion-time bucket
+    // (seconds/86400). The tag lives on each superfile entry (stamped by the
+    // manifest's `update()` at commit); parts no longer carry a key of their own.
     let superfiles = m.get_all_superfiles();
     assert_eq!(superfiles.len(), 3);
     for sf in superfiles {
-        assert_eq!(sf.partition_key, [0u8, 0, 0, 0]);
+        assert_eq!(sf.partition_key.len(), PARTITION_KEY_BYTES);
     }
 }
 

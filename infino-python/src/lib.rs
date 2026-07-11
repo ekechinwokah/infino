@@ -14,7 +14,9 @@
 //! maturin — it consumes the core crate's curated public API only (no
 //! `test-helpers`), so it is also a public-surface consumer test.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::compute::concat_batches;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
@@ -28,7 +30,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use infino::{
-    BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions, InfinoError, Metric,
+    BoolMode, ColdFetchMode, CompactionSettings, ConnectOptions, GcError, InfinoError, Metric,
     OptimizeError, OptimizeOptions, VectorFilter, VectorSearchOptions,
 };
 
@@ -51,6 +53,10 @@ fn optimize_err(e: OptimizeError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
+fn gc_err(e: GcError) -> PyErr {
+    PyRuntimeError::new_err(e.to_string())
+}
+
 /// Parse a metric name (`"cosine"` / `"l2sq"` / `"negdot"`).
 fn metric_from_str(s: &str) -> PyResult<Metric> {
     match s.to_ascii_lowercase().as_str() {
@@ -68,7 +74,9 @@ fn cold_fetch_from_str(s: &str) -> PyResult<ColdFetchMode> {
     match s.to_ascii_lowercase().as_str() {
         "hybrid_with_prefetch" => Ok(ColdFetchMode::HybridWithPrefetch),
         "range_only" => Ok(ColdFetchMode::RangeOnly),
-        "lazy_foreground_with_background_fill" => Ok(ColdFetchMode::LazyForegroundWithBackgroundFill),
+        "lazy_foreground_with_background_fill" => {
+            Ok(ColdFetchMode::LazyForegroundWithBackgroundFill)
+        }
         other => Err(PyValueError::new_err(format!(
             "unknown cold_fetch_mode {other:?}; use 'hybrid_with_prefetch', \
              'range_only', or 'lazy_foreground_with_background_fill'"
@@ -77,44 +85,32 @@ fn cold_fetch_from_str(s: &str) -> PyResult<ColdFetchMode> {
 }
 
 /// Open (or create) a catalog rooted at `uri`. Storage config the URI
-/// can't carry is passed as keyword arguments: explicit S3 endpoint +
-/// static credentials, and the optional local disk cache (`cache_dir`,
-/// `cache_budget_bytes`, `cold_fetch_mode`). Omit all for local /
-/// `memory://` / ambient-credential S3.
-// Flat kwargs are the intended Python API; a config struct would change it.
-#[allow(clippy::too_many_arguments)]
+/// can't carry is passed as keyword arguments: `storage_options` (a map
+/// of `object_store` config keys — `aws_*` / `azure_*` / `google_*`) and the optional
+/// local disk cache. Pass `validate=True` to probe the object store at
+/// connect (off by default) so bad credentials fail there. Omit all for
+/// local / `memory://` / ambient-credential object storage.
 #[pyfunction]
-#[pyo3(signature = (uri, *, endpoint=None, region=None, access_key=None, secret_key=None,
-                    cache_dir=None, cache_budget_bytes=None, cold_fetch_mode=None))]
+#[pyo3(signature = (uri, *, storage_options=None, cache_dir=None, cache_budget_bytes=None,
+                    cold_fetch_mode=None, validate=None))]
 fn connect(
     py: Python<'_>,
     uri: &str,
-    endpoint: Option<String>,
-    region: Option<String>,
-    access_key: Option<String>,
-    secret_key: Option<String>,
+    storage_options: Option<HashMap<String, String>>,
     cache_dir: Option<String>,
     cache_budget_bytes: Option<u64>,
     cold_fetch_mode: Option<String>,
+    validate: Option<bool>,
 ) -> PyResult<Connection> {
     // Opening a connection can touch object storage; release the GIL so
     // other Python threads run during the (blocking) I/O.
     let inner = py.detach(|| {
         let mut opts = ConnectOptions::new();
         let mut has_options = false;
-        // The S3 endpoint + credentials are all-or-nothing: any one of them
-        // means the caller wants an explicit endpoint, so require the rest
-        // rather than silently dropping a partial config back to ambient.
-        if endpoint.is_some() || region.is_some() || access_key.is_some() || secret_key.is_some() {
-            let endpoint = endpoint
-                .ok_or_else(|| PyValueError::new_err("endpoint is required with S3 credentials"))?;
-            let region = region
-                .ok_or_else(|| PyValueError::new_err("region is required for an S3 endpoint"))?;
-            let access_key = access_key
-                .ok_or_else(|| PyValueError::new_err("access_key is required for an S3 endpoint"))?;
-            let secret_key = secret_key
-                .ok_or_else(|| PyValueError::new_err("secret_key is required for an S3 endpoint"))?;
-            opts = opts.with_s3_endpoint(endpoint, region, access_key, secret_key);
+        if let Some(options) = storage_options {
+            for (key, value) in options {
+                opts = opts.with_storage_option(key, value);
+            }
             has_options = true;
         }
         if let Some(dir) = cache_dir {
@@ -127,6 +123,10 @@ fn connect(
         }
         if let Some(mode) = cold_fetch_mode {
             opts = opts.with_cold_fetch_mode(cold_fetch_from_str(&mode)?);
+            has_options = true;
+        }
+        if let Some(v) = validate {
+            opts = opts.with_validate(v);
             has_options = true;
         }
         // Preserve the plain `connect(uri)` path when no options are set.
@@ -216,9 +216,7 @@ impl Connection {
 
     /// Open an existing table by name.
     fn open_table(&self, py: Python<'_>, name: &str) -> PyResult<Table> {
-        let inner = py
-            .detach(|| self.inner.open_table(name))
-            .map_err(py_err)?;
+        let inner = py.detach(|| self.inner.open_table(name)).map_err(py_err)?;
         Ok(Table { inner })
     }
 
@@ -241,9 +239,7 @@ impl Connection {
     /// Search is available in SQL via the TVFs, e.g.
     /// `SELECT _id, score FROM bm25_search('docs', 'body', 'q', 10)`.
     fn query_sql<'py>(&self, py: Python<'py>, sql: &str) -> PyResult<Bound<'py, PyAny>> {
-        let batches = py
-            .detach(|| self.inner.query_sql(sql))
-            .map_err(py_err)?;
+        let batches = py.detach(|| self.inner.query_sql(sql)).map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
     }
 }
@@ -275,6 +271,47 @@ impl MutationStats {
         format!(
             "MutationStats(matched={}, n_tombstoned={}, n_not_found={})",
             self.matched, self.n_tombstoned, self.n_not_found
+        )
+    }
+}
+
+#[pyclass(name = "GcReport", frozen)]
+struct GcReport {
+    #[pyo3(get)]
+    bytes_freed: u64,
+    #[pyo3(get)]
+    objects_deleted: u64,
+    #[pyo3(get)]
+    objects_skipped_live: u64,
+    #[pyo3(get)]
+    objects_skipped_too_new: u64,
+    #[pyo3(get)]
+    delete_errors: u64,
+}
+
+impl GcReport {
+    fn from_core(r: &infino::GcReport) -> Self {
+        Self {
+            bytes_freed: r.bytes_freed,
+            objects_deleted: r.objects_deleted,
+            objects_skipped_live: r.objects_skipped_live,
+            objects_skipped_too_new: r.objects_skipped_too_new,
+            delete_errors: r.delete_errors,
+        }
+    }
+}
+
+#[pymethods]
+impl GcReport {
+    fn __repr__(&self) -> String {
+        format!(
+            "GcReport(bytes_freed={}, objects_deleted={}, objects_skipped_live={}, \
+             objects_skipped_too_new={}, delete_errors={})",
+            self.bytes_freed,
+            self.objects_deleted,
+            self.objects_skipped_live,
+            self.objects_skipped_too_new,
+            self.delete_errors,
         )
     }
 }
@@ -351,7 +388,8 @@ impl Table {
         let batches = py
             .detach(|| {
                 let names = projection_refs(&projection);
-                self.inner.bm25_search(column, query, k, mode, names.as_deref())
+                self.inner
+                    .bm25_search(column, query, k, mode, names.as_deref())
             })
             .map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
@@ -391,7 +429,11 @@ impl Table {
         // `filter_query` must be supplied together; `filter_mode` is only
         // meaningful alongside them (a lone `filter_mode` is rejected rather
         // than silently ignored, so an invalid value never passes unnoticed).
-        let filter = match (filter_column.as_deref(), filter_query.as_deref(), filter_mode) {
+        let filter = match (
+            filter_column.as_deref(),
+            filter_query.as_deref(),
+            filter_mode,
+        ) {
             (Some(col), Some(q), mode) => Some(VectorFilter {
                 column: col,
                 query: q,
@@ -436,7 +478,8 @@ impl Table {
         let batches = py
             .detach(|| {
                 let names = projection_refs(&projection);
-                self.inner.token_match(column, query, mode, names.as_deref())
+                self.inner
+                    .token_match(column, query, mode, names.as_deref())
             })
             .map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
@@ -458,6 +501,65 @@ impl Table {
             .detach(|| {
                 let names = projection_refs(&projection);
                 self.inner.exact_match(column, value, names.as_deref())
+            })
+            .map_err(py_err)?;
+        batches_to_pyarrow_table(py, batches)
+    }
+
+    /// Count rows matching a BM25 keyword `query` over `column`, without
+    /// fetching them. `mode` is `"or"` (default) or `"and"`.
+    #[pyo3(signature = (column, query, mode=None))]
+    fn count(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        query: &str,
+        mode: Option<&str>,
+    ) -> PyResult<u64> {
+        let mode = parse_mode(mode)?;
+        py.detach(|| self.inner.count(column, query, mode))
+            .map_err(py_err)
+    }
+
+    /// Hybrid BM25 + vector search fused with reciprocal-rank fusion.
+    /// `text_column` / `text_query` (under `mode`) drive BM25;
+    /// `vector_column` / `vector_query` (with optional `nprobe`) drive
+    /// vector kNN. `k` bounds each retriever and the fused result.
+    /// Returns a pyarrow `Table` like `bm25_search`, with `score` the
+    /// fused RRF score (higher is better); `projection` follows the same
+    /// rules.
+    #[pyo3(signature = (text_column, text_query, vector_column, vector_query, k, mode=None, nprobe=None, projection=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn hybrid_search<'py>(
+        &self,
+        py: Python<'py>,
+        text_column: &str,
+        text_query: &str,
+        vector_column: &str,
+        vector_query: Vec<f32>,
+        k: usize,
+        mode: Option<&str>,
+        nprobe: Option<usize>,
+        projection: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mode = parse_mode(mode)?;
+        let mut opts = VectorSearchOptions::new();
+        if let Some(n) = nprobe {
+            opts = opts.with_nprobe(n);
+        }
+        let batches = py
+            .detach(|| {
+                let names = projection_refs(&projection);
+                self.inner.hybrid_search(
+                    text_column,
+                    text_query,
+                    mode,
+                    vector_column,
+                    &vector_query,
+                    opts,
+                    k,
+                    names.as_deref(),
+                )
             })
             .map_err(py_err)?;
         batches_to_pyarrow_table(py, batches)
@@ -516,7 +618,17 @@ impl Table {
             }
         }
         let opts = OptimizeOptions::compact(s);
-        py.detach(|| self.inner.optimize(&opts)).map_err(optimize_err)
+        py.detach(|| self.inner.optimize(&opts))
+            .map_err(optimize_err)
+    }
+
+    /// Delete orphaned storage objects left by compaction or interrupted
+    /// writes. Only objects older than `grace_secs` (a safety window against
+    /// racing readers/writers) are removed. Requires durable storage.
+    fn gc(&self, py: Python<'_>, grace_secs: f64) -> PyResult<GcReport> {
+        let grace = Duration::from_secs_f64(grace_secs.max(0.0));
+        let report = py.detach(|| self.inner.gc(grace)).map_err(gc_err)?;
+        Ok(GcReport::from_core(&report))
     }
 
     /// The user-facing Arrow schema, as a pyarrow `Schema`.
@@ -538,7 +650,7 @@ impl Table {
 }
 
 /// Borrow an optional Python projection (`list[str]`) as the `&str`
-/// slices the Rust search APIs take. Shared by all four search methods.
+/// slices the Rust search APIs take. Shared by every search method.
 fn projection_refs(projection: &Option<Vec<String>>) -> Option<Vec<&str>> {
     projection
         .as_ref()
@@ -635,17 +747,20 @@ fn coerce_to_record_batch(
     }
 }
 
-// Named `infino_ext` (not `infino`) so the generated module item doesn't
-// shadow the `infino` crate inside this file; `#[pyo3(name = "infino")]`
-// keeps the Python module name `infino` (init symbol `PyInit_infino`).
+// The compiled extension is `infino._infino`: the `python/infino/`
+// package re-exports it and carries the typing artifacts (`py.typed`,
+// stubs, `__version__`). Naming the module item `infino_ext` keeps it
+// from shadowing the `infino` crate inside this file; the init symbol is
+// `PyInit__infino`.
 #[pymodule]
-#[pyo3(name = "infino")]
+#[pyo3(name = "_infino")]
 fn infino_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_class::<Connection>()?;
     m.add_class::<Table>()?;
     m.add_class::<IndexSpec>()?;
     m.add_class::<MutationStats>()?;
+    m.add_class::<GcReport>()?;
     m.add_class::<CompactOptions>()?;
     Ok(())
 }

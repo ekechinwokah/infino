@@ -1,21 +1,25 @@
 # infino
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/infino-ai/infino)
+[![Crates.io](https://img.shields.io/crates/v/infino.svg)](https://crates.io/crates/infino)
+[![docs.rs](https://img.shields.io/docsrs/infino)](https://docs.rs/infino)
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**infino is a fast retrieval engine that runs SQL, full-text search, and vector search over a single copy of your data on object storage.** Data stays in Parquet on S3 (or Azure, or local disk) and you can query it at scale.
+**infino is a fast retrieval engine that runs SQL, full-text search, and vector search over a single copy of your data on object storage.** Data stays in Parquet on S3 (or Azure, GCS, or local disk) and you can query it at scale.
 
 **Why infino**
 
-- **Speed per dollar** — infino optimizes for speed per dollar, making tradeoffs to achieve object-storage economics at search engine speeds.
+- **Speed per dollar** — infino optimizes for speed per dollar, making tradeoffs to achieve object-storage economics at search engine speeds. On a 1-million-document index, warm BM25 queries return in the microsecond range — see [benchmarks](benches/README.md).
 - **Multi-modal queries** — keyword (BM25), vector, and SQL queries over the same rows, offering flexible query paths for agents.
-- **Object-storage-native** — data lives on S3, Azure, or local disk, with snapshot-isolated reads and atomic commits. 
+- **Object-storage-native** — data lives on S3, Azure, GCS, or local disk, with snapshot-isolated reads and atomic commits.
 - **Open format, no lock in** — text and numeric data is stored as spec-compliant Parquet, so anything that reads Parquet can read your data.
 
 ## Contents
 
 - [Install](#install)
 - [Quickstart](#quickstart)
+- [Cloud storage](#cloud-storage)
 - [Architecture](#architecture)
 - [SQL joins across tables](#sql-joins-across-tables)
 - [Hybrid search](#hybrid-search)
@@ -29,17 +33,16 @@
 **Python**
 
 ```sh
-# Install from TestPyPI.
-pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ infino
+pip install infino
 
 # Or with uv (https://docs.astral.sh/uv/):
-uv pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ infino
+uv pip install infino
 ```
 
 **Node.js**
 
 ```sh
-npm install infino --registry https://npm-proxy.fury.io/infino/
+npm install @infino-ai/infino
 ```
 
 **Rust**
@@ -54,6 +57,13 @@ or in `Cargo.toml`:
 [dependencies]
 infino = "0.1"
 ```
+
+The full Rust API reference is on [docs.rs/infino](https://docs.rs/infino).
+
+infino installs the [mimalloc](https://github.com/microsoft/mimalloc)
+global allocator by default. If you embed infino in a process that already
+sets a global allocator, turn it off to avoid a second one:
+`infino = { version = "0.1", default-features = false }`.
 
 ## Quickstart
 
@@ -101,7 +111,7 @@ billing  = db.query_sql("SELECT body FROM docs WHERE source = 'help-center'")  #
 **Node.js**
 
 ```javascript
-import { connect, IndexSpec } from "infino";
+import { connect, IndexSpec } from "@infino-ai/infino";
 
 // A knowledge base your agent retrieves over. "memory://" is in-process;
 // use "./data" or "s3://bucket/prefix" to persist.
@@ -201,6 +211,104 @@ Bindings live in [`infino-python/`](infino-python/) (PyO3 + maturin) and
 The Node API is synchronous — objects in, plain records out, with `_id`
 returned as a JavaScript `bigint`.
 
+### Open format: read it as Parquet
+
+A superfile *is* a spec-compliant Parquet file. The embedded BM25 and
+vector index regions are spliced in ahead of a standard Parquet footer
+and pointed at by `inf.*` key/value metadata keys, which any conformant
+Parquet reader ignores. So the columnar body opens in DuckDB, pandas,
+pyarrow, or DataFusion with **no infino in the read path** and no export
+step:
+
+```python
+import infino, pyarrow as pa, glob, duckdb
+
+db = infino.connect("./data")          # persist to disk (not "memory://")
+docs = db.create_table(
+    "docs",
+    pa.schema([
+        pa.field("source", pa.large_utf8(), nullable=False),
+        pa.field("body", pa.large_utf8(), nullable=False),
+    ]),
+    infino.IndexSpec().fts("body"),
+)
+docs.append([
+    {"source": "help-center", "body": "To cancel a subscription, open Settings then Billing."},
+    {"source": "help-center", "body": "Refunds return to the original payment method."},
+    {"source": "blog",        "body": "Enable dark mode under Settings then Appearance."},
+])
+
+# The superfiles are ordinary files on disk (one write can shard into
+# several, so read them as a set):
+files = glob.glob("data/**/*.sf.parquet", recursive=True)
+print(files[0])   # e.g. data/docs-18bc4051eb6a9468-0/data/seg-....sf.parquet
+
+# Read them with a third-party engine, no infino in this line:
+duckdb.sql("SELECT source, count(*) FROM read_parquet('data/**/*.sf.parquet') GROUP BY source").show()
+# ┌─────────────┬──────────────┐
+# │   source    │ count_star() │
+# ├─────────────┼──────────────┤
+# │ help-center │            2 │
+# │ blog        │            1 │
+# └─────────────┴──────────────┘
+```
+
+**Read-only openness.** Standard tools *read* a superfile's columns with
+no export step. Rewriting it through a generic Parquet writer (e.g.
+`pyarrow.parquet.write_table`) produces valid Parquet that has silently
+dropped the embedded BM25/vector indexes, so it's no longer a superfile.
+The compatibility is one-directional.
+
+The shortest end-to-end demo (write a corpus, run BM25 + vector +
+SQL/hybrid retrieval against it, then read the very same file back with
+DuckDB *and* pyarrow) is
+[`infino-python/examples/parquet_interop.py`](infino-python/examples/parquet_interop.py).
+
+## Cloud storage
+
+The backend is chosen by the URI scheme — `s3://bucket/prefix`,
+`az://container/prefix`, `gs://bucket/prefix`, `file://path`, a bare path,
+or `memory://`. Credentials go through `ConnectOptions`, keyed by
+`object_store`'s config strings (`aws_*` / `azure_*` / `google_*` — the
+names the AWS/Azure/GCS SDKs use). Infino reads no credentials from the
+environment; omit them to use ambient cloud identity (IAM instance role /
+managed identity / workload-identity ADC).
+
+```rust
+use infino::{connect_with, ConnectOptions};
+
+// S3
+let db = connect_with("s3://bucket/prefix", ConnectOptions::new()
+    .with_storage_option("aws_access_key_id", "…")
+    .with_storage_option("aws_secret_access_key", "…")
+    .with_storage_option("aws_region", "us-east-1"))?;
+
+// Azure
+let db = connect_with("az://container/prefix", ConnectOptions::new()
+    .with_storage_option("azure_storage_account_name", "…")
+    .with_storage_option("azure_storage_account_key", "…"))?;
+
+// GCS
+let db = connect_with("gs://bucket/prefix", ConnectOptions::new()
+    .with_storage_option("google_service_account_key", "…"))?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Common keys:
+
+| Backend | Keys |
+| ------- | ---- |
+| S3      | `aws_access_key_id`, `aws_secret_access_key`, `aws_region`, `aws_session_token`, `aws_endpoint` |
+| Azure   | `azure_storage_account_name`, `azure_storage_account_key`, `azure_storage_sas_key`, `azure_storage_client_id`, `azure_storage_client_secret`, `azure_storage_tenant_id` |
+| GCS     | `google_service_account` (path), `google_service_account_key` (inline JSON), `google_application_credentials`, `google_skip_signature` |
+
+The full set is whatever `object_store` accepts for the backend; an unknown
+or cross-backend key is rejected at connect. `with_validate(true)` opts into
+a connect-time reachability probe, so bad credentials fail at `connect`
+rather than on the first query. The same options exist in the config file
+(`storage.storage_options`) and both bindings (`storage_options` +
+`validate`).
+
 ## Architecture
 
 Three docs cover the design, from the high-level tour down to the
@@ -217,6 +325,9 @@ on-disk bytes:
   layer over many superfiles: manifest snapshots, the commit/publish
   path, pluggable storage, query fan-out with manifest-only skip
   pruning, and reader/writer concurrency.
+
+For concepts, quickstart, guides, and examples (Python, Node.js, and Rust), see
+the full documentation at **[docs.infino.ai](https://docs.infino.ai)**.
 
 ## SQL joins across tables
 
@@ -349,7 +460,7 @@ shared layer.
 
 Retrieval composes the same way. The ranked `bm25_search` /
 `vector_search` / `hybrid_search` and the unranked `token_match` /
-`exact_match` are table functions so a candidate set is the 
+`exact_match` are table functions so a candidate set is the
 *first stage of a plan* rather than its result:
 
 ```sql
@@ -388,12 +499,16 @@ reviewed as a contract change in the same pull request.
   Arrow-native (`RecordBatch`, `SchemaRef`, `Expr`); a major bump of
   arrow / datafusion that changes an exposed type is a breaking change to
   infino. The supported version range is documented and CI-tested.
-- **MSRV.** Raising the minimum Rust version is a minor bump, never a
+- **MSRV.** The minimum supported Rust version is **1.95** (enforced by
+  `rust-version` in `Cargo.toml`). Raising it is a minor bump, never a
   patch.
 - **Deprecation.** Post-1.0, removals go through `#[deprecated]` for at
   least one minor release first.
-- **Python.** The wheel tracks the crate version 1:1.
-- **Node.** The npm package tracks the crate version 1:1.
+- **Bindings version independently.** The Python (`pip install infino`)
+  and Node (`npm install @infino-ai/infino`) packages are versioned on their own
+  SemVer lines — each embeds its own copy of the engine, so a binding
+  version need not match this crate's. See
+  [`docs/versioning.md`](https://github.com/infino-ai/infino/blob/main/docs/versioning.md).
 
 ## Development
 
@@ -407,7 +522,8 @@ cargo run --example demo   # end-to-end tour: build, BM25 + vector search, read 
 The toolchain is pinned by `rust-toolchain.toml`, so `rustup` installs
 the right stable Rust on first build. Run `cargo test --features test-helpers`
 for the suite (integration tests use `infino::test_helpers`) and `make ci`
-before opening a pull request.
+before opening a pull request. Browse the full API locally with `make doc`
+(`cargo doc --no-deps --open` — the same docs [docs.rs](https://docs.rs/infino) renders).
 
 For an enhanced local development experience, install and configure
 [pre-commit](https://pre-commit.com/#install) hooks with `pre-commit install`

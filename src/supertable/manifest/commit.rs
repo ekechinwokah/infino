@@ -49,7 +49,7 @@ use zstd::zstd_safe::get_frame_content_size;
 use crate::{
     storage::{ObjectMeta, StorageError, StorageProvider},
     supertable::{
-        ManifestSnapshot, ManifestLoadError,
+        ManifestLoadError, ManifestSnapshot,
         error::CommitError,
         manifest::{
             list::{self as list_mod, Manifest as PersistedManifest},
@@ -67,13 +67,13 @@ use crate::{
 /// paths is invisible (no committed pointer references it).
 pub const POINTER_PATH: &str = "_supertable/current";
 
-/// Subdirectory for manifest list files.
+/// Subdirectory for manifest files.
 pub const MANIFEST_DIR: &str = "manifest";
 
 /// Subdirectory for manifest part files.
 pub const MANIFEST_PARTS_DIR: &str = "manifest-parts";
 
-/// Build the URI for a manifest list at a given manifest_id.
+/// Build the URI for a manifest at a given manifest_id.
 /// 6-digit zero-pad gives stable lexicographic ordering for
 /// `aws s3 ls`-style listings up through 999,999 versions.
 pub fn manifest_uri(manifest_id: u64) -> String {
@@ -174,9 +174,8 @@ impl PointerFile {
         Ok(Self {
             manifest_id: manifest_id
                 .ok_or_else(|| ManifestLoadError::PointerParse("missing manifest_id".into()))?,
-            manifest_uri: manifest_uri.ok_or_else(|| {
-                ManifestLoadError::PointerParse("missing manifest_uri".into())
-            })?,
+            manifest_uri: manifest_uri
+                .ok_or_else(|| ManifestLoadError::PointerParse("missing manifest_uri".into()))?,
             content_hash: content_hash
                 .ok_or_else(|| ManifestLoadError::PointerParse("missing content_hash".into()))?,
         })
@@ -218,7 +217,7 @@ pub struct PartWriteResult {
     pub size_bytes_uncompressed: u64,
 }
 
-/// Outcome of writing a manifest list.
+/// Outcome of writing a manifest.
 #[derive(Debug, Clone)]
 pub struct ManifestWriteResult {
     pub uri: String,
@@ -287,7 +286,7 @@ pub(crate) async fn write_part_bytes(
 
 /// Encode + write a manifest list. Conditional-create
 /// (`put_atomic`) — exactly one writer succeeds in publishing
-/// a given `manifest_id`'s list; concurrent attempts surface
+/// a given `manifest_id`'s manifest; concurrent attempts surface
 /// `PreconditionFailed` and the caller's commit fails (the
 /// writer's OCC retry loop catches this).
 pub async fn write_manifest(
@@ -391,12 +390,17 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::storage::LocalFsStorageProvider;
+    use crate::{
+        storage::LocalFsStorageProvider,
+        supertable::manifest::list::{
+            FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest as PersistedManifest, PartitionStrategy,
+        },
+    };
 
     // ---- URI helpers ---------------------------------------------------
 
     #[test]
-    fn list_uri_zero_pads_to_six_digits() {
+    fn manifest_uri_zero_pads_to_six_digits() {
         // 6-digit zero-pad gives stable lexicographic ordering
         // for `aws s3 ls`-style listings up to 999,999 versions.
         assert_eq!(manifest_uri(0), "manifest/manifest-000000.json");
@@ -405,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn list_uri_overflows_padding_for_large_ids_intentionally() {
+    fn manifest_uri_overflows_padding_for_large_ids_intentionally() {
         // Past 6 digits the format widens — no truncation, just
         // breaks lex ordering. Spec'd behaviour; locked in to
         // catch accidental width changes.
@@ -554,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn pointer_file_from_bytes_rejects_missing_list_uri() {
+    fn pointer_file_from_bytes_rejects_missing_manifest_uri() {
         assert_parse_err(
             b"manifest_id=1\ncontent_hash=blake3:0000000000000000000000000000000000000000000000000000000000000000\n",
             "missing manifest_uri",
@@ -563,10 +567,7 @@ mod tests {
 
     #[test]
     fn pointer_file_from_bytes_rejects_missing_content_hash() {
-        assert_parse_err(
-            b"manifest_id=1\nmanifest_uri=x\n",
-            "missing content_hash",
-        );
+        assert_parse_err(b"manifest_id=1\nmanifest_uri=x\n", "missing content_hash");
     }
 
     // ---- translate_contention ------------------------------------------
@@ -659,9 +660,6 @@ mod tests {
         // and PUTs at manifest_uri(manifest_id). Verify the
         // returned URI matches the deterministic naming rule
         // and the bytes are reachable through `get`.
-        use crate::supertable::manifest::list::{
-            FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest as PersistedManifest, PartitionStrategy,
-        };
         let (_dir, storage) = local_storage();
         // Smallest valid Manifest shape — no parts, no
         // columns, an empty schema. Encoding only requires the

@@ -25,6 +25,7 @@
 pub mod aggregates;
 pub mod bloom;
 pub mod commit;
+pub mod disk_cache;
 pub mod encoding;
 pub mod hll;
 pub mod list;
@@ -70,6 +71,7 @@ use crate::{
                 EncodedPart, PointerFile, frame_content_size, part_uri, read_pointer,
                 translate_contention, write_manifest, write_part_bytes, write_pointer,
             },
+            disk_cache::ManifestDiskCache,
             list::{
                 FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest, ManifestPartEntry,
                 PartitionStrategy,
@@ -92,6 +94,12 @@ pub const MANIFEST_ZSTD_LEVEL: i32 = 3;
 /// bytes live (`<data>/seg-<id>.sf.parquet`). Shared by [`SuperfileUri::storage_path`]
 /// and the GC live-set sweep so both agree on the superfile namespace.
 pub(crate) const SUPERFILE_DATA_DIR: &str = "data";
+
+/// Legacy storage-subtree prefix for the hidden vector-index sibling
+/// supertable — the commit-time default stamped when a vector table's
+/// manifest carries no explicit prefix. New tables generate a unique
+/// prefix at create; this constant only keeps pre-prefix tables readable.
+pub(crate) const DEFAULT_VECTOR_INDEX_PREFIX: &str = "_vector_index";
 
 /// One immutable point-in-time view of the supertable.
 ///
@@ -258,7 +266,12 @@ impl ManifestSnapshot {
         if let Some(storage) = storage
             && let Some(list) = list
         {
-            let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
+            let manifest_cache = superfile_list.options.manifest_disk_cache.clone();
+            let loader = Arc::new(ManifestPartLoader::new_with_cache(
+                Arc::clone(&storage),
+                &list,
+                manifest_cache,
+            ));
             Self {
                 superfile_list,
                 list: Some(list),
@@ -318,6 +331,95 @@ impl ManifestSnapshot {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+        }
+    }
+
+    /// A *materialized* empty manifest at `manifest_id = 0`, ready to persist.
+    /// Unlike [`Self::empty`] (which is in-process-only, `list: None`), this
+    /// carries a `Some(list)`, so [`Self::write`] emits the initial (empty)
+    /// manifest list + pointer. `Supertable::create` persists this on durable
+    /// storage so the table is openable immediately — before its first append,
+    /// after a reopen, or from another process — without shifting the
+    /// `manifest_id` sequence (the first append still commits `manifest_id 1`).
+    /// `vector_index_storage_prefix` is the hidden-sibling subtree the caller
+    /// generated at create (`None` for tables without vector columns, and for
+    /// the hidden sibling itself).
+    pub(crate) fn materialized_empty_with_vector_index_prefix(
+        options: Arc<SupertableOptions>,
+        vector_index_storage_prefix: Option<String>,
+    ) -> Self {
+        let strategy = options.effective_partition_strategy();
+        let list = Self::build_list(
+            &options,
+            strategy,
+            0,
+            Vec::new(),
+            vector_index_storage_prefix.clone(),
+        );
+        let loader = options.storage.as_ref().map(|storage| {
+            Arc::new(ManifestPartLoader::new_with_cache(
+                storage.clone(),
+                &list,
+                options.manifest_disk_cache.clone(),
+            ))
+        });
+        Self {
+            superfile_list: SuperfileList::empty_with_vector_index_prefix(
+                options,
+                vector_index_storage_prefix,
+            ),
+            list: Some(list),
+            parts: DashMap::new(),
+            loader,
+            stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
+        }
+    }
+
+    /// Build a manifest list from the supertable `options` at `manifest_id`,
+    /// carrying `parts`. Used by the initial empty-manifest materialization
+    /// ([`Self::materialized_empty_with_vector_index_prefix`]) so the
+    /// options→list field mapping lives in one place.
+    fn build_list(
+        options: &SupertableOptions,
+        strategy: PartitionStrategy,
+        manifest_id: u64,
+        parts: Vec<ManifestPartEntry>,
+        vector_index_storage_prefix: Option<String>,
+    ) -> Manifest {
+        Manifest {
+            format_version: LIST_FORMAT_VERSION.into(),
+            manifest_id,
+            options_hash: options_hash::compute_options_hash(options, &strategy),
+            schema: Vec::new(),
+            id_column: options.id_column.clone(),
+            fts_columns: options
+                .fts_columns
+                .iter()
+                .map(|f| list::FtsColumnInfo {
+                    column: f.column.clone(),
+                })
+                .collect(),
+            vector_columns: options
+                .vector_columns
+                .iter()
+                .map(|v| list::VectorColumnInfo {
+                    column: v.column.clone(),
+                    dim: v.dim,
+                    n_cent: v.n_cent,
+                    rot_seed: v.rot_seed,
+                    metric: format!("{:?}", v.metric).to_lowercase(),
+                })
+                .collect(),
+            partition_strategy: strategy,
+            vector_index_storage_prefix,
+            global_vector_index: None,
+            drained_ranges: Default::default(),
+            deleted_user_ids_inline: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
+            parts,
         }
     }
 
@@ -400,7 +502,7 @@ impl ManifestSnapshot {
         if let Some(prefix) = self.vector_index_storage_prefix() {
             return Some(prefix.to_string());
         }
-        Some("_vector_index".to_string())
+        Some(DEFAULT_VECTOR_INDEX_PREFIX.to_string())
     }
 
     pub fn get_cached_part_by_id(&self, part_id: &PartId) -> Option<Arc<ManifestPart>> {
@@ -417,6 +519,16 @@ impl ManifestSnapshot {
         self.get_cached_part_by_id(&part_id)
     }
 
+    /// Load the committed manifest from storage.
+    ///
+    /// A genuinely absent pointer is [`ManifestLoadError::PointerNotFound`]:
+    /// `Supertable::create` persists the initial (empty) pointer, so a
+    /// registered table always has one. A missing pointer is therefore the
+    /// open-or-create trigger for a never-created table, or a *lost* pointer
+    /// on a created one — either way an error the caller sees, never a
+    /// silently-empty table (which would mask committed-then-lost data). A
+    /// *corrupt* pointer is a different error variant (`PointerParse`) and
+    /// also propagates, so corruption is never masked.
     pub(crate) async fn load(
         current_manifest: Option<Arc<Self>>,
         storage: Arc<dyn StorageProvider>,
@@ -425,9 +537,6 @@ impl ManifestSnapshot {
         // 1. Read the pointer file.
         let (pointer, _) = match read_pointer(storage.as_ref()).await? {
             Some(p) => p,
-            // No pointer yet means nobody has committed; our next
-            // attempt will write the initial pointer with
-            // expected_prev_etag = None.
             None => return Err(ManifestLoadError::PointerNotFound),
         };
 
@@ -469,7 +578,11 @@ impl ManifestSnapshot {
         }
 
         // 3. Build the loader, superfiles & parts
-        let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
+        let loader = Arc::new(ManifestPartLoader::new_with_cache(
+            Arc::clone(&storage),
+            &list,
+            options.manifest_disk_cache.clone(),
+        ));
         let parts: DashMap<_, _> = DashMap::new();
         let mut all_superfiles: Vec<Arc<SuperfileEntry>> = Vec::new();
 
@@ -1093,7 +1206,7 @@ impl ManifestSnapshot {
         Ok(None)
     }
 
-    /// Returns the new ManifestListEntries when `new_entries` are added to `old` manifest. This
+    /// Returns the new ManifestPartEntries when `new_entries` are added to `old` manifest. This
     /// operation may create new ManifestParts. The function also returns the new ManifestParts that
     /// the caller can decide to write to storage.
     pub async fn update(
@@ -1399,10 +1512,13 @@ impl ManifestSnapshot {
             superfiles: new_superfile_list,
             vector_index_storage_prefix: None,
         };
-        let loader = opts
-            .storage
-            .as_ref()
-            .map(|storage| Arc::new(ManifestPartLoader::new(storage.clone(), &new_list)));
+        let loader = opts.storage.as_ref().map(|storage| {
+            Arc::new(ManifestPartLoader::new_with_cache(
+                storage.clone(),
+                &new_list,
+                opts.manifest_disk_cache.clone(),
+            ))
+        });
         // Inherit only the cached parts the new list still
         // references — entries for rewritten/removed parts are
         // dropped rather than carried forward, so the in-memory
@@ -1489,15 +1605,32 @@ fn rebuild_part_and_entry(
 /// One `ManifestPartLoader` per `ManifestSnapshot`. The same `Arc<dyn
 /// StorageProvider>` is shared with the `DiskCacheStore` —
 /// one auth handshake, one connection pool.
+///
+/// An optional [`ManifestDiskCache`] short-circuits the storage GET
+/// when the part's compressed bytes are already on local disk. Because
+/// parts are content-addressed, a cache hit can never be stale.
 pub struct ManifestPartLoader {
     storage: Arc<dyn StorageProvider>,
     /// Maps `PartId → (expected content_hash, uri)`. Built from
     /// the manifest list at construction; immutable per-`ManifestSnapshot`.
     parts_index: HashMap<PartId, (ContentHash, String)>,
+    /// On-disk cache for compressed part bytes. `None` disables the
+    /// cache (in-process-only supertables, tests, or storage attached
+    /// without a `disk_cache_root` configured).
+    manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
 }
 
 impl ManifestPartLoader {
     pub fn new(storage: Arc<dyn StorageProvider>, list: &Manifest) -> Self {
+        Self::new_with_cache(storage, list, None)
+    }
+
+    /// Like [`Self::new`] but attaches an on-disk part-bytes cache.
+    pub fn new_with_cache(
+        storage: Arc<dyn StorageProvider>,
+        list: &Manifest,
+        manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+    ) -> Self {
         let mut idx = HashMap::with_capacity(list.parts.len());
         for entry in &list.parts {
             idx.insert(entry.part_id, (entry.content_hash, entry.uri.clone()));
@@ -1505,16 +1638,31 @@ impl ManifestPartLoader {
         Self {
             storage,
             parts_index: idx,
+            manifest_disk_cache,
         }
     }
 
     /// Fetch + verify + decode one part. Returns the parsed
     /// `Arc<ManifestPart>`.
+    ///
+    /// Consults the on-disk cache first (a hit skips the storage GET);
+    /// on a miss the freshly-fetched bytes are written back to the
+    /// cache (best-effort) before decoding.
     pub async fn load(&self, part_id: PartId) -> Result<Arc<ManifestPart>, ManifestLoadError> {
         let (expected_hash, uri) = self
             .parts_index
             .get(&part_id)
             .ok_or(ManifestLoadError::PartNotInList { part_id })?;
+
+        // Disk-cache hit: bytes are verified against `expected_hash`
+        // inside `get`, so they're known-good here.
+        if let Some(cache) = &self.manifest_disk_cache
+            && let Some(bytes) = cache.get(expected_hash).await
+        {
+            let parsed = part::decode(&bytes)?;
+            return Ok(Arc::new(parsed));
+        }
+
         let (bytes, _) = self
             .storage
             .get(uri)
@@ -1526,6 +1674,11 @@ impl ManifestPartLoader {
                 expected: expected_hash.to_hex(),
                 actual: actual_hash.to_hex(),
             });
+        }
+        // Populate the cache for next time (best-effort; the hash is
+        // already verified, satisfying `put`'s contract).
+        if let Some(cache) = &self.manifest_disk_cache {
+            cache.put(actual_hash, &bytes).await;
         }
         let parsed = part::decode(&bytes)?;
         Ok(Arc::new(parsed))
@@ -1777,24 +1930,30 @@ pub(crate) fn merge_min_max_arrays(
     existing_max: &ArrayRef,
     other_max: &ArrayRef,
 ) -> Option<(ArrayRef, ArrayRef)> {
+    // Merge two optional bounds into the surviving one — smaller for a min,
+    // larger for a max. A `None` (the column is all-null on that side)
+    // yields to a present value; both `None` stays `None`, so an all-null
+    // column stays all-null through the fold, while a manifest part with any
+    // populated superfile keeps its real bound.
+    #[inline]
+    fn merge_opt<T: PartialOrd>(a: Option<T>, b: Option<T>, keep_min: bool) -> Option<T> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(if keep_min == (a <= b) { a } else { b }),
+            (Some(v), None) | (None, Some(v)) => Some(v),
+            (None, None) => None,
+        }
+    }
+
     macro_rules! prim_merge {
         ($array_ty:ty) => {{
-            let ex_min_arr = existing_min.as_any().downcast_ref::<$array_ty>()?;
-            let ot_min_arr = other_min.as_any().downcast_ref::<$array_ty>()?;
-            let ex_max_arr = existing_max.as_any().downcast_ref::<$array_ty>()?;
-            let ot_max_arr = other_max.as_any().downcast_ref::<$array_ty>()?;
-
-            let ex_min = ex_min_arr.value(0);
-            let ot_min = ot_min_arr.value(0);
-            let ex_max = ex_max_arr.value(0);
-            let ot_max = ot_max_arr.value(0);
-
-            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
-            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
-
+            let exn = existing_min.as_any().downcast_ref::<$array_ty>()?;
+            let otn = other_min.as_any().downcast_ref::<$array_ty>()?;
+            let exx = existing_max.as_any().downcast_ref::<$array_ty>()?;
+            let otx = other_max.as_any().downcast_ref::<$array_ty>()?;
+            let at = |a: &$array_ty| (!a.is_null(0)).then(|| a.value(0));
             Some((
-                Arc::new(<$array_ty>::from(vec![merged_min])) as ArrayRef,
-                Arc::new(<$array_ty>::from(vec![merged_max])) as ArrayRef,
+                Arc::new(<$array_ty>::from(vec![merge_opt(at(exn), at(otn), true)])) as ArrayRef,
+                Arc::new(<$array_ty>::from(vec![merge_opt(at(exx), at(otx), false)])) as ArrayRef,
             ))
         }};
     }
@@ -1810,93 +1969,64 @@ pub(crate) fn merge_min_max_arrays(
         DataType::Int64 => prim_merge!(Int64Array),
         DataType::Float32 => prim_merge!(Float32Array),
         DataType::Float64 => prim_merge!(Float64Array),
-        DataType::Boolean => {
-            let ex_min = existing_min
-                .as_any()
-                .downcast_ref::<BooleanArray>()?
-                .value(0);
-            let ot_min = other_min.as_any().downcast_ref::<BooleanArray>()?.value(0);
-            let ex_max = existing_max
-                .as_any()
-                .downcast_ref::<BooleanArray>()?
-                .value(0);
-            let ot_max = other_max.as_any().downcast_ref::<BooleanArray>()?.value(0);
-            let merged_min = ex_min && ot_min;
-            let merged_max = ex_max || ot_max;
-            Some((
-                Arc::new(BooleanArray::from(vec![merged_min])),
-                Arc::new(BooleanArray::from(vec![merged_max])),
-            ))
-        }
+        // `false < true`, so min folds like AND and max like OR.
+        DataType::Boolean => prim_merge!(BooleanArray),
         DataType::Utf8 => {
-            let ex_min = existing_min
-                .as_any()
-                .downcast_ref::<StringArray>()?
-                .value(0);
-            let ot_min = other_min.as_any().downcast_ref::<StringArray>()?.value(0);
-            let ex_max = existing_max
-                .as_any()
-                .downcast_ref::<StringArray>()?
-                .value(0);
-            let ot_max = other_max.as_any().downcast_ref::<StringArray>()?.value(0);
-            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
-            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
+            let exn = existing_min.as_any().downcast_ref::<StringArray>()?;
+            let otn = other_min.as_any().downcast_ref::<StringArray>()?;
+            let exx = existing_max.as_any().downcast_ref::<StringArray>()?;
+            let otx = other_max.as_any().downcast_ref::<StringArray>()?;
+            let min = merge_opt(
+                (!exn.is_null(0)).then(|| exn.value(0)),
+                (!otn.is_null(0)).then(|| otn.value(0)),
+                true,
+            );
+            let max = merge_opt(
+                (!exx.is_null(0)).then(|| exx.value(0)),
+                (!otx.is_null(0)).then(|| otx.value(0)),
+                false,
+            );
             Some((
-                Arc::new(StringArray::from(vec![merged_min])),
-                Arc::new(StringArray::from(vec![merged_max])),
+                Arc::new(StringArray::from(vec![min])),
+                Arc::new(StringArray::from(vec![max])),
             ))
         }
         DataType::LargeUtf8 => {
-            let ex_min = existing_min
-                .as_any()
-                .downcast_ref::<LargeStringArray>()?
-                .value(0);
-            let ot_min = other_min
-                .as_any()
-                .downcast_ref::<LargeStringArray>()?
-                .value(0);
-            let ex_max = existing_max
-                .as_any()
-                .downcast_ref::<LargeStringArray>()?
-                .value(0);
-            let ot_max = other_max
-                .as_any()
-                .downcast_ref::<LargeStringArray>()?
-                .value(0);
-            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
-            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
+            let exn = existing_min.as_any().downcast_ref::<LargeStringArray>()?;
+            let otn = other_min.as_any().downcast_ref::<LargeStringArray>()?;
+            let exx = existing_max.as_any().downcast_ref::<LargeStringArray>()?;
+            let otx = other_max.as_any().downcast_ref::<LargeStringArray>()?;
+            let min = merge_opt(
+                (!exn.is_null(0)).then(|| exn.value(0)),
+                (!otn.is_null(0)).then(|| otn.value(0)),
+                true,
+            );
+            let max = merge_opt(
+                (!exx.is_null(0)).then(|| exx.value(0)),
+                (!otx.is_null(0)).then(|| otx.value(0)),
+                false,
+            );
             Some((
-                Arc::new(LargeStringArray::from(vec![merged_min])),
-                Arc::new(LargeStringArray::from(vec![merged_max])),
+                Arc::new(LargeStringArray::from(vec![min])),
+                Arc::new(LargeStringArray::from(vec![max])),
             ))
         }
         DataType::Decimal128(precision, scale) => {
-            let ex_min = existing_min
-                .as_any()
-                .downcast_ref::<Decimal128Array>()?
-                .value(0);
-            let ot_min = other_min
-                .as_any()
-                .downcast_ref::<Decimal128Array>()?
-                .value(0);
-            let ex_max = existing_max
-                .as_any()
-                .downcast_ref::<Decimal128Array>()?
-                .value(0);
-            let ot_max = other_max
-                .as_any()
-                .downcast_ref::<Decimal128Array>()?
-                .value(0);
-            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
-            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
+            let exn = existing_min.as_any().downcast_ref::<Decimal128Array>()?;
+            let otn = other_min.as_any().downcast_ref::<Decimal128Array>()?;
+            let exx = existing_max.as_any().downcast_ref::<Decimal128Array>()?;
+            let otx = other_max.as_any().downcast_ref::<Decimal128Array>()?;
+            let at = |a: &Decimal128Array| (!a.is_null(0)).then(|| a.value(0));
+            let min = merge_opt(at(exn), at(otn), true);
+            let max = merge_opt(at(exx), at(otx), false);
             Some((
                 Arc::new(
-                    Decimal128Array::from(vec![merged_min])
+                    Decimal128Array::from(vec![min])
                         .with_precision_and_scale(*precision, *scale)
                         .ok()?,
                 ),
                 Arc::new(
-                    Decimal128Array::from(vec![merged_max])
+                    Decimal128Array::from(vec![max])
                         .with_precision_and_scale(*precision, *scale)
                         .ok()?,
                 ),
@@ -1908,7 +2038,9 @@ pub(crate) fn merge_min_max_arrays(
 
 /// Compute (min, max) for one Arrow array as length-1 `ArrayRef`s.
 ///
-/// Returns `None` for unsupported types or for all-null inputs.
+/// Returns `None` only for unsupported types. An all-null input of a
+/// supported type yields length-1 *null* min/max arrays (not `None`), so
+/// its null count is still recorded and `IS [NOT] NULL` can prune on it.
 /// Supported set: integer (signed + unsigned, all widths), float
 /// (f32, f64), boolean, Utf8, LargeUtf8. The supertable schema
 /// rejects vector columns up at the SupertableOptions layer, so
@@ -2035,13 +2167,14 @@ pub(crate) fn column_hll(col: &ArrayRef) -> Option<hll::HllSketch> {
 }
 
 pub(crate) fn column_min_max(col: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
+    // An all-null column yields *null* min/max (not no-stat), so its null
+    // count is still recorded for `IS [NOT] NULL` pruning — hence the
+    // `Option` min/max are kept rather than `?`-unwrapped away.
     macro_rules! prim {
         ($array_ty:ty) => {{
             let a = col.as_any().downcast_ref::<$array_ty>()?;
-            let mn = agg::min(a)?;
-            let mx = agg::max(a)?;
-            let mn_arr: ArrayRef = Arc::new(<$array_ty>::from(vec![mn]));
-            let mx_arr: ArrayRef = Arc::new(<$array_ty>::from(vec![mx]));
+            let mn_arr: ArrayRef = Arc::new(<$array_ty>::from(vec![agg::min(a)]));
+            let mx_arr: ArrayRef = Arc::new(<$array_ty>::from(vec![agg::max(a)]));
             Some((mn_arr, mx_arr))
         }};
     }
@@ -2059,43 +2192,35 @@ pub(crate) fn column_min_max(col: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
         DataType::Float64 => prim!(Float64Array),
         DataType::Boolean => {
             let a = col.as_any().downcast_ref::<BooleanArray>()?;
-            let mn = agg::min_boolean(a)?;
-            let mx = agg::max_boolean(a)?;
             Some((
-                Arc::new(BooleanArray::from(vec![mn])),
-                Arc::new(BooleanArray::from(vec![mx])),
+                Arc::new(BooleanArray::from(vec![agg::min_boolean(a)])),
+                Arc::new(BooleanArray::from(vec![agg::max_boolean(a)])),
             ))
         }
         DataType::Utf8 => {
             let a = col.as_any().downcast_ref::<StringArray>()?;
-            let mn = agg::min_string(a)?;
-            let mx = agg::max_string(a)?;
             Some((
-                Arc::new(StringArray::from(vec![mn])),
-                Arc::new(StringArray::from(vec![mx])),
+                Arc::new(StringArray::from(vec![agg::min_string(a)])),
+                Arc::new(StringArray::from(vec![agg::max_string(a)])),
             ))
         }
         DataType::LargeUtf8 => {
             let a = col.as_any().downcast_ref::<LargeStringArray>()?;
-            let mn = agg::min_string(a)?;
-            let mx = agg::max_string(a)?;
             Some((
-                Arc::new(LargeStringArray::from(vec![mn])),
-                Arc::new(LargeStringArray::from(vec![mx])),
+                Arc::new(LargeStringArray::from(vec![agg::min_string(a)])),
+                Arc::new(LargeStringArray::from(vec![agg::max_string(a)])),
             ))
         }
         DataType::Decimal128(precision, scale) => {
             let a = col.as_any().downcast_ref::<Decimal128Array>()?;
-            let mn = agg::min(a)?;
-            let mx = agg::max(a)?;
             Some((
                 Arc::new(
-                    Decimal128Array::from(vec![mn])
+                    Decimal128Array::from(vec![agg::min(a)])
                         .with_precision_and_scale(*precision, *scale)
                         .ok()?,
                 ),
                 Arc::new(
-                    Decimal128Array::from(vec![mx])
+                    Decimal128Array::from(vec![agg::max(a)])
                         .with_precision_and_scale(*precision, *scale)
                         .ok()?,
                 ),
@@ -2292,11 +2417,12 @@ impl ClusterCentroids {
 
 #[cfg(test)]
 mod tests {
-    use std::{hint::black_box, slice::from_ref, sync::Arc};
+    use std::{hint::black_box, slice::from_ref, sync::Arc, time::Instant};
 
-    use arrow_array::Array;
+    use arrow_array::{Array, Int64Array};
     use arrow_schema::{DataType, Field, Schema};
     use dashmap::DashMap;
+    use datafusion::scalar::ScalarValue;
     use tempfile::TempDir;
     use tokio::sync::OnceCell;
 
@@ -2306,7 +2432,7 @@ mod tests {
         superfile::{builder::FtsConfig, vector::distance::distance},
         supertable::manifest::{
             commit::{PartWriteResult, write_manifest_part},
-            list::PartitionStrategy,
+            list::{Manifest, PartitionStrategy},
         },
         test_helpers::default_tokenizer,
     };
@@ -2325,6 +2451,32 @@ mod tests {
         let counts: Vec<u32> = (0..nc).map(|c| if c == nc / 2 { 0 } else { 10 }).collect();
         let cc = ClusterCentroids::from_fp32(n_cent, dim, &centroids, counts);
         (cc, centroids)
+    }
+
+    #[test]
+    fn min_max_stats_record_and_fold_all_null_columns() {
+        let arr = |vals: Vec<Option<i64>>| Arc::new(Int64Array::from(vals)) as ArrayRef;
+        let scalar = |a: &ArrayRef| ScalarValue::try_from_array(a, 0).expect("decode");
+
+        // All-null column still yields a stat, with null min/max (so the
+        // null count is recorded and `IS [NOT] NULL` can prune on it).
+        let (mn, mx) = column_min_max(&arr(vec![None, None])).expect("all-null stat");
+        assert!(mn.is_null(0) && mx.is_null(0));
+
+        // Populated column → real min/max, nulls ignored.
+        let (mn, mx) = column_min_max(&arr(vec![Some(5), Some(2), None])).expect("stat");
+        assert_eq!(scalar(&mn), ScalarValue::Int64(Some(2)));
+        assert_eq!(scalar(&mx), ScalarValue::Int64(Some(5)));
+
+        // Fold: a real bound wins over a null bound; both-null stays null.
+        let null1 = arr(vec![None]);
+        let (mn, mx) =
+            merge_min_max_arrays(&null1, &arr(vec![Some(2)]), &null1, &arr(vec![Some(9)]))
+                .expect("merge real over null");
+        assert_eq!(scalar(&mn), ScalarValue::Int64(Some(2)));
+        assert_eq!(scalar(&mx), ScalarValue::Int64(Some(9)));
+        let (mn, mx) = merge_min_max_arrays(&null1, &null1, &null1, &null1).expect("merge null");
+        assert!(mn.is_null(0) && mx.is_null(0));
     }
 
     /// `score_clusters_into` must match [`distance`] on the fp32 centroid slice.
@@ -2375,7 +2527,6 @@ mod tests {
     #[test]
     #[ignore = "perf microbench, not a correctness gate"]
     fn score_clusters_microbench() {
-        use std::time::Instant;
         let (n_cent, dim) = (4096u32, 384u32);
         let iters = 50usize;
         let (cc, _) = synth_clusters(n_cent, dim, 99);
@@ -2586,9 +2737,7 @@ mod tests {
             supertable::{
                 SupertableOptions,
                 manifest::{
-                    list::{
-                        FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest, PartitionStrategy,
-                    },
+                    list::{FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest, PartitionStrategy},
                     part::{self as part_mod, ContentHash, ManifestPart, PartId},
                 },
             },
@@ -2904,6 +3053,72 @@ mod tests {
                 storage.get_call_count(),
                 0,
                 "missing-id check happens before any storage.get"
+            );
+        }
+
+        #[tokio::test]
+        async fn disk_cache_hit_serves_second_loader_without_storage_get() {
+            // Two independent loaders sharing one on-disk manifest cache
+            // (models a fresh manifest snapshot, or a process restart):
+            // the first populates the cache from storage, the second
+            // reads the part bytes off local disk with zero storage GETs.
+            let part = make_test_part(23);
+            let (objects, entries) = encode_and_index(from_ref(&part));
+            let storage = Arc::new(CountingMockStorage::new(objects));
+            let storage_dyn = Arc::clone(&storage) as Arc<dyn StorageProvider>;
+            let list = fresh_list(entries);
+
+            let cache_root = std::env::temp_dir()
+                .join("infino-manifest-cache-loader-test-disk_cache_hit_second_loader");
+            let _ = std::fs::remove_dir_all(&cache_root);
+            let cache = ManifestDiskCache::new(cache_root.clone(), 1 << 20).expect("cache");
+
+            // Loader A: cold — one storage GET, cache populated.
+            let loader_a = ManifestPartLoader::new_with_cache(
+                Arc::clone(&storage_dyn),
+                &list,
+                Some(Arc::clone(&cache)),
+            );
+            let a = loader_a.load(part.part_id).await.expect("first load");
+            assert_eq!(a.part_id, part.part_id);
+            assert_eq!(storage.get_call_count(), 1, "first loader fetches once");
+            assert_eq!(cache.stats().n_entries, 1, "part bytes cached on disk");
+
+            // Loader B: fresh loader, same cache — disk hit, no new GET.
+            let loader_b = ManifestPartLoader::new_with_cache(
+                Arc::clone(&storage_dyn),
+                &list,
+                Some(Arc::clone(&cache)),
+            );
+            let b = loader_b.load(part.part_id).await.expect("second load");
+            assert_eq!(b.part_id, part.part_id);
+            assert_eq!(
+                storage.get_call_count(),
+                1,
+                "disk-cache hit ⇒ no additional storage.get"
+            );
+            assert!(cache.stats().n_hits >= 1, "recorded a cache hit");
+
+            let _ = std::fs::remove_dir_all(&cache_root);
+        }
+
+        #[tokio::test]
+        async fn loader_without_cache_always_hits_storage() {
+            // Sanity: with no cache attached, each loader load is a
+            // storage GET — confirms the cache is what removes them.
+            let part = make_test_part(29);
+            let (objects, entries) = encode_and_index(from_ref(&part));
+            let storage = Arc::new(CountingMockStorage::new(objects));
+            let storage_dyn = Arc::clone(&storage) as Arc<dyn StorageProvider>;
+            let list = fresh_list(entries);
+
+            let loader = ManifestPartLoader::new(Arc::clone(&storage_dyn), &list);
+            loader.load(part.part_id).await.expect("load 1");
+            loader.load(part.part_id).await.expect("load 2");
+            assert_eq!(
+                storage.get_call_count(),
+                2,
+                "no cache ⇒ every load round-trips to storage"
             );
         }
 

@@ -49,8 +49,8 @@ pub use gc::GcReport;
 pub use handle::{Supertable, SupertableReader};
 pub use lazy_source::StorageRangeSource;
 pub use manifest::{
-    FtsSummaryAgg, ManifestSnapshot, ManifestLoadError, ManifestPartLoader, ScalarStatsAgg, SuperfileEntry,
-    SuperfileList, SuperfileUri, VectorSummary,
+    FtsSummaryAgg, ManifestLoadError, ManifestPartLoader, ManifestSnapshot, ScalarStatsAgg,
+    SuperfileEntry, SuperfileList, SuperfileUri, VectorSummary,
 };
 pub use mutations::MutationStats;
 pub use options::SupertableOptions;

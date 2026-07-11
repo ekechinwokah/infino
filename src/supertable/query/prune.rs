@@ -30,18 +30,19 @@ use std::sync::Arc;
 
 use datafusion::scalar::ScalarValue;
 
-use super::skip::{
-    ScalarPredicate, fts_bloom_skip, fts_prefix_skip, scalar_skip, scalar_value_may_match,
-};
 use crate::{
     superfile::fts::reader::BoolMode,
     supertable::{
         error::QueryError,
         manifest::{
-            ManifestSnapshot, SuperfileEntry,
+            ManifestSnapshot, ScalarStatsAgg, SuperfileEntry,
             list::Manifest,
             list_prune::{prune_parts_for_fts_prefix, prune_parts_for_fts_terms},
             part::PartId,
+        },
+        query::skip::{
+            ScalarOp, ScalarPredicate, fts_bloom_skip, fts_prefix_skip, null_check_may_match,
+            null_check_skip, scalar_skip, scalar_value_may_match, scalar_value_set_skip,
         },
     },
 };
@@ -64,11 +65,20 @@ pub(crate) enum PruneLeaf {
     Prefix { column: String, prefix: Vec<u8> },
     /// Scalar comparison on a scalar column → per-column min/max.
     Scalar(ScalarPredicate),
+    /// `column IN (values)` → keep if the min/max could hold any value.
+    ScalarValueSet {
+        column: String,
+        values: Vec<ScalarValue>,
+    },
+    /// `column IS NULL` (`want_null`) / `IS NOT NULL` → keep via the
+    /// per-column null count and all-null check.
+    NullCheck { column: String, want_null: bool },
 }
 
 impl PruneLeaf {
-    /// Part-tier keep set for this leaf, or `None` when the leaf has no
-    /// part-level pruner (it imposes no part constraint → keep all).
+    /// Identified Which manifest parts this leaf keeps, from the part-level
+    /// aggregates (`ManifestPartEntry`). `None` = no part constraint →
+    /// keep all parts. The per-superfile tier runs separately.
     pub(crate) fn keep_parts(&self, list: &Manifest) -> Option<Vec<PartId>> {
         match self {
             PruneLeaf::TermPresence {
@@ -83,40 +93,81 @@ impl PruneLeaf {
                 Some(prune_parts_for_fts_prefix(list, column, prefix))
             }
             PruneLeaf::Scalar(pred) => Some(scalar_keep_parts(list, pred)),
+            PruneLeaf::ScalarValueSet { column, values } => {
+                Some(scalar_value_set_keep_parts(list, column, values))
+            }
+            PruneLeaf::NullCheck { column, want_null } => {
+                Some(null_check_keep_parts(list, column, *want_null))
+            }
         }
     }
 }
 
-/// Part-tier scalar prune: keep each part whose aggregate min/max for
-/// the predicate's column could satisfy it. A missing aggregate or
-/// undecodable bounds → keep (conservative — never a false prune).
-///
-/// The aggregate min/max are held as length-1 [`ArrayRef`]s
-/// (`ScalarStatsAgg.{min,max}`), already decoded when the manifest list
-/// was loaded — so this hot path reads the [`ScalarValue`] straight from
-/// the array with no per-query Arrow-IPC decode, then reuses the same
-/// comparison core the superfile tier uses ([`scalar_value_may_match`]).
-fn scalar_keep_parts(list: &Manifest, pred: &ScalarPredicate) -> Vec<PartId> {
+/// Keep each part whose `column` aggregate satisfies `keep`. A missing
+/// aggregate keeps the part (conservative — never a false prune). The
+/// stats are length-1 [`ArrayRef`]s decoded when the list loaded, so
+/// reading them here is free of per-query Arrow decode.
+fn keep_parts_where_agg(
+    list: &Manifest,
+    column: &str,
+    keep: impl Fn(&ScalarStatsAgg) -> bool,
+) -> Vec<PartId> {
     list.parts
         .iter()
         .filter_map(|entry| {
-            let keep = match entry.scalar_stats_agg.get(&pred.column) {
-                None => true,
-                Some(agg) => {
-                    match (
-                        ScalarValue::try_from_array(agg.min.as_ref(), 0).ok(),
-                        ScalarValue::try_from_array(agg.max.as_ref(), 0).ok(),
-                    ) {
-                        (Some(min), Some(max)) => {
-                            scalar_value_may_match(&min, &max, pred.op, &pred.value)
-                        }
-                        _ => true,
-                    }
-                }
-            };
-            keep.then_some(entry.part_id)
+            let k = entry.scalar_stats_agg.get(column).is_none_or(&keep);
+            k.then_some(entry.part_id)
         })
         .collect()
+}
+
+// Keep each part whose aggregate min/max for `column` satisfies `may_match`;
+// undecodable bounds keep the part.
+fn keep_parts_where(
+    list: &Manifest,
+    column: &str,
+    may_match: impl Fn(&ScalarValue, &ScalarValue) -> bool,
+) -> Vec<PartId> {
+    keep_parts_where_agg(list, column, |agg| {
+        agg_minmax(agg).is_none_or(|(min, max)| may_match(&min, &max))
+    })
+}
+
+// An aggregate's decoded min/max, or `None` when the bounds don't decode.
+fn agg_minmax(agg: &ScalarStatsAgg) -> Option<(ScalarValue, ScalarValue)> {
+    match (
+        ScalarValue::try_from_array(agg.min.as_ref(), 0),
+        ScalarValue::try_from_array(agg.max.as_ref(), 0),
+    ) {
+        (Ok(min), Ok(max)) => Some((min, max)),
+        _ => None,
+    }
+}
+
+// Part-tier `IS [NOT] NULL` prune; the superfile-tier sibling lives in `skip`.
+fn null_check_keep_parts(list: &Manifest, column: &str, want_null: bool) -> Vec<PartId> {
+    keep_parts_where_agg(list, column, |agg| null_check_may_match(agg, want_null))
+}
+
+// Part-tier scalar prune: keep parts whose min/max could satisfy `pred`.
+fn scalar_keep_parts(list: &Manifest, pred: &ScalarPredicate) -> Vec<PartId> {
+    keep_parts_where(list, &pred.column, |min, max| {
+        scalar_value_may_match(min, max, pred.op, &pred.value)
+    })
+}
+
+// Part-tier `IN` prune: keep parts whose min/max could hold *any* listed
+// value (an `IN` is a disjunction of equalities).
+fn scalar_value_set_keep_parts(
+    list: &Manifest,
+    column: &str,
+    values: &[ScalarValue],
+) -> Vec<PartId> {
+    keep_parts_where(list, column, |min, max| {
+        values
+            .iter()
+            .any(|v| scalar_value_may_match(min, max, ScalarOp::Eq, v))
+    })
 }
 
 /// Select the superfiles a predicate could match, newest-first in
@@ -173,6 +224,15 @@ pub(crate) async fn select_superfiles(
             PruneLeaf::Prefix { column, prefix } => {
                 and_into(&mut mask, &fts_prefix_skip(&superfiles, column, prefix));
             }
+            PruneLeaf::ScalarValueSet { column, values } => {
+                and_into(
+                    &mut mask,
+                    &scalar_value_set_skip(&superfiles, column, values),
+                );
+            }
+            PruneLeaf::NullCheck { column, want_null } => {
+                and_into(&mut mask, &null_check_skip(&superfiles, column, *want_null));
+            }
             // Scalar leaves handled above as one conjunction.
             PruneLeaf::Scalar(_) => {}
         }
@@ -196,10 +256,14 @@ fn and_into(dst: &mut [bool], src: &[bool]) {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, slice::from_ref};
+    use std::{
+        collections::{HashMap, HashSet},
+        slice::from_ref,
+    };
 
     use arrow_array::{Int64Array, LargeStringArray};
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::prelude::{col, lit};
     use uuid::Uuid;
 
     use super::*;
@@ -210,12 +274,13 @@ mod tests {
         supertable::{
             SupertableOptions,
             manifest::{
-                FtsSummaryAgg, ManifestSnapshot, ScalarStatsAgg, SuperfileEntry, SuperfileUri, aggregates,
+                FtsSummaryAgg, ManifestSnapshot, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
+                aggregates,
                 bloom::BloomBuilder,
                 list::{FORMAT_VERSION, Manifest, ManifestPartEntry, PartitionStrategy},
                 part::{ContentHash, PartId},
             },
-            query::skip::ScalarOp,
+            query::{provider::exprs_to_value_set_leaves, skip::ScalarOp},
         },
         test_helpers::default_tokenizer,
     };
@@ -317,6 +382,62 @@ mod tests {
     }
 
     #[test]
+    fn scalar_value_set_keep_parts_keeps_every_part_holding_a_listed_value() {
+        let p0 = part_from(&[seg_int("x", 0, 10)], 0);
+        let p1 = part_from(&[seg_int("x", 100, 110)], 1);
+        let p2 = part_from(&[seg_int("x", 200, 210)], 2);
+        let list = list_with(vec![p0.clone(), p1.clone(), p2.clone()]);
+        let i = |n| ScalarValue::Int64(Some(n));
+
+        // IN (5, 205) → p0 ([0,10]) and p2 ([200,210]); not p1.
+        assert_eq!(
+            scalar_value_set_keep_parts(&list, "x", &[i(5), i(205)]),
+            vec![p0.part_id, p2.part_id]
+        );
+        // IN (50) → in no part's range.
+        assert!(scalar_value_set_keep_parts(&list, "x", &[i(50)]).is_empty());
+        // Unknown column → conservative keep-all.
+        assert_eq!(
+            scalar_value_set_keep_parts(&list, "missing", &[i(5)]),
+            vec![p0.part_id, p1.part_id, p2.part_id]
+        );
+    }
+
+    #[test]
+    fn or_of_equalities_prunes_at_both_tiers() {
+        // `x = 5 OR x = 205` lowers to the same ScalarValueSet the IN path
+        // builds; measure the drop each tier makes for that leaf.
+        let s = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let expr = col("x").eq(lit(5_i64)).or(col("x").eq(lit(205_i64)));
+        let leaves = exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), None);
+        let (column, values) = match leaves.as_slice() {
+            [PruneLeaf::ScalarValueSet { column, values }] => (column.as_str(), values.clone()),
+            _ => panic!("expected one ScalarValueSet leaf from the OR"),
+        };
+
+        // Tier A — part aggregates: 3 parts → 2; p1's [100,110] holds
+        // neither value, so the part-level prune drops it.
+        let p0 = part_from(&[seg_int("x", 0, 10)], 0);
+        let p1 = part_from(&[seg_int("x", 100, 110)], 1);
+        let p2 = part_from(&[seg_int("x", 200, 210)], 2);
+        let list = list_with(vec![p0.clone(), p1, p2.clone()]);
+        assert_eq!(
+            scalar_value_set_keep_parts(&list, column, &values),
+            vec![p0.part_id, p2.part_id],
+            "part tier prunes 1 of 3"
+        );
+
+        // Tier B — per-superfile stats: within a surviving part, 2
+        // superfiles → 1; [50,60] holds neither value, dropped here.
+        let segs = vec![seg_int("x", 0, 10), seg_int("x", 50, 60)];
+        assert_eq!(
+            scalar_value_set_skip(&segs, column, &values),
+            vec![true, false],
+            "superfile tier prunes 1 of 2"
+        );
+    }
+
+    #[test]
     fn scalar_keep_parts_keeps_on_missing_column_aggregate() {
         // No aggregate for the queried column → conservative keep.
         let p0 = part_from(&[seg_int("x", 0, 10)], 0);
@@ -412,7 +533,8 @@ mod tests {
         // Superfile B: {kiwi, mango} → actually contains "mango".
         let a = seg_title(&["apple", "zebra"]);
         let b = seg_title(&["kiwi", "mango"]);
-        let manifest = ManifestSnapshot::empty(opts_title_fts()).with_appended(vec![a.clone(), b.clone()]);
+        let manifest =
+            ManifestSnapshot::empty(opts_title_fts()).with_appended(vec![a.clone(), b.clone()]);
 
         let scalar_leaf = PruneLeaf::Scalar(ScalarPredicate {
             column: "title".into(),

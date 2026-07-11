@@ -2921,6 +2921,132 @@ mod tests {
     /// The `Debug` impl reports the builder's shape (column counts and
     /// doc-id cursor) without panicking, and `set_fts_spill_threshold_bytes`
     /// forwards to the live FTS builder.
+    // --- Sq8 compaction coverage -------------------------------------------
+
+    #[tokio::test]
+    async fn sq8_source_merges_via_ivf_byte_splice() {
+        // An Sq8 source superfile must be mergeable, but NOT by decoding it back
+        // to fp32 and re-quantizing (lossy, and it would break the recall gate).
+        // `add_batch_from_reader` therefore rejects an Sq8 column outright and
+        // directs callers to the byte-splice path `build_from_sq8_ivf_readers`,
+        // which copies the stored Sq8 IVF bytes without a decode/re-encode round
+        // trip. This test pins both halves of that contract.
+        let sq8_opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![],
+            vec![default_vector_config("emb", 7).with_rerank_codec(RerankCodec::Sq8Residual)],
+            None,
+        );
+        let mut b1 = SuperfileBuilder::new(sq8_opts.clone()).expect("new SuperfileBuilder");
+        let schema = b1.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        let mut v: Vec<f32> = vec![0.0; 32]; // 2 rows × 16 dim
+        v[0] = 1.0; // doc 0 → axis 0
+        v[16 + 1] = 1.0; // doc 1 → axis 1
+        b1.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
+        let source_bytes = b1.finish().expect("finish builder");
+
+        let reader =
+            Arc::new(SuperfileReader::open(Bytes::from(source_bytes)).expect("open source"));
+
+        // The fp32 add-batch merge path must refuse an Sq8 column rather than
+        // decode-and-requantize it.
+        let mut b2 = SuperfileBuilder::new(sq8_opts).expect("new SuperfileBuilder");
+        assert!(
+            b2.add_batch_from_reader(&reader, None).is_err(),
+            "add_batch_from_reader must reject an Sq8 source (splice path only)"
+        );
+
+        // The byte-splice path merges it losslessly.
+        let (merged_bytes, stats) =
+            SuperfileBuilder::build_from_sq8_ivf_readers(&[(Arc::clone(&reader), None)])
+                .expect("build_from_sq8_ivf_readers must merge an Sq8 source");
+        assert_eq!(stats.n_docs, 2);
+
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged reader");
+        assert_eq!(merged.n_docs(), 2);
+
+        // Sq8 codec must be preserved in the merged output.
+        let col = merged
+            .vec()
+            .expect("vector index present")
+            .vector_columns_config()
+            .next()
+            .expect("has column");
+        assert_eq!(
+            col.rerank_codec,
+            RerankCodec::Sq8Residual,
+            "merged superfile must carry the Sq8Residual codec"
+        );
+
+        // Self-query: axis-0 vector must be top hit.
+        let mut query = vec![0.0f32; 16];
+        query[0] = 1.0;
+        let hits = merged
+            .vec()
+            .expect("vector reader")
+            .search("emb", &query, 1, 4, 100)
+            .await
+            .expect("vector search on merged Sq8 superfile");
+        assert!(!hits.is_empty(), "search should return at least one result");
+        assert_eq!(hits[0].0, 0, "top hit for axis-0 query must be doc 0");
+    }
+
+    #[tokio::test]
+    async fn build_from_readers_fp32_codec_preserved_by_new_from_reader() {
+        // new_from_reader previously omitted .with_rerank_codec, so an Fp32 source
+        // produced a Sq8 merged output.  After the fix the codec round-trips exactly.
+        let fp32_opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![],
+            vec![default_vector_config("emb", 7)], // Fp32 is the default_vector_config codec
+            None,
+        );
+        let mut b = SuperfileBuilder::new(fp32_opts).expect("new SuperfileBuilder");
+        let schema = b.opts.schema.clone();
+        let batch = batch_two_rows(&schema);
+        let mut v: Vec<f32> = vec![0.0; 32];
+        v[0] = 1.0;
+        v[16 + 1] = 1.0;
+        b.add_batch(&batch, &[v.as_slice()]).expect("add_batch");
+        let source_bytes = b.finish().expect("finish builder");
+
+        let reader = SuperfileReader::open(Bytes::from(source_bytes)).expect("open reader");
+        let (merged_bytes, stats) =
+            SuperfileBuilder::build_from_readers(&[(Arc::new(reader), empty_bitmap())])
+                .expect("build_from_readers");
+        assert_eq!(stats.n_docs, 2);
+
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged reader");
+
+        // Fp32 codec must survive the round-trip through new_from_reader.
+        let col = merged
+            .vec()
+            .expect("vector index")
+            .vector_columns_config()
+            .next()
+            .expect("has column");
+        assert_eq!(
+            col.rerank_codec,
+            RerankCodec::Fp32,
+            "build_from_readers must preserve Fp32 codec from source superfile"
+        );
+
+        // Search must still work on the Fp32 merged output.
+        let mut query = vec![0.0f32; 16];
+        query[0] = 1.0;
+        let hits = merged
+            .vec()
+            .expect("vector reader")
+            .search("emb", &query, 1, 4, 100)
+            .await
+            .expect("vector search on merged Fp32 superfile");
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].0, 0, "top hit for axis-0 query must be doc 0");
+    }
+
     #[test]
     fn debug_and_set_fts_spill_threshold() {
         const FORCE_SPILL_THRESHOLD: usize = 1;

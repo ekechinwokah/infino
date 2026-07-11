@@ -8,8 +8,8 @@
 //!
 //! - A commit on a storage-backed supertable writes:
 //!   - each new superfile's bytes to `data/seg-<uuid>.sf.parquet`
-//!   - one manifest part to `manifests/part-<hash>.avro.zst`
-//!   - the manifest list to `manifest/manifest-NNNNNN.json`
+//!   - one manifest part to `manifest-parts/part-<hash>.avro.zst`
+//!   - the manifest to `manifest/manifest-NNNNNN.json`
 //!   - the pointer to `_supertable/current`
 //! - The pointer is readable after commit; manifest_id
 //!   increments per commit.
@@ -56,18 +56,14 @@ fn commit_persists_pointer_list_part_and_superfile() {
         .expect("read")
         .expect("pointer present");
     assert_eq!(pointer.get_manifest_id(), 1);
-    assert!(
-        pointer
-            .manifest_uri
-            .starts_with("manifest/manifest-")
-    );
+    assert!(pointer.manifest_uri.starts_with("manifest/manifest-"));
 
-    // ManifestSnapshot list file exists and is non-empty.
+    // Manifest file exists and is non-empty.
     let (list_bytes, _) =
         futures::executor::block_on(storage.get(&pointer.manifest_uri)).expect("get list");
     assert!(!list_bytes.is_empty());
 
-    // At least one manifest part exists in manifests/.
+    // At least one manifest part exists in manifest-parts/.
     let manifest_parts_dir = dir.path().join("manifest-parts");
     let parts: Vec<_> = std::fs::read_dir(&manifest_parts_dir)
         .expect("readdir")
@@ -125,13 +121,17 @@ fn two_successive_commits_both_publish() {
         "two commits ⇒ pointer at manifest_id=2"
     );
 
-    // Both manifest list versions persist (immutable per id).
-    let lists_dir = dir.path().join("manifest");
-    let n_lists = std::fs::read_dir(&lists_dir)
+    // Each manifest version persists (immutable per id): the empty manifest
+    // published by `create` (id 0) plus the two commits (ids 1 + 2).
+    let manifest_dir = dir.path().join("manifest");
+    let n_manifests = std::fs::read_dir(&manifest_dir)
         .expect("readdir")
         .filter_map(|e| e.ok())
         .count();
-    assert_eq!(n_lists, 2, "two list files (manifest_id 1 + 2)");
+    assert_eq!(
+        n_manifests, 3,
+        "three manifest files (manifest_id 0 + 1 + 2)"
+    );
 
     // ManifestSnapshot part count = 2 (each commit writes a fresh part
     // under content-addressed URI; single-partition mode
@@ -283,11 +283,19 @@ fn manifest_id_increments_only_on_non_empty_commits() {
     w.commit().expect("empty commit"); // no buffer → no-op
     drop(w);
 
-    // Pointer doesn't exist yet (no real commit happened).
-    let pointer = futures::executor::block_on(read_pointer(&*storage)).expect("read");
-    assert!(pointer.is_none(), "empty commit must not publish a pointer");
+    // `create` publishes the initial empty manifest, so the pointer already
+    // exists at manifest_id=0. The empty commit above is a no-op: it must
+    // neither advance the id nor republish.
+    let (pointer, _) = futures::executor::block_on(read_pointer(&*storage))
+        .expect("read")
+        .expect("create publishes the initial empty-manifest pointer");
+    assert_eq!(
+        pointer.get_manifest_id(),
+        0,
+        "empty commit must not advance the manifest_id past create's id 0"
+    );
 
-    // Now do a real commit; pointer appears at manifest_id=1.
+    // Now do a real commit; pointer advances to manifest_id=1.
     let mut w = st.writer().expect("w");
     w.append(&build_title_batch(&["only", "real"]))
         .expect("append");

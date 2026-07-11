@@ -30,17 +30,23 @@ export type AppendData = RowRecord[] | arrow.Table | arrow.RecordBatch | Buffer 
 
 /** Storage and cache config the `connect` URI can't carry. All optional. */
 export interface ConnectOptions {
-  /** S3-compatible endpoint; requires `region`, `accessKey`, `secretKey`. */
-  endpoint?: string;
-  region?: string;
-  accessKey?: string;
-  secretKey?: string;
+  /**
+   * Credentials/tuning for the URI-selected backend, keyed by `object_store`
+   * config strings (`aws_*` / `azure_*` / `google_*`). An unknown key is
+   * rejected at `connect`.
+   */
+  storageOptions?: Record<string, string>;
   /** Local disk-cache directory for remote-backed tables. */
   cacheDir?: string;
   /** Disk-cache budget in bytes. */
   cacheBudgetBytes?: number;
   /** How cold misses are serviced. */
   coldFetchMode?: "hybrid_with_prefetch" | "range_only" | "lazy_foreground_with_background_fill";
+  /**
+   * Probe the object store at `connect` (default `false`). `true` fails fast
+   * on bad credentials instead of on the first table operation.
+   */
+  validate?: boolean;
 }
 
 /** Row counts returned by `update` / `delete`. */
@@ -51,6 +57,20 @@ export interface MutationStats {
   nTombstoned: number;
   /** Matched rows not found in any live segment. */
   nNotFound: number;
+}
+
+/** Counts from a `gc` sweep. */
+export interface GcReport {
+  /** Bytes reclaimed by deleting orphaned objects. */
+  bytesFreed: number;
+  /** Orphaned objects deleted. */
+  objectsDeleted: number;
+  /** Objects kept because they are still referenced by the live set. */
+  objectsSkippedLive: number;
+  /** Objects kept because they are younger than the grace period. */
+  objectsSkippedTooNew: number;
+  /** Objects that failed to delete (left for the next sweep). */
+  deleteErrors: number;
 }
 
 /** Tuning for `optimize`; all fields optional (omitted ⇒ engine default). */
@@ -90,6 +110,16 @@ export interface VectorSearchOptions {
   /** Restrict the kNN to rows matching a text predicate (pushdown pre-filter). */
   filter?: VectorFilter;
 }
+/** Options for `hybridSearch`. `mode` applies to the BM25 side; `nprobe` to
+ * the vector side. */
+export interface HybridSearchOptions {
+  /** BM25 boolean mode: `"or"` (default) or `"and"`. */
+  mode?: BoolMode;
+  /** IVF partitions to probe on the vector side (higher = better recall). */
+  nprobe?: number;
+  projection?: string[];
+  arrow?: boolean;
+}
 export interface TokenMatchOptions {
   mode?: BoolMode;
   projection?: string[];
@@ -98,6 +128,9 @@ export interface TokenMatchOptions {
 export interface MatchOptions {
   projection?: string[];
   arrow?: boolean;
+}
+export interface CountOptions {
+  mode?: BoolMode;
 }
 export interface QueryOptions {
   arrow?: boolean;
@@ -288,6 +321,17 @@ export class Table {
     return decode(buf, opts.arrow);
   }
 
+  /** Hybrid BM25 + vector search, fused with reciprocal-rank fusion; rows as
+   * records (or an Arrow `Table`). `score` is the fused RRF score (higher is
+   * better). */
+  hybridSearch(textColumn: string, textQuery: string, vectorColumn: string, vectorQuery: number[] | Float32Array, k: number, opts: HybridSearchOptions & { arrow: true }): arrow.Table;
+  hybridSearch(textColumn: string, textQuery: string, vectorColumn: string, vectorQuery: number[] | Float32Array, k: number, opts?: HybridSearchOptions): RowRecord[];
+  hybridSearch(textColumn: string, textQuery: string, vectorColumn: string, vectorQuery: number[] | Float32Array, k: number, opts: HybridSearchOptions = {}): RowRecord[] | arrow.Table {
+    const q = vectorQuery instanceof Float32Array ? vectorQuery : Float32Array.from(vectorQuery);
+    const buf = this.inner.hybridSearch(textColumn, textQuery, vectorColumn, q, k, opts.mode, opts.nprobe, opts.projection);
+    return decode(buf, opts.arrow);
+  }
+
   /** Unranked token match; matching rows as records (or an Arrow `Table`). */
   tokenMatch(column: string, query: string, opts: TokenMatchOptions & { arrow: true }): arrow.Table;
   tokenMatch(column: string, query: string, opts?: TokenMatchOptions): RowRecord[];
@@ -302,6 +346,12 @@ export class Table {
   exactMatch(column: string, value: string, opts: MatchOptions = {}): RowRecord[] | arrow.Table {
     const buf = this.inner.exactMatch(column, value, opts.projection);
     return decode(buf, opts.arrow);
+  }
+
+  /** Count rows matching a BM25 keyword `query` over `column`, without
+   * fetching them. `mode` is `"or"` (default) or `"and"`. */
+  count(column: string, query: string, opts: CountOptions = {}): number {
+    return this.inner.count(column, query, opts.mode);
   }
 
   /** Replace rows matching a SQL predicate (e.g. `"status = 'spam'"`) with
@@ -321,6 +371,13 @@ export class Table {
    * for engine defaults). */
   optimize(settings?: OptimizeOptions): void {
     this.inner.optimize(settings);
+  }
+
+  /** Delete orphaned storage objects left by compaction or interrupted writes.
+   * Only objects older than `graceSecs` (a safety window against racing
+   * readers/writers) are removed. Requires durable storage (not `memory://`). */
+  gc(graceSecs: number): GcReport {
+    return this.inner.gc(graceSecs);
   }
 }
 

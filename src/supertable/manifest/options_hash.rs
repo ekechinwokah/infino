@@ -7,7 +7,7 @@
 //! `ContentHash` over the load-bearing options fields — the
 //! Arrow schema, id column, FTS / vector column declarations,
 //! and the resolved partition strategy. Stamped onto
-//! [`Manifest::options_hash`] at commit time; verified
+//! `Manifest::options_hash` at commit time; verified
 //! at [`Supertable::open`] against the caller's options so a
 //! schema mismatch surfaces as a clean
 //! [`OpenError::OptionsHashMismatch`] instead of a parquet /
@@ -43,7 +43,7 @@
 //! [`verify_options_hash`] — older manifests + test fixtures that
 //! construct lists manually keep opening cleanly.
 //!
-//! [`Manifest::options_hash`]: super::list::Manifest
+//! `Manifest::options_hash`: see super::list::Manifest
 //! [`Supertable::open`]: crate::supertable::Supertable::open
 //! [`OpenError::OptionsHashMismatch`]: crate::supertable::OpenError::OptionsHashMismatch
 
@@ -137,6 +137,10 @@ pub fn compute_options_hash(opts: &SupertableOptions, strategy: &PartitionStrate
             buf.extend_from_slice(&(routing.nprobe_min as u64).to_le_bytes());
             buf.extend_from_slice(&(routing.nprobe_max as u64).to_le_bytes());
             buf.extend_from_slice(&routing.slack.to_le_bytes());
+        }
+        PartitionStrategy::IngestionTime { granularity_secs } => {
+            push_tag(&mut buf, b"ingestion_time");
+            buf.extend_from_slice(&granularity_secs.to_le_bytes());
         }
     }
 

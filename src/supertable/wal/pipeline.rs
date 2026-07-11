@@ -1190,6 +1190,7 @@ mod tests {
         storage::{LocalFsStorageProvider, StorageProvider},
         supertable::{
             Supertable,
+            manifest::ManifestSnapshot,
             wal::{
                 state_doc::{
                     OpKind, RowId, SCHEMA_VERSION, SealRecord, TombstoneEntry, TombstoneOutcome,

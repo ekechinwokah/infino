@@ -35,12 +35,17 @@
 //! commit succeed?" reduces to "did the pointer's rename
 //! complete?" — a single atomic operation on LocalFS.
 //!
+//! `Supertable::create` publishes an initial empty manifest
+//! (id 0) before any commit, so a freshly created table is
+//! already durably openable. The kill points below account for
+//! create's initial list + pointer PUTs (see `kill_point_config`).
+//!
 //! Kill points exercised (one test function each):
 //!
 //! | Test fn                                                      | Crash point                                | Expected post-crash open state                    |
 //! |--------------------------------------------------------------|---------------------------------------------|----------------------------------------------------|
-//! | `crash_post_superfile_no_prior_commit_yields_pointer_unreadable` | After 1st superfile PUT, before list/pointer | `OpenError::PointerUnreadable`                     |
-//! | `crash_post_list_no_prior_commit_yields_pointer_unreadable`    | After 1st list PUT, before pointer         | `OpenError::PointerUnreadable`                     |
+//! | `crash_post_superfile_no_prior_commit_yields_empty_table`      | After 1st commit's superfile PUT, before its list/pointer | `manifest_id == 0` (create's empty manifest), orphan superfile |
+//! | `crash_post_list_no_prior_commit_yields_pointer_unreadable`    | After create's list PUT, before its pointer | `OpenError::PointerUnreadable`                     |
 //! | `crash_post_superfile_on_second_commit_yields_v1`                | First commit succeeds; 2nd commit's superfile PUT triggers | `manifest_id == 1` (v_prev), orphan v2 superfile    |
 //! | `crash_post_list_on_second_commit_yields_v1`                   | First commit succeeds; 2nd commit's list PUT triggers   | `manifest_id == 1`, orphan v2 list + part         |
 //! | `crash_post_pointer_on_second_commit_yields_v2`                | First commit succeeds; 2nd commit's pointer PUT triggers AFTER it lands | `manifest_id == 2` (commit was durable)           |
@@ -178,12 +183,22 @@ impl StorageProvider for CrashStorage {
 /// to configure `CrashStorage` and decide how many successful
 /// commits to land before the crashing one.
 fn kill_point_config(kp: &str) -> (&'static str, usize, usize) {
+    // `Supertable::create` publishes an initial empty manifest before any
+    // commit: one PUT to `manifest/` (the id-0 list) and one to
+    // `_supertable/current` (the id-0 pointer), and zero to `data/`. The
+    // nth-match counts below account for that initial write:
+    //   - `KP_LIST_FIRST` (nth=1) now fires on create's own list write —
+    //     still "no pointer written yet", so still yields PointerUnreadable.
+    //   - the second-commit list/pointer kill points are +1 (nth=3): create's
+    //     initial write occupies the first match, the first commit the second,
+    //     the crashing second commit the third.
+    //   - `data/` counts are unaffected (create writes no superfile).
     match kp {
         KP_SEG_FIRST => ("data/", 1, 1),
         KP_LIST_FIRST => ("manifest/", 1, 1),
         KP_SEG_SECOND => ("data/", 2, 2),
-        KP_LIST_SECOND => ("manifest/", 2, 2),
-        KP_POINTER_SECOND => ("_supertable/current", 2, 2),
+        KP_LIST_SECOND => ("manifest/", 3, 2),
+        KP_POINTER_SECOND => ("_supertable/current", 3, 2),
         other => panic!("unknown kill point {other}"),
     }
 }
@@ -272,25 +287,33 @@ fn dispatch_child_if_set() -> Option<()> {
 }
 
 #[test]
-fn crash_post_superfile_no_prior_commit_yields_pointer_unreadable() {
+fn crash_post_superfile_no_prior_commit_yields_empty_table() {
     if dispatch_child_if_set().is_some() {
         return; // unreachable; child never returns
     }
     let dir = spawn_crash_child(
-        "crash_post_superfile_no_prior_commit_yields_pointer_unreadable",
+        "crash_post_superfile_no_prior_commit_yields_empty_table",
         KP_SEG_FIRST,
     );
 
-    // Parent verifies. The crash fired after the first
-    // superfile PUT, before any manifest writes. No pointer
-    // exists yet → open must return PointerUnreadable.
+    // Parent verifies. The crash fired after the first commit's superfile PUT,
+    // before that commit's manifest list/pointer. `create` already published
+    // the initial empty manifest (id 0), so open recovers that durable empty
+    // state rather than failing — the uncommitted superfile is an orphan the
+    // reader ignores.
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
-    let err = Supertable::open(default_supertable_options().with_storage(storage))
-        .expect_err("must reject post-crash state with no pointer");
-    assert!(
-        matches!(err, OpenError::ManifestLoadError(_)),
-        "expected PointerUnreadable, got {err:?}"
+    let recovered = Supertable::open(default_supertable_options().with_storage(storage))
+        .expect("open recovers create's empty id-0 manifest");
+    assert_eq!(
+        recovered.manifest_id(),
+        0,
+        "no commit landed → recover create's empty id-0 manifest"
+    );
+    assert_eq!(
+        recovered.reader().n_superfiles(),
+        0,
+        "the orphan superfile is invisible without a committed manifest list"
     );
 
     // The orphan superfile file is present and ignored — the
@@ -325,14 +348,14 @@ fn crash_post_list_no_prior_commit_yields_pointer_unreadable() {
         "expected PointerUnreadable, got {err:?}"
     );
 
-    // The orphan manifest list is on disk but unreferenced.
-    let lists_dir = dir.join("manifest");
-    let n_orphan_lists = std::fs::read_dir(&lists_dir)
+    // The orphan manifest is on disk but unreferenced.
+    let manifest_dir = dir.join("manifest");
+    let n_orphan_manifests = std::fs::read_dir(&manifest_dir)
         .map(|rd| rd.count())
         .unwrap_or(0);
     assert!(
-        n_orphan_lists >= 1,
-        "orphan manifest list must be present; found {n_orphan_lists} in {lists_dir:?}"
+        n_orphan_manifests >= 1,
+        "orphan manifest must be present; found {n_orphan_manifests} in {manifest_dir:?}"
     );
 }
 
@@ -374,8 +397,8 @@ fn crash_post_list_on_second_commit_yields_v1() {
 
     // Orphan v2 manifest list and v2 part are on disk —
     // tolerated here; compaction GCs them later.
-    let lists_dir = dir.join("manifest");
-    let n_lists = std::fs::read_dir(&lists_dir)
+    let manifest_dir = dir.join("manifest");
+    let n_lists = std::fs::read_dir(&manifest_dir)
         .map(|rd| rd.count())
         .unwrap_or(0);
     assert!(

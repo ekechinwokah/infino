@@ -82,17 +82,19 @@ fn compact_then_gc_removes_stale_files_and_preserves_queries() {
 
     let n_commits = markers.len();
     let data_dir = dir.path().join("data");
-    let lists_dir = dir.path().join("manifest");
+    let manifest_dir = dir.path().join("manifest");
 
     assert_eq!(
         count_dir(&data_dir),
         n_commits,
         "one superfile per commit before compact"
     );
+    // One manifest per commit, plus the empty manifest `create` published
+    // (manifest_id 0) before the first append.
     assert_eq!(
-        count_dir(&lists_dir),
-        n_commits,
-        "one manifest list per commit before compact"
+        count_dir(&manifest_dir),
+        n_commits + 1,
+        "one manifest per commit, plus create's empty manifest, before compact"
     );
 
     let r = st.reader();
@@ -145,11 +147,11 @@ fn compact_then_gc_removes_stale_files_and_preserves_queries() {
         n_after_compact,
         "only compacted superfiles remain after GC"
     );
-    // Only the current manifest list survives.
+    // Only the current manifest survives.
     assert_eq!(
-        count_dir(&lists_dir),
+        count_dir(&manifest_dir),
         1,
-        "only current manifest list remains after GC"
+        "only current manifest remains after GC"
     );
 
     // All markers still queryable after GC.

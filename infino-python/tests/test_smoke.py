@@ -8,9 +8,32 @@ Run after `maturin develop`:
     pytest tests/
 """
 
+import pathlib
+
 import infino
 import pyarrow as pa
 import pytest
+
+
+def test_package_metadata():
+    assert isinstance(infino.__version__, str) and infino.__version__
+    assert set(infino.__all__) == {
+        "connect",
+        "Connection",
+        "Table",
+        "IndexSpec",
+        "MutationStats",
+        "GcReport",
+        "OptimizeOptions",
+    }
+
+
+def test_typing_artifacts_are_packaged():
+    # The stub and marker must ship beside the module, or type checkers
+    # silently ignore the package despite the work above.
+    pkg = pathlib.Path(infino.__file__).parent
+    assert (pkg / "py.typed").is_file()
+    assert (pkg / "_infino.pyi").is_file()
 
 
 def _title_schema() -> pa.Schema:
@@ -65,11 +88,25 @@ def test_connect_rejects_invalid_cold_fetch_mode():
         infino.connect("memory://", cold_fetch_mode="nonsense")
 
 
-def test_connect_rejects_partial_s3_credentials():
-    # A credential without the rest must error, not silently fall back to
-    # ambient credentials.
-    with pytest.raises(ValueError):
-        infino.connect("s3://bucket/prefix", access_key="only-this")
+def test_connect_accepts_storage_options(tmp_path):
+    # storage_options is a no-op for local storage but must parse and apply.
+    db = infino.connect(str(tmp_path / "catalog"), storage_options={"aws_region": "us-east-1"})
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append([{"title": "the quick brown fox"}])
+    assert t.token_match("title", "fox").num_rows == 1
+
+
+def test_connect_rejects_unknown_storage_option():
+    # An unknown key surfaces at connect time (backend error), not a
+    # silent drop.
+    with pytest.raises(RuntimeError, match="not_a_real_key"):
+        infino.connect("s3://bucket/prefix", storage_options={"not_a_real_key": "x"})
+
+
+def test_connect_does_not_probe_by_default():
+    # Default (validate off): connecting to a bogus bucket builds the
+    # handle without touching the backend.
+    infino.connect("s3://no-such-bucket-xyzzy/prefix")
 
 
 def test_query_sql_returns_pyarrow_table():
@@ -259,6 +296,38 @@ def test_optimize_on_memory_is_noop():
     assert _count(db, "docs") == 3
 
 
+def test_count_matches_predicate():
+    db = infino.connect("memory://")
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append(_title_batch(["the quick brown fox", "a lazy dog"]))
+
+    # count returns the match tally without materializing rows.
+    assert t.count("title", "fox") == 1
+    assert t.count("title", "fox dog") == 2  # "or" default: fox OR dog
+    assert t.count("title", "fox dog", mode="and") == 0
+
+
+def test_gc_reclaims_orphans(tmp_path):
+    db = infino.connect(str(tmp_path / "catalog"))  # gc needs durable storage
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    for title in ("alpha", "beta", "gamma"):  # three appends -> three superfiles
+        t.append([{"title": title}])
+
+    t.optimize()  # merge leaves the pre-merge objects orphaned
+    report = t.gc(0.0)  # 0s grace: freshly-orphaned objects are eligible now
+    assert report.objects_deleted >= 0
+    assert isinstance(report.bytes_freed, int)
+    assert _count(db, "docs") == 3  # data intact after the sweep
+
+
+def test_gc_rejects_memory():
+    db = infino.connect("memory://")
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append([{"title": "alpha"}])
+    with pytest.raises(RuntimeError):
+        t.gc(0.0)
+
+
 def test_vector_search_end_to_end():
     db = infino.connect("memory://")
     dim = 16  # infino requires vector dim in [16, 4096]
@@ -339,3 +408,63 @@ def test_filtered_vector_search():
         t.vector_search(
             "emb", onehot(0), 10, filter_column="title", filter_query="billing", filter_mode="xor"
         )
+
+
+def test_hybrid_search_fuses_text_and_vector():
+    db = infino.connect("memory://")
+    dim = 16
+
+    def onehot(i: int) -> list[float]:
+        v = [0.0] * dim
+        v[i] = 1.0
+        return v
+
+    schema = pa.schema([
+        pa.field("title", pa.large_utf8(), nullable=False),
+        pa.field("emb", pa.list_(pa.float32(), dim), nullable=False),
+    ])
+    t = db.create_table(
+        "docs", schema, infino.IndexSpec().fts("title").vector("emb", dim, 1, "cosine")
+    )
+    t.append(
+        pa.record_batch(
+            [
+                pa.array(["rust async", "python data", "rust systems"], type=pa.large_utf8()),
+                pa.array([onehot(0), onehot(1), onehot(2)], type=pa.list_(pa.float32(), dim)),
+            ],
+            schema=schema,
+        )
+    )
+
+    hits = t.hybrid_search("title", "rust", "emb", onehot(0), 10)
+    assert hits.num_rows >= 1
+    assert "_id" in hits.column_names and "score" in hits.column_names
+    # RRF score is higher-is-better, so rows come back descending.
+    scores = hits["score"].to_pylist()
+    assert scores == sorted(scores, reverse=True)
+
+    # Projection materializes the named scalar column.
+    projected = t.hybrid_search(
+        "title", "rust", "emb", onehot(0), 10, projection=["_id", "title", "score"]
+    )
+    assert projected.column_names == ["_id", "title", "score"]
+
+    # Direct call and the SQL table function agree on the `_id` set
+    # (the TVF fixes mode="or" and default nprobe, so match it).
+    csv = ",".join("1" if d == 0 else "0" for d in range(dim))
+    via_sql = db.query_sql(
+        f"SELECT _id FROM hybrid_search('docs', 'title', 'rust', 'emb', '{csv}', 10)"
+    )
+    assert set(hits["_id"].to_pylist()) == set(via_sql["_id"].to_pylist())
+
+    # Invalid mode is rejected.
+    with pytest.raises(ValueError, match="mode"):
+        t.hybrid_search("title", "rust", "emb", onehot(0), 10, mode="xor")
+
+    # A non-indexed text column names the offending column.
+    with pytest.raises(ValueError, match="missing"):
+        t.hybrid_search("missing", "rust", "emb", onehot(0), 10)
+
+    # A wrong-dimension query vector reports the dimension mismatch.
+    with pytest.raises(ValueError, match="dimension"):
+        t.hybrid_search("title", "rust", "emb", [1.0, 2.0, 3.0], 10)

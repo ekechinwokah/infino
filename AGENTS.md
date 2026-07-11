@@ -127,7 +127,7 @@ src/
 ├── lib.rs                 ← crate root (small; declares modules + curated re-exports)
 ├── catalog/               ← public entry point (connect → Connection → tables, search TVFs)
 ├── error.rs               ← the single public InfinoError (coarse, #[non_exhaustive])
-├── storage/               ← byte-level I/O (StorageProvider trait, LocalFs, S3, Azure)
+├── storage/               ← byte-level I/O (StorageProvider trait, LocalFs, S3, Azure, GCS)
 ├── superfile/             ← single-file format (immutable superfiles)
 │   ├── builder.rs         ← write path
 │   ├── reader.rs          ← read path
@@ -234,7 +234,7 @@ storage/superfile/supertable layers, which are themselves internal.
 
 - **Entry points** — `connect(uri)` and `connect_with(uri, ConnectOptions)`, returning a `Connection`.
 - `**Connection`** — `create_table`, `open_table`, `drop_table` (logical by default; `purge = true` also deletes the table's storage subtree), `list_tables`, `query_sql`.
-- `**Supertable`** (the table handle) — `append`, `update`, `delete`, `schema`, plus the sync search surface. All four search methods (`bm25_search`, `vector_search`, and the unranked `token_match` / `exact_match`) return Arrow rows (`Vec<RecordBatch>`) and take a `projection: Option<&[&str]>` naming the output columns (`_id`, any visible scalar column, or the trailing `score`); `None` returns the engine-native `_id` + `score` pair (no scalar decode — `_id` reads from its dedicated id pages), and materializing row data is an explicit opt-in by naming the columns to decode. The async kernels and the superfile-local hit representation stay on the internal `SupertableReader`; the public methods resolve to the stable `_id` before returning.
+- `**Supertable`** (the table handle) — `append`, `update`, `delete`, `schema`, plus the sync search surface. All five search methods (`bm25_search`, `vector_search`, `hybrid_search`, and the unranked `token_match` / `exact_match`) return Arrow rows (`Vec<RecordBatch>`) and take a `projection: Option<&[&str]>` naming the output columns (`_id`, any visible scalar column, or the trailing `score`); `None` returns the engine-native `_id` + `score` pair (no scalar decode — `_id` reads from its dedicated id pages), and materializing row data is an explicit opt-in by naming the columns to decode. The async kernels and the superfile-local hit representation stay on the internal `SupertableReader`; the public methods resolve to the stable `_id` before returning.
 - **Supporting types** — `ConnectOptions`, `ColdFetchMode`, `IndexSpec`, `Metric`, `BoolMode`, `VectorSearchOptions`, `MutationStats`, the `InfinoError` enum, and `BUILDER_ID`.
 
 Everything else — `SupertableReader`/`SupertableWriter`, the manifest

@@ -34,9 +34,11 @@
 //! 3. Add a docstring and a unit test exercising the override path.
 
 use std::{
+    collections::HashMap,
     env, fmt,
     path::{Path, PathBuf},
     sync::OnceLock,
+    time::Duration,
 };
 
 use figment::{
@@ -51,6 +53,15 @@ use serde::{
 
 /// Embedded baseline. Compiled in via `include_str!`.
 const EMBEDDED_DEFAULT: &str = include_str!("config.yaml");
+
+/// Engine default connection budget when none is configured; used by both
+/// [`MemorySettings`] and the connect path. `0` is the deliberate measure-only
+/// (no-ceiling) sentinel that `from_budget_bytes` maps to a measured budget.
+///
+/// A future non-trivial default (e.g. a fraction of system RAM) changes here.
+/// `from_budget_bytes` stays a pure value mapper; the only added work then is
+/// letting the config field distinguish "unset" from an explicit `0`.
+pub(crate) const DEFAULT_CONNECTION_BUDGET_BYTES: u64 = 0;
 
 /// Errors from config load + validation.
 ///
@@ -93,6 +104,33 @@ pub struct Config {
     /// results. Default: everything off.
     #[serde(default)]
     pub diagnostics: DiagnosticsSettings,
+    /// Per-connection memory budget.
+    #[serde(default)]
+    pub memory: MemorySettings,
+}
+
+/// Memory subsection of [`Config`]. All memory-related settings for Infino here.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MemorySettings {
+    /// Per-connection memory (heap) budget in bytes. `0` (the default) is
+    /// measure-only: usage is tracked but never refused. A positive value
+    /// enforces a ceiling so one connection can't exhaust process memory.
+    ///
+    /// Applies to connections built from a config file (`apply_config`). Code
+    /// that opens a connection programmatically sets the budget on
+    /// [`ConnectOptions::with_connection_memory_budget_bytes`] instead.
+    ///
+    /// [`ConnectOptions::with_connection_memory_budget_bytes`]: crate::ConnectOptions::with_connection_memory_budget_bytes
+    pub connection_budget_bytes: u64,
+}
+
+impl Default for MemorySettings {
+    fn default() -> Self {
+        Self {
+            connection_budget_bytes: DEFAULT_CONNECTION_BUDGET_BYTES,
+        }
+    }
 }
 
 /// Process-wide config, loaded once from the standard hierarchy
@@ -193,6 +231,9 @@ impl Default for CompactionSettings {
         }
     }
 }
+
+/// Minimum age an unreferenced object must reach before [`crate::Supertable::optimize`] deletes it.
+pub const DEFAULT_GC_SAFETY_GAP: Duration = Duration::from_secs(86_400);
 
 // Vector-tuning defaults. Kept equal to the historical inline
 // literals so folding these knobs into config preserves behavior.
@@ -343,6 +384,8 @@ pub enum StorageBackend {
     /// Azure Blob provider; `storage.bucket` names the container,
     /// rooted at `azure://storage.bucket/storage.prefix`.
     Azure,
+    /// GCS provider rooted at `gs://storage.bucket/storage.prefix`.
+    Gcs,
 }
 
 /// Config-side spelling for disk-cache cold-fetch mode. Kept
@@ -381,6 +424,9 @@ pub struct StorageSettings {
     pub local_root: Option<PathBuf>,
     /// Object-store bucket name (used by the `s3` backend).
     pub bucket: Option<String>,
+    /// Credentials/tuning for the backend, keyed by `object_store`
+    /// config strings (`aws_*` / `azure_*`). Empty → ambient identity.
+    pub storage_options: HashMap<String, String>,
     /// Logical key prefix inside the bucket. All manifest and
     /// superfile objects are written under
     /// `<bucket>/<prefix>/<manifest|superfiles>/…`. Empty means the
@@ -392,6 +438,12 @@ pub struct StorageSettings {
     /// through the object-store lazy/cached path.
     pub disk_cache_root: Option<PathBuf>,
     pub disk_budget_bytes: u64,
+    /// Byte budget for the content-addressed manifest-part cache, kept
+    /// in a `manifest-parts/` subdirectory of `disk_cache_root`. The
+    /// loader reads part bytes from local disk on a hit instead of
+    /// fetching from object storage. Independent of `disk_budget_bytes`
+    /// (which sizes the superfile-content cache). Default 2 GiB.
+    pub manifest_disk_budget_bytes: u64,
     pub cold_fetch_mode: StorageColdFetchMode,
     pub cold_fetch_streams: usize,
     pub cold_fetch_chunk_bytes: u64,
@@ -416,9 +468,11 @@ impl Default for StorageSettings {
             backend: StorageBackend::None,
             local_root: None,
             bucket: None,
+            storage_options: HashMap::new(),
             prefix: String::new(),
             disk_cache_root: None,
             disk_budget_bytes: DEFAULT_DISK_BUDGET_BYTES,
+            manifest_disk_budget_bytes: DEFAULT_MANIFEST_DISK_BUDGET_BYTES,
             cold_fetch_mode: StorageColdFetchMode::LazyForegroundWithBackgroundFill,
             cold_fetch_streams: DEFAULT_COLD_FETCH_STREAMS,
             cold_fetch_chunk_bytes: DEFAULT_COLD_FETCH_CHUNK_BYTES,
@@ -431,6 +485,9 @@ impl Default for StorageSettings {
 
 /// Default disk-cache byte budget exposed in the shipped config (10 GiB).
 const DEFAULT_DISK_BUDGET_BYTES: u64 = 10 * (1 << 30);
+/// Default manifest-part cache byte budget (2 GiB). Parts are small
+/// (KB–few MB each), so this holds a large working set of parts.
+const DEFAULT_MANIFEST_DISK_BUDGET_BYTES: u64 = 2 * (1 << 30);
 /// Default parallel cold-fetch streams at the config layer.
 const DEFAULT_COLD_FETCH_STREAMS: usize = 8;
 /// Default cold-fetch range chunk size (4 MiB).
@@ -697,6 +754,23 @@ storage:
     }
 
     #[test]
+    fn storage_gcs_config_parses_bucket() {
+        let yaml = r#"
+storage:
+  backend: gcs
+  bucket: infino-gcs-bucket
+  prefix: tbl
+"#;
+        let fig = Figment::new()
+            .merge(Yaml::string(EMBEDDED_DEFAULT))
+            .merge(Yaml::string(yaml));
+        let cfg = Config::from_figment(fig).expect("parse config");
+        assert_eq!(cfg.storage.backend, StorageBackend::Gcs);
+        assert_eq!(cfg.storage.bucket.as_deref(), Some("infino-gcs-bucket"));
+        assert_eq!(cfg.storage.prefix, "tbl");
+    }
+
+    #[test]
     fn last_yaml_wins_among_layers() {
         // Layer order: A (default 1024) → B (set 256) → C (set 4096).
         // Final value is 4096; the middle layer is shadowed.
@@ -770,6 +844,12 @@ storage:
         let cfg = Config::defaults().expect("embedded default must parse");
         assert_eq!(cfg.supertable.reader_threads, ThreadCount::Auto);
         assert_eq!(cfg.supertable.writer_threads, ThreadCount::Auto);
+    }
+
+    #[test]
+    fn memory_budget_defaults_to_measure_only() {
+        let cfg = Config::defaults().expect("embedded default must parse");
+        assert_eq!(cfg.memory.connection_budget_bytes, 0);
     }
 
     #[test]

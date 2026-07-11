@@ -1745,6 +1745,35 @@ pub fn normalize(v: &mut [f32]) {
 mod tests {
     use super::*;
 
+    /// Scalar reference decode of `Sq8Residual` per-vector bytes back to fp32,
+    /// used to check the SIMD residual kernels. Lives here, not in production
+    /// code, because the real merge path never decodes Sq8 back to fp32 — it
+    /// splices the stored IVF bytes via `build_from_sq8_ivf_readers`.
+    ///
+    /// `codes` — `dim` u8 quantization codes; `residuals` — `dim` i8 residuals
+    /// stored as raw bytes (each byte reinterpreted as `i8`).
+    /// `scale`/`offset` are the per-cluster quantizer arrays (length `dim`).
+    fn decode_sq8_residual(
+        codes: &[u8],
+        residuals: &[u8],
+        dim: usize,
+        scale: &[f32],
+        offset: &[f32],
+        residual_divisor: f32,
+    ) -> Vec<f32> {
+        codes
+            .iter()
+            .zip(residuals.iter())
+            .enumerate()
+            .map(|(i, (&c, &r))| {
+                let d = i % dim;
+                (c as f32) * scale[d]
+                    + offset[d]
+                    + (i8::from_le_bytes([r]) as f32) * scale[d] / residual_divisor
+            })
+            .collect()
+    }
+
     fn approx(a: f32, b: f32, eps: f32) -> bool {
         (a - b).abs() < eps
     }
@@ -2066,30 +2095,6 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, &c)| (c as f32) * scale[i % dim] + offset[i % dim])
-            .collect()
-    }
-
-    /// Decode `Sq8Residual` codes (`code * scale + offset + residual
-    /// * scale / divisor`) — the reference the residual kernel must
-    /// agree with.
-    fn decode_sq8_residual(
-        codes: &[u8],
-        residuals: &[u8],
-        dim: usize,
-        scale: &[f32],
-        offset: &[f32],
-        residual_divisor: f32,
-    ) -> Vec<f32> {
-        codes
-            .iter()
-            .zip(residuals.iter())
-            .enumerate()
-            .map(|(i, (&c, &r))| {
-                let d = i % dim;
-                (c as f32) * scale[d]
-                    + offset[d]
-                    + (i8::from_le_bytes([r]) as f32) * scale[d] / residual_divisor
-            })
             .collect()
     }
 

@@ -3,8 +3,8 @@
 
 //! List-level skip pruning — reader-side.
 //!
-//! Walks a [`Manifest`]'s `parts` and applies the
-//! aggregate skip tests in [`ManifestListEntry`] to identify
+//! Walks a `Manifest`'s `parts` and applies the
+//! aggregate skip tests in [`ManifestPartEntry`] to identify
 //! candidate parts for a given query shape. Survivors are
 //! the parts the query layer should load (via
 //! [`ManifestSnapshot::part`]) for per-superfile pruning.
@@ -30,7 +30,7 @@
 //! [`ManifestSnapshot`]: super::ManifestSnapshot
 //! [`ManifestSnapshot::part`]: super::ManifestSnapshot::part
 //! [`Manifest`]: super::list::Manifest
-//! [`ManifestListEntry`]: super::list::ManifestListEntry
+//! [`ManifestPartEntry`]: super::list::ManifestPartEntry
 
 use crate::{
     superfile::fts::reader::BoolMode,
@@ -169,11 +169,7 @@ fn part_matches_terms(
 /// injected `_id` column), so this is the type-specialized
 /// hot path for `WHERE _id BETWEEN ? AND ?`. For other
 /// scalar columns, use [`prune_parts_for_scalar_min_max_bytes`].
-pub fn prune_parts_for_id_range(
-    list: &Manifest,
-    query_min: i128,
-    query_max: i128,
-) -> Vec<PartId> {
+pub fn prune_parts_for_id_range(list: &Manifest, query_min: i128, query_max: i128) -> Vec<PartId> {
     list.parts
         .iter()
         .filter_map(|entry| {
