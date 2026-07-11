@@ -81,13 +81,12 @@ use super::{
     SuperfileHit,
     candidate::CandidatePlan,
     dispatch,
-    exec::common::{SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_object_store},
+    exec::common::{SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_byte_source},
     prune::{PruneLeaf, select_superfiles},
 };
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::{
     config,
-    storage::StorageProvider,
     superfile::{SuperfileReader, fts::reader::BoolMode, vector::layout::VectorLayout},
     supertable::{
         error::QueryError,
@@ -300,40 +299,10 @@ async fn read_ids_for_locals(
             .map_err(|e| QueryError::Execute(e.to_string()))?;
         return id_values_from_batch(&batch);
     }
-    // A lazy (non-resident) reader implies an object-store backend; store-only
-    // tables always resolve through the resident paths above.
-    let storage = storage
-        .ok_or_else(|| QueryError::Execute("id remap on a lazy reader needs storage".into()))?;
-    let batch = read_ids_batch_object_store(entry, local_ids, id_column, storage, &reader).await?;
+    let batch = take_rows_byte_source(&reader, local_ids, &[id_column])
+        .await
+        .map_err(|error| QueryError::Execute(error.to_string()))?;
     id_values_from_batch(&batch)
-}
-
-/// Read the `_id` column at `local_ids` from a superfile via object-store range
-/// GETs. Works regardless of whether a reader is eager or lazy, so it serves
-/// both the no-disk-cache path and the fallback when a cached reader is still a
-/// lazy foreground reader (pre-mmap-promotion).
-async fn read_ids_batch_object_store(
-    entry: &SuperfileEntry,
-    local_ids: &[u32],
-    id_column: &str,
-    storage: &Arc<dyn StorageProvider>,
-    reader: &SuperfileReader,
-) -> Result<arrow_array::RecordBatch, QueryError> {
-    let (obj_store, path) = storage
-        .object_store_handle(&entry.uri.storage_path())
-        .ok_or_else(|| QueryError::Execute("no object_store handle for superfile".into()))?;
-    let file_size = entry.subsection_offsets.as_ref().map(|o| o.total_size);
-    take_rows_object_store(
-        obj_store,
-        path,
-        file_size,
-        reader.schema(),
-        reader.n_docs(),
-        local_ids,
-        &[id_column],
-    )
-    .await
-    .map_err(|e| QueryError::Execute(e.to_string()))
 }
 
 /// Remap step 1 (deduped): resolve the user `_id` that dual-write stamped into
@@ -397,58 +366,25 @@ fn projection_is_id_score_only(projection: Option<&[&str]>, id_column: &str) -> 
     }
 }
 
-/// `_id` + `score` batch from hits. Fan-out stamps the user `_id` on
-/// `stable_id` for hidden-index hits; pre-drain user-table hits resolve
-/// from manifest span arithmetic.
-pub(crate) async fn hits_id_score_batch(
+/// Build `_id` + `score` directly from search-wave stable-ID stamps.
+///
+/// Identity resolution belongs before this boundary. Reaching output
+/// materialization without a stamp is an upstream query bug; this function
+/// never opens a manifest part or Parquet `_id` page.
+pub(crate) fn hits_id_score_batch(
     user_reader: &SupertableReader,
     hits: &[SuperfileHit],
 ) -> Result<RecordBatch, QueryError> {
-    let user_manifest = user_reader.manifest();
-    let id_column = user_reader.options().id_column.as_str();
-    let hidden_manifest = user_reader
-        .vector_index_table()
-        .map(|vit| Arc::clone(vit.pinned_reader().manifest()));
-    let deleted = user_reader
-        .vector_index_table()
-        .and_then(|vit| vit.pinned_reader().hidden_deleted_ids().ok());
     let mut ids = Vec::with_capacity(hits.len());
     let mut scores = Vec::with_capacity(hits.len());
     for hit in hits {
-        let user_row_id = if let Some(id) = hit.stable_id {
-            id
-        } else if let Some(entry) = user_manifest
-            .lookup_superfile_entry(hit.superfile)
-            .await
-            .map_err(QueryError::ManifestLoad)?
-        {
-            if let Some(id) = row_id_from_manifest_entry(&entry, hit.local_doc_id) {
-                id
-            } else {
-                read_ids_for_locals(
-                    user_manifest,
-                    entry.as_ref(),
-                    std::slice::from_ref(&hit.local_doc_id),
-                    id_column,
-                    false,
-                )
-                .await?[0]
-            }
-        } else if let Some(ref hm) = hidden_manifest {
-            hidden_hits_user_ids(hm, std::slice::from_ref(hit), id_column).await?[0]
-        } else {
-            return Err(QueryError::Execute(format!(
-                "hit superfile {:?} missing from manifests",
-                hit.superfile
-            )));
-        };
-        if deleted
-            .as_ref()
-            .is_some_and(|d| d.binary_search(&user_row_id).is_ok())
-        {
-            continue;
-        }
-        ids.push(user_row_id);
+        let id = hit.stable_id.ok_or_else(|| {
+            QueryError::Execute(format!(
+                "hit {:?}/{} missing stable _id before output materialization",
+                hit.superfile, hit.local_doc_id
+            ))
+        })?;
+        ids.push(id);
         scores.push(hit.score);
     }
     id_score_batch(user_reader, &ids, &scores).map_err(|e| QueryError::Execute(e.to_string()))
@@ -719,46 +655,40 @@ impl SupertableReader {
                 }
                 let selected_cells = &ranked[..cutoff];
                 let selected: HashSet<u32> = selected_cells.iter().copied().collect();
-                let mut fine_by_fragment: HashMap<(u32, usize), Vec<(u32, f32, u64)>> =
-                    HashMap::new();
+                let mut fine = Vec::new();
                 for (si, cluster, score, cell, count) in candidates {
                     match cell {
-                        Some(cell) if selected.contains(&cell) => fine_by_fragment
-                            .entry((cell, si))
-                            .or_default()
-                            .push((cluster, score, count)),
+                        Some(cell) if selected.contains(&cell) => {
+                            fine.push((si, cluster, score, count));
+                        }
                         Some(_) => {}
                         None => scored.push((si, cluster, score)),
                     }
                 }
-                let mut remaining = Vec::new();
-                for &cell in selected_cells {
-                    let mut fragment_ids: Vec<usize> = fine_by_fragment
-                        .keys()
-                        .filter_map(|(candidate_cell, si)| (*candidate_cell == cell).then_some(*si))
-                        .collect();
-                    fragment_ids.sort_unstable();
-                    for si in fragment_ids {
-                        let Some(mut fine) = fine_by_fragment.remove(&(cell, si)) else {
-                            continue;
-                        };
-                        fine.sort_unstable_by(|a, b| {
-                            a.1.partial_cmp(&b.1)
-                                .unwrap_or(Ordering::Equal)
-                                .then_with(|| a.0.cmp(&b.0))
-                        });
-                        let keep = nprobe.max(1).min(fine.len());
-                        let tail = fine.split_off(keep);
-                        gated.extend(
-                            fine.into_iter()
-                                .map(|(cluster, score, _)| (si, cluster, score)),
-                        );
-                        remaining.extend(
-                            tail.into_iter()
-                                .map(|(cluster, score, count)| (si, cluster, score, count)),
-                        );
+                fine.sort_unstable_by(|a, b| {
+                    a.2.partial_cmp(&b.2)
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
+                });
+                let mut keep = nprobe.max(1).min(fine.len());
+                // Equal-distance centroids in separate immutable fragments
+                // represent the same part of the routed cells. Keep the whole
+                // tie at the cutoff instead of discarding fragments by URI
+                // order; real-valued centroids rarely tie, while repeated
+                // exact vectors remain reachable across commits.
+                if keep < fine.len() {
+                    let cutoff_score = fine[keep - 1].2;
+                    while keep < fine.len()
+                        && fine[keep].2.total_cmp(&cutoff_score) == Ordering::Equal
+                    {
+                        keep += 1;
                     }
                 }
+                let mut remaining = fine.split_off(keep);
+                gated.extend(
+                    fine.into_iter()
+                        .map(|(si, cluster, score, _)| (si, cluster, score)),
+                );
                 let mut postings: u64 = gated
                     .iter()
                     .map(|(si, cluster, _)| {
@@ -789,7 +719,7 @@ impl SupertableReader {
         }
 
         // Cell-tagged candidates above keep the closest `nprobe` fine
-        // centroids per immutable fragment inside each selected coarse cell.
+        // centroids across all selected coarse cells and their fragments.
         // Untagged legacy candidates still use the global fallback budget.
         let n_eligible = {
             let mut segs: Vec<usize> = scored
@@ -1642,7 +1572,7 @@ impl SupertableReader {
             }
         };
         let fast_state = async {
-            let _ = vit.refresh().await;
+            vit.ensure_fresh_async().await;
             vit.pinned_reader()
                 .hidden_deleted_ids()
                 .map_err(|error| QueryError::Execute(error.to_string()))
@@ -1662,9 +1592,15 @@ impl SupertableReader {
                 .await?
         };
         let mut combined = top_k_ascending(vec![hidden_hits, user_hits], candidate_k);
+        if let Some(hit) = combined.iter().find(|hit| hit.stable_id.is_none()) {
+            return Err(QueryError::Execute(format!(
+                "hit {:?}/{} missing stable _id before combined delete filtering",
+                hit.superfile, hit.local_doc_id
+            )));
+        }
         combined.retain(|hit| {
             hit.stable_id
-                .is_none_or(|id| deleted.binary_search(&id).is_err())
+                .is_some_and(|id| deleted.binary_search(&id).is_err())
         });
         combined.truncate(k);
         Ok(combined)
@@ -1710,7 +1646,7 @@ impl SupertableReader {
             };
             let id_column = self.options().id_column.as_str();
             if projection_is_id_score_only(projection, id_column) {
-                let batch = hits_id_score_batch(self, &hits).await?;
+                let batch = hits_id_score_batch(self, &hits)?;
                 return Ok(vec![batch]);
             }
             let hits = user_placement_for_scalar_resolve(self, &hits).await?;

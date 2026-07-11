@@ -443,29 +443,40 @@ impl ExecutionPlan for HybridSearchExec {
 /// fusion.
 ///
 /// Each list is assumed best-first. A hit at 0-based position `r`
-/// contributes `1 / (RRF_K + r + 1)` to its `(superfile, local_doc_id)`
-/// identity; contributions from the two lists are summed. The result
+/// contributes `1 / (RRF_K + r + 1)` to its stable `_id` identity when
+/// stamped, otherwise to its `(superfile, local_doc_id)` identity;
+/// contributions from the two lists are summed. Stable identity matters for
+/// cell-packed files because BM25 local ids follow Parquet order while vector
+/// local ids follow packed-cell order. The result
 /// is sorted by fused score descending — `(superfile, local_doc_id)` as
 /// a total tie-break so the order is deterministic regardless of the
 /// `HashMap`'s iteration order — and truncated to `k`. The returned
 /// hits carry the fused RRF score (higher is better).
 fn rrf_fuse(bm25: &[SuperfileHit], vector: &[SuperfileHit], k: usize) -> Vec<SuperfileHit> {
-    let mut acc: HashMap<(SuperfileUri, u32), f32> =
+    #[derive(Clone, Copy, Eq, Hash, PartialEq)]
+    enum HitIdentity {
+        Stable(i128),
+        Local(SuperfileUri, u32),
+    }
+
+    let mut acc: HashMap<HitIdentity, (SuperfileHit, f32)> =
         HashMap::with_capacity(bm25.len() + vector.len());
     for list in [bm25, vector] {
         for (rank, hit) in list.iter().enumerate() {
             let contribution = 1.0 / (RRF_K + rank as f32 + 1.0);
-            *acc.entry((hit.superfile, hit.local_doc_id)).or_insert(0.0) += contribution;
+            let identity = hit.stable_id.map_or(
+                HitIdentity::Local(hit.superfile, hit.local_doc_id),
+                HitIdentity::Stable,
+            );
+            acc.entry(identity).or_insert((*hit, 0.0)).1 += contribution;
         }
     }
 
     let mut fused: Vec<SuperfileHit> = acc
         .into_iter()
-        .map(|((superfile, local_doc_id), score)| SuperfileHit {
-            superfile,
-            local_doc_id,
-            score,
-            stable_id: None,
+        .map(|(_, (mut hit, score))| {
+            hit.score = score;
+            hit
         })
         .collect();
     fused.sort_by(|a, b| {
@@ -699,6 +710,29 @@ mod tests {
         }];
         let fused = rrf_fuse(&bm25, &vector, 10);
         assert_eq!(fused.len(), 2, "distinct superfiles → distinct hits");
+    }
+
+    #[test]
+    fn rrf_fuse_joins_different_layout_locals_by_stable_id() {
+        let stable_id = 42i128;
+        let bm25 = vec![SuperfileHit {
+            superfile: SuperfileUri::new_v4(),
+            local_doc_id: 3,
+            score: 1.0,
+            stable_id: Some(stable_id),
+        }];
+        let vector = vec![SuperfileHit {
+            superfile: SuperfileUri::new_v4(),
+            local_doc_id: 17,
+            score: 0.1,
+            stable_id: Some(stable_id),
+        }];
+
+        let fused = rrf_fuse(&bm25, &vector, 10);
+        assert_eq!(fused.len(), 1, "one logical row must fuse once");
+        assert_eq!(fused[0].stable_id, Some(stable_id));
+        let expected = 2.0 / (RRF_K + 1.0);
+        assert!((fused[0].score - expected).abs() < 1e-6);
     }
 
     // ---- end-to-end through query_sql ----

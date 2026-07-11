@@ -96,7 +96,7 @@ use crate::{
         manifest::SuperfileEntry,
         query::{
             SuperfileHit, dispatch,
-            exec::common::{resolve_hits_named, take_rows_object_store},
+            exec::common::{resolve_hits_named, take_rows_byte_source},
             prune::{PruneLeaf, select_superfiles},
         },
         tombstones::SidecarCache,
@@ -353,9 +353,10 @@ impl SupertableReader {
                 Ok(hits)
             }
         };
-        let per_unit = dispatch::fanout(self, units, kernel).await?;
-
-        Ok(top_k_descending(per_unit, k))
+        let per_unit = dispatch::fanout_local_hits(self, units, kernel).await?;
+        let mut hits = top_k_descending(per_unit, k);
+        dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
+        Ok(hits)
     }
 
     /// Prefix-expanded BM25 search across the pinned manifest's
@@ -435,9 +436,10 @@ impl SupertableReader {
                 }
             }
         };
-        let per_unit = dispatch::fanout(self, units, kernel).await?;
-
-        Ok(top_k_descending(per_unit, k))
+        let per_unit = dispatch::fanout_local_hits(self, units, kernel).await?;
+        let mut hits = top_k_descending(per_unit, k);
+        dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
+        Ok(hits)
     }
 
     /// Unranked token match across the pinned snapshot. Returns
@@ -486,8 +488,10 @@ impl SupertableReader {
                 Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
             }
         };
-        let per_unit = dispatch::fanout(self, units, kernel).await?;
-        Ok(per_unit.into_iter().flatten().collect())
+        let per_unit = dispatch::fanout_local_hits(self, units, kernel).await?;
+        let mut hits: Vec<SuperfileHit> = per_unit.into_iter().flatten().collect();
+        dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
+        Ok(hits)
     }
 
     /// Count documents whose `column` matches `query`'s tokens under
@@ -621,7 +625,6 @@ impl SupertableReader {
         let column_arc = Arc::new(column.to_owned());
         let value_arc = Arc::new(value.to_owned());
         let tokens_arc = Arc::new(term_strings);
-        let storage = manifest.options.storage.clone();
         let body = move |r: Arc<SuperfileReader>,
                          entry: Arc<SuperfileEntry>,
                          tombstone_cache: Option<Arc<SidecarCache>>,
@@ -630,7 +633,6 @@ impl SupertableReader {
             let column_arc = Arc::clone(&column_arc);
             let value_arc = Arc::clone(&value_arc);
             let tokens_arc = Arc::clone(&tokens_arc);
-            let storage = storage.clone();
             async move {
                 let candidates: Vec<u32> = if tokens_arc.is_empty() {
                     (0..r.n_docs() as u32).collect()
@@ -647,33 +649,9 @@ impl SupertableReader {
                     r.take_by_local_doc_ids(&candidates, &[column_arc.as_str()])
                         .map_err(|e| QueryError::Parquet(e.to_string()))?
                 } else {
-                    let storage = storage.as_ref().ok_or_else(|| {
-                        QueryError::Execute(
-                            "exact_match lazy verification needs a storage backend".into(),
-                        )
-                    })?;
-                    let (object_store, path) = storage
-                        .object_store_handle(&entry.uri.storage_path())
-                        .ok_or_else(|| {
-                            QueryError::Execute(
-                                "exact_match storage has no object_store handle".into(),
-                            )
-                        })?;
-                    let file_size = entry
-                        .subsection_offsets
-                        .as_ref()
-                        .map(|offsets| offsets.total_size);
-                    take_rows_object_store(
-                        object_store,
-                        path,
-                        file_size,
-                        r.schema(),
-                        r.n_docs(),
-                        &candidates,
-                        &[column_arc.as_str()],
-                    )
-                    .await
-                    .map_err(|e| QueryError::Execute(e.to_string()))?
+                    take_rows_byte_source(&r, &candidates, &[column_arc.as_str()])
+                        .await
+                        .map_err(|e| QueryError::Execute(e.to_string()))?
                 };
                 let values = batch
                     .column(0)
@@ -703,7 +681,9 @@ impl SupertableReader {
             }
         };
         let per_unit = dispatch::fanout_with(self, units, true, body).await?;
-        Ok(per_unit.into_iter().flatten().collect())
+        let mut hits: Vec<SuperfileHit> = per_unit.into_iter().flatten().collect();
+        dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
+        Ok(hits)
     }
 }
 

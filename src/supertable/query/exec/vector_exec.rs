@@ -403,7 +403,6 @@ impl ExecutionPlan for VectorSearchExec {
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             if let Some(indices) = id_score_projection {
                 return hits_id_score_batch(&reader, &hits)
-                    .await
                     .map_err(|e| DataFusionError::Execution(e.to_string()))?
                     .project(&indices)
                     .map_err(|e| DataFusionError::Execution(e.to_string()));

@@ -442,6 +442,44 @@ impl Supertable {
     }
     }
 
+    /// Decide whether this handle's consistency policy requires a pointer read
+    /// now. Bounded-staleness callers share the timestamp so concurrent query
+    /// paths cannot stampede storage.
+    fn pointer_refresh_due(&self) -> bool {
+        if self.inner.options.storage.is_none() {
+            return false;
+        }
+        match self.inner.options.read_consistency {
+            Consistency::Snapshot => false,
+            Consistency::Strong => true,
+            Consistency::BoundedStaleness(window) => {
+                // Decide whether a check is due under the lock, stamp
+                // "now" optimistically so concurrent queries don't all
+                // stampede the pointer, then release the lock before I/O.
+                {
+                    let mut last = self
+                        .inner
+                        .last_pointer_check
+                        .lock()
+                        .expect("last_pointer_check mutex poisoned");
+                    let due = last.map(|t| t.elapsed() >= window).unwrap_or(true);
+                    if due {
+                        *last = Some(Instant::now());
+                    }
+                    due
+                }
+            }
+        }
+    }
+
+    /// Async form used when freshness is one branch of a query I/O wave.
+    /// Best-effort: a failed pointer read leaves the current snapshot in place.
+    pub(crate) async fn ensure_fresh_async(&self) {
+        if self.pointer_refresh_due() {
+            let _ = self.refresh().await;
+        }
+    }
+
     /// Engine-driven read-path freshness. Applies
     /// `options.read_consistency` ([`crate::supertable::options::Consistency`]):
     /// re-checks the storage manifest pointer and advances the
@@ -455,35 +493,8 @@ impl Supertable {
     /// Best-effort: a failed pointer read leaves the current snapshot
     /// in place rather than failing the query.
     pub(crate) fn ensure_fresh(&self) {
-        if self.inner.options.storage.is_none() {
-            return;
-        }
-        match self.inner.options.read_consistency {
-            Consistency::Snapshot => {}
-            Consistency::Strong => {
-                let _ = bridge_sync_to_async(self.refresh());
-            }
-            Consistency::BoundedStaleness(window) => {
-                // Decide whether a check is due under the lock, stamp
-                // "now" optimistically so concurrent queries don't all
-                // stampede the pointer, then release the lock *before*
-                // the (blocking) pointer read.
-                let due = {
-                    let mut last = self
-                        .inner
-                        .last_pointer_check
-                        .lock()
-                        .expect("last_pointer_check mutex poisoned");
-                    let due = last.map(|t| t.elapsed() >= window).unwrap_or(true);
-                    if due {
-                        *last = Some(Instant::now());
-                    }
-                    due
-                };
-                if due {
-                    let _ = bridge_sync_to_async(self.refresh());
-                }
-            }
+        if self.pointer_refresh_due() {
+            let _ = bridge_sync_to_async(self.refresh());
         }
     }
 
@@ -1062,7 +1073,8 @@ fn build_vector_index_options(
     .ok()?;
     hidden_opts = hidden_opts
         .with_storage(Arc::clone(&sub_storage))
-        .with_vector_layout(crate::superfile::vector::layout::VectorLayout::Ivf);
+        .with_vector_layout(crate::superfile::vector::layout::VectorLayout::Ivf)
+        .with_read_consistency(user_opts.read_consistency);
     if let Some(cache) = user_opts.disk_cache.as_ref() {
         hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
     }

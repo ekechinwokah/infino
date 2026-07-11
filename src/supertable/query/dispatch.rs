@@ -32,7 +32,12 @@
 //! descending for BM25 relevance) stays with each caller; this layer
 //! returns the per-unit tagged+filtered hit lists.
 
-use std::{collections::HashSet, future::Future, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    sync::Arc,
+    time::Instant,
+};
 
 use arrow_array::Decimal128Array;
 use futures::future::try_join_all;
@@ -45,8 +50,12 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::SupertableReader,
-        manifest::SuperfileEntry,
-        query::{exec::common::take_rows_object_store, superfile_reader::superfile_reader},
+        manifest::{SuperfileEntry, SuperfileUri},
+        query::{
+            exec::common::{take_rows_byte_source, take_rows_object_store},
+            superfile_reader::superfile_reader,
+            vector::row_id_from_manifest_entry,
+        },
         reader_cache::{DiskCacheStore, SuperfileReaderCache},
         tombstones::SidecarCache,
     },
@@ -220,11 +229,124 @@ async fn apply_resolved_tombstone_filter(
     Ok(())
 }
 
+/// Attach stable `_id`s to tagged hits without paying a Parquet `_id` decode
+/// when span arithmetic already answers.
+///
+/// Id-ordered user superfiles (FTS-only, and any non-MultiCell layout) map
+/// `local → id_min + local` from the manifest. Cell-packed MultiCell files and
+/// gapped spans fall through to [`stable_ids_for_tagged_hits`] (inline IVF
+/// region, then resident `_id` pages). Callers can defer a lazy FTS `_id` read
+/// until after global top-k selection, avoiding one decode per candidate
+/// superfile. Skipping the Parquet take on the arithmetic path is what keeps
+/// warm FTS at microseconds instead of tens of milliseconds — the same class
+/// of bug as the SQL vector id-only fast path.
+async fn attach_stable_ids(
+    reader: &SuperfileReader,
+    entry: &SuperfileEntry,
+    hits: &mut [SuperfileHit],
+    fetch_lazy_id_page: bool,
+) -> Result<(), QueryError> {
+    if hits.is_empty() {
+        return Ok(());
+    }
+    if let Some(base) = row_id_from_manifest_entry(entry, 0) {
+        for hit in hits.iter_mut() {
+            hit.stable_id = Some(base + i128::from(hit.local_doc_id));
+        }
+        return Ok(());
+    }
+    let locals: Vec<u32> = hits.iter().map(|h| h.local_doc_id).collect();
+    if let Some(ids) = stable_ids_for_tagged_hits(reader, &locals).await? {
+        for (hit, id) in hits.iter_mut().zip(ids) {
+            hit.stable_id = Some(id);
+        }
+        return Ok(());
+    }
+    if !fetch_lazy_id_page {
+        return Ok(());
+    }
+    let id_column = reader.id_column();
+    let batch = take_rows_byte_source(reader, &locals, &[id_column])
+        .await
+        .map_err(|error| QueryError::Execute(error.to_string()))?;
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| QueryError::Execute("_id column missing".into()))?;
+    for (hit, id) in hits.iter_mut().zip(ids.values()) {
+        hit.stable_id = Some(*id);
+    }
+    Ok(())
+}
+
+/// Stamp a final hit set before row resolution.
+///
+/// Fan-out intentionally avoids fetching a lazy `_id` page for every candidate
+/// superfile. Once the caller has reduced those candidates to its final result
+/// set, this helper groups unresolved hits by URI and performs at most one
+/// targeted `_id` read per hit-bearing file.
+pub(crate) async fn attach_stable_ids_to_hits(
+    table_reader: &SupertableReader,
+    hits: &mut [SuperfileHit],
+) -> Result<(), QueryError> {
+    let mut grouped: HashMap<SuperfileUri, Vec<(usize, SuperfileHit)>> = HashMap::new();
+    for (index, hit) in hits.iter().copied().enumerate() {
+        if hit.stable_id.is_none() {
+            grouped.entry(hit.superfile).or_default().push((index, hit));
+        }
+    }
+    if grouped.is_empty() {
+        return Ok(());
+    }
+
+    let manifest = Arc::clone(table_reader.manifest());
+    let store = Arc::clone(&manifest.options.store);
+    let disk_cache = manifest.options.disk_cache.clone();
+    let storage = manifest.options.storage.clone();
+    let stamped = try_join_all(grouped.into_iter().map(|(uri, indexed_hits)| {
+        let manifest = Arc::clone(&manifest);
+        let store = Arc::clone(&store);
+        let disk_cache = disk_cache.clone();
+        let storage = storage.clone();
+        async move {
+            let entry = manifest
+                .lookup_superfile_entry(uri)
+                .await
+                .map_err(QueryError::ManifestLoad)?
+                .ok_or_else(|| {
+                    QueryError::Execute(format!("hit superfile {uri:?} missing from manifest"))
+                })?;
+            let reader = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry).await?;
+            let mut local_hits: Vec<SuperfileHit> =
+                indexed_hits.iter().map(|(_, hit)| *hit).collect();
+            attach_stable_ids(&reader, &entry, &mut local_hits, true).await?;
+            indexed_hits
+                .into_iter()
+                .zip(local_hits)
+                .map(|((index, _), hit)| {
+                    hit.stable_id.map(|id| (index, id)).ok_or_else(|| {
+                        QueryError::Execute(format!(
+                            "hit {uri:?}/{} missing stable _id after search-wave stamping",
+                            hit.local_doc_id
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        }
+    }))
+    .await?;
+    for (index, id) in stamped.into_iter().flatten() {
+        hits[index].stable_id = Some(id);
+    }
+    Ok(())
+}
+
 /// Resolve stable user `_id`s for tagged hits from bytes already resident
 /// on this superfile reader — inline IVF region first (materialized hidden
-/// cells), then the scalar `_id` column (INCOMING staging superfiles).
-/// `None` when the bytes are not yet mmap'd (cold lazy); the remap step
-/// falls back to a manifest-backed read.
+/// cells), then the scalar `_id` column (INCOMING staging / MultiCell).
+/// `None` when the bytes are not yet mmap'd (cold lazy); [`attach_stable_ids`]
+/// then performs the targeted object-store read before returning the hit set.
 async fn stable_ids_for_tagged_hits(
     reader: &SuperfileReader,
     locals: &[u32],
@@ -308,19 +430,9 @@ where
                 let reader_for_ids = Arc::clone(&r);
                 let hits = kernel(r, params).await?;
                 let mut tagged = tag_hits(&entry, hits);
-                // Piggyback the hidden→user `_id` resolve onto the search.
-                // Materialized hidden cells: inline `_id` region (prefetched
-                // on cold, resident on warm). INCOMING staging superfiles:
-                // scalar `_id` column via sync `take_by_local_doc_ids` on
-                // resident bytes — both skip the trailing remap GET.
-                if !tagged.is_empty() {
-                    let locals: Vec<u32> = tagged.iter().map(|h| h.local_doc_id).collect();
-                    if let Some(ids) = stable_ids_for_tagged_hits(&reader_for_ids, &locals).await? {
-                        for (h, id) in tagged.iter_mut().zip(ids) {
-                            h.stable_id = Some(id);
-                        }
-                    }
-                }
+                // Prefer manifest span arithmetic; only touch `_id` pages /
+                // inline IVF regions when the layout is cell-packed or gapped.
+                attach_stable_ids(&reader_for_ids, &entry, &mut tagged, false).await?;
                 apply_resolved_tombstone_filter(
                     &reader_for_ids,
                     storage.as_ref(),
@@ -330,6 +442,39 @@ where
                     now,
                 )
                 .await?;
+                Ok::<Vec<SuperfileHit>, QueryError>(tagged)
+            }
+        },
+    )
+    .await
+}
+
+/// Fan out a kernel whose local ids are Parquet-local (FTS and exact-match).
+///
+/// These hits can apply ordinary tombstones directly and defer stable-id
+/// stamping until after global top-k selection. Vector MultiCell hits use
+/// [`fanout`] instead because their local ids include cell-ordering and
+/// boundary stubs.
+pub(crate) async fn fanout_local_hits<P, K, Fut>(
+    reader: &SupertableReader,
+    units: Vec<(Arc<SuperfileEntry>, P)>,
+    kernel: K,
+) -> Result<Vec<Vec<SuperfileHit>>, QueryError>
+where
+    P: Send + 'static,
+    K: Fn(Arc<SuperfileReader>, P) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<Vec<(u32, f32)>, QueryError>> + Send + 'static,
+{
+    fanout_with(
+        reader,
+        units,
+        true,
+        move |r, entry, tombstone_cache, now, params| {
+            let kernel = kernel.clone();
+            async move {
+                let hits = kernel(r, params).await?;
+                let mut tagged = tag_hits(&entry, hits);
+                apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
                 Ok::<Vec<SuperfileHit>, QueryError>(tagged)
             }
         },
@@ -360,14 +505,7 @@ where
                 let reader_for_ids = Arc::clone(&r);
                 let hits = kernel(r, params).await?;
                 let mut tagged = tag_hits(&entry, hits);
-                if !tagged.is_empty() {
-                    let locals: Vec<u32> = tagged.iter().map(|h| h.local_doc_id).collect();
-                    if let Some(ids) = stable_ids_for_tagged_hits(&reader_for_ids, &locals).await? {
-                        for (h, id) in tagged.iter_mut().zip(ids) {
-                            h.stable_id = Some(id);
-                        }
-                    }
-                }
+                attach_stable_ids(&reader_for_ids, &entry, &mut tagged, false).await?;
                 Ok::<Vec<SuperfileHit>, QueryError>(tagged)
             }
         },
