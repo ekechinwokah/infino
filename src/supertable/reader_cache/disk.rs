@@ -7,12 +7,12 @@
 
 use std::{
     collections::HashSet,
-    fmt, fs, io,
+    env, fmt, fs, io,
     io::SeekFrom,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -21,12 +21,15 @@ use std::{
 
 use bytes::Bytes;
 use dashmap::{DashMap, mapref::entry::Entry};
-use futures::future::try_join_all;
+use futures::{
+    future::try_join_all,
+    stream::{FuturesUnordered, StreamExt},
+};
 use memmap2::{Mmap, UncheckedAdvice};
 use thiserror::Error;
 use tokio::{
     io::{AsyncSeekExt, AsyncWriteExt},
-    sync::{OnceCell, oneshot},
+    sync::{OnceCell, Semaphore, oneshot},
     task::{JoinHandle, spawn_blocking},
 };
 
@@ -66,6 +69,9 @@ const FTS_OPEN_HEADER_FALLBACK_BYTES: u64 = 48;
 /// superfile. Short so the waiter picks up the promotion promptly
 /// without busy-spinning.
 const MMAP_PROMOTION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Yield cadence while a background fill waits for its foreground reader.
+const STORE_UPGRADE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Filename suffix for per-superfile sparse block-cache files.
 const BLOCKS_FILE_SUFFIX: &str = ".blocks";
@@ -148,6 +154,9 @@ struct CachedEntry {
     size_bytes: Arc<AtomicU64>,
     /// Who owns accounting release for this entry.
     accounting: EntryAccounting,
+    /// Identity of the sparse source currently allowed to grow this lazy
+    /// entry. `None` for eager and mmap-backed entries.
+    block_token: Option<Arc<()>>,
     last_access_us: AtomicU64,
 }
 
@@ -156,6 +165,7 @@ enum EntryAccounting {
     /// Store-reserved entry; removal releases `size_bytes`.
     Eager,
     /// Block-source-reserved entry; source drop releases bytes.
+    #[cfg(test)]
     SourceOwned,
 }
 
@@ -230,6 +240,8 @@ pub struct DiskCacheStore {
     /// mutex and invoke it lock-free, so the mutex is held
     /// only for the Arc bump.
     pinned_fn: std::sync::Mutex<Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync>>,
+    /// Global cap on concurrent background full-superfile fills.
+    prefetch_semaphore: Arc<Semaphore>,
 }
 
 impl fmt::Debug for DiskCacheStore {
@@ -262,6 +274,7 @@ impl DiskCacheStore {
         let threshold_secs = config.mmap_cold_threshold_secs;
         let interval_secs = config.mmap_sweep_interval_secs.max(1);
         let configured_budget = config.disk_budget_bytes;
+        let prefetch_semaphore = Arc::new(Semaphore::new(config.prefetch_concurrency.max(1)));
         let store = Arc::new(Self {
             storage,
             config,
@@ -277,6 +290,7 @@ impl DiskCacheStore {
             n_madvise_calls: AtomicU64::new(0),
             n_promotion_waiters: AtomicU64::new(0),
             pinned_fn: std::sync::Mutex::new(pinned_fn),
+            prefetch_semaphore,
         });
 
         // Reuse any cache files a prior run (or another handle) left on disk:
@@ -962,6 +976,7 @@ impl DiskCacheStore {
             mmap: Some(mmap_arc),
             size_bytes: Arc::new(AtomicU64::new(size)),
             accounting: EntryAccounting::Eager,
+            block_token: None,
             last_access_us: AtomicU64::new(self.now_us()),
         }))
     }
@@ -1160,6 +1175,7 @@ impl DiskCacheStore {
             mmap: None, // hybrid foreground entry is in-memory; finalizer mmaps later
             size_bytes: Arc::new(AtomicU64::new(size)),
             accounting: EntryAccounting::Eager,
+            block_token: None,
             last_access_us: AtomicU64::new(self.now_us()),
         });
         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
@@ -1267,8 +1283,8 @@ impl DiskCacheStore {
         fetch_storage: Arc<dyn StorageProvider>,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = Self::storage_path(uri);
-        let filled_bytes: Arc<AtomicU64>;
-        let (lazy_reader, _size) = if let Some(offsets) = offsets {
+        let block_token: Arc<()>;
+        let (lazy_reader, size) = if let Some(offsets) = offsets {
             let total_size = offsets.total_size;
 
             // Match `SuperfileReader::open_lazy_with`'s parquet tail
@@ -1301,17 +1317,21 @@ impl DiskCacheStore {
                 }
             };
 
-            // Build the lazy source stack: storage range source ->
-            // block cache source -> prefetch overlay.
+            // Build the lazy source with the size baked in (no HEAD or suffix
+            // discovery), then overlay the open-time byte ranges.
             let inner: Arc<dyn LazyByteSource> = Arc::new(StorageRangeSource::with_known_size(
                 Arc::clone(&fetch_storage),
                 storage_uri.clone(),
                 total_size,
             ));
-            let block_src =
-                BlockCachedSource::new(inner, Arc::downgrade(self), *uri, self.blocks_path(uri));
-            filled_bytes = block_src.filled_bytes_handle();
-            let mut overlay = PrefetchedSource::new(block_src);
+            let block_source = BlockCachedSource::new_pre_reserved(
+                inner,
+                Arc::downgrade(self),
+                *uri,
+                self.blocks_path(uri),
+            );
+            block_token = block_source.entry_token();
+            let mut overlay = PrefetchedSource::new(block_source);
 
             if !offsets.open_blob.is_empty() {
                 // The open-batch bytes (parquet tail + vector + FTS open
@@ -1384,33 +1404,59 @@ impl DiskCacheStore {
                     Arc::clone(&fetch_storage),
                     storage_uri.clone(),
                 ));
-            let block_src = BlockCachedSource::new(
+            let block_source = BlockCachedSource::new_pre_reserved(
                 range_src,
                 Arc::downgrade(self),
                 *uri,
                 self.blocks_path(uri),
             );
-            filled_bytes = block_src.filled_bytes_handle();
-            let block_src: Arc<dyn LazyByteSource> = block_src;
+            block_token = block_source.entry_token();
+            let source: Arc<dyn LazyByteSource> = block_source;
             let lazy_reader = SuperfileReader::open_lazy_with(
-                Arc::clone(&block_src),
+                Arc::clone(&source),
                 OpenOptions { verify_crc: false },
             )
             .await?;
-            let size = block_src.size();
+            let size = source.size();
             (lazy_reader, size)
         };
+
+        self.reserve_manual(size).await?;
+        let reserved_bytes = size;
 
         let lazy_reader = Arc::new(lazy_reader);
         let entry = Arc::new(CachedEntry {
             reader: Arc::clone(&lazy_reader),
             mmap: None,
-            size_bytes: filled_bytes,
-            accounting: EntryAccounting::SourceOwned,
+            size_bytes: Arc::new(AtomicU64::new(size)),
+            accounting: EntryAccounting::Eager,
+            block_token: Some(block_token),
             last_access_us: AtomicU64::new(self.now_us()),
         });
         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
         self.cached.insert(*uri, Arc::clone(&entry));
+
+        // Do not let the full download compete with the foreground lazy
+        // query. Once that reader is released, promote the immutable
+        // superfile to an mmap-backed cache entry.
+        if !skip_background_fill() {
+            let store = Arc::downgrade(self);
+            let reader = Arc::downgrade(&lazy_reader);
+            let uri_owned = *uri;
+            let storage_uri_owned = storage_uri;
+            tokio::spawn(async move {
+                let _ = lazy_background_fill(
+                    store,
+                    reader,
+                    uri_owned,
+                    storage_uri_owned,
+                    size,
+                    reserved_bytes,
+                    fetch_storage,
+                )
+                .await;
+            });
+        }
 
         Ok(entry)
     }
@@ -1453,6 +1499,7 @@ impl DiskCacheStore {
             mmap: Some(mmap_arc),
             size_bytes: Arc::new(AtomicU64::new(size)),
             accounting: EntryAccounting::Eager,
+            block_token: None,
             last_access_us: AtomicU64::new(self.now_us()),
         });
         self.cached.insert(*uri, Arc::clone(&entry));
@@ -1499,15 +1546,16 @@ impl DiskCacheStore {
         self.current_bytes.fetch_sub(bytes, Ordering::Release);
     }
 
-    /// True when `filled` is still the live `size_bytes` counter for `uri`.
-    pub(super) fn lazy_block_entry_is_current(
-        &self,
-        uri: &SuperfileUri,
-        filled: &Arc<AtomicU64>,
-    ) -> bool {
+    /// True when `token` still identifies the live lazy entry for `uri`.
+    pub(super) fn lazy_block_entry_is_current(&self, uri: &SuperfileUri, token: &Arc<()>) -> bool {
         self.cached
             .get(uri)
-            .map(|entry| Arc::ptr_eq(&entry.size_bytes, filled))
+            .and_then(|entry| {
+                entry
+                    .block_token
+                    .as_ref()
+                    .map(|current| Arc::ptr_eq(current, token))
+            })
             .unwrap_or(false)
     }
 
@@ -1520,7 +1568,12 @@ impl DiskCacheStore {
     }
 
     #[cfg(test)]
-    pub(super) fn install_block_entry_for_test(&self, uri: SuperfileUri, filled: Arc<AtomicU64>) {
+    pub(super) fn install_block_entry_for_test(
+        &self,
+        uri: SuperfileUri,
+        filled: Arc<AtomicU64>,
+        block_token: Arc<()>,
+    ) {
         let reader =
             SuperfileReader::open(tests::tiny_superfile_bytes()).expect("tiny superfile opens");
         self.cached.insert(
@@ -1530,6 +1583,7 @@ impl DiskCacheStore {
                 mmap: None,
                 size_bytes: filled,
                 accounting: EntryAccounting::SourceOwned,
+                block_token: Some(block_token),
                 last_access_us: AtomicU64::new(self.now_us()),
             }),
         );
@@ -1787,6 +1841,7 @@ async fn finalize_to_mmap(
                     mmap: Some(mmap_arc),
                     size_bytes: Arc::new(AtomicU64::new(size)),
                     accounting: EntryAccounting::Eager,
+                    block_token: None,
                     last_access_us: AtomicU64::new(store.started_at.elapsed().as_micros() as u64),
                 });
             }
@@ -1836,6 +1891,226 @@ async fn fetch_hint_ranges(
     .await
 }
 
+fn background_store_abandoned(store: &Arc<DiskCacheStore>) -> bool {
+    Arc::strong_count(store) == 1
+}
+
+async fn wait_for_lazy_foreground_release(
+    store: &Weak<DiskCacheStore>,
+    reader: &Weak<SuperfileReader>,
+) -> Option<Arc<DiskCacheStore>> {
+    loop {
+        if store.strong_count() == 0 || reader.strong_count() == 0 {
+            return None;
+        }
+        if let Some(strong) = store.upgrade()
+            && strong.n_promotion_waiters.load(Ordering::Acquire) > 0
+        {
+            return Some(strong);
+        }
+        if reader.strong_count() <= 1 {
+            // `strong_count == 1` also occurs briefly while a caller is
+            // acquiring the cache entry, so re-check after one scheduler turn.
+            tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
+            if reader.strong_count() <= 1 {
+                return store.upgrade();
+            }
+            continue;
+        }
+        tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
+    }
+}
+
+/// Wait for a quiet interval with no foreground query. The grace re-check
+/// prevents a fill from starting between reader open and query execution.
+async fn wait_for_foreground_quiescence(store: &Arc<DiskCacheStore>) -> bool {
+    loop {
+        while FOREGROUND_QUERIES.load(Ordering::Acquire) > 0 {
+            if background_store_abandoned(store) {
+                return false;
+            }
+            tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
+        }
+        tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
+        if FOREGROUND_QUERIES.load(Ordering::Acquire) == 0 {
+            return !background_store_abandoned(store);
+        }
+    }
+}
+
+async fn cold_fetch_to_disk_cancelable(
+    store: &Arc<DiskCacheStore>,
+    fetch_storage: &Arc<dyn StorageProvider>,
+    storage_uri: &str,
+    dest_path: &Path,
+    size: u64,
+) -> Result<bool, DiskCacheError> {
+    let n_streams = store.config.cold_fetch_streams.max(1);
+    let chunk_size = store.config.cold_fetch_chunk_bytes.max(1);
+    let file = {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dest_path)?;
+        file.set_len(size)?;
+        Arc::new(file)
+    };
+
+    let n_chunks = if size == 0 {
+        0
+    } else {
+        size.div_ceil(chunk_size)
+    };
+    let mut next_chunk = 0u64;
+    let mut in_flight = FuturesUnordered::new();
+
+    // Bound memory by `n_streams × chunk_size` and stop promptly when the
+    // short-lived cache that requested this background fill is dropped.
+    loop {
+        while next_chunk < n_chunks && in_flight.len() < n_streams {
+            if background_store_abandoned(store) {
+                return Ok(false);
+            }
+            let start = next_chunk * chunk_size;
+            let end = (start + chunk_size).min(size);
+            let storage = Arc::clone(fetch_storage);
+            let file = Arc::clone(&file);
+            let uri = storage_uri.to_string();
+            in_flight.push(async move {
+                let bytes = storage.get_range(&uri, start..end).await?;
+                spawn_blocking(move || file.write_all_at(&bytes, start))
+                    .await
+                    .map_err(|error| {
+                        DiskCacheError::SuperfileOpen(format!("write join: {error}"))
+                    })??;
+                Ok::<(), DiskCacheError>(())
+            });
+            next_chunk += 1;
+        }
+
+        match in_flight.next().await {
+            Some(result) => result?,
+            None => break,
+        }
+        if background_store_abandoned(store) {
+            return Ok(false);
+        }
+    }
+
+    if background_store_abandoned(store) {
+        return Ok(false);
+    }
+    spawn_blocking(move || file.sync_all())
+        .await
+        .map_err(|error| DiskCacheError::SuperfileOpen(format!("fsync join: {error}")))??;
+    Ok(true)
+}
+
+fn rollback_lazy_background_fill(store: &Arc<DiskCacheStore>, uri: &SuperfileUri, tmp: &Path) {
+    if let Some((_, entry)) = store.cached.remove(uri) {
+        store.release_entry_accounting(&entry);
+    }
+    store.coordinators.remove(uri);
+    let _ = fs::remove_file(tmp);
+}
+
+/// Diagnostic gate for measuring lazy foreground reads without promotion.
+pub(crate) fn skip_background_fill() -> bool {
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    *SKIP.get_or_init(|| {
+        env::var("INFINO_DISABLE_BG_FILL")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Promote one released lazy reader to an mmap-backed cache entry.
+async fn lazy_background_fill(
+    store: Weak<DiskCacheStore>,
+    reader: Weak<SuperfileReader>,
+    uri: SuperfileUri,
+    storage_uri: String,
+    size: u64,
+    reserved_bytes: u64,
+    fetch_storage: Arc<dyn StorageProvider>,
+) -> Result<(), DiskCacheError> {
+    let Some(store) = wait_for_lazy_foreground_release(&store, &reader).await else {
+        return Ok(());
+    };
+    let tmp = store.tmp_path(&uri);
+    let final_path = store.cache_path(&uri);
+
+    if background_store_abandoned(&store) {
+        rollback_lazy_background_fill(&store, &uri, &tmp);
+        let _ = reserved_bytes;
+        return Ok(());
+    }
+
+    let _prefetch_permit = match Arc::clone(&store.prefetch_semaphore).acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => {
+            rollback_lazy_background_fill(&store, &uri, &tmp);
+            return Err(DiskCacheError::SuperfileOpen(format!(
+                "prefetch semaphore closed: {error}"
+            )));
+        }
+    };
+    if !wait_for_foreground_quiescence(&store).await {
+        rollback_lazy_background_fill(&store, &uri, &tmp);
+        return Ok(());
+    }
+
+    let result: Result<(), DiskCacheError> = async {
+        if background_store_abandoned(&store) {
+            return Ok(());
+        }
+        if !cold_fetch_to_disk_cancelable(&store, &fetch_storage, &storage_uri, &tmp, size).await? {
+            return Ok(());
+        }
+        if background_store_abandoned(&store) {
+            return Ok(());
+        }
+
+        tokio::fs::rename(&tmp, &final_path).await?;
+        let mmap = open_readonly_mmap(&final_path)?;
+        let mmap_arc = Arc::new(mmap);
+        let bytes = Bytes::from_owner(ArcMmapOwner(Arc::clone(&mmap_arc)));
+        let reader = SuperfileReader::open_with(
+            bytes,
+            OpenOptions {
+                verify_crc: store.config.verify_crc_on_open,
+            },
+        )?;
+
+        match store.cached.entry(uri) {
+            Entry::Occupied(mut occupied) => {
+                *occupied.get_mut() = Arc::new(CachedEntry {
+                    reader: Arc::new(reader),
+                    mmap: Some(mmap_arc),
+                    size_bytes: Arc::new(AtomicU64::new(size)),
+                    accounting: EntryAccounting::Eager,
+                    block_token: None,
+                    last_access_us: AtomicU64::new(store.now_us()),
+                });
+            }
+            Entry::Vacant(_) => {
+                let _ = fs::remove_file(&final_path);
+            }
+        }
+        store.coordinators.remove(&uri);
+        Ok(())
+    }
+    .await;
+
+    if result.is_err() || background_store_abandoned(&store) {
+        rollback_lazy_background_fill(&store, &uri, &tmp);
+        let _ = fs::remove_file(&tmp);
+    }
+    let _ = reserved_bytes;
+    result
+}
+
 /// Newtype around `Arc<Mmap>` that delegates `AsRef<[u8]>`
 /// to the underlying `Mmap`. Lets the cache's `mmap: Arc<Mmap>`
 /// field and the reader's `Bytes::from_owner(...)` share the
@@ -1875,6 +2150,11 @@ mod tests {
         superfile::builder::{BuilderOptions, SuperfileBuilder},
         test_helpers::{decimal128_id_field, decimal128_ids},
     };
+
+    /// Local-filesystem background promotion should finish well within this.
+    const PROMOTE_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Long enough to cover several background quiet-interval checks.
+    const FOREGROUND_GUARD_HOLD: Duration = Duration::from_millis(50);
 
     /// Build the raw bytes of a minimal superfile (one scalar batch,
     /// no indexes).
@@ -2437,7 +2717,7 @@ mod tests {
     // ----- lazy-foreground-with-background-fill mode -----
 
     #[tokio::test]
-    async fn reader_lazy_unknown_size_cold_then_stays_lazy() {
+    async fn reader_lazy_unknown_size_promotes_after_release() {
         let (_dir, store) = test_store_with(|cfg| {
             cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
         });
@@ -2449,15 +2729,21 @@ mod tests {
         assert_eq!(r.n_docs(), 1);
         assert_eq!(store.stats().n_cold_fetches, 1);
 
-        // Drop and re-read: still cached, no extra cold fetch, no mmap promotion.
+        // Releasing the foreground reader permits the full-file background
+        // fill to replace the lazy entry with an mmap-backed reader.
         drop(r);
-        let _r2 = store.reader(&uri).await.expect("warm lazy");
+        store
+            .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
+            .await
+            .expect("background promotion");
+        let r2 = store.reader(&uri).await.expect("warm mmap");
         assert_eq!(store.stats().n_cold_fetches, 1);
-        assert!(!store.is_mmap_promoted(&uri));
+        assert!(store.is_mmap_promoted(&uri));
+        assert!(r2.parquet_bytes().is_some());
     }
 
     #[tokio::test]
-    async fn reader_lazy_with_hints_known_size_stays_lazy() {
+    async fn reader_lazy_with_hints_known_size_promotes_after_release() {
         let (_dir, store) = test_store_with(|cfg| {
             cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
         });
@@ -2484,12 +2770,41 @@ mod tests {
         assert_eq!(r.n_docs(), 1);
         assert_eq!(store.stats().n_cold_fetches, 1);
         drop(r);
-        let _r2 = store
+        store
+            .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
+            .await
+            .expect("background promotion");
+        let r2 = store
             .reader_with_hints(&uri, Some(&offsets), None)
             .await
-            .expect("warm hinted lazy");
+            .expect("warm hinted mmap");
         assert_eq!(store.stats().n_cold_fetches, 1);
-        assert!(!store.is_mmap_promoted(&uri));
+        assert!(store.is_mmap_promoted(&uri));
+        assert!(r2.parquet_bytes().is_some());
+    }
+
+    #[tokio::test]
+    async fn background_fill_waits_for_foreground_query_guard() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+
+        let reader = store.reader(&uri).await.expect("lazy cold");
+        let foreground = ForegroundQueryGuard::enter();
+        drop(reader);
+        tokio::time::sleep(FOREGROUND_GUARD_HOLD).await;
+        assert!(
+            !store.is_mmap_promoted(&uri),
+            "background promotion must yield while a foreground query is active"
+        );
+
+        drop(foreground);
+        store
+            .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
+            .await
+            .expect("promotion resumes after foreground query");
     }
 
     // ----- wait_until_mmap_promoted timeout path -----

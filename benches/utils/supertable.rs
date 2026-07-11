@@ -37,8 +37,8 @@
 //! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SUPERTABLE_DOCS=100000 cargo bench -- supertable
 //! ```
 
-#[allow(unused_imports)] // `Instant` is consumed by the child mods via `use super::*`
-use std::time::Instant;
+#[allow(unused_imports)] // consumed by child mods via `use super::*`
+use std::time::{Duration, Instant};
 use std::{
     env,
     process::{Command, Stdio},
@@ -653,6 +653,8 @@ pub fn run() {
 const WARM_ITERS: usize = 20;
 const COLD_ITERS: usize = 5;
 const TOP_K: usize = 10;
+/// Maximum wait for background full-file cache promotion before warm timing.
+const WARM_PROMOTION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Selected phases for a per-modality supertable runner.
 ///
@@ -789,9 +791,9 @@ pub mod fts {
                     "Supertable FTS — search, multi-superfile / object-store ({} docs)",
                     fmt_count(n_docs)
                 ),
-                "Warm = shared consumer + disk cache; each query runs once untimed (cache fill), then \
-                 p50 over repeated bm25_search. Cold = fresh disk cache + consumer per iteration, so \
-                 each read pays the object-store cold open. Δ is vs the previous run.",
+                "Warm = shared consumer after every superfile is mmap-promoted; each query then runs \
+                 once untimed before p50 over repeated bm25_search. Cold = fresh disk cache + consumer \
+                 per iteration, so each read pays the object-store cold open. Δ is vs the previous run.",
                 warm.as_deref(),
                 cold.as_ref(),
                 None,
@@ -876,9 +878,13 @@ pub mod fts {
         eprintln!("[supertable_fts] warm: opening shared consumer...");
         crate::rss::log_rss_breakdown("supertable_fts before consumer open");
         let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
+        crate::executors::open_all_superfiles(&consumer);
+        consumer
+            .wait_until_warm(WARM_PROMOTION_TIMEOUT)
+            .expect("FTS warm cache promotion");
         let reader = consumer.reader();
         eprintln!(
-            "[supertable_fts] warm: timing {} queries × {WARM_ITERS} iters via bm25_search (untimed prewarm per query)...",
+            "[supertable_fts] warm: mmap ready; timing {} queries × {WARM_ITERS} iters via bm25_search (untimed prewarm per query)...",
             FTS_BATTERY.len(),
         );
         let out = exec_fts::measure_warm(

@@ -74,6 +74,10 @@ pub(crate) struct BlockCachedSource {
     store: Weak<DiskCacheStore>,
     uri: SuperfileUri,
     path: PathBuf,
+    /// Distinguishes this source from a replacement entry for the same URI.
+    entry_token: Arc<()>,
+    /// Whether this source reserves and releases touched-block bytes itself.
+    owns_accounting: bool,
     state: OnceLock<Option<BlockFile>>,
     /// Filled-block set. Guarded by a sync mutex; never held across await.
     filled: Mutex<RoaringBitmap>,
@@ -84,25 +88,55 @@ pub(crate) struct BlockCachedSource {
 }
 
 impl BlockCachedSource {
+    #[cfg(test)]
     pub(crate) fn new(
         inner: Arc<dyn LazyByteSource>,
         store: Weak<DiskCacheStore>,
         uri: SuperfileUri,
         path: PathBuf,
     ) -> Arc<Self> {
+        Self::new_with_accounting(inner, store, uri, path, true)
+    }
+
+    /// Construct a sparse source whose owning entry has already reserved the
+    /// complete object size.
+    pub(crate) fn new_pre_reserved(
+        inner: Arc<dyn LazyByteSource>,
+        store: Weak<DiskCacheStore>,
+        uri: SuperfileUri,
+        path: PathBuf,
+    ) -> Arc<Self> {
+        Self::new_with_accounting(inner, store, uri, path, false)
+    }
+
+    fn new_with_accounting(
+        inner: Arc<dyn LazyByteSource>,
+        store: Weak<DiskCacheStore>,
+        uri: SuperfileUri,
+        path: PathBuf,
+        owns_accounting: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner,
             store,
             uri,
             path,
+            entry_token: Arc::new(()),
+            owns_accounting,
             state: OnceLock::new(),
             filled: Mutex::new(RoaringBitmap::new()),
             filled_bytes: Arc::new(AtomicU64::new(0)),
         })
     }
 
+    /// Identity token installed on the cache entry that owns this source.
+    pub(crate) fn entry_token(&self) -> Arc<()> {
+        Arc::clone(&self.entry_token)
+    }
+
     /// Shared filled-bytes counter, installed as the cache entry's
     /// `size_bytes` so accounting and eviction see live growth.
+    #[cfg(test)]
     pub(crate) fn filled_bytes_handle(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.filled_bytes)
     }
@@ -205,31 +239,35 @@ impl BlockCachedSource {
         // Only the source installed in the live cache entry accounts bytes:
         // after eviction or mmap promotion replaced the entry, keep serving
         // already-filled blocks but stop growing the footprint.
-        if !store.lazy_block_entry_is_current(&self.uri, &self.filled_bytes) {
+        if !store.lazy_block_entry_is_current(&self.uri, &self.entry_token) {
             return Ok(false);
         }
         for (rb0, rb1) in self.missing_runs(b0, b1) {
             let run_start = u64::from(rb0) * CACHE_BLOCK_BYTES;
             let run_end = (u64::from(rb1) + 1) * CACHE_BLOCK_BYTES;
             let run_len = run_end.min(bf.size) - run_start;
-            if store.reserve_block_bytes(run_len).await.is_err() {
+            if self.owns_accounting && store.reserve_block_bytes(run_len).await.is_err() {
                 // Budget pressure with no evictable victims: serve uncached.
                 return Ok(false);
             }
             let bytes = match self.inner.range(run_start, run_len).await {
                 Ok(b) => b,
                 Err(e) => {
-                    store.release_block_bytes(run_len);
+                    if self.owns_accounting {
+                        store.release_block_bytes(run_len);
+                    }
                     return Err(e);
                 }
             };
             if bf.file.write_all_at(&bytes, run_start).is_err() {
-                store.release_block_bytes(run_len);
+                if self.owns_accounting {
+                    store.release_block_bytes(run_len);
+                }
                 return Ok(false);
             }
             let newly = self.mark_filled(bf.size, rb0, rb1);
             self.filled_bytes.fetch_add(newly, Ordering::AcqRel);
-            if newly < run_len {
+            if self.owns_accounting && newly < run_len {
                 // A concurrent filler beat us to some blocks; its accounting
                 // stands, ours is released.
                 store.release_block_bytes(run_len - newly);
@@ -244,7 +282,9 @@ impl Drop for BlockCachedSource {
         // Last reader over this source is gone (entry evicted/replaced and
         // no in-flight queries): release the accounted bytes and remove the
         // sparse file. The store may already be gone at process teardown.
-        if let Some(store) = self.store.upgrade() {
+        if self.owns_accounting
+            && let Some(store) = self.store.upgrade()
+        {
             let filled = self.filled_bytes.load(Ordering::Acquire);
             if filled > 0 {
                 store.release_block_bytes(filled);
@@ -445,7 +485,7 @@ mod tests {
             dir.path().join("t.blocks"),
         );
         // Install the source as current for its (synthetic) entry.
-        store.install_block_entry_for_test(uri, src.filled_bytes_handle());
+        store.install_block_entry_for_test(uri, src.filled_bytes_handle(), src.entry_token());
 
         // Read spanning blocks 0..=2 (one contiguous missing run → 1 GET).
         let start = 100u64;
@@ -512,7 +552,7 @@ mod tests {
             uri,
             dir.path().join("runs.blocks"),
         );
-        store.install_block_entry_for_test(uri, src.filled_bytes_handle());
+        store.install_block_entry_for_test(uri, src.filled_bytes_handle(), src.entry_token());
 
         // Fill block 2 first.
         let b = CACHE_BLOCK_BYTES;

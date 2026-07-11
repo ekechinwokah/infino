@@ -44,7 +44,7 @@ use crate::{
     supertable::{
         ManifestLoadError, SuperfileUri, SupertableStats,
         options::Consistency,
-        reader_cache::disk::DiskCacheError,
+        reader_cache::disk::{DiskCacheError, skip_background_fill},
         stats::process_rss_bytes,
         tombstones::{SidecarCache, cache::DEFAULT_REFRESH_TTL},
         utils::idgen::IdGenerator,
@@ -616,12 +616,28 @@ impl Supertable {
     }
     }
 
-    /// Legacy warm barrier. With block-level lazy caching, warm-up is
-    /// query-driven and does not require full-file promotion.
+    /// Block until every resident superfile in the current manifest is
+    /// mmap-backed, or `timeout` elapses for one of them.
+    ///
+    /// The caller must first open the readers it wants warmed. Registering
+    /// this waiter lets their background fills proceed even if another handle
+    /// still holds a lazy reader.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn wait_until_warm(&self, timeout: Duration) -> Result<(), DiskCacheError> {
-        let _ = timeout;
-        Ok(())
+        let Some(cache) = self.inner.options.disk_cache.as_ref() else {
+            return Ok(());
+        };
+        if skip_background_fill() {
+            return Ok(());
+        }
+        let cache = Arc::clone(cache);
+        let manifest = self.inner.manifest.load_full();
+        self.block_on_query(async move {
+            for entry in manifest.superfiles.iter() {
+                cache.wait_until_mmap_promoted(&entry.uri, timeout).await?;
+            }
+            Ok(())
+        })
     }
 
     /// This handle's lease-owner id. Stamped on every WAL the
