@@ -97,8 +97,8 @@ use crate::{
     },
 };
 
-/// Per-tier candidate overfetch before final combined delete filtering.
-const COMBINED_DELETE_OVERFETCH_FACTOR: usize = 2;
+/// Candidate growth when a deleted row occupies a current top-k slot.
+const DELETE_REFILL_GROWTH_FACTOR: usize = 2;
 
 /// An optional text-predicate filter for vector kNN search. When
 /// supplied, kNN is ranked only among rows matching the predicate
@@ -1509,7 +1509,6 @@ impl SupertableReader {
         if k == 0 {
             return Ok(Vec::new());
         }
-        let candidate_k = k.saturating_mul(COMBINED_DELETE_OVERFETCH_FACTOR).max(k);
         let Some(vit) = self.vector_index_table() else {
             return self
                 .vector_search_user_table_async(column, query, k, options)
@@ -1531,7 +1530,7 @@ impl SupertableReader {
                 Ok(Vec::new())
             } else {
                 hidden_reader
-                    .fanout_vector_clusters(&hidden_entries, column, query, candidate_k, options)
+                    .fanout_vector_clusters(&hidden_entries, column, query, k, options)
                     .await
             }
         };
@@ -1543,31 +1542,78 @@ impl SupertableReader {
         };
         let user_parts = self.manifest().get_undrained_superfiles_loaded(&drained);
         let (hidden_hits, deleted, user_entries) = join!(hidden_search, fast_state, user_parts);
-        let hidden_hits = hidden_hits?;
+        let mut hidden_hits = hidden_hits?;
         let deleted = deleted?;
         let user_entries = user_entries.map_err(QueryError::ManifestLoad)?;
 
         // Wave 2 only when the resident user list identifies files newer than
         // the hidden watermark.
-        let user_hits = if user_entries.is_empty() {
+        let mut user_hits = if user_entries.is_empty() {
             Vec::new()
         } else {
-            self.fanout_vector_clusters(&user_entries, column, query, candidate_k, options)
+            self.fanout_vector_clusters(&user_entries, column, query, k, options)
                 .await?
         };
-        let mut combined = top_k_ascending(vec![hidden_hits, user_hits], candidate_k);
-        if let Some(hit) = combined.iter().find(|hit| hit.stable_id.is_none()) {
-            return Err(QueryError::Execute(format!(
-                "hit {:?}/{} missing stable _id before combined delete filtering",
-                hit.superfile, hit.local_doc_id
-            )));
+        let refill_cap = k.saturating_add(deleted.len()).max(k);
+        let mut requested = k;
+        loop {
+            let mut combined = top_k_ascending(vec![hidden_hits, user_hits], requested);
+            if let Some(hit) = combined.iter().find(|hit| hit.stable_id.is_none()) {
+                return Err(QueryError::Execute(format!(
+                    "hit {:?}/{} missing stable _id before combined delete filtering",
+                    hit.superfile, hit.local_doc_id
+                )));
+            }
+            let live = combined
+                .iter()
+                .filter(|hit| {
+                    hit.stable_id
+                        .is_some_and(|id| deleted.binary_search(&id).is_err())
+                })
+                .count();
+            let deleted_occupies_top_k = live < k && live < combined.len();
+            if !deleted_occupies_top_k || requested >= refill_cap {
+                combined.retain(|hit| {
+                    hit.stable_id
+                        .is_some_and(|id| deleted.binary_search(&id).is_err())
+                });
+                combined.truncate(k);
+                return Ok(combined);
+            }
+
+            let next = requested
+                .saturating_mul(DELETE_REFILL_GROWTH_FACTOR)
+                .min(refill_cap);
+            if next == requested {
+                combined.retain(|hit| {
+                    hit.stable_id
+                        .is_some_and(|id| deleted.binary_search(&id).is_err())
+                });
+                combined.truncate(k);
+                return Ok(combined);
+            }
+            requested = next;
+            let hidden_retry = async {
+                if hidden_entries.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    hidden_reader
+                        .fanout_vector_clusters(&hidden_entries, column, query, requested, options)
+                        .await
+                }
+            };
+            let user_retry = async {
+                if user_entries.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    self.fanout_vector_clusters(&user_entries, column, query, requested, options)
+                        .await
+                }
+            };
+            let (next_hidden, next_user) = join!(hidden_retry, user_retry);
+            hidden_hits = next_hidden?;
+            user_hits = next_user?;
         }
-        combined.retain(|hit| {
-            hit.stable_id
-                .is_some_and(|id| deleted.binary_search(&id).is_err())
-        });
-        combined.truncate(k);
-        Ok(combined)
     }
 
     /// Default async vector kernel — routes through the global hidden index
