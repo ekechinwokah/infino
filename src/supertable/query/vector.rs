@@ -522,6 +522,7 @@ impl SupertableReader {
         let filtered = allow.is_some();
         let (nprobe, _) = options.resolve(filtered);
         let manifest = self.manifest();
+        let hidden_vector_index = is_hidden_vector_index_table(&manifest.options);
 
         // ---- Global cross-superfile cluster selection.
         //
@@ -662,13 +663,65 @@ impl SupertableReader {
                     cutoff += 1;
                 }
                 let selected_cells = &ranked[..cutoff];
-                for (si, cluster, score, cell, _) in candidates {
-                    match cell {
-                        Some(cell) if selected_cells.contains(&cell) => {
-                            gated.push((si, cluster, score));
+                if hidden_vector_index && !filtered {
+                    let mut fine = Vec::new();
+                    for (si, cluster, score, cell, count) in candidates {
+                        match cell {
+                            Some(cell) if selected_cells.contains(&cell) => {
+                                fine.push((si, cluster, score, count));
+                            }
+                            Some(_) => {}
+                            None => scored.push((si, cluster, score)),
                         }
-                        Some(_) => {}
-                        None => scored.push((si, cluster, score)),
+                    }
+                    fine.sort_unstable_by(|a, b| {
+                        a.2.partial_cmp(&b.2)
+                            .unwrap_or(Ordering::Equal)
+                            .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
+                    });
+                    let mut keep = nprobe.max(1).min(fine.len());
+                    if keep < fine.len() {
+                        let cutoff_score = fine[keep - 1].2;
+                        while keep < fine.len()
+                            && fine[keep].2.total_cmp(&cutoff_score) == Ordering::Equal
+                        {
+                            keep += 1;
+                        }
+                    }
+                    let mut remaining = fine.split_off(keep);
+                    gated.extend(
+                        fine.into_iter()
+                            .map(|(si, cluster, score, _)| (si, cluster, score)),
+                    );
+                    let mut postings: u64 = gated
+                        .iter()
+                        .map(|(si, cluster, _)| {
+                            candidate_counts.get(&(*si, *cluster)).copied().unwrap_or(0)
+                        })
+                        .sum();
+                    if postings < gated_target {
+                        remaining.sort_unstable_by(|a, b| {
+                            a.2.partial_cmp(&b.2)
+                                .unwrap_or(Ordering::Equal)
+                                .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
+                        });
+                        for (si, cluster, score, count) in remaining {
+                            gated.push((si, cluster, score));
+                            postings += count;
+                            if postings >= gated_target {
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    for (si, cluster, score, cell, _) in candidates {
+                        match cell {
+                            Some(cell) if selected_cells.contains(&cell) => {
+                                gated.push((si, cluster, score));
+                            }
+                            Some(_) => {}
+                            None => scored.push((si, cluster, score)),
+                        }
                     }
                 }
             }
@@ -680,10 +733,10 @@ impl SupertableReader {
             }
         }
 
-        // Cell-tagged candidates keep the complete fine runs inside the
-        // selected coarse cells. Their adjacent cluster ranges coalesce into
-        // one fetch per fragment; sparse fine-centroid pruning here previously
-        // inflated a 6-GET hidden query to 24-28 GETs.
+        // Unfiltered hidden search globally ranks fine centroids within the
+        // selected coarse cells. User/undrained and filtered paths retain
+        // complete cell-run coverage so fragment-local or selective matches
+        // are not starved.
         // Untagged legacy candidates still use the global fallback budget.
         let n_eligible = {
             let mut segs: Vec<usize> = scored
@@ -710,7 +763,7 @@ impl SupertableReader {
         // for filtered search (a flat nprobe there starves filtered recall)
         // and a flat nprobe when unfiltered.
         let scaled_budget = nprobe.saturating_mul(n_eligible.max(1)).max(nprobe);
-        let default_budget = if is_hidden_vector_index_table(&manifest.options) {
+        let default_budget = if hidden_vector_index {
             let hidden_default = if filtered {
                 scaled_budget
             } else {
@@ -831,7 +884,6 @@ impl SupertableReader {
         // width so transient memory stays bounded. The unfiltered path
         // carries no bitmaps and fans out all units at once (matching
         // main's concurrency — every superfile GET overlaps on tokio).
-        let hidden_vector_index = is_hidden_vector_index_table(&manifest.options);
         let per_superfile = if allow.is_some() {
             let fanout_width = manifest.options.reader_pool.current_num_threads().max(1);
             let mut collected = Vec::new();
