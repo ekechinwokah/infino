@@ -295,7 +295,15 @@ impl SupertableReader {
             let tombstones = tombstones.clone();
             async move {
                 let term_refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
-                let floor = shared.floor();
+                // A cross-file floor can suppress score-tied single-term hits
+                // according to task completion order. Local BMW still prunes
+                // those queries; share the global floor only for multi-term
+                // paths.
+                let floor = if term_refs.len() == 1 {
+                    f32::NEG_INFINITY
+                } else {
+                    shared.floor()
+                };
                 let hits = match range {
                     // Ranged units exist only for negation-free queries
                     // (`fanout_for` never slices otherwise).

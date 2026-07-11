@@ -44,6 +44,7 @@ use crate::{
     supertable::{
         ManifestLoadError, SuperfileUri, SupertableStats,
         options::Consistency,
+        query::scalar_cache::DecodedScalarCache,
         reader_cache::disk::{DiskCacheError, skip_background_fill},
         stats::process_rss_bytes,
         tombstones::{SidecarCache, cache::DEFAULT_REFRESH_TTL},
@@ -129,6 +130,9 @@ pub(super) struct SupertableInner {
     /// manifest identity. Physical plans are intentionally rebuilt so fresh
     /// tombstone overlays and query-stable functions retain their semantics.
     pub(super) sql_logical_plan_cache: Mutex<Option<(Arc<Manifest>, HashMap<String, LogicalPlan>)>>,
+    /// Bounded decoded-row cache shared by all readers of this immutable
+    /// supertable handle.
+    pub(super) decoded_scalar_cache: DecodedScalarCache,
     /// Per-process reader-side cache of per-superfile tombstone
     /// bitmaps. `Some` when storage is attached (the cache
     /// fetches sidecars from `superfiles/<id>.tombstones`);
@@ -1131,6 +1135,7 @@ async fn build_handle(
         query_runtime: OnceLock::new(),
         sql_session_cache: Mutex::new(None),
         sql_logical_plan_cache: Mutex::new(None),
+        decoded_scalar_cache: DecodedScalarCache::default(),
         tombstone_cache,
         handle_id,
         vector_index_table,
@@ -1301,6 +1306,10 @@ impl SupertableReader {
     /// + summaries directly.
     pub fn manifest(&self) -> &Arc<Manifest> {
         &self.manifest
+    }
+
+    pub(crate) fn decoded_scalar_cache(&self) -> &DecodedScalarCache {
+        &self.inner.decoded_scalar_cache
     }
 
     /// The shared `Arc<SupertableInner>` backing this reader. Used to

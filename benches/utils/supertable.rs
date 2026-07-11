@@ -38,7 +38,7 @@
 //! ```
 
 #[allow(unused_imports)] // consumed by child mods via `use super::*`
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::{
     env,
     process::{Command, Stdio},
@@ -468,18 +468,13 @@ fn log_cold_split(prefix: &str, split: &storage_meter::ColdStoreSplit) {
     );
 }
 
-/// Print the first cold query's per-request read trace — the exact files
-/// and byte ranges behind the fan count — in request order (fetch waves
-/// stay visible). Each line: class, URI (hidden prefix elided — the class
-/// label already names the table), range, length.
-fn log_cold_first_query_trace(prefix: &str, trace: &[storage_meter::TraceEntry]) {
+/// Print one query window's per-request read trace — the exact files and byte
+/// ranges behind the fan count, in request order.
+fn log_query_read_trace(prefix: &str, phase: &str, trace: &[storage_meter::TraceEntry]) {
     if trace.is_empty() {
         return;
     }
-    eprintln!(
-        "[{prefix}] first cold query read trace ({} requests):",
-        trace.len()
-    );
+    eprintln!("[{prefix}] {phase} read trace ({} requests):", trace.len());
     for entry in trace.iter().take(COLD_TRACE_PRINT_MAX) {
         let class = storage_meter::UriClass::of(&entry.uri);
         // Elide the `_infino_<uuid>_vector_index/` prefix: the class label
@@ -653,8 +648,6 @@ pub fn run() {
 const WARM_ITERS: usize = 20;
 const COLD_ITERS: usize = 5;
 const TOP_K: usize = 10;
-/// Maximum wait for background full-file cache promotion before warm timing.
-const WARM_PROMOTION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Selected phases for a per-modality supertable runner.
 ///
@@ -791,9 +784,9 @@ pub mod fts {
                     "Supertable FTS — search, multi-superfile / object-store ({} docs)",
                     fmt_count(n_docs)
                 ),
-                "Warm = shared consumer after every superfile is mmap-promoted; each query then runs \
-                 once untimed before p50 over repeated bm25_search. Cold = fresh disk cache + consumer \
-                 per iteration, so each read pays the object-store cold open. Δ is vs the previous run.",
+                "Warm = shared consumer + disk cache; each query runs once untimed (cache fill), then \
+                 p50 over repeated bm25_search. Cold = fresh disk cache + consumer per iteration, so \
+                 each read pays the object-store cold open. Δ is vs the previous run.",
                 warm.as_deref(),
                 cold.as_ref(),
                 None,
@@ -878,13 +871,9 @@ pub mod fts {
         eprintln!("[supertable_fts] warm: opening shared consumer...");
         crate::rss::log_rss_breakdown("supertable_fts before consumer open");
         let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
-        crate::executors::open_all_superfiles(&consumer);
-        consumer
-            .wait_until_warm(WARM_PROMOTION_TIMEOUT)
-            .expect("FTS warm cache promotion");
         let reader = consumer.reader();
         eprintln!(
-            "[supertable_fts] warm: mmap ready; timing {} queries × {WARM_ITERS} iters via bm25_search (untimed prewarm per query)...",
+            "[supertable_fts] warm: timing {} queries × {WARM_ITERS} iters via bm25_search (untimed prewarm per query)...",
             FTS_BATTERY.len(),
         );
         let out = exec_fts::measure_warm(
@@ -970,7 +959,7 @@ pub mod fts {
         };
         log_cold_split("supertable_fts", &split);
         if let Some(trace) = first_query_trace {
-            log_cold_first_query_trace("supertable_fts", &trace);
+            log_query_read_trace("supertable_fts", "first cold query", &trace);
         }
         Some(split)
     }
@@ -1616,7 +1605,7 @@ pub mod vector {
         };
         log_cold_split(label, &split);
         if let Some(trace) = first_query_trace {
-            log_cold_first_query_trace(label, &trace);
+            log_query_read_trace(label, "first cold query", &trace);
         }
         Some(RoutingColdStat {
             split,
@@ -1663,6 +1652,10 @@ pub mod vector {
                     .expect("routing-state warm vector search")
             };
             black_box(search());
+            let trace_enabled = cold_trace_enabled();
+            if trace_enabled {
+                consumer_meter.start_trace();
+            }
             let before = consumer_meter.snapshot();
             let mut samples = Vec::with_capacity(ROUTING_STATE_WARM_ITERS);
             let cpu0 = cpu::process_cpu_ns();
@@ -1673,7 +1666,13 @@ pub mod vector {
             }
             let warm_cpu_s = cpu::cpu_seconds_since(cpu0)
                 .map(|seconds| seconds / ROUTING_STATE_WARM_ITERS as f64);
+            let warm_trace = trace_enabled.then(|| consumer_meter.take_trace());
             let warm_io = consumer_meter.snapshot().since(&before);
+            if let Some(trace) = warm_trace
+                && !trace.is_empty()
+            {
+                log_query_read_trace(label, "warm measurement", &trace);
+            }
             samples.sort_unstable();
             let p50_ns = samples[samples.len() / 2].as_secs_f64() * 1e9;
             let ram_bytes = sampler.stop_stats().peak_rss_bytes;

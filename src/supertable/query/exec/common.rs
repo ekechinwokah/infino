@@ -387,8 +387,18 @@ async fn resolve_columns(
     let store = &manifest.options.store;
     let disk_cache = manifest.options.disk_cache.as_ref();
     let storage = manifest.options.storage.as_ref();
+    let decoded_cache = reader.decoded_scalar_cache();
+    let mut slots: Vec<Option<RecordBatch>> = vec![None; seg_order.len()];
+    let mut misses = Vec::new();
+    for (index, (&uri, locals)) in seg_order.iter().zip(&seg_locals).enumerate() {
+        if let Some(batch) = decoded_cache.get(uri, locals, names) {
+            slots[index] = Some(batch);
+        } else {
+            misses.push((index, uri));
+        }
+    }
 
-    let opened = try_join_all(seg_order.iter().map(|&uri| async move {
+    let opened = try_join_all(misses.into_iter().map(|(index, uri)| async move {
         let entry = manifest
             .lookup_superfile_entry(uri)
             .await
@@ -406,6 +416,7 @@ async fn resolve_columns(
             entry.subsection_offsets.as_ref(),
         )
         .await
+        .map(|reader| (index, reader))
         .map_err(|error| DataFusionError::Execution(error.to_string()))
     }))
     .await?;
@@ -428,11 +439,12 @@ async fn resolve_columns(
     // entry per distinct hit-bearing superfile), so the fan-out is small.
     let mut warm_inputs: Vec<(usize, Arc<SuperfileReader>, Vec<u32>)> = Vec::new();
     let mut cold_units: Vec<(usize, &Arc<SuperfileReader>, &[u32])> = Vec::new();
-    for (i, (rd, locals)) in opened.iter().zip(seg_locals.iter()).enumerate() {
+    for (i, rd) in &opened {
+        let locals = &seg_locals[*i];
         if rd.can_take_by_local_doc_ids() {
-            warm_inputs.push((i, Arc::clone(rd), locals.clone()));
+            warm_inputs.push((*i, Arc::clone(rd), locals.clone()));
         } else {
-            cold_units.push((i, rd, locals.as_slice()));
+            cold_units.push((*i, rd, locals.as_slice()));
         }
     }
 
@@ -474,8 +486,8 @@ async fn resolve_columns(
     );
 
     let (warm_done, cold_done) = tokio::join!(warm_wave, cold_wave);
-    let mut slots: Vec<Option<RecordBatch>> = vec![None; seg_order.len()];
     for (i, batch) in warm_done?.into_iter().chain(cold_done?) {
+        decoded_cache.insert(seg_order[i], &seg_locals[i], names, batch.clone());
         slots[i] = Some(batch);
     }
     let per_superfile: Vec<RecordBatch> = slots
@@ -729,7 +741,7 @@ mod tests {
     };
 
     /// Force Snowflake ids in one committed superfile across an ms boundary.
-    const ID_GAP_WAIT: Duration = Duration::from_millis(2);
+    const ID_GAP_WAIT: Duration = Duration::from_millis(20);
 
     #[test]
     fn arg_to_string_accepts_utf8_literal_rejects_int() {

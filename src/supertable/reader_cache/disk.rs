@@ -29,7 +29,7 @@ use memmap2::{Mmap, UncheckedAdvice};
 use thiserror::Error;
 use tokio::{
     io::{AsyncSeekExt, AsyncWriteExt},
-    sync::{OnceCell, Semaphore, oneshot},
+    sync::{Notify, OnceCell, Semaphore, oneshot},
     task::{JoinHandle, spawn_blocking},
 };
 
@@ -78,6 +78,13 @@ const BLOCKS_FILE_SUFFIX: &str = ".blocks";
 
 /// Process-global count of in-flight foreground queries.
 static FOREGROUND_QUERIES: AtomicU64 = AtomicU64::new(0);
+/// Wakes background fills so their in-flight range futures can be cancelled
+/// when foreground work arrives.
+static FOREGROUND_NOTIFY: OnceLock<Notify> = OnceLock::new();
+
+fn foreground_notify() -> &'static Notify {
+    FOREGROUND_NOTIFY.get_or_init(Notify::new)
+}
 
 /// RAII guard marking a foreground query in flight for its lifetime.
 pub struct ForegroundQueryGuard(());
@@ -85,6 +92,7 @@ pub struct ForegroundQueryGuard(());
 impl ForegroundQueryGuard {
     pub fn enter() -> Self {
         FOREGROUND_QUERIES.fetch_add(1, Ordering::AcqRel);
+        foreground_notify().notify_waiters();
         ForegroundQueryGuard(())
     }
 }
@@ -1938,13 +1946,20 @@ async fn wait_for_foreground_quiescence(store: &Arc<DiskCacheStore>) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundFillOutcome {
+    Complete,
+    Paused,
+    Abandoned,
+}
+
 async fn cold_fetch_to_disk_cancelable(
     store: &Arc<DiskCacheStore>,
     fetch_storage: &Arc<dyn StorageProvider>,
     storage_uri: &str,
     dest_path: &Path,
     size: u64,
-) -> Result<bool, DiskCacheError> {
+) -> Result<BackgroundFillOutcome, DiskCacheError> {
     let n_streams = store.config.cold_fetch_streams.max(1);
     let chunk_size = store.config.cold_fetch_chunk_bytes.max(1);
     let file = {
@@ -1970,7 +1985,10 @@ async fn cold_fetch_to_disk_cancelable(
     loop {
         while next_chunk < n_chunks && in_flight.len() < n_streams {
             if background_store_abandoned(store) {
-                return Ok(false);
+                return Ok(BackgroundFillOutcome::Abandoned);
+            }
+            if FOREGROUND_QUERIES.load(Ordering::Acquire) > 0 {
+                return Ok(BackgroundFillOutcome::Paused);
             }
             let start = next_chunk * chunk_size;
             let end = (start + chunk_size).min(size);
@@ -1989,22 +2007,37 @@ async fn cold_fetch_to_disk_cancelable(
             next_chunk += 1;
         }
 
-        match in_flight.next().await {
-            Some(result) => result?,
-            None => break,
+        let foreground = foreground_notify().notified();
+        tokio::pin!(foreground);
+        let _ = foreground.as_mut().enable();
+        if FOREGROUND_QUERIES.load(Ordering::Acquire) > 0 {
+            return Ok(BackgroundFillOutcome::Paused);
+        }
+        tokio::select! {
+            biased;
+            _ = &mut foreground => {
+                return Ok(BackgroundFillOutcome::Paused);
+            }
+            result = in_flight.next() => match result {
+                Some(result) => result?,
+                None => break,
+            }
         }
         if background_store_abandoned(store) {
-            return Ok(false);
+            return Ok(BackgroundFillOutcome::Abandoned);
         }
     }
 
     if background_store_abandoned(store) {
-        return Ok(false);
+        return Ok(BackgroundFillOutcome::Abandoned);
+    }
+    if FOREGROUND_QUERIES.load(Ordering::Acquire) > 0 {
+        return Ok(BackgroundFillOutcome::Paused);
     }
     spawn_blocking(move || file.sync_all())
         .await
         .map_err(|error| DiskCacheError::SuperfileOpen(format!("fsync join: {error}")))??;
-    Ok(true)
+    Ok(BackgroundFillOutcome::Complete)
 }
 
 fn rollback_lazy_background_fill(store: &Arc<DiskCacheStore>, uri: &SuperfileUri, tmp: &Path) {
@@ -2056,18 +2089,26 @@ async fn lazy_background_fill(
             )));
         }
     };
-    if !wait_for_foreground_quiescence(&store).await {
-        rollback_lazy_background_fill(&store, &uri, &tmp);
-        return Ok(());
+    loop {
+        if !wait_for_foreground_quiescence(&store).await {
+            rollback_lazy_background_fill(&store, &uri, &tmp);
+            return Ok(());
+        }
+        match cold_fetch_to_disk_cancelable(&store, &fetch_storage, &storage_uri, &tmp, size)
+            .await?
+        {
+            BackgroundFillOutcome::Complete => break,
+            BackgroundFillOutcome::Paused => {
+                let _ = fs::remove_file(&tmp);
+            }
+            BackgroundFillOutcome::Abandoned => {
+                rollback_lazy_background_fill(&store, &uri, &tmp);
+                return Ok(());
+            }
+        }
     }
 
     let result: Result<(), DiskCacheError> = async {
-        if background_store_abandoned(&store) {
-            return Ok(());
-        }
-        if !cold_fetch_to_disk_cancelable(&store, &fetch_storage, &storage_uri, &tmp, size).await? {
-            return Ok(());
-        }
         if background_store_abandoned(&store) {
             return Ok(());
         }
@@ -2143,6 +2184,7 @@ mod tests {
     use arrow_array::{LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use tempfile::TempDir;
+    use tokio::{spawn, task::yield_now, time::timeout};
 
     use super::*;
     use crate::{
@@ -2155,6 +2197,9 @@ mod tests {
     const PROMOTE_TIMEOUT: Duration = Duration::from_secs(10);
     /// Long enough to cover several background quiet-interval checks.
     const FOREGROUND_GUARD_HOLD: Duration = Duration::from_millis(50);
+    /// Large enough that one-byte sequential range reads cannot finish before
+    /// the preemption test enters its foreground guard.
+    const PREEMPT_TEST_BYTES: usize = 1 << 20;
 
     /// Build the raw bytes of a minimal superfile (one scalar batch,
     /// no indexes).
@@ -2805,6 +2850,50 @@ mod tests {
             .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
             .await
             .expect("promotion resumes after foreground query");
+    }
+
+    #[tokio::test]
+    async fn foreground_query_cancels_in_flight_background_ranges() {
+        let (dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_streams = 1;
+            cfg.cold_fetch_chunk_bytes = 1;
+        });
+        let uri = SuperfileUri::new_v4();
+        let storage_uri = uri.storage_path();
+        store
+            .storage
+            .put_atomic(&storage_uri, Bytes::from(vec![7u8; PREEMPT_TEST_BYTES]))
+            .await
+            .expect("put background-fill payload");
+        let destination = dir.path().join("preempt.tmp");
+        let fill_store = Arc::clone(&store);
+        let fill_storage = Arc::clone(&store.storage);
+        let fill_destination = destination.clone();
+        let fill = spawn(async move {
+            cold_fetch_to_disk_cancelable(
+                &fill_store,
+                &fill_storage,
+                &storage_uri,
+                &fill_destination,
+                PREEMPT_TEST_BYTES as u64,
+            )
+            .await
+        });
+
+        timeout(PROMOTE_TIMEOUT, async {
+            while !destination.exists() {
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("background fill started");
+        let foreground = ForegroundQueryGuard::enter();
+        let outcome = fill
+            .await
+            .expect("background task joined")
+            .expect("background fill returned an outcome");
+        assert_eq!(outcome, BackgroundFillOutcome::Paused);
+        drop(foreground);
     }
 
     // ----- wait_until_mmap_promoted timeout path -----

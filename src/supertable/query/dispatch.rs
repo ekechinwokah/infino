@@ -129,15 +129,15 @@ pub(crate) async fn open_compaction_input(
     open_reader(store, disk_cache, storage, entry).await
 }
 
-/// Tag a kernel's `(local_doc_id, score)` results with their source
-/// superfile URI.
+/// Tag a kernel's results with their source and stamp stable ids immediately
+/// when the manifest's contiguous span makes that translation arithmetic.
 pub(crate) fn tag_hits(entry: &SuperfileEntry, hits: Vec<(u32, f32)>) -> Vec<SuperfileHit> {
     hits.into_iter()
         .map(|(local_doc_id, score)| SuperfileHit {
             superfile: entry.uri,
             local_doc_id,
             score,
-            stable_id: None,
+            stable_id: row_id_from_manifest_entry(entry, local_doc_id),
         })
         .collect()
 }

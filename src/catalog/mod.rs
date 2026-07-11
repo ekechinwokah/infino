@@ -55,7 +55,7 @@ use crate::{
     supertable::{
         Supertable,
         options::SupertableOptions,
-        reader_cache::{DiskCacheConfig, DiskCacheStore},
+        reader_cache::{DiskCacheConfig, DiskCacheStore, disk::ForegroundQueryGuard},
     },
 };
 
@@ -423,6 +423,7 @@ impl Connection {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
+        let _foreground = ForegroundQueryGuard::enter();
         let ctx = SessionContext::new();
 
         // Resolve the relations the query names and register each that is a
