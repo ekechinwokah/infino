@@ -2745,10 +2745,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // semantics). Pack their per-cell accumulators in memory-bounded waves.
     if !cell_rows.is_empty() {
         let build_t0 = time::Instant::now();
-        let mut cell_subs = cell_rows.into_cell_rows()?;
-        cell_subs.sort_unstable_by_key(|(cell_id, _)| *cell_id);
-        let total_rows: u64 = cell_subs.iter().map(|(_, rows)| rows.len() as u64).sum();
-        let n_cells_total = cell_subs.len();
+        let total_rows: u64 = added_per_cell.values().map(|rows| u64::from(*rows)).sum();
+        let n_cells_total = cell_rows.len();
         let vc = hidden_inner
             .options
             .vector_columns
@@ -2761,11 +2759,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         let mut wave: Vec<(u32, Vec<MaterializedIvfRow>)> = Vec::new();
         let mut wave_bytes = 0u64;
         let mut n_waves = 0usize;
-        let mut cells_iter = cell_subs.into_iter().peekable();
-        while let Some((cell_id, rows)) = cells_iter.next() {
+        let cells_iter = cell_rows.into_cell_rows_iter();
+        for (cell_index, cell) in cells_iter.enumerate() {
+            let (cell_id, rows) = cell?;
             wave_bytes += rows.len() as u64 * DRAIN_MEMORY_ROW_BYTES_ESTIMATE;
             wave.push((cell_id, rows));
-            let flush = wave_bytes >= DRAIN_BUILD_GROUP_BYTES || cells_iter.peek().is_none();
+            let flush = wave_bytes >= DRAIN_BUILD_GROUP_BYTES || cell_index + 1 == n_cells_total;
             if !flush {
                 continue;
             }

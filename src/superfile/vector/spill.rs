@@ -34,6 +34,7 @@ use std::{
     mem::size_of,
     path::{Path, PathBuf},
     sync::Arc,
+    vec::IntoIter,
 };
 
 use bytemuck::{cast_slice, try_cast_slice};
@@ -419,6 +420,31 @@ enum CellRowStore {
     Disk(MaterializedRowSpillWriter),
 }
 
+/// Consuming, cell-at-a-time view over a drain accumulator.
+///
+/// A disk-backed cell is finished and read only when `next()` reaches it, so
+/// callers can build and drop one bounded wave without materializing every
+/// spilled row in the table at once.
+pub(crate) struct CellRowIterator {
+    stores: IntoIter<(u32, CellRowStore)>,
+}
+
+impl Iterator for CellRowIterator {
+    type Item = Result<(u32, Vec<MaterializedIvfRow>), BuildError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (cell, store) = self.stores.next()?;
+        Some(match store {
+            CellRowStore::Memory(rows) => Ok((cell, rows)),
+            CellRowStore::Disk(writer) => writer.finish().and_then(|spill| {
+                let rows = read_spilled_cell_rows(&spill)?;
+                spill.remove_files();
+                Ok((cell, rows))
+            }),
+        })
+    }
+}
+
 /// Drain-side accumulator of [`MaterializedIvfRow`]s keyed by cell.
 ///
 /// When `prefer_memory` is true (single-batch drain, or an fp32 stream
@@ -507,22 +533,24 @@ impl CellRowAccumulator {
         }
     }
 
-    /// Finish every cell into `(cell_id, rows)` ready for IVF build.
-    /// Memory stores move their vecs; disk stores read spill files back.
-    pub(crate) fn into_cell_rows(self) -> Result<Vec<(u32, Vec<MaterializedIvfRow>)>, BuildError> {
-        let mut out = Vec::with_capacity(self.cells.len());
-        for (cell, store) in self.cells {
-            let rows = match store {
-                CellRowStore::Memory(rows) => rows,
-                CellRowStore::Disk(w) => {
-                    let spill = w.finish()?;
-                    read_spilled_cell_rows(&spill)?
-                }
-            };
-            out.push((cell, rows));
+    /// Finish cells lazily in ascending cell-id order.
+    ///
+    /// Memory stores move their vec only when visited; disk stores finish and
+    /// read one spill at a time. This is the production drain handoff: keeping
+    /// the iterator lazy is what makes the downstream build-wave cap real.
+    pub(crate) fn into_cell_rows_iter(self) -> CellRowIterator {
+        let mut stores: Vec<(u32, CellRowStore)> = self.cells.into_iter().collect();
+        stores.sort_unstable_by_key(|(cell, _)| *cell);
+        CellRowIterator {
+            stores: stores.into_iter(),
         }
-        out.sort_unstable_by_key(|(cell, _)| *cell);
-        Ok(out)
+    }
+
+    /// Collect every cell. Test/small-shape convenience; production drain uses
+    /// [`Self::into_cell_rows_iter`] to retain bounded memory.
+    #[cfg(test)]
+    pub(crate) fn into_cell_rows(self) -> Result<Vec<(u32, Vec<MaterializedIvfRow>)>, BuildError> {
+        self.into_cell_rows_iter().collect()
     }
 }
 
@@ -969,6 +997,55 @@ mod tests {
         assert_eq!(cells[1].1.len(), 2);
         assert_eq!(cells[1].1[0].stable_id, 10);
         assert_eq!(cells[1].1[1].stable_id, 12);
+    }
+
+    #[test]
+    fn cell_row_accumulator_disk_iterates_one_sorted_cell_at_a_time() {
+        const DIM: usize = 4;
+        let directory = tempdir().expect("tempdir");
+        let quant: (Arc<[f32]>, Arc<[f32]>) =
+            (Arc::from(vec![1.0f32; DIM]), Arc::from(vec![0.0f32; DIM]));
+        let row = |id: i128, cell: u32| MaterializedIvfRow {
+            local_doc_id: 0,
+            stable_id: id,
+            cluster: cell,
+            rabitq_code: vec![id as u8],
+            encoded: EncodedCellRow {
+                stable_id: id,
+                rerank_codec: RerankCodec::Sq8Residual,
+                scale: Arc::clone(&quant.0),
+                offset: Arc::clone(&quant.1),
+                codes: vec![id as u8; DIM],
+                residuals: vec![0u8; DIM],
+                norm_sq: None,
+            },
+        };
+
+        let mut accumulator = CellRowAccumulator::disk(directory.path().to_path_buf());
+        accumulator.append(3, &row(10, 3)).expect("cell 3");
+        accumulator.append(1, &row(11, 1)).expect("cell 1");
+        accumulator.append(3, &row(12, 3)).expect("cell 3 second");
+
+        let mut cells = accumulator.into_cell_rows_iter();
+        let (first_cell, first_rows) = cells.next().expect("first").expect("read first");
+        assert_eq!(first_cell, 1);
+        assert_eq!(
+            first_rows
+                .iter()
+                .map(|row| row.stable_id)
+                .collect::<Vec<_>>(),
+            vec![11]
+        );
+        let (second_cell, second_rows) = cells.next().expect("second").expect("read second");
+        assert_eq!(second_cell, 3);
+        assert_eq!(
+            second_rows
+                .iter()
+                .map(|row| row.stable_id)
+                .collect::<Vec<_>>(),
+            vec![10, 12]
+        );
+        assert!(cells.next().is_none());
     }
 
     #[test]
