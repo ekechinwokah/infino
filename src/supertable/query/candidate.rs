@@ -55,7 +55,7 @@ use crate::{
     },
     supertable::{
         error::QueryError,
-        manifest::Manifest,
+        manifest::ManifestSnapshot,
         query::prune::{PruneLeaf, select_superfiles},
     },
 };
@@ -157,13 +157,13 @@ impl CandidatePlan {
 }
 
 impl CandidatePlan {
-    /// Manifest-only superfile survival gate for this plan: the superfile
+    /// ManifestSnapshot-only superfile survival gate for this plan: the superfile
     /// ids that *could* match according to term blooms. `None` means no
     /// gate — the plan is [`Unbounded`], contains an `OR`, or otherwise
     /// cannot be expressed as a conjunction of bloom leaves.
     pub(crate) async fn surviving_superfile_ids(
         &self,
-        manifest: &Manifest,
+        manifest: &ManifestSnapshot,
     ) -> Result<Option<HashSet<u128>>, QueryError> {
         let mut groups = Vec::new();
         if !self.collect_survival_or_groups(&mut groups) {

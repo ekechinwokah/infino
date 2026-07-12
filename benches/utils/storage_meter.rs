@@ -38,9 +38,9 @@ use crate::rss::fmt_bytes;
 const HIDDEN_INDEX_PATH_TOKEN: &str = "_vector_index";
 /// Path tokens of the manifest namespace on either table: the pointer
 /// (`_supertable/current`), the list dir, and the parts dir. Three separate
-/// top-level dirs — matching `POINTER_PATH`, `MANIFEST_LISTS_DIR`, and
+/// top-level dirs — matching `POINTER_PATH`, `MANIFEST_DIR`, and
 /// `MANIFEST_PARTS_DIR` in `supertable::manifest::commit`.
-const MANIFEST_PATH_TOKENS: [&str; 3] = ["_supertable/", "manifest-lists/", "manifest-parts/"];
+const MANIFEST_PATH_TOKENS: [&str; 3] = ["_supertable/", "manifest/", "manifest-parts/"];
 
 /// Which table + namespace a request URI belongs to. GETs are attributed
 /// per class so a query's fan can be split into user vs hidden traffic.
@@ -599,7 +599,7 @@ mod tests {
         assert_eq!(UriClass::of("superfiles/ab12.parquet"), UriClass::UserData);
         assert_eq!(UriClass::of("_supertable/current"), UriClass::UserManifest);
         assert_eq!(
-            UriClass::of("manifest-lists/list-1.avro.zst"),
+            UriClass::of("manifest/manifest-1.avro.zst"),
             UriClass::UserManifest
         );
         assert_eq!(

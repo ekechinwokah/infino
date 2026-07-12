@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! `ManifestList` — the top-tier of the two-tier hierarchical manifest.
+//! `Manifest` — the top-tier of the two-tier hierarchical manifest.
 //! A small JSON document (~MB even at 1M superfiles) that references one or
 //! more [`ManifestPart`] files by URI + content hash, carries the
 //! table-level metadata (schema, column configs, partition strategy), and
@@ -79,7 +79,7 @@ const DEFAULT_CELL_FINE_NPROBE: usize = 8;
 /// shape callers (the supertable's load/refresh path and
 /// the writer's commit path) consume.
 #[derive(Debug, Clone)]
-pub struct ManifestList {
+pub struct Manifest {
     /// `[FORMAT_VERSION]` constant at encode time; rejected
     /// at decode time if major mismatch.
     pub format_version: String,
@@ -133,7 +133,7 @@ pub struct ManifestList {
     /// Present only on the hidden vector-index table, stamped exclusively by
     /// drain / hidden compaction; the user table's slow section stays `None`
     /// (the inverse of the hidden manifest — same format, no special paths).
-    /// `Manifest::update` deliberately does NOT carry these into its
+    /// `ManifestSnapshot::update` deliberately does NOT carry these into its
     /// successor list: any membership change invalidates the blob, and only
     /// maintenance republishes it. Every consumer keys on ref presence,
     /// never on table kind.
@@ -146,7 +146,7 @@ pub struct ManifestList {
 }
 
 /// Global vector cell-index state owned by the user-table manifest (see
-/// [`ManifestList::global_vector_index`]). Distinct from
+/// [`Manifest::global_vector_index`]). Distinct from
 /// [`PartitionStrategy`]: it describes the *global grid the table's vectors are
 /// indexed into*, not how this table partitions its own superfiles (user
 /// superfiles are append-only and span all cells).
@@ -327,6 +327,9 @@ pub enum PartitionStrategy {
         column: String,
         clusters: super::ClusterCentroids,
         routing: CellRoutingParams,
+    },
+    IngestionTime {
+        granularity_secs: i64,
     },
 }
 
@@ -571,7 +574,9 @@ impl ScalarStatsAgg {
     ///
     /// Returns `None` for types without a well-defined ordering (anything
     /// other than integer / float / boolean / utf8 / decimal) — those carry
-    /// no min/max, so there's nothing to prune on. When present, every
+    /// no min/max, so there's nothing to prune on. An all-null column of a
+    /// supported type still returns an aggregate: null min/max plus the
+    /// null count, so `IS [NOT] NULL` can prune on it. When present, every
     /// companion stat (null count, exact sum, HLL sketch) is computed in the
     /// same pass; sum/HLL/value counts stay `None` for unsupported types or
     /// when the exact-value cardinality cap is exceeded.
@@ -747,7 +752,7 @@ pub struct ScalarStatsMergeError {
 
 /// FTS skip summary for one column. Used both per-superfile
 /// (`SuperfileEntry.fts_summary`) and as the per-part aggregate
-/// (`ManifestListEntry.fts_summary_agg`) — the per-part value is the
+/// (`ManifestPartEntry.fts_summary_agg`) — the per-part value is the
 /// bloom-union + range-union across the part's superfiles.
 ///
 /// The bloom is held as a decoded [`Bloom`] (cheap `Arc<[u64]>` clone) so
@@ -971,7 +976,7 @@ pub enum ListEncodeError {
 /// `to_writer_pretty` preserves declaration order, so output
 /// is deterministic for content-addressing.
 #[derive(Serialize, Deserialize)]
-struct ManifestListDto {
+struct ManifestDto {
     format_version: String,
     manifest_id: u64,
     options_hash: String, // "blake3:<64hex>"
@@ -1052,6 +1057,9 @@ enum PartitionStrategyDto {
         clusters_b64: String,
         #[serde(default)]
         routing: Option<CellRoutingParamsDto>,
+    },
+    IngestionTime {
+        granularity_secs: i64,
     },
 }
 
@@ -1398,6 +1406,11 @@ fn strategy_to_dto(s: &PartitionStrategy) -> PartitionStrategyDto {
                 routing: Some(CellRoutingParamsDto::from(*routing)),
             }
         }
+        PartitionStrategy::IngestionTime { granularity_secs } => {
+            PartitionStrategyDto::IngestionTime {
+                granularity_secs: *granularity_secs,
+            }
+        }
     }
 }
 
@@ -1438,16 +1451,19 @@ fn strategy_from_dto(d: PartitionStrategyDto) -> Result<PartitionStrategy, ListP
                 routing: routing.map(CellRoutingParams::from).unwrap_or_default(),
             }
         }
+        PartitionStrategyDto::IngestionTime { granularity_secs } => {
+            PartitionStrategy::IngestionTime { granularity_secs }
+        }
     })
 }
 
-fn list_to_dto(l: &ManifestList) -> Result<ManifestListDto, ListEncodeError> {
+fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
     let parts = l
         .parts
         .iter()
         .map(entry_to_dto)
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(ManifestListDto {
+    Ok(ManifestDto {
         format_version: l.format_version.clone(),
         manifest_id: l.manifest_id,
         options_hash: encode_hash(&l.options_hash),
@@ -1482,7 +1498,7 @@ fn list_to_dto(l: &ManifestList) -> Result<ManifestListDto, ListEncodeError> {
     })
 }
 
-fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
+fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
     check_major(&d.format_version)?;
     let options_hash = decode_hash(&d.options_hash)?;
     let schema = decode_b64(&d.schema, "schema")?;
@@ -1490,7 +1506,7 @@ fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
     for entry in d.parts {
         parts.push(entry_from_dto(entry)?);
     }
-    Ok(ManifestList {
+    Ok(Manifest {
         format_version: d.format_version,
         manifest_id: d.manifest_id,
         options_hash,
@@ -1542,18 +1558,18 @@ fn list_from_dto(d: ManifestListDto) -> Result<ManifestList, ListParseError> {
 // ---------- Encode / decode ----------
 
 /// JSON-encode a manifest list. Pretty-printed; field order
-/// is the declaration order in `ManifestListDto` and child
+/// is the declaration order in `ManifestDto` and child
 /// types, so byte-output is deterministic for content-equal
 /// inputs.
-pub fn encode(list: &ManifestList) -> Result<Vec<u8>, ListEncodeError> {
+pub fn encode(list: &Manifest) -> Result<Vec<u8>, ListEncodeError> {
     let dto = list_to_dto(list)?;
     Ok(serde_json::to_vec_pretty(&dto)?)
 }
 
 /// JSON-decode a manifest list. Verifies major-version
 /// compatibility; allows unknown minor versions.
-pub fn decode(bytes: &[u8]) -> Result<ManifestList, ListParseError> {
-    let dto: ManifestListDto = serde_json::from_slice(bytes)?;
+pub fn decode(bytes: &[u8]) -> Result<Manifest, ListParseError> {
+    let dto: ManifestDto = serde_json::from_slice(bytes)?;
     list_from_dto(dto)
 }
 
@@ -1574,7 +1590,7 @@ fn check_major(fv: &str) -> Result<(), ListParseError> {
 
 #[cfg(test)]
 mod tests {
-    //! JSON round-trip tests for `ManifestList`.
+    //! JSON round-trip tests for `Manifest`.
     //!
     //! Covers: empty / N-entry round-trip; every
     //! `PartitionStrategy` variant; aggregate skip summaries
@@ -2073,8 +2089,8 @@ mod tests {
         );
     }
 
-    fn empty_list() -> ManifestList {
-        ManifestList {
+    fn empty_list() -> Manifest {
+        Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: FORMAT_VERSION.into(),
@@ -2153,7 +2169,7 @@ mod tests {
         }
     }
 
-    fn rich_list(n_parts: u8) -> ManifestList {
+    fn rich_list(n_parts: u8) -> Manifest {
         let mut list = empty_list();
         list.manifest_id = 42;
         list.options_hash = ContentHash([0xab; 32]);
@@ -2199,7 +2215,7 @@ mod tests {
         assert_eq!(a.fts_summary_agg, b.fts_summary_agg, "fts_summary_agg");
     }
 
-    fn assert_lists_equal(a: &ManifestList, b: &ManifestList) {
+    fn assert_lists_equal(a: &Manifest, b: &Manifest) {
         assert_eq!(a.format_version, b.format_version);
         assert_eq!(a.manifest_id, b.manifest_id);
         assert_eq!(a.options_hash, b.options_hash);
@@ -2594,7 +2610,7 @@ mod tests {
         // both reference the same entry must round-trip into
         // bit-equal entries — the property that lets readers
         // Arc::clone the part from the prior in-memory
-        // Manifest into the new one.
+        // ManifestSnapshot into the new one.
         let entry = rich_entry(99);
 
         let mut list_v42 = empty_list();
@@ -2618,7 +2634,7 @@ mod tests {
 
     #[test]
     fn json_top_level_keys_are_jq_friendly() {
-        // Manifest list is the operator's debugging surface;
+        // ManifestSnapshot list is the operator's debugging surface;
         // the top-level keys are the contract.
         let list = rich_list(1);
         let bytes = encode(&list).expect("encode");

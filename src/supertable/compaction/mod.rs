@@ -199,23 +199,19 @@ impl Supertable {
             self.inner().manifest.load().get_partition_strategy(),
             PartitionStrategy::VectorCell { .. }
         ) {
-            if let Err(e) = refresh_slow_vector_state(self.inner()).await {
-                tracing::warn!(
-                    "supertable: slow vector-state refresh after direct hidden compaction failed: {e}"
-                );
-            }
+            refresh_slow_vector_state(self.inner())
+                .await
+                .map_err(|error| CompactionError::Refresh(error.to_string()))?;
         } else if let Some(hidden) = self.inner().vector_index_table.as_ref() {
             Self::compact_one_table(hidden, &hidden_vector_index_compaction_settings()).await?;
             // The hidden pass settled vector membership (merges + finalize +
             // any cell splits); its `update`s cleared the slow-CAS ref, so
-            // republish the entry blob and restamp. Warn-only: compaction is
-            // durable, and an unstamped ref just leaves consumers on the
-            // part-loading fallback until the next maintenance pass.
-            if let Err(e) = refresh_slow_vector_state(hidden.inner()).await {
-                tracing::warn!(
-                    "supertable: slow vector-state refresh after hidden compaction failed: {e}"
-                );
-            }
+            // republish the entry blob and restamp. Hidden tables have no
+            // manifest parts, so publication is required for reopen and a
+            // failure must be visible to the caller.
+            refresh_slow_vector_state(hidden.inner())
+                .await
+                .map_err(|error| CompactionError::Refresh(error.to_string()))?;
         }
         Ok(())
     }
@@ -1718,7 +1714,7 @@ mod tests {
             "overall superfile count must have decreased from original 20"
         );
 
-        // Manifest consistency: per-entry doc counts sum to 40.
+        // ManifestSnapshot consistency: per-entry doc counts sum to 40.
         let sfs = &r.manifest().superfiles;
         let total_from_manifest: u64 = sfs.iter().map(|s| s.n_docs).sum();
         assert_eq!(total_from_manifest, 40);
@@ -1808,7 +1804,7 @@ mod tests {
             "overall superfile count must have decreased from original 30"
         );
 
-        // Manifest consistency: per-entry doc counts sum to 245760.
+        // ManifestSnapshot consistency: per-entry doc counts sum to 245760.
         let sfs = &r.manifest().superfiles;
         let total_from_manifest: u64 = sfs.iter().map(|s| s.n_docs).sum();
         assert_eq!(total_from_manifest, 245760);

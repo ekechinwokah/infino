@@ -68,7 +68,7 @@ jobs:
       - run: make public-api
 
   python:
-    name: Python bindings (${{ matrix.os }})
+    name: Python wheel & tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     # The bindings build `infino` as a normal dependency; don't fail the
     # build on a transitive-dependency deprecation warning. infino's own
@@ -77,8 +77,9 @@ jobs:
       RUSTFLAGS: ""
     strategy:
       fail-fast: false
+      # Native host build (no cross-compile); one abi3 wheel each, CPython >= 3.9.
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14]
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
@@ -99,8 +100,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: infino-python
-      # Builds the extension + runs the smoke tests (self-contained venv).
-      - run: make python-test
+      # Release abi3 wheel — the shipped artifact.
+      - run: make python-wheel
+      # Test the wheel via the advertised `uv pip install` path.
+      # duckdb keeps the Parquet-interop test from being skipped.
+      - name: Smoke-test wheel with uv
+        shell: bash
+        run: |
+          python3 -m pip install --upgrade uv
+          uv venv /tmp/uv-smoke
+          uv pip install --python /tmp/uv-smoke infino-python/dist/*.whl pytest pyarrow pandas duckdb
+          /tmp/uv-smoke/bin/python -m pytest infino-python/tests/ -v
+      # mypy --strict over the stubs; platform-independent, so run once.
+      - name: Type-check stubs
+        if: matrix.os == 'ubuntu-latest'
+        run: make python-typecheck
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}
+          path: infino-python/dist
 
   python-examples:
     name: Python examples (end to end)
@@ -141,52 +159,6 @@ jobs:
           restore-keys: hf-${{ runner.os }}-
       # Run every notebook; the LLM answer step runs when the secrets are present.
       - run: make python-examples-test
-
-  python-wheels:
-    name: Wheel (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    env:
-      RUSTFLAGS: ""
-    strategy:
-      fail-fast: false
-      # Native runner per platform — `make python-wheel` builds for the
-      # host, so no cross-compilation. One abi3 wheel each (CPython >= 3.9).
-      matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Free disk space
-        if: runner.os == 'Linux'
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: infino-python
-      - run: make python-wheel
-      # The README advertises `uv pip install infino`; verify that path
-      # against the freshly built wheel, not just pip.
-      - name: Smoke-test wheel with uv
-        shell: bash
-        run: |
-          python3 -m pip install --upgrade uv
-          uv venv /tmp/uv-smoke
-          uv pip install --python /tmp/uv-smoke infino-python/dist/*.whl pytest pyarrow pandas
-          /tmp/uv-smoke/bin/python -m pytest infino-python/tests/ -v
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheel-${{ matrix.os }}
-          path: infino-python/dist
 
   node:
     name: Node bindings (${{ matrix.os }})
@@ -258,39 +230,148 @@ jobs:
       # Run each example end to end (self-asserting; non-zero exit fails the job).
       - run: make node-example
 
-  # Informational benchmark — superfile + supertable tiers, one in-region
-  # Azure VM each, in parallel. Never blocks merge. On a PR: diff vs main's baseline.
-  # On merge to main: publish the run as that baseline + a per-commit history
-  # point. Same-repo only (fork PRs can't use the Azure OIDC secrets).
-  bench:
-    if: >-
-      github.event_name == 'push' ||
-      github.event.pull_request.head.repo.full_name == github.repository
-    strategy:
-      fail-fast: false # one member failing must not cancel the other
-      matrix:
-        # `suffix` makes each leg's Azure resources unique — both legs
-        # share one run_id, so without it they'd collide / cross-delete.
-        include:
-          - { bench: superfile, docs: "1000000", suffix: sf }
-          - { bench: supertable, docs: "1000000", suffix: st }
-    # PR: a new push cancels the in-flight run. main: serialize per bench so
-    # concurrent merges don't race the baseline blob (never cancel).
-    concurrency:
-      group: bench-${{ github.event_name == 'push' && 'main' || github.event.pull_request.number }}-${{ matrix.bench }}
-      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-    permissions:
-      id-token: write
-      contents: read
-      pull-requests: write # post the bench-results comment on the PR
-    # Informational: keep these checks out of branch-protection's required
-    # set so a red bench never blocks merge.
-    uses: ./.github/workflows/supertable-bench-azure.yml
-    with:
-      bench: ${{ matrix.bench }}
-      docs: ${{ matrix.docs }}
-      ref: ${{ github.event_name == 'push' && github.sha || github.event.pull_request.head.sha }}
-      name_suffix: -${{ matrix.suffix }}
-      update_baseline: ${{ github.event_name == 'push' }}
-      pr_number: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
-    secrets: inherit
+  # LOCOMO recall tripwire — runs the locomo-recall example against the committed
+  # fixture (frozen vectors → only the engine varies) and reports recall@k on real
+  # long-term-memory queries. Complements the brute-force recall gate in `check`
+  # (which proves the ANN index returns the true neighbours); this proves
+  # ranking/fusion quality holds up on real questions. Cheap — no embedder or
+  # network. Keep it out of branch protection's required set so a recall wobble
+  # never blocks a merge; tighten --fail-under as the baseline firms up.
+  locomo-recall:
+    name: LOCOMO recall test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Frozen fixture → no embedder, key, or network. Reports recall@k + every
+      # hybrid miss in the log, and fails only below the tolerance floor.
+      - run: cargo run --example locomo-recall -- --fail-under=0.68
+
+  # Gate for `object-store-e2e`: object-store secrets are absent on fork
+  # PRs, so probe for them once and let the e2e job key off the result (a
+  # job-level `if` can't read secrets directly).
+  object-store-e2e-guard:
+    name: Object store e2e (secret check)
+    runs-on: ubuntu-latest
+    environment: ci
+    outputs:
+      azure: ${{ steps.check.outputs.azure }}
+      gcs: ${{ steps.check.outputs.gcs }}
+      any: ${{ steps.check.outputs.any }}
+    steps:
+      - id: check
+        run: |
+          azure=false; gcs=false
+          if [ -n "${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}" ] && [ -n "${{ secrets.INFINO_REAL_AZURE_CONTAINER }}" ]; then azure=true; fi
+          if [ -n "${{ secrets.GCP_SA_KEY }}" ] && [ -n "${{ secrets.INFINO_REAL_GCS_BUCKET }}" ]; then gcs=true; fi
+          any=false; if [ "$azure" = true ] || [ "$gcs" = true ]; then any=true; fi
+          { echo "azure=$azure"; echo "gcs=$gcs"; echo "any=$any"; } >> "$GITHUB_OUTPUT"
+
+  # Engine end-to-end against real object stores: the Python and Node bindings
+  # run the full storage_options + connect-probe path over the wire, one step
+  # per backend (Azure, GCS). Bindings are built once and reused. Each backend
+  # step runs only when its secrets are present, so a fork PR (no secrets) or a
+  # single-backend outage never blocks a merge; the bindings' smoke suites are
+  # the deterministic gate.
+  object-store-e2e:
+    name: Object store e2e
+    needs: object-store-e2e-guard
+    if: needs.object-store-e2e-guard.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    environment: ci
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: ""
+      INFINO_TEST_REAL_AZURE: "1"
+      INFINO_TEST_REAL_GCS: "1"
+      AZURE_STORAGE_ACCOUNT_NAME: ${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
+      AZURE_STORAGE_ACCOUNT_KEY: ${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}
+      AZURE_STORAGE_CONTAINER_NAME: ${{ secrets.INFINO_REAL_AZURE_CONTAINER }}
+      INFINO_REAL_GCS_BUCKET: ${{ secrets.INFINO_REAL_GCS_BUCKET }}
+      GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SA_KEY }}
+      # Run-scoped so cleanup can't touch a parallel run's objects.
+      INFINO_E2E_PREFIX: e2e/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: Swatinem/rust-cache@v2
+      # Build both bindings once; every backend step below reuses them.
+      - name: Build Python binding
+        run: |
+          python3 -m pip install --upgrade uv
+          uv venv /tmp/uv-object-store-e2e
+          source /tmp/uv-object-store-e2e/bin/activate
+          uv pip install maturin pytest pyarrow
+          maturin develop --manifest-path infino-python/Cargo.toml
+      - name: Build Node binding
+        working-directory: infino-node
+        run: |
+          npm install
+          npm run build:debug
+      # --- Azure ---
+      - name: Azure · Python
+        if: needs.object-store-e2e-guard.outputs.azure == 'true'
+        run: |
+          source /tmp/uv-object-store-e2e/bin/activate
+          python -m pytest infino-python/tests/test_azure_e2e.py -v
+      - name: Azure · Node
+        if: needs.object-store-e2e-guard.outputs.azure == 'true'
+        working-directory: infino-node
+        run: node --test __test__/azure.e2e.test.mjs
+      # --- GCS ---
+      - name: GCS · Python
+        if: needs.object-store-e2e-guard.outputs.gcs == 'true'
+        run: |
+          source /tmp/uv-object-store-e2e/bin/activate
+          python -m pytest infino-python/tests/test_gcs_e2e.py -v
+      - name: GCS · Node
+        if: needs.object-store-e2e-guard.outputs.gcs == 'true'
+        working-directory: infino-node
+        run: node --test __test__/gcs.e2e.test.mjs
+      # Per-backend cleanup of this run's prefix, incl. the catalog object
+      # drop_table leaves. Best-effort: a hiccup must not fail the job.
+      - name: Clean up Azure blobs
+        if: always() && needs.object-store-e2e-guard.outputs.azure == 'true'
+        continue-on-error: true
+        run: |
+          az storage blob delete-batch \
+            --account-name "$AZURE_STORAGE_ACCOUNT_NAME" \
+            --account-key "$AZURE_STORAGE_ACCOUNT_KEY" \
+            --source "$AZURE_STORAGE_CONTAINER_NAME" \
+            --pattern "$INFINO_E2E_PREFIX/*"
+      - name: Clean up GCS objects
+        if: always() && needs.object-store-e2e-guard.outputs.gcs == 'true'
+        continue-on-error: true
+        run: |
+          printf '%s' "$GOOGLE_SERVICE_ACCOUNT_KEY" > /tmp/gcs-key.json
+          gcloud auth activate-service-account --key-file=/tmp/gcs-key.json
+          gcloud storage rm -r "gs://$INFINO_REAL_GCS_BUCKET/$INFINO_E2E_PREFIX/" || true
+          rm -f /tmp/gcs-key.json

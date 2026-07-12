@@ -1,30 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! In-memory manifest types: `Manifest`, `SuperfileEntry`,
+//! In-memory manifest types: `ManifestSnapshot`, `SuperfileEntry`,
 //! `VectorSummary`. Per-column skip stats live on `SuperfileEntry` as
 //! `HashMap<String, ScalarStatsAgg>` (scalar) and
 //! `HashMap<String, FtsSummaryAgg>` (FTS).
 //!
-//! `Manifest` is the single immutable point-in-time view of which
+//! `ManifestSnapshot` is the single immutable point-in-time view of which
 //! superfiles exist. `Supertable` holds the current manifest behind
-//! an `ArcSwap<Manifest>`; commits build a new `Manifest` (superfiles:
+//! an `ArcSwap<ManifestSnapshot>`; commits build a new `ManifestSnapshot` (superfiles:
 //! old + new) and atomically swap it in. Readers
 //! `ArcSwap::load_full` once at construction to pin a snapshot for
 //! the lifetime of their queries.
 //!
 //! ## Construction is copy-on-write
 //!
-//! `Manifest::with_appended` clones the outer `Vec` and shares each
+//! `ManifestSnapshot::with_appended` clones the outer `Vec` and shares each
 //! existing `Arc<SuperfileEntry>` between the old and new manifests,
 //! so the only per-commit allocation is the new entries plus the
-//! `Vec` header. `Manifest` itself is immutable — never mutated in
+//! `Vec` header. `ManifestSnapshot` itself is immutable — never mutated in
 //! place — which is what makes lock-free reader-writer isolation
 //! possible.
 
 pub mod aggregates;
 pub mod bloom;
 pub mod commit;
+pub mod disk_cache;
 pub mod encoding;
 pub mod hll;
 pub mod list;
@@ -68,10 +69,11 @@ use crate::{
         manifest::{
             commit::{
                 EncodedPart, PointerFile, frame_content_size, part_uri, read_pointer,
-                translate_contention, write_manifest_list, write_part_bytes, write_pointer,
+                translate_contention, write_manifest, write_part_bytes, write_pointer,
             },
+            disk_cache::ManifestDiskCache,
             list::{
-                FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, ManifestPartEntry,
+                FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest, ManifestPartEntry,
                 PartitionStrategy,
             },
             part::{ContentHash, ManifestPart, PartId},
@@ -93,27 +95,33 @@ pub const MANIFEST_ZSTD_LEVEL: i32 = 3;
 /// and the GC live-set sweep so both agree on the superfile namespace.
 pub(crate) const SUPERFILE_DATA_DIR: &str = "data";
 
+/// Legacy storage-subtree prefix for the hidden vector-index sibling
+/// supertable — the commit-time default stamped when a vector table's
+/// manifest carries no explicit prefix. New tables generate a unique
+/// prefix at create; this constant only keeps pre-prefix tables readable.
+pub(crate) const DEFAULT_VECTOR_INDEX_PREFIX: &str = "_vector_index";
+
 /// One immutable point-in-time view of the supertable.
 ///
 /// **Construction is copy-on-write.** Adding a superfile via
-/// [`Manifest::with_appended`] returns a new `Manifest` whose
+/// [`ManifestSnapshot::with_appended`] returns a new `ManifestSnapshot` whose
 /// `superfiles` is `Vec::clone()` + new entries appended; the original
-/// `Manifest`'s `superfiles` is unchanged. `Arc<SuperfileEntry>` shares
+/// `ManifestSnapshot`'s `superfiles` is unchanged. `Arc<SuperfileEntry>` shares
 /// the underlying entries between the old and new manifests so the
 /// only per-commit allocation is the outer `Vec` and the new
 /// entries themselves.
 ///
 /// **Reader isolation.** Readers `ArcSwap::load_full` an
-/// `Arc<Manifest>` at construction and hold it for their lifetime.
+/// `Arc<ManifestSnapshot>` at construction and hold it for their lifetime.
 /// New commits don't affect them. Old manifests are dropped
 /// automatically once no reader holds an Arc to them.
 ///
-/// `Manifest` is the outer hierarchical wrapper (it adds the
+/// `ManifestSnapshot` is the outer hierarchical wrapper (it adds the
 /// `list` / `parts` / `loader` persistence-side fields);
-/// `SuperfileList` is the flat in-process view that `Manifest`
+/// `SuperfileList` is the flat in-process view that `ManifestSnapshot`
 /// derefs to, so callers can access `.manifest_id`,
 /// `.superfiles[i]`, `.n_docs_total()` etc. directly through a
-/// `Manifest`.
+/// `ManifestSnapshot`.
 #[derive(Debug, Clone)]
 pub struct SuperfileList {
     /// Monotonic point-in-time identifier. Starts at 0 (empty
@@ -181,7 +189,7 @@ impl SuperfileList {
 /// [`SuperfileList`] (flat in-process view) plus the
 /// persistence-side metadata:
 ///
-/// - `list`: the [`ManifestList`] when this manifest was loaded
+/// - `list`: the [`Manifest`] when this manifest was loaded
 ///   from / persisted to storage. `None` for in-process-only
 ///   supertables (no storage attached).
 /// - `parts`: per-part lazy-load cache. `OnceCell` per part
@@ -194,13 +202,13 @@ impl SuperfileList {
 ///
 /// `Deref` exposes the [`SuperfileList`] fields directly so
 /// `manifest.manifest_id`, `manifest.superfiles[i]`,
-/// `manifest.n_docs_total()` etc. work through a `Manifest`
+/// `manifest.n_docs_total()` etc. work through a `ManifestSnapshot`
 /// reference.
 ///
-/// [`ManifestList`]: list::ManifestList
-pub struct Manifest {
+/// [`Manifest`]: list::Manifest
+pub struct ManifestSnapshot {
     superfile_list: SuperfileList,
-    list: Option<ManifestList>,
+    list: Option<Manifest>,
     parts: DashMap<PartId, Arc<OnceCell<Arc<ManifestPart>>>>,
     loader: Option<Arc<ManifestPartLoader>>,
     /// Stamped partition strategy before the first list lands, or
@@ -209,18 +217,18 @@ pub struct Manifest {
     /// Stamped global vector grid before the first list lands (mirrors
     /// `stamped_partition_strategy`): the user commit bootstraps the grid into
     /// this on the first commit-with-vectors, and `update` reads it back via
-    /// [`Manifest::get_global_vector_index`] to persist it into the new list.
+    /// [`ManifestSnapshot::get_global_vector_index`] to persist it into the new list.
     stamped_global_vector_index: Option<list::GlobalVectorIndex>,
     /// Stamped drained-version set before the (hidden) list lands. The drain
-    /// advances this via [`Manifest::with_drained_ranges`] and `update` reads
-    /// it back via [`Manifest::get_drained_ranges`] to persist it. Hidden
+    /// advances this via [`ManifestSnapshot::with_drained_ranges`] and `update` reads
+    /// it back via [`ManifestSnapshot::get_drained_ranges`] to persist it. Hidden
     /// manifest only.
     stamped_drained_ranges: Option<list::DrainedVersionRanges>,
 }
 
-impl fmt::Debug for Manifest {
+impl fmt::Debug for ManifestSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Manifest")
+        f.debug_struct("ManifestSnapshot")
             .field("manifest_id", &self.superfile_list.manifest_id)
             .field("n_superfiles", &self.superfile_list.superfiles.len())
             .field("has_list", &self.list.is_some())
@@ -234,20 +242,20 @@ impl fmt::Debug for Manifest {
     }
 }
 
-impl Deref for Manifest {
+impl Deref for ManifestSnapshot {
     type Target = SuperfileList;
     fn deref(&self) -> &Self::Target {
         &self.superfile_list
     }
 }
 
-impl Manifest {
+impl ManifestSnapshot {
     pub fn new(
         manifest_id: u64,
         options: Arc<SupertableOptions>,
         superfile_list: Vec<Arc<SuperfileEntry>>,
         storage: Option<Arc<dyn StorageProvider>>,
-        list: Option<ManifestList>,
+        list: Option<Manifest>,
     ) -> Self {
         let superfile_list = SuperfileList {
             manifest_id,
@@ -258,7 +266,12 @@ impl Manifest {
         if let Some(storage) = storage
             && let Some(list) = list
         {
-            let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
+            let manifest_cache = superfile_list.options.manifest_disk_cache.clone();
+            let loader = Arc::new(ManifestPartLoader::new_with_cache(
+                Arc::clone(&storage),
+                &list,
+                manifest_cache,
+            ));
             Self {
                 superfile_list,
                 list: Some(list),
@@ -286,7 +299,7 @@ impl Manifest {
         opts: Arc<SupertableOptions>,
         superfiles: Vec<Arc<SuperfileEntry>>,
     ) -> Self {
-        Manifest::empty(opts).with_appended(superfiles)
+        ManifestSnapshot::empty(opts).with_appended(superfiles)
     }
 
     /// Empty initial manifest at `manifest_id = 0`. Used by
@@ -321,6 +334,95 @@ impl Manifest {
         }
     }
 
+    /// A *materialized* empty manifest at `manifest_id = 0`, ready to persist.
+    /// Unlike [`Self::empty`] (which is in-process-only, `list: None`), this
+    /// carries a `Some(list)`, so [`Self::write`] emits the initial (empty)
+    /// manifest list + pointer. `Supertable::create` persists this on durable
+    /// storage so the table is openable immediately — before its first append,
+    /// after a reopen, or from another process — without shifting the
+    /// `manifest_id` sequence (the first append still commits `manifest_id 1`).
+    /// `vector_index_storage_prefix` is the hidden-sibling subtree the caller
+    /// generated at create (`None` for tables without vector columns, and for
+    /// the hidden sibling itself).
+    pub(crate) fn materialized_empty_with_vector_index_prefix(
+        options: Arc<SupertableOptions>,
+        vector_index_storage_prefix: Option<String>,
+    ) -> Self {
+        let strategy = options.effective_partition_strategy();
+        let list = Self::build_list(
+            &options,
+            strategy,
+            0,
+            Vec::new(),
+            vector_index_storage_prefix.clone(),
+        );
+        let loader = options.storage.as_ref().map(|storage| {
+            Arc::new(ManifestPartLoader::new_with_cache(
+                storage.clone(),
+                &list,
+                options.manifest_disk_cache.clone(),
+            ))
+        });
+        Self {
+            superfile_list: SuperfileList::empty_with_vector_index_prefix(
+                options,
+                vector_index_storage_prefix,
+            ),
+            list: Some(list),
+            parts: DashMap::new(),
+            loader,
+            stamped_partition_strategy: None,
+            stamped_global_vector_index: None,
+            stamped_drained_ranges: None,
+        }
+    }
+
+    /// Build a manifest list from the supertable `options` at `manifest_id`,
+    /// carrying `parts`. Used by the initial empty-manifest materialization
+    /// ([`Self::materialized_empty_with_vector_index_prefix`]) so the
+    /// options→list field mapping lives in one place.
+    fn build_list(
+        options: &SupertableOptions,
+        strategy: PartitionStrategy,
+        manifest_id: u64,
+        parts: Vec<ManifestPartEntry>,
+        vector_index_storage_prefix: Option<String>,
+    ) -> Manifest {
+        Manifest {
+            format_version: LIST_FORMAT_VERSION.into(),
+            manifest_id,
+            options_hash: options_hash::compute_options_hash(options, &strategy),
+            schema: Vec::new(),
+            id_column: options.id_column.clone(),
+            fts_columns: options
+                .fts_columns
+                .iter()
+                .map(|f| list::FtsColumnInfo {
+                    column: f.column.clone(),
+                })
+                .collect(),
+            vector_columns: options
+                .vector_columns
+                .iter()
+                .map(|v| list::VectorColumnInfo {
+                    column: v.column.clone(),
+                    dim: v.dim,
+                    n_cent: v.n_cent,
+                    rot_seed: v.rot_seed,
+                    metric: format!("{:?}", v.metric).to_lowercase(),
+                })
+                .collect(),
+            partition_strategy: strategy,
+            vector_index_storage_prefix,
+            global_vector_index: None,
+            drained_ranges: Default::default(),
+            deleted_user_ids_inline: None,
+            slow_vector_state_uri: None,
+            slow_vector_state_content_hash: None,
+            parts,
+        }
+    }
+
     pub fn get_manifest_id(&self) -> u64 {
         self.superfile_list.manifest_id
     }
@@ -345,7 +447,7 @@ impl Manifest {
 
     /// The global vector cell-index grid this (user) table owns, or `None`
     /// before the first commit-with-vectors. Honors the in-memory stamp set by
-    /// [`Manifest::with_global_vector_index`] before the first list lands, then
+    /// [`ManifestSnapshot::with_global_vector_index`] before the first list lands, then
     /// the persisted list.
     pub fn get_global_vector_index(&self) -> Option<list::GlobalVectorIndex> {
         if let Some(g) = &self.stamped_global_vector_index {
@@ -357,7 +459,7 @@ impl Manifest {
     }
 
     /// Drained user commit-versions recorded on this (hidden) manifest. Honors
-    /// the in-memory stamp set by [`Manifest::with_drained_ranges`] before the
+    /// the in-memory stamp set by [`ManifestSnapshot::with_drained_ranges`] before the
     /// first list lands, then the persisted list. Empty by default.
     pub fn get_drained_ranges(&self) -> list::DrainedVersionRanges {
         if let Some(d) = &self.stamped_drained_ranges {
@@ -420,7 +522,7 @@ impl Manifest {
         if let Some(prefix) = self.vector_index_storage_prefix() {
             return Some(prefix.to_string());
         }
-        Some("_vector_index".to_string())
+        Some(DEFAULT_VECTOR_INDEX_PREFIX.to_string())
     }
 
     pub fn get_cached_part_by_id(&self, part_id: &PartId) -> Option<Arc<ManifestPart>> {
@@ -437,6 +539,16 @@ impl Manifest {
         self.get_cached_part_by_id(&part_id)
     }
 
+    /// Load the committed manifest from storage.
+    ///
+    /// A genuinely absent pointer is [`ManifestLoadError::PointerNotFound`]:
+    /// `Supertable::create` persists the initial (empty) pointer, so a
+    /// registered table always has one. A missing pointer is therefore the
+    /// open-or-create trigger for a never-created table, or a *lost* pointer
+    /// on a created one — either way an error the caller sees, never a
+    /// silently-empty table (which would mask committed-then-lost data). A
+    /// *corrupt* pointer is a different error variant (`PointerParse`) and
+    /// also propagates, so corruption is never masked.
     pub(crate) async fn load(
         current_manifest: Option<Arc<Self>>,
         storage: Arc<dyn StorageProvider>,
@@ -445,9 +557,6 @@ impl Manifest {
         // 1. Read the pointer file.
         let (pointer, _) = match read_pointer(storage.as_ref()).await? {
             Some(p) => p,
-            // No pointer yet means nobody has committed; our next
-            // attempt will write the initial pointer with
-            // expected_prev_etag = None.
             None => return Err(ManifestLoadError::PointerNotFound),
         };
 
@@ -460,7 +569,7 @@ impl Manifest {
 
         // 2. Load + parse the manifest list.
         let (list_bytes, _) = storage
-            .get(&pointer.manifest_list_uri)
+            .get(&pointer.manifest_uri)
             .await
             .map_err(ManifestLoadError::Storage)?;
         let list = list::decode(&list_bytes).map_err(ManifestLoadError::ListParse)?;
@@ -489,7 +598,11 @@ impl Manifest {
         }
 
         // 3. Build the loader, superfiles & parts
-        let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
+        let loader = Arc::new(ManifestPartLoader::new_with_cache(
+            Arc::clone(&storage),
+            &list,
+            options.manifest_disk_cache.clone(),
+        ));
         let parts: DashMap<_, _> = DashMap::new();
         let mut all_superfiles: Vec<Arc<SuperfileEntry>> = Vec::new();
 
@@ -646,13 +759,13 @@ impl Manifest {
                 }
             } else {
                 // Lazy path: each part gets an empty
-                // `OnceCell`; first `Manifest::part(id).await`
+                // `OnceCell`; first `ManifestSnapshot::part(id).await`
                 // triggers a single storage GET for that part.
                 // `superfile_list.superfiles` stays empty — legacy
                 // flat-iteration queries return zero results
                 // until the hierarchical query path lands.
                 // Callers in lazy mode today drive
-                // `Manifest::part().await` directly.
+                // `ManifestSnapshot::part().await` directly.
                 for entry in &list.parts {
                     parts.insert(entry.part_id, Arc::new(OnceCell::new()));
                 }
@@ -662,7 +775,7 @@ impl Manifest {
         let mut new_superfile_list = SuperfileList::empty(options.clone());
         new_superfile_list.manifest_id = pointer.manifest_id;
         new_superfile_list.superfiles = all_superfiles;
-        let new_manifest = Manifest {
+        let new_manifest = ManifestSnapshot {
             superfile_list: new_superfile_list,
             list: Some(list),
             parts,
@@ -686,7 +799,7 @@ impl Manifest {
     ///    [`futures::future::join_all`].
     /// 2. Await all of the above (visibility barrier #1: parts
     ///    and list must be durable before the pointer publishes).
-    /// 3. Build the new pointer file (manifest_id, list_uri,
+    /// 3. Build the new pointer file (manifest_id, manifest_uri,
     ///    list_content_hash).
     /// 4. Conditional pointer-PUT (visibility barrier #2: the
     ///    rename is the only thing readers observe).
@@ -712,7 +825,7 @@ impl Manifest {
         // each part's URI are content-addressable from the
         // in-memory bytes before any I/O, so there's no
         // happens-before edge between them.
-        let list_fut = write_manifest_list(storage, list_to_write);
+        let list_fut = write_manifest(storage, list_to_write);
         let part_futs = parts_to_write
             .iter()
             .map(|encoded| write_part_bytes(storage, encoded));
@@ -731,7 +844,7 @@ impl Manifest {
         // Step 3: build pointer.
         let pointer = PointerFile {
             manifest_id: self.get_manifest_id(),
-            manifest_list_uri: list_res.uri,
+            manifest_uri: list_res.uri,
             content_hash: list_res.content_hash,
         };
 
@@ -947,9 +1060,9 @@ impl Manifest {
     /// content-addressed object holding this table's superfile entries
     /// (drain-owned routing/centroid state). Bumps `manifest_id` like a
     /// normal commit without touching superfiles or parts, mirroring
-    /// [`Manifest::with_deleted_user_ids`]. Called only from drain / hidden
+    /// [`ManifestSnapshot::with_deleted_user_ids`]. Called only from drain / hidden
     /// compaction publication; ordinary commits instead CLEAR the ref via
-    /// [`Manifest::update`] (membership change invalidates the blob).
+    /// [`ManifestSnapshot::update`] (membership change invalidates the blob).
     pub fn with_slow_vector_state(&self, uri: String, hash: part::ContentHash) -> Self {
         let next_id = self.get_next_manifest_id();
         let new_list = self.list.as_ref().map(|list| {
@@ -1007,7 +1120,7 @@ impl Manifest {
     }
 
     /// Stamp (or replace) the global vector cell-index grid on this snapshot.
-    /// Mirrors [`Manifest::with_partition_strategy`]: updates the persisted list
+    /// Mirrors [`ManifestSnapshot::with_partition_strategy`]: updates the persisted list
     /// metadata when present, and the in-memory stamp used before the first
     /// list write lands (the first commit-with-vectors).
     pub fn with_global_vector_index(&self, index: list::GlobalVectorIndex) -> Self {
@@ -1113,14 +1226,14 @@ impl Manifest {
         Ok(None)
     }
 
-    /// Returns the new ManifestListEntries when `new_entries` are added to `old` manifest. This
+    /// Returns the new ManifestPartEntries when `new_entries` are added to `old` manifest. This
     /// operation may create new ManifestParts. The function also returns the new ManifestParts that
     /// the caller can decide to write to storage.
     pub async fn update(
         &self,
         new_entries: &[Arc<SuperfileEntry>],
         entries_to_remove: &[Arc<SuperfileEntry>],
-    ) -> Result<(Manifest, Vec<EncodedPart>), ManifestError> {
+    ) -> Result<(ManifestSnapshot, Vec<EncodedPart>), ManifestError> {
         self.update_inner(new_entries, entries_to_remove, false)
             .await
     }
@@ -1133,7 +1246,7 @@ impl Manifest {
         &self,
         new_entries: &[Arc<SuperfileEntry>],
         entries_to_remove: &[Arc<SuperfileEntry>],
-    ) -> Result<(Manifest, Vec<EncodedPart>), ManifestError> {
+    ) -> Result<(ManifestSnapshot, Vec<EncodedPart>), ManifestError> {
         self.update_inner(new_entries, entries_to_remove, true)
             .await
     }
@@ -1143,7 +1256,7 @@ impl Manifest {
         new_entries: &[Arc<SuperfileEntry>],
         entries_to_remove: &[Arc<SuperfileEntry>],
         preserve_birth_versions: bool,
-    ) -> Result<(Manifest, Vec<EncodedPart>), ManifestError> {
+    ) -> Result<(ManifestSnapshot, Vec<EncodedPart>), ManifestError> {
         // 1. Resolve the effective partition strategy. Locked at
         //    first commit: read from the existing manifest list
         //    if present, else use the options default.
@@ -1355,7 +1468,7 @@ impl Manifest {
                 metric: format!("{:?}", v.metric).to_lowercase(),
             })
             .collect();
-        let new_list = ManifestList {
+        let new_list = Manifest {
             // Carry/advance the hidden drain watermark via the stamp (the drain
             // sets it with `with_drained_ranges` in the same commit). Empty on
             // the user manifest.
@@ -1419,10 +1532,13 @@ impl Manifest {
             superfiles: new_superfile_list,
             vector_index_storage_prefix: None,
         };
-        let loader = opts
-            .storage
-            .as_ref()
-            .map(|storage| Arc::new(ManifestPartLoader::new(storage.clone(), &new_list)));
+        let loader = opts.storage.as_ref().map(|storage| {
+            Arc::new(ManifestPartLoader::new_with_cache(
+                storage.clone(),
+                &new_list,
+                opts.manifest_disk_cache.clone(),
+            ))
+        });
         // Inherit only the cached parts the new list still
         // references — entries for rewritten/removed parts are
         // dropped rather than carried forward, so the in-memory
@@ -1444,7 +1560,7 @@ impl Manifest {
             );
         }
 
-        let new_manifest = Manifest {
+        let new_manifest = ManifestSnapshot {
             superfile_list: new_superfile_list,
             list: Some(new_list),
             parts,
@@ -1506,18 +1622,35 @@ fn rebuild_part_and_entry(
 /// Pulls manifest parts through a [`StorageProvider`] and verifies
 /// content-hash on load.
 ///
-/// One `ManifestPartLoader` per `Manifest`. The same `Arc<dyn
+/// One `ManifestPartLoader` per `ManifestSnapshot`. The same `Arc<dyn
 /// StorageProvider>` is shared with the `DiskCacheStore` —
 /// one auth handshake, one connection pool.
+///
+/// An optional [`ManifestDiskCache`] short-circuits the storage GET
+/// when the part's compressed bytes are already on local disk. Because
+/// parts are content-addressed, a cache hit can never be stale.
 pub struct ManifestPartLoader {
     storage: Arc<dyn StorageProvider>,
     /// Maps `PartId → (expected content_hash, uri)`. Built from
-    /// the manifest list at construction; immutable per-`Manifest`.
+    /// the manifest list at construction; immutable per-`ManifestSnapshot`.
     parts_index: HashMap<PartId, (ContentHash, String)>,
+    /// On-disk cache for compressed part bytes. `None` disables the
+    /// cache (in-process-only supertables, tests, or storage attached
+    /// without a `disk_cache_root` configured).
+    manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
 }
 
 impl ManifestPartLoader {
-    pub fn new(storage: Arc<dyn StorageProvider>, list: &ManifestList) -> Self {
+    pub fn new(storage: Arc<dyn StorageProvider>, list: &Manifest) -> Self {
+        Self::new_with_cache(storage, list, None)
+    }
+
+    /// Like [`Self::new`] but attaches an on-disk part-bytes cache.
+    pub fn new_with_cache(
+        storage: Arc<dyn StorageProvider>,
+        list: &Manifest,
+        manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+    ) -> Self {
         let mut idx = HashMap::with_capacity(list.parts.len());
         for entry in &list.parts {
             idx.insert(entry.part_id, (entry.content_hash, entry.uri.clone()));
@@ -1525,16 +1658,31 @@ impl ManifestPartLoader {
         Self {
             storage,
             parts_index: idx,
+            manifest_disk_cache,
         }
     }
 
     /// Fetch + verify + decode one part. Returns the parsed
     /// `Arc<ManifestPart>`.
+    ///
+    /// Consults the on-disk cache first (a hit skips the storage GET);
+    /// on a miss the freshly-fetched bytes are written back to the
+    /// cache (best-effort) before decoding.
     pub async fn load(&self, part_id: PartId) -> Result<Arc<ManifestPart>, ManifestLoadError> {
         let (expected_hash, uri) = self
             .parts_index
             .get(&part_id)
             .ok_or(ManifestLoadError::PartNotInList { part_id })?;
+
+        // Disk-cache hit: bytes are verified against `expected_hash`
+        // inside `get`, so they're known-good here.
+        if let Some(cache) = &self.manifest_disk_cache
+            && let Some(bytes) = cache.get(expected_hash).await
+        {
+            let parsed = part::decode(&bytes)?;
+            return Ok(Arc::new(parsed));
+        }
+
         let (bytes, _) = self
             .storage
             .get(uri)
@@ -1547,12 +1695,17 @@ impl ManifestPartLoader {
                 actual: actual_hash.to_hex(),
             });
         }
+        // Populate the cache for next time (best-effort; the hash is
+        // already verified, satisfying `put`'s contract).
+        if let Some(cache) = &self.manifest_disk_cache {
+            cache.put(actual_hash, &bytes).await;
+        }
         let parsed = part::decode(&bytes)?;
         Ok(Arc::new(parsed))
     }
 }
 
-/// Errors raised by [`Manifest::part`] and [`ManifestPartLoader::load`].
+/// Errors raised by [`ManifestSnapshot::part`] and [`ManifestPartLoader::load`].
 ///
 /// Standalone (not folded into the supertable-level
 /// `OpenError`) so the per-part load surface stays narrowly
@@ -1567,7 +1720,7 @@ pub enum ManifestLoadError {
     /// Pointer parse error.
     #[error("pointer parse error: {0}")]
     PointerParse(String),
-    /// Caller invoked `Manifest::part(...)` on an in-process-only
+    /// Caller invoked `ManifestSnapshot::part(...)` on an in-process-only
     /// manifest (no storage attached). The hierarchical manifest
     /// has no on-disk parts to load from.
     #[error("no storage / loader attached to this manifest")]
@@ -1673,7 +1826,7 @@ pub struct SuperfileEntry {
     pub subsection_offsets: Option<SubsectionOffsets>,
     pub(crate) vector_layout: VectorLayout,
     /// The `manifest_id` of the commit that introduced this superfile — its
-    /// **birth version**. Stamped in [`Manifest::update`] for newly-added
+    /// **birth version**. Stamped in [`ManifestSnapshot::update`] for newly-added
     /// entries (re-derived per OCC attempt, so it always equals the winning
     /// commit's version); carried over unchanged for entries that survive a
     /// commit. The hidden-index drain uses it to track which user commits it
@@ -1797,24 +1950,30 @@ pub(crate) fn merge_min_max_arrays(
     existing_max: &ArrayRef,
     other_max: &ArrayRef,
 ) -> Option<(ArrayRef, ArrayRef)> {
+    // Merge two optional bounds into the surviving one — smaller for a min,
+    // larger for a max. A `None` (the column is all-null on that side)
+    // yields to a present value; both `None` stays `None`, so an all-null
+    // column stays all-null through the fold, while a manifest part with any
+    // populated superfile keeps its real bound.
+    #[inline]
+    fn merge_opt<T: PartialOrd>(a: Option<T>, b: Option<T>, keep_min: bool) -> Option<T> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(if keep_min == (a <= b) { a } else { b }),
+            (Some(v), None) | (None, Some(v)) => Some(v),
+            (None, None) => None,
+        }
+    }
+
     macro_rules! prim_merge {
         ($array_ty:ty) => {{
-            let ex_min_arr = existing_min.as_any().downcast_ref::<$array_ty>()?;
-            let ot_min_arr = other_min.as_any().downcast_ref::<$array_ty>()?;
-            let ex_max_arr = existing_max.as_any().downcast_ref::<$array_ty>()?;
-            let ot_max_arr = other_max.as_any().downcast_ref::<$array_ty>()?;
-
-            let ex_min = ex_min_arr.value(0);
-            let ot_min = ot_min_arr.value(0);
-            let ex_max = ex_max_arr.value(0);
-            let ot_max = ot_max_arr.value(0);
-
-            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
-            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
-
+            let exn = existing_min.as_any().downcast_ref::<$array_ty>()?;
+            let otn = other_min.as_any().downcast_ref::<$array_ty>()?;
+            let exx = existing_max.as_any().downcast_ref::<$array_ty>()?;
+            let otx = other_max.as_any().downcast_ref::<$array_ty>()?;
+            let at = |a: &$array_ty| (!a.is_null(0)).then(|| a.value(0));
             Some((
-                Arc::new(<$array_ty>::from(vec![merged_min])) as ArrayRef,
-                Arc::new(<$array_ty>::from(vec![merged_max])) as ArrayRef,
+                Arc::new(<$array_ty>::from(vec![merge_opt(at(exn), at(otn), true)])) as ArrayRef,
+                Arc::new(<$array_ty>::from(vec![merge_opt(at(exx), at(otx), false)])) as ArrayRef,
             ))
         }};
     }
@@ -1830,93 +1989,64 @@ pub(crate) fn merge_min_max_arrays(
         DataType::Int64 => prim_merge!(Int64Array),
         DataType::Float32 => prim_merge!(Float32Array),
         DataType::Float64 => prim_merge!(Float64Array),
-        DataType::Boolean => {
-            let ex_min = existing_min
-                .as_any()
-                .downcast_ref::<BooleanArray>()?
-                .value(0);
-            let ot_min = other_min.as_any().downcast_ref::<BooleanArray>()?.value(0);
-            let ex_max = existing_max
-                .as_any()
-                .downcast_ref::<BooleanArray>()?
-                .value(0);
-            let ot_max = other_max.as_any().downcast_ref::<BooleanArray>()?.value(0);
-            let merged_min = ex_min && ot_min;
-            let merged_max = ex_max || ot_max;
-            Some((
-                Arc::new(BooleanArray::from(vec![merged_min])),
-                Arc::new(BooleanArray::from(vec![merged_max])),
-            ))
-        }
+        // `false < true`, so min folds like AND and max like OR.
+        DataType::Boolean => prim_merge!(BooleanArray),
         DataType::Utf8 => {
-            let ex_min = existing_min
-                .as_any()
-                .downcast_ref::<StringArray>()?
-                .value(0);
-            let ot_min = other_min.as_any().downcast_ref::<StringArray>()?.value(0);
-            let ex_max = existing_max
-                .as_any()
-                .downcast_ref::<StringArray>()?
-                .value(0);
-            let ot_max = other_max.as_any().downcast_ref::<StringArray>()?.value(0);
-            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
-            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
+            let exn = existing_min.as_any().downcast_ref::<StringArray>()?;
+            let otn = other_min.as_any().downcast_ref::<StringArray>()?;
+            let exx = existing_max.as_any().downcast_ref::<StringArray>()?;
+            let otx = other_max.as_any().downcast_ref::<StringArray>()?;
+            let min = merge_opt(
+                (!exn.is_null(0)).then(|| exn.value(0)),
+                (!otn.is_null(0)).then(|| otn.value(0)),
+                true,
+            );
+            let max = merge_opt(
+                (!exx.is_null(0)).then(|| exx.value(0)),
+                (!otx.is_null(0)).then(|| otx.value(0)),
+                false,
+            );
             Some((
-                Arc::new(StringArray::from(vec![merged_min])),
-                Arc::new(StringArray::from(vec![merged_max])),
+                Arc::new(StringArray::from(vec![min])),
+                Arc::new(StringArray::from(vec![max])),
             ))
         }
         DataType::LargeUtf8 => {
-            let ex_min = existing_min
-                .as_any()
-                .downcast_ref::<LargeStringArray>()?
-                .value(0);
-            let ot_min = other_min
-                .as_any()
-                .downcast_ref::<LargeStringArray>()?
-                .value(0);
-            let ex_max = existing_max
-                .as_any()
-                .downcast_ref::<LargeStringArray>()?
-                .value(0);
-            let ot_max = other_max
-                .as_any()
-                .downcast_ref::<LargeStringArray>()?
-                .value(0);
-            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
-            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
+            let exn = existing_min.as_any().downcast_ref::<LargeStringArray>()?;
+            let otn = other_min.as_any().downcast_ref::<LargeStringArray>()?;
+            let exx = existing_max.as_any().downcast_ref::<LargeStringArray>()?;
+            let otx = other_max.as_any().downcast_ref::<LargeStringArray>()?;
+            let min = merge_opt(
+                (!exn.is_null(0)).then(|| exn.value(0)),
+                (!otn.is_null(0)).then(|| otn.value(0)),
+                true,
+            );
+            let max = merge_opt(
+                (!exx.is_null(0)).then(|| exx.value(0)),
+                (!otx.is_null(0)).then(|| otx.value(0)),
+                false,
+            );
             Some((
-                Arc::new(LargeStringArray::from(vec![merged_min])),
-                Arc::new(LargeStringArray::from(vec![merged_max])),
+                Arc::new(LargeStringArray::from(vec![min])),
+                Arc::new(LargeStringArray::from(vec![max])),
             ))
         }
         DataType::Decimal128(precision, scale) => {
-            let ex_min = existing_min
-                .as_any()
-                .downcast_ref::<Decimal128Array>()?
-                .value(0);
-            let ot_min = other_min
-                .as_any()
-                .downcast_ref::<Decimal128Array>()?
-                .value(0);
-            let ex_max = existing_max
-                .as_any()
-                .downcast_ref::<Decimal128Array>()?
-                .value(0);
-            let ot_max = other_max
-                .as_any()
-                .downcast_ref::<Decimal128Array>()?
-                .value(0);
-            let merged_min = if ex_min < ot_min { ex_min } else { ot_min };
-            let merged_max = if ex_max > ot_max { ex_max } else { ot_max };
+            let exn = existing_min.as_any().downcast_ref::<Decimal128Array>()?;
+            let otn = other_min.as_any().downcast_ref::<Decimal128Array>()?;
+            let exx = existing_max.as_any().downcast_ref::<Decimal128Array>()?;
+            let otx = other_max.as_any().downcast_ref::<Decimal128Array>()?;
+            let at = |a: &Decimal128Array| (!a.is_null(0)).then(|| a.value(0));
+            let min = merge_opt(at(exn), at(otn), true);
+            let max = merge_opt(at(exx), at(otx), false);
             Some((
                 Arc::new(
-                    Decimal128Array::from(vec![merged_min])
+                    Decimal128Array::from(vec![min])
                         .with_precision_and_scale(*precision, *scale)
                         .ok()?,
                 ),
                 Arc::new(
-                    Decimal128Array::from(vec![merged_max])
+                    Decimal128Array::from(vec![max])
                         .with_precision_and_scale(*precision, *scale)
                         .ok()?,
                 ),
@@ -1928,7 +2058,9 @@ pub(crate) fn merge_min_max_arrays(
 
 /// Compute (min, max) for one Arrow array as length-1 `ArrayRef`s.
 ///
-/// Returns `None` for unsupported types or for all-null inputs.
+/// Returns `None` only for unsupported types. An all-null input of a
+/// supported type yields length-1 *null* min/max arrays (not `None`), so
+/// its null count is still recorded and `IS [NOT] NULL` can prune on it.
 /// Supported set: integer (signed + unsigned, all widths), float
 /// (f32, f64), boolean, Utf8, LargeUtf8. The supertable schema
 /// rejects vector columns up at the SupertableOptions layer, so
@@ -2055,13 +2187,14 @@ pub(crate) fn column_hll(col: &ArrayRef) -> Option<hll::HllSketch> {
 }
 
 pub(crate) fn column_min_max(col: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
+    // An all-null column yields *null* min/max (not no-stat), so its null
+    // count is still recorded for `IS [NOT] NULL` pruning — hence the
+    // `Option` min/max are kept rather than `?`-unwrapped away.
     macro_rules! prim {
         ($array_ty:ty) => {{
             let a = col.as_any().downcast_ref::<$array_ty>()?;
-            let mn = agg::min(a)?;
-            let mx = agg::max(a)?;
-            let mn_arr: ArrayRef = Arc::new(<$array_ty>::from(vec![mn]));
-            let mx_arr: ArrayRef = Arc::new(<$array_ty>::from(vec![mx]));
+            let mn_arr: ArrayRef = Arc::new(<$array_ty>::from(vec![agg::min(a)]));
+            let mx_arr: ArrayRef = Arc::new(<$array_ty>::from(vec![agg::max(a)]));
             Some((mn_arr, mx_arr))
         }};
     }
@@ -2079,43 +2212,35 @@ pub(crate) fn column_min_max(col: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
         DataType::Float64 => prim!(Float64Array),
         DataType::Boolean => {
             let a = col.as_any().downcast_ref::<BooleanArray>()?;
-            let mn = agg::min_boolean(a)?;
-            let mx = agg::max_boolean(a)?;
             Some((
-                Arc::new(BooleanArray::from(vec![mn])),
-                Arc::new(BooleanArray::from(vec![mx])),
+                Arc::new(BooleanArray::from(vec![agg::min_boolean(a)])),
+                Arc::new(BooleanArray::from(vec![agg::max_boolean(a)])),
             ))
         }
         DataType::Utf8 => {
             let a = col.as_any().downcast_ref::<StringArray>()?;
-            let mn = agg::min_string(a)?;
-            let mx = agg::max_string(a)?;
             Some((
-                Arc::new(StringArray::from(vec![mn])),
-                Arc::new(StringArray::from(vec![mx])),
+                Arc::new(StringArray::from(vec![agg::min_string(a)])),
+                Arc::new(StringArray::from(vec![agg::max_string(a)])),
             ))
         }
         DataType::LargeUtf8 => {
             let a = col.as_any().downcast_ref::<LargeStringArray>()?;
-            let mn = agg::min_string(a)?;
-            let mx = agg::max_string(a)?;
             Some((
-                Arc::new(LargeStringArray::from(vec![mn])),
-                Arc::new(LargeStringArray::from(vec![mx])),
+                Arc::new(LargeStringArray::from(vec![agg::min_string(a)])),
+                Arc::new(LargeStringArray::from(vec![agg::max_string(a)])),
             ))
         }
         DataType::Decimal128(precision, scale) => {
             let a = col.as_any().downcast_ref::<Decimal128Array>()?;
-            let mn = agg::min(a)?;
-            let mx = agg::max(a)?;
             Some((
                 Arc::new(
-                    Decimal128Array::from(vec![mn])
+                    Decimal128Array::from(vec![agg::min(a)])
                         .with_precision_and_scale(*precision, *scale)
                         .ok()?,
                 ),
                 Arc::new(
-                    Decimal128Array::from(vec![mx])
+                    Decimal128Array::from(vec![agg::max(a)])
                         .with_precision_and_scale(*precision, *scale)
                         .ok()?,
                 ),
@@ -2312,11 +2437,12 @@ impl ClusterCentroids {
 
 #[cfg(test)]
 mod tests {
-    use std::{hint::black_box, slice::from_ref, sync::Arc};
+    use std::{hint::black_box, slice::from_ref, sync::Arc, time::Instant};
 
-    use arrow_array::Array;
+    use arrow_array::{Array, Int64Array};
     use arrow_schema::{DataType, Field, Schema};
     use dashmap::DashMap;
+    use datafusion::scalar::ScalarValue;
     use tempfile::TempDir;
     use tokio::sync::OnceCell;
 
@@ -2326,7 +2452,7 @@ mod tests {
         superfile::{builder::FtsConfig, vector::distance::distance},
         supertable::manifest::{
             commit::{PartWriteResult, write_manifest_part},
-            list::PartitionStrategy,
+            list::{Manifest, PartitionStrategy},
         },
         test_helpers::default_tokenizer,
     };
@@ -2345,6 +2471,32 @@ mod tests {
         let counts: Vec<u32> = (0..nc).map(|c| if c == nc / 2 { 0 } else { 10 }).collect();
         let cc = ClusterCentroids::from_fp32(n_cent, dim, &centroids, counts);
         (cc, centroids)
+    }
+
+    #[test]
+    fn min_max_stats_record_and_fold_all_null_columns() {
+        let arr = |vals: Vec<Option<i64>>| Arc::new(Int64Array::from(vals)) as ArrayRef;
+        let scalar = |a: &ArrayRef| ScalarValue::try_from_array(a, 0).expect("decode");
+
+        // All-null column still yields a stat, with null min/max (so the
+        // null count is recorded and `IS [NOT] NULL` can prune on it).
+        let (mn, mx) = column_min_max(&arr(vec![None, None])).expect("all-null stat");
+        assert!(mn.is_null(0) && mx.is_null(0));
+
+        // Populated column → real min/max, nulls ignored.
+        let (mn, mx) = column_min_max(&arr(vec![Some(5), Some(2), None])).expect("stat");
+        assert_eq!(scalar(&mn), ScalarValue::Int64(Some(2)));
+        assert_eq!(scalar(&mx), ScalarValue::Int64(Some(5)));
+
+        // Fold: a real bound wins over a null bound; both-null stays null.
+        let null1 = arr(vec![None]);
+        let (mn, mx) =
+            merge_min_max_arrays(&null1, &arr(vec![Some(2)]), &null1, &arr(vec![Some(9)]))
+                .expect("merge real over null");
+        assert_eq!(scalar(&mn), ScalarValue::Int64(Some(2)));
+        assert_eq!(scalar(&mx), ScalarValue::Int64(Some(9)));
+        let (mn, mx) = merge_min_max_arrays(&null1, &null1, &null1, &null1).expect("merge null");
+        assert!(mn.is_null(0) && mx.is_null(0));
     }
 
     /// `score_clusters_into` must match [`distance`] on the fp32 centroid slice.
@@ -2395,7 +2547,6 @@ mod tests {
     #[test]
     #[ignore = "perf microbench, not a correctness gate"]
     fn score_clusters_microbench() {
-        use std::time::Instant;
         let (n_cent, dim) = (4096u32, 384u32);
         let iters = 50usize;
         let (cc, _) = synth_clusters(n_cent, dim, 99);
@@ -2456,7 +2607,7 @@ mod tests {
 
     #[test]
     fn empty_manifest_starts_at_zero() {
-        let m = Manifest::empty(opts());
+        let m = ManifestSnapshot::empty(opts());
         assert_eq!(m.manifest_id, 0);
         assert_eq!(m.superfiles.len(), 0);
         assert_eq!(m.n_docs_total(), 0);
@@ -2464,7 +2615,7 @@ mod tests {
 
     #[test]
     fn with_appended_increments_manifest_id_and_extends_superfiles() {
-        let m0 = Manifest::empty(opts());
+        let m0 = ManifestSnapshot::empty(opts());
         let entry = seg_entry(Uuid::new_v4(), 100);
         let m1 = m0.with_appended(vec![entry.clone()]);
         assert_eq!(m1.manifest_id, 1);
@@ -2478,7 +2629,7 @@ mod tests {
 
     #[test]
     fn with_appended_chains_to_higher_manifest_ids() {
-        let m0 = Manifest::empty(opts());
+        let m0 = ManifestSnapshot::empty(opts());
         let m1 = m0.with_appended(vec![seg_entry(Uuid::new_v4(), 50)]);
         let m2 = m1.with_appended(vec![seg_entry(Uuid::new_v4(), 75)]);
         assert_eq!(m0.manifest_id, 0);
@@ -2496,7 +2647,7 @@ mod tests {
         // the original's superfiles[0] — copy-on-write doesn't
         // re-allocate per-superfile. (Verified by Arc::ptr_eq.)
         let entry = seg_entry(Uuid::new_v4(), 1);
-        let m0 = Manifest::empty(opts()).with_appended(vec![entry.clone()]);
+        let m0 = ManifestSnapshot::empty(opts()).with_appended(vec![entry.clone()]);
         let m1 = m0.with_appended(vec![seg_entry(Uuid::new_v4(), 2)]);
         assert!(Arc::ptr_eq(&m0.superfiles[0], &m1.superfiles[0]));
     }
@@ -2508,7 +2659,7 @@ mod tests {
         // is a "should" decision or "ok behavior" is fine here —
         // the writer won't call it with empty input in practice;
         // the test pins the current behavior.)
-        let m0 = Manifest::empty(opts());
+        let m0 = ManifestSnapshot::empty(opts());
         let m1 = m0.with_appended(vec![]);
         assert_eq!(m1.manifest_id, 1);
         assert_eq!(m1.superfiles.len(), 0);
@@ -2521,7 +2672,7 @@ mod tests {
         // at 1 and the manifest carries exactly the entries handed in.
         let a = seg_entry(Uuid::new_v4(), 10);
         let b = seg_entry(Uuid::new_v4(), 20);
-        let m = Manifest::new_from_superfiles(opts(), vec![a.clone(), b.clone()]);
+        let m = ManifestSnapshot::new_from_superfiles(opts(), vec![a.clone(), b.clone()]);
         assert_eq!(m.manifest_id, 1);
         assert_eq!(m.superfiles.len(), 2);
         assert_eq!(m.n_docs_total(), 30);
@@ -2530,7 +2681,7 @@ mod tests {
         assert!(Arc::ptr_eq(&m.superfiles[0], &a));
         assert!(Arc::ptr_eq(&m.superfiles[1], &b));
         // No storage attached, so it's an in-process-only manifest
-        // (no ManifestList / loader).
+        // (no Manifest / loader).
         assert!(m.is_in_process_only());
     }
 
@@ -2538,7 +2689,7 @@ mod tests {
     fn new_from_superfiles_with_empty_input_is_empty_at_id_one() {
         // Mirrors `with_appended(vec![])`: no superfiles, but the
         // single append hop still advances manifest_id to 1.
-        let m = Manifest::new_from_superfiles(opts(), vec![]);
+        let m = ManifestSnapshot::new_from_superfiles(opts(), vec![]);
         assert_eq!(m.manifest_id, 1);
         assert_eq!(m.superfiles.len(), 0);
         assert_eq!(m.n_docs_total(), 0);
@@ -2546,7 +2697,7 @@ mod tests {
 
     #[test]
     fn get_next_manifest_id_is_current_plus_one() {
-        let m0 = Manifest::empty(opts());
+        let m0 = ManifestSnapshot::empty(opts());
         assert_eq!(m0.get_manifest_id(), 0);
         assert_eq!(m0.get_next_manifest_id(), 1);
 
@@ -2559,7 +2710,7 @@ mod tests {
     fn get_next_manifest_id_is_a_pure_read() {
         // Querying the successor id is side-effect-free: the
         // manifest's own id is untouched and repeat calls are stable.
-        let m = Manifest::empty(opts());
+        let m = ManifestSnapshot::empty(opts());
         let _ = m.get_next_manifest_id();
         assert_eq!(m.get_manifest_id(), 0, "current id unchanged");
         assert_eq!(m.get_next_manifest_id(), m.get_next_manifest_id());
@@ -2573,7 +2724,7 @@ mod tests {
     }
 
     // ============================================================
-    // In-memory `Manifest` with lazy-load parts — content-hash-
+    // In-memory `ManifestSnapshot` with lazy-load parts — content-hash-
     // verified per-part fetch through an injected
     // `StorageProvider`, OnceCell coalescing on cold cells,
     // typed errors for missing loader / missing part / hash
@@ -2606,9 +2757,7 @@ mod tests {
             supertable::{
                 SupertableOptions,
                 manifest::{
-                    list::{
-                        FORMAT_VERSION as LIST_FORMAT_VERSION, ManifestList, PartitionStrategy,
-                    },
+                    list::{FORMAT_VERSION as LIST_FORMAT_VERSION, Manifest, PartitionStrategy},
                     part::{self as part_mod, ContentHash, ManifestPart, PartId},
                 },
             },
@@ -2740,8 +2889,8 @@ mod tests {
             (objects, entries)
         }
 
-        fn fresh_list(entries: Vec<ManifestPartEntry>) -> ManifestList {
-            ManifestList {
+        fn fresh_list(entries: Vec<ManifestPartEntry>) -> Manifest {
+            Manifest {
                 drained_ranges: Default::default(),
                 global_vector_index: None,
                 format_version: LIST_FORMAT_VERSION.into(),
@@ -2773,11 +2922,11 @@ mod tests {
         }
 
         fn build_manifest_with_loader(
-            list: ManifestList,
+            list: Manifest,
             storage: Arc<dyn StorageProvider>,
-        ) -> Manifest {
+        ) -> ManifestSnapshot {
             let loader = Arc::new(ManifestPartLoader::new(Arc::clone(&storage), &list));
-            Manifest {
+            ManifestSnapshot {
                 superfile_list: SuperfileList::empty(options_for_test()),
                 list: Some(list),
                 parts: DashMap::new(),
@@ -2928,11 +3077,77 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn disk_cache_hit_serves_second_loader_without_storage_get() {
+            // Two independent loaders sharing one on-disk manifest cache
+            // (models a fresh manifest snapshot, or a process restart):
+            // the first populates the cache from storage, the second
+            // reads the part bytes off local disk with zero storage GETs.
+            let part = make_test_part(23);
+            let (objects, entries) = encode_and_index(from_ref(&part));
+            let storage = Arc::new(CountingMockStorage::new(objects));
+            let storage_dyn = Arc::clone(&storage) as Arc<dyn StorageProvider>;
+            let list = fresh_list(entries);
+
+            let cache_root = std::env::temp_dir()
+                .join("infino-manifest-cache-loader-test-disk_cache_hit_second_loader");
+            let _ = std::fs::remove_dir_all(&cache_root);
+            let cache = ManifestDiskCache::new(cache_root.clone(), 1 << 20).expect("cache");
+
+            // Loader A: cold — one storage GET, cache populated.
+            let loader_a = ManifestPartLoader::new_with_cache(
+                Arc::clone(&storage_dyn),
+                &list,
+                Some(Arc::clone(&cache)),
+            );
+            let a = loader_a.load(part.part_id).await.expect("first load");
+            assert_eq!(a.part_id, part.part_id);
+            assert_eq!(storage.get_call_count(), 1, "first loader fetches once");
+            assert_eq!(cache.stats().n_entries, 1, "part bytes cached on disk");
+
+            // Loader B: fresh loader, same cache — disk hit, no new GET.
+            let loader_b = ManifestPartLoader::new_with_cache(
+                Arc::clone(&storage_dyn),
+                &list,
+                Some(Arc::clone(&cache)),
+            );
+            let b = loader_b.load(part.part_id).await.expect("second load");
+            assert_eq!(b.part_id, part.part_id);
+            assert_eq!(
+                storage.get_call_count(),
+                1,
+                "disk-cache hit ⇒ no additional storage.get"
+            );
+            assert!(cache.stats().n_hits >= 1, "recorded a cache hit");
+
+            let _ = std::fs::remove_dir_all(&cache_root);
+        }
+
+        #[tokio::test]
+        async fn loader_without_cache_always_hits_storage() {
+            // Sanity: with no cache attached, each loader load is a
+            // storage GET — confirms the cache is what removes them.
+            let part = make_test_part(29);
+            let (objects, entries) = encode_and_index(from_ref(&part));
+            let storage = Arc::new(CountingMockStorage::new(objects));
+            let storage_dyn = Arc::clone(&storage) as Arc<dyn StorageProvider>;
+            let list = fresh_list(entries);
+
+            let loader = ManifestPartLoader::new(Arc::clone(&storage_dyn), &list);
+            loader.load(part.part_id).await.expect("load 1");
+            loader.load(part.part_id).await.expect("load 2");
+            assert_eq!(
+                storage.get_call_count(),
+                2,
+                "no cache ⇒ every load round-trips to storage"
+            );
+        }
+
+        #[tokio::test]
         async fn no_loader_attached_surfaces_typed_error() {
-            // In-process-only manifest — Manifest::empty has
+            // In-process-only manifest — ManifestSnapshot::empty has
             // no loader. Calling part() must error cleanly,
             // not panic.
-            let manifest = Manifest::empty(options_for_test());
+            let manifest = ManifestSnapshot::empty(options_for_test());
             let err = manifest
                 .get_part_by_id(PartId(Uuid::nil()))
                 .await
@@ -2961,9 +3176,9 @@ mod tests {
 
     #[test]
     fn manifest_debug_reports_counts() {
-        let m = Manifest::empty(opts()).with_appended(vec![seg_entry(Uuid::new_v4(), 3)]);
+        let m = ManifestSnapshot::empty(opts()).with_appended(vec![seg_entry(Uuid::new_v4(), 3)]);
         let dbg = format!("{m:?}");
-        assert!(dbg.contains("Manifest"));
+        assert!(dbg.contains("ManifestSnapshot"));
         assert!(dbg.contains("manifest_id"));
         assert!(dbg.contains("n_superfiles"));
         // No storage attached ⇒ has_loader false, has_list false.
@@ -2972,12 +3187,12 @@ mod tests {
 
     #[test]
     fn manifest_debug_with_list_reports_part_count() {
-        // A Manifest carrying a `list` exercises the Some-arm of the
-        // `n_parts` closure in Debug (the empty-Manifest test above
+        // A ManifestSnapshot carrying a `list` exercises the Some-arm of the
+        // `n_parts` closure in Debug (the empty-ManifestSnapshot test above
         // only hits the `unwrap_or(0)` None-arm).
-        use list::{ManifestList, PartitionStrategy};
+        use list::{Manifest, PartitionStrategy};
         let entry = part::PartId::new_v4();
-        let list = ManifestList {
+        let list = Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -3007,7 +3222,7 @@ mod tests {
                 fts_summary_agg: Default::default(),
             }],
         };
-        let m = Manifest {
+        let m = ManifestSnapshot {
             superfile_list: SuperfileList::empty(opts()),
             list: Some(list),
             parts: DashMap::new(),
@@ -3091,7 +3306,7 @@ mod tests {
         assert!(r.is_none(), "type mismatch drops the stat");
     }
 
-    // ---- Manifest::update-------------------------------------------
+    // ---- ManifestSnapshot::update-------------------------------------------
     fn make_superfile_entry(docs: u64) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
             birth_version: 0,
@@ -3126,10 +3341,10 @@ mod tests {
             .expect("valid options")
     }
 
-    fn empty_manifest(opts: &Arc<SupertableOptions>) -> Arc<Manifest> {
-        Arc::new(Manifest {
+    fn empty_manifest(opts: &Arc<SupertableOptions>) -> Arc<ManifestSnapshot> {
+        Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList::empty(opts.clone()),
-            list: Some(ManifestList {
+            list: Some(Manifest {
                 drained_ranges: Default::default(),
                 global_vector_index: None,
                 format_version: list::FORMAT_VERSION.into(),
@@ -3255,7 +3470,7 @@ mod tests {
     /// Number of parts whose `OnceCell` actually holds decoded bytes —
     /// distinct from `get_num_parts_loaded()`, which counts map slots (the
     /// lazy and hydrated branches pre-insert empty cells for every part).
-    fn n_parts_initialized(m: &Manifest) -> usize {
+    fn n_parts_initialized(m: &ManifestSnapshot) -> usize {
         m.parts
             .iter()
             .filter(|kv| kv.value().get().is_some())
@@ -3282,7 +3497,7 @@ mod tests {
             Some((u, h)) => (Some(u), Some(h)),
             None => (None, None),
         };
-        let list = ManifestList {
+        let list = Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -3312,14 +3527,14 @@ mod tests {
                 fts_summary_agg: Default::default(),
             }],
         };
-        let lw = write_manifest_list(storage.as_ref(), &list)
+        let lw = write_manifest(storage.as_ref(), &list)
             .await
             .expect("write list");
         write_pointer(
             storage.as_ref(),
             &PointerFile {
                 manifest_id: 1,
-                manifest_list_uri: lw.uri,
+                manifest_uri: lw.uri,
                 content_hash: lw.content_hash,
             },
             None,
@@ -3346,7 +3561,7 @@ mod tests {
         drop(storage2); // single-storage test; helper writes to `storage`.
         let persisted = persist_two_entry_table(&storage, Some((blob_uri, blob_hash))).await;
 
-        let loaded = Manifest::load(None, Arc::clone(&storage), Some(opts))
+        let loaded = ManifestSnapshot::load(None, Arc::clone(&storage), Some(opts))
             .await
             .expect("load");
         assert_eq!(loaded.superfiles.len(), 2);
@@ -3379,7 +3594,7 @@ mod tests {
             .expect("write blob");
         persist_two_entry_table(&storage, Some((blob_uri, blob_hash))).await;
 
-        let a = Manifest::load(None, Arc::clone(&storage), Some(Arc::clone(&opts)))
+        let a = ManifestSnapshot::load(None, Arc::clone(&storage), Some(Arc::clone(&opts)))
             .await
             .expect("load A");
         // List-only churn: stamp deleted-ids (preserves the slow ref) and
@@ -3395,7 +3610,7 @@ mod tests {
             .await
             .expect("stamp publish");
 
-        let b = Manifest::load(Some(Arc::clone(&a)), Arc::clone(&storage), None)
+        let b = ManifestSnapshot::load(Some(Arc::clone(&a)), Arc::clone(&storage), None)
             .await
             .expect("refresh");
         assert_eq!(b.get_manifest_id(), a.get_manifest_id() + 1);
@@ -3430,7 +3645,7 @@ mod tests {
         );
         persist_two_entry_table(&storage, Some(bogus)).await;
 
-        let err = Manifest::load(None, Arc::clone(&storage), Some(opts))
+        let err = ManifestSnapshot::load(None, Arc::clone(&storage), Some(opts))
             .await
             .expect_err("corrupt slow-state ref must fail the load loudly");
         assert!(
@@ -3456,7 +3671,7 @@ mod tests {
             .await
             .expect("write part");
 
-        let list = ManifestList {
+        let list = Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -3493,7 +3708,7 @@ mod tests {
             pw.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
-        let old_manifest = Arc::new(Manifest {
+        let old_manifest = Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -3601,7 +3816,7 @@ mod tests {
         // List order: [part_0, part_1, part_2]. part_2 is the last
         // (rewrite candidate under option-B); part_0 and part_1 are
         // frozen earlier parts.
-        let list = ManifestList {
+        let list = Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -3634,7 +3849,7 @@ mod tests {
             part_a_latest.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(part_a_latest)))),
         );
-        let old_manifest = Arc::new(Manifest {
+        let old_manifest = Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -3814,7 +4029,7 @@ mod tests {
             .await
             .expect("write part");
 
-        let list = ManifestList {
+        let list = Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -3851,7 +4066,7 @@ mod tests {
             pw.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
-        let old_manifest = Arc::new(Manifest {
+        let old_manifest = Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -3912,7 +4127,7 @@ mod tests {
             .await
             .expect("write part");
 
-        let list = ManifestList {
+        let list = Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -3949,7 +4164,7 @@ mod tests {
             pw.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
-        let old_manifest = Arc::new(Manifest {
+        let old_manifest = Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4023,7 +4238,7 @@ mod tests {
             .await
             .expect("write part");
 
-        let list = ManifestList {
+        let list = Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -4062,7 +4277,7 @@ mod tests {
             pw.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
-        let old_manifest = Arc::new(Manifest {
+        let old_manifest = Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4157,7 +4372,7 @@ mod tests {
 
         // Old manifest with TWO entries for same partition (result of prior split)
         // Second one is the "latest" for that partition
-        let list = ManifestList {
+        let list = Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -4207,7 +4422,7 @@ mod tests {
             part_latest.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(part_latest)))),
         );
-        let old_manifest = Arc::new(Manifest {
+        let old_manifest = Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4285,7 +4500,7 @@ mod tests {
             .await
             .expect("write part_b");
 
-        let list = ManifestList {
+        let list = Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -4338,7 +4553,7 @@ mod tests {
             part_b.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(part_b)))),
         );
-        let old_manifest = Arc::new(Manifest {
+        let old_manifest = Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4424,7 +4639,7 @@ mod tests {
             .await
             .expect("write part_b");
 
-        let list = ManifestList {
+        let list = Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -4477,7 +4692,7 @@ mod tests {
             part_b.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(part_b)))),
         );
-        let old_manifest = Arc::new(Manifest {
+        let old_manifest = Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4580,7 +4795,7 @@ mod tests {
                 .expect("write part_b_latest");
 
         // List order: [a_old, a_latest, b_old, b_latest]
-        let list = ManifestList {
+        let list = Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -4655,7 +4870,7 @@ mod tests {
             part_b_latest.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(part_b_latest)))),
         );
-        let old_manifest = Arc::new(Manifest {
+        let old_manifest = Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4735,7 +4950,7 @@ mod tests {
             .await
             .expect("write part");
 
-        let list = ManifestList {
+        let list = Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -4771,7 +4986,7 @@ mod tests {
             existing_part.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
-        let old_manifest = Arc::new(Manifest {
+        let old_manifest = Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4829,7 +5044,7 @@ mod tests {
             .await
             .expect("write part");
 
-        let list = ManifestList {
+        let list = Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -4865,7 +5080,7 @@ mod tests {
             existing_part.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
-        let old_manifest = Arc::new(Manifest {
+        let old_manifest = Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -4938,7 +5153,7 @@ mod tests {
             .await
             .expect("write part_b");
 
-        let list = ManifestList {
+        let list = Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -4991,7 +5206,7 @@ mod tests {
             part_b.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(part_b)))),
         );
-        let old_manifest = Arc::new(Manifest {
+        let old_manifest = Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -5076,7 +5291,7 @@ mod tests {
                 .await
                 .expect("write part_a_latest");
 
-        let list = ManifestList {
+        let list = Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -5129,7 +5344,7 @@ mod tests {
             part_a_latest.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(part_a_latest)))),
         );
-        let old_manifest = Arc::new(Manifest {
+        let old_manifest = Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -5204,7 +5419,7 @@ mod tests {
             .await
             .expect("write part");
 
-        let list = ManifestList {
+        let list = Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -5240,7 +5455,7 @@ mod tests {
             existing_part.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
-        let old_manifest = Arc::new(Manifest {
+        let old_manifest = Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -5289,7 +5504,7 @@ mod tests {
             .await
             .expect("write part");
 
-        let list = ManifestList {
+        let list = Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -5325,7 +5540,7 @@ mod tests {
             existing_part.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(existing_part)))),
         );
-        let old_manifest = Arc::new(Manifest {
+        let old_manifest = Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -5395,7 +5610,7 @@ mod tests {
                 .await
                 .expect("write part_a_latest");
 
-        let list = ManifestList {
+        let list = Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -5448,7 +5663,7 @@ mod tests {
             part_a_latest.part_id,
             Arc::new(OnceCell::new_with(Some(Arc::new(part_a_latest)))),
         );
-        let old_manifest = Arc::new(Manifest {
+        let old_manifest = Arc::new(ManifestSnapshot {
             superfile_list: SuperfileList {
                 manifest_id: 0,
                 options: opts.clone(),
@@ -5499,11 +5714,11 @@ mod tests {
         assert_eq!(list_entries[1].n_superfiles, 1);
     }
 
-    /// Build a single-part `ManifestList` carrying `n_parts` placeholder
-    /// entries — enough to exercise the list-aware `Manifest` accessors
+    /// Build a single-part `Manifest` carrying `n_parts` placeholder
+    /// entries — enough to exercise the list-aware `ManifestSnapshot` accessors
     /// without attaching storage.
-    fn list_with_parts(n_parts: usize) -> list::ManifestList {
-        use list::{ManifestList, ManifestPartEntry, PartitionStrategy};
+    fn list_with_parts(n_parts: usize) -> list::Manifest {
+        use list::{Manifest, ManifestPartEntry, PartitionStrategy};
         let parts = (0..n_parts)
             .map(|i| ManifestPartEntry {
                 part_id: part::PartId(Uuid::from_u128(i as u128 + 1)),
@@ -5517,7 +5732,7 @@ mod tests {
                 fts_summary_agg: Default::default(),
             })
             .collect();
-        ManifestList {
+        Manifest {
             drained_ranges: Default::default(),
             global_vector_index: None,
             format_version: list::FORMAT_VERSION.into(),
@@ -5539,8 +5754,8 @@ mod tests {
         }
     }
 
-    fn manifest_with_list(list: list::ManifestList) -> Manifest {
-        Manifest {
+    fn manifest_with_list(list: list::Manifest) -> ManifestSnapshot {
+        ManifestSnapshot {
             superfile_list: SuperfileList::empty(opts()),
             list: Some(list),
             parts: DashMap::new(),
@@ -5552,7 +5767,7 @@ mod tests {
     }
 
     /// `get_num_parts` / `get_all_list_entries` read straight off the
-    /// attached `ManifestList` (the Some-arm of both accessors).
+    /// attached `Manifest` (the Some-arm of both accessors).
     #[test]
     fn list_accessors_read_from_attached_list() {
         let m = manifest_with_list(list_with_parts(3));
@@ -5562,7 +5777,7 @@ mod tests {
         assert!(!m.is_in_process_only(), "a list is attached");
 
         // No-list manifest takes the None-arms.
-        let empty = Manifest::empty(opts());
+        let empty = ManifestSnapshot::empty(opts());
         assert_eq!(empty.get_num_parts(), 0);
         assert!(empty.get_all_list_entries().is_empty());
         assert!(empty.is_in_process_only());
@@ -5600,15 +5815,15 @@ mod tests {
         assert!(m.get_cached_part_by_list_idx(1).is_none());
 
         // A manifest with no list has no parts to resolve by index.
-        let empty = Manifest::empty(opts());
+        let empty = ManifestSnapshot::empty(opts());
         assert!(empty.get_cached_part_by_list_idx(0).is_none());
     }
 
-    /// `Manifest::new` with no storage/list takes the in-process-only
+    /// `ManifestSnapshot::new` with no storage/list takes the in-process-only
     /// constructor branch (loader + list both `None`).
     #[test]
     fn manifest_new_without_storage_is_in_process_only() {
-        let m = Manifest::new(7, opts(), vec![seg_entry(Uuid::new_v4(), 4)], None, None);
+        let m = ManifestSnapshot::new(7, opts(), vec![seg_entry(Uuid::new_v4(), 4)], None, None);
         assert_eq!(m.get_manifest_id(), 7);
         assert!(m.is_in_process_only());
         assert_eq!(m.get_num_parts(), 0);

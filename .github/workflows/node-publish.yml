@@ -4,12 +4,21 @@ name: Node publish
 # thin `infino` package plus its per-platform binary packages (`infino-<triple>`)
 # to npm.
 #
-# Triggered manually. The default run is a dry run: it packs and validates the
-# main package and every platform package without uploading anything. Re-run
-# with dry_run unchecked to publish for real. A real run needs the NPM_TOKEN
-# secret, with publish rights to the packages under the infino-ai org.
+# Triggered two ways: (1) a `v<version>` tag — but ONLY for a coordinated
+# minor/major release (patch == 0, e.g. `v0.2.0`); a crate-only patch tag (e.g.
+# `v0.1.1`) skips the bindings, which patch independently. The version comes from
+# package.json and a guard asserts it matches the tag. (2) a manual run
+# (workflow_dispatch) — the path for an independent Node patch — defaults to a
+# dry run; re-run with dry_run unchecked to publish. A real run needs the
+# NPM_TOKEN secret, with publish rights to the packages under the infino-ai org.
+#
+# major.minor is locked in sync across crate/Node/Python (coordinated `vX.Y.0`
+# releases); patch is independent per package, so the crate's patch counter and
+# Node's never share a number — see docs/versioning.md.
 
 on:
+  push:
+    tags: ["v[0-9]*"]
   workflow_dispatch:
     inputs:
       dry_run:
@@ -26,17 +35,26 @@ env:
 jobs:
   build:
     name: Build addon (${{ matrix.target }})
+    # Coordinated-release gate: on a tag push, run only when the tag is a
+    # minor/major (patch == 0, tag ends in `.0`). A crate-only patch tag skips
+    # the bindings. A manual run always proceeds (independent Node patch).
+    if: ${{ github.event_name == 'workflow_dispatch' || endsWith(github.ref_name, '.0') }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      # One native runner per target — `make node-build` builds for the host,
-      # no cross-compilation. These four cover every published platform.
+      # glibc + macOS build natively, one runner per target (`make node-build`
+      # builds for the host). musl (Alpine) has no native GitHub runner, so it
+      # builds inside the napi-rs Alpine image where the system `cc` is musl —
+      # the crate has C-based deps (e.g. zstd), so a native musl toolchain is
+      # simpler and more reliable than cross-compiling from glibc.
       matrix:
         include:
           - { os: ubuntu-latest, target: linux-x64-gnu }
           - { os: ubuntu-24.04-arm, target: linux-arm64-gnu }
           - { os: macos-15-intel, target: darwin-x64 }
           - { os: macos-14, target: darwin-arm64 }
+          - { os: ubuntu-latest, target: linux-x64-musl, musl: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: linux-arm64-musl, musl: aarch64-unknown-linux-musl }
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
@@ -50,14 +68,44 @@ jobs:
           large-packages: true
           docker-images: true
           swap-storage: true
+      # --- native build (glibc / macOS) ---
       - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !matrix.musl }}
       - uses: actions/setup-node@v4
+        if: ${{ !matrix.musl }}
         with:
           node-version: "20"
       - uses: Swatinem/rust-cache@v2
+        if: ${{ !matrix.musl }}
         with:
           workspaces: infino-node
-      - run: make node-build
+      - name: Build addon (native)
+        if: ${{ !matrix.musl }}
+        run: make node-build
+      # Smoke-test the AS-SHIPPED package on this platform: pack the tarballs,
+      # install them into a throwaway project, and run a real query — proving the
+      # loader resolves the per-platform binary from a clean install (not the
+      # sibling build `npm test` uses). Reuses the build above (no rebuild).
+      - name: Verify packaged binary (native)
+        if: ${{ !matrix.musl }}
+        run: make node-verify
+      # --- musl build (Alpine, via the napi-rs builder image; cc is musl) ---
+      # Runs on the host runner (so the disk-free step above still applies) but
+      # compiles inside Alpine, where the target arch matches the runner arch —
+      # so this is a native musl build, not a cross-compile. Same install→load→
+      # query smoke-test as the native legs, run inside the container (bash is
+      # not in the base image, so add it for verify-pack.sh).
+      - name: Build addon (musl, in Alpine) + verify packaged binary
+        if: ${{ matrix.musl }}
+        run: |
+          docker run --rm -v "$PWD:/build" -w /build/infino-node \
+            ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine \
+            sh -c "apk add --no-cache bash >/dev/null && \
+                   rustup target add ${{ matrix.musl }} && \
+                   npm install --ignore-scripts && \
+                   npx napi build --platform --release --strip --target ${{ matrix.musl }} --js native.js --dts native.d.ts infino && \
+                   npx tsc && \
+                   bash ./scripts/verify-pack.sh"
       - name: Upload addon
         uses: actions/upload-artifact@v4
         with:
@@ -81,9 +129,26 @@ jobs:
   publish:
     name: Publish to npm
     needs: build
+    if: ${{ github.event_name == 'workflow_dispatch' || endsWith(github.ref_name, '.0') }}
     runs-on: ubuntu-latest
+    # OIDC token for npm provenance — the "built from this repo at this commit"
+    # attestation shown on npmjs.org. A real supply-chain trust signal at launch.
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
+      # On a tag push the published version comes from package.json — assert it
+      # matches the tag so a coordinated release can't ship a mismatched version.
+      - name: Check package.json version matches tag
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(jq -r .version infino-node/package.json)"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag v$tag does not match infino-node/package.json version $pkg"
+            exit 1
+          fi
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -111,21 +176,24 @@ jobs:
       - name: Stage binaries into platform packages
         run: cd infino-node && npm run artifacts
       - name: Validate (dry run)
-        if: ${{ inputs.dry_run }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         run: |
           cd infino-node
           npx napi prepublish -t npm --skip-gh-release --dry-run
-          npm publish --dry-run --tag latest
+          npm publish --dry-run --tag latest --access public
       # Publishes the per-platform packages and pins them in the main
       # package's optionalDependencies, then publishes the main package.
       # `--tag latest` is required (not just default): the name's history
       # includes a higher version, so npm won't move the latest tag onto
       # 0.1.0 implicitly. Passing it explicitly sets latest to the engine.
       - name: Publish to npm
-        if: ${{ !inputs.dry_run }}
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
         run: |
           cd infino-node
           npx napi prepublish -t npm --skip-gh-release
-          npm publish --tag latest
+          npm publish --tag latest --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Emit provenance for the main package AND every per-platform package
+          # (napi's prepublish shells out to `npm publish`, which honors this).
+          NPM_CONFIG_PROVENANCE: "true"

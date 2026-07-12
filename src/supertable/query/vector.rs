@@ -33,7 +33,7 @@
 //!
 //! Internally pins a snapshot reader and drives the async
 //! kernel to completion via the sync→async bridge. The reader
-//! holds a pinned `Arc<Manifest>`; for each visible superfile we:
+//! holds a pinned `Arc<ManifestSnapshot>`; for each visible superfile we:
 //!
 //!   1. Fetch the superfile's `SuperfileReader` from the store.
 //!   2. Delegate to `SuperfileReader::vector_search`
@@ -92,7 +92,7 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
-        manifest::{Manifest, SuperfileEntry, SuperfileUri, list::PartitionStrategy},
+        manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri, list::PartitionStrategy},
         tombstones::SidecarCache,
     },
 };
@@ -142,7 +142,7 @@ pub(crate) struct PreparedGlobalAllow {
 /// entire top-k. The previous per-hit lookup could decode the same full column
 /// twice per hit: once to identify its owner and again to locate its row.
 async fn lookup_user_placements_by_id(
-    manifest: &Manifest,
+    manifest: &ManifestSnapshot,
     user_row_ids: &[i128],
 ) -> Result<Vec<(Arc<SuperfileEntry>, u32)>, QueryError> {
     if user_row_ids.is_empty() {
@@ -261,7 +261,7 @@ pub(crate) fn row_id_from_manifest_entry(
 /// [`hidden_hits_user_ids`]: span arithmetic → resident `take_by_local_doc_ids`
 /// → [`read_ids_for_locals`].
 pub(crate) async fn stable_ids_by_local_for_routing(
-    manifest: &Manifest,
+    manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
     reader: &SuperfileReader,
 ) -> Result<Vec<i128>, QueryError> {
@@ -300,7 +300,7 @@ pub(crate) async fn stable_ids_by_local_for_routing(
 ///   - `false` — never use the inline region; read the scalar `_id` column
 ///     (user superfiles after compaction — inline region is cluster-ordered).
 async fn read_ids_for_locals(
-    manifest: &Manifest,
+    manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
     local_ids: &[u32],
     id_column: &str,
@@ -355,7 +355,7 @@ async fn read_ids_for_locals(
 /// reading only the rows the hits touch — versus the previous per-hit
 /// object-store read that dominated warm latency.
 async fn hidden_hits_user_ids(
-    hidden_manifest: &Manifest,
+    hidden_manifest: &ManifestSnapshot,
     hidden_hits: &[SuperfileHit],
     id_column: &str,
 ) -> Result<Vec<i128>, QueryError> {
@@ -405,7 +405,7 @@ fn projection_is_id_score_only(projection: Option<&[&str]>, id_column: &str) -> 
     }
 }
 
-fn is_hidden_vector_manifest(manifest: &Manifest) -> bool {
+fn is_hidden_vector_manifest(manifest: &ManifestSnapshot) -> bool {
     matches!(
         manifest.get_partition_strategy(),
         PartitionStrategy::VectorCell { .. }
@@ -897,11 +897,13 @@ impl SupertableReader {
         // Skipped superfiles issue zero GETs.
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
+        let reader_pool = Arc::clone(&manifest.options.reader_pool);
         let kernel =
             move |reader: Arc<SuperfileReader>,
                   (ids, bitmap): (Vec<u32>, Option<Arc<RoaringBitmap>>)| {
                 let column = Arc::clone(&column_arc);
                 let query = Arc::clone(&query_arc);
+                let pool = Some(Arc::clone(&reader_pool));
                 async move {
                     let replica_overhead = reader
                         .vec()
@@ -910,7 +912,7 @@ impl SupertableReader {
                     let k_fetch = k.saturating_add(replica_overhead);
                     reader
                         .vector_search_clusters_filtered(
-                            &column, &query, k_fetch, &ids, options, bitmap, None,
+                            &column, &query, k_fetch, &ids, options, bitmap, None, pool,
                         )
                         .await
                         .map_err(|e| QueryError::Parquet(e.to_string()))
@@ -1023,7 +1025,7 @@ impl SupertableReader {
     /// survival set.
     async fn vector_pruned_superfiles_intersect(
         &self,
-        manifest: &Manifest,
+        manifest: &ManifestSnapshot,
         surviving: &HashSet<u128>,
     ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
         Ok(manifest

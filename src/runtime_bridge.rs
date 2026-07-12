@@ -116,6 +116,16 @@ where
     }
 }
 
+/// Process-wide query runtime, shared by every `Connection` and
+/// `Supertable` so open handles add zero tokio workers. Never shut
+/// down — the static keeps a reference until process exit, so handle
+/// drops from inside a caller's async context have nothing to tear down.
+static SHARED_IO_RUNTIME: OnceLock<Arc<runtime::Runtime>> = OnceLock::new();
+
+pub(crate) fn shared_io_runtime() -> Arc<runtime::Runtime> {
+    Arc::clone(SHARED_IO_RUNTIME.get_or_init(|| build_query_runtime("infino-io")))
+}
+
 /// Shared multi-thread runtime for driving the sync query API's async I/O.
 ///
 /// Multi-thread is required, not just preferred: the bridges above take the
@@ -123,7 +133,7 @@ where
 /// `block_in_place` panics on a `current_thread` runtime. Workers scale to
 /// the CPU count so a cold query's per-superfile fan-out overlaps instead
 /// of serializing.
-pub(crate) fn build_query_runtime(thread_name: &str) -> Arc<runtime::Runtime> {
+fn build_query_runtime(thread_name: &str) -> Arc<runtime::Runtime> {
     let workers = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(FALLBACK_QUERY_RUNTIME_WORKERS);
@@ -138,27 +148,6 @@ pub(crate) fn build_query_runtime(thread_name: &str) -> Arc<runtime::Runtime> {
                  catastrophic OS resource exhaustion",
             ),
     )
-}
-
-/// Get (or lazily build, named `name`) the shared query runtime stored in
-/// `slot`. Shared by the holders of a lazy `query_runtime` (`SupertableInner`,
-/// `ConnectionInner`) so the get-or-init lives in one place.
-pub(crate) fn get_or_init_query_runtime(
-    slot: &OnceLock<Arc<runtime::Runtime>>,
-    name: &str,
-) -> Arc<runtime::Runtime> {
-    Arc::clone(slot.get_or_init(|| build_query_runtime(name)))
-}
-
-/// `Drop`-safe shutdown for a lazily-built query runtime: take it out of `slot`
-/// and, only when this is the last owner, shut it down in the background
-/// (never blocking, so it is safe to call from inside an async context).
-pub(crate) fn shutdown_query_runtime_on_drop(slot: &mut OnceLock<Arc<runtime::Runtime>>) {
-    if let Some(rt) = slot.take()
-        && let Ok(rt) = Arc::try_unwrap(rt)
-    {
-        rt.shutdown_background();
-    }
 }
 
 fn build_current_thread_runtime() -> runtime::Runtime {

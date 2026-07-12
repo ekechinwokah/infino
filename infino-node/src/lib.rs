@@ -28,8 +28,10 @@
 //! plain JS objects `{ id, score }`; query-vector arrays cross as
 //! `Float32Array` (by reference, no copy).
 
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::compute::concat_batches;
 use arrow::error::ArrowError;
@@ -44,7 +46,7 @@ use datafusion::common::DFSchema;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use infino::{
-    BoolMode, ColdFetchMode, CompactionSettings, InfinoError, Metric, OptimizeError,
+    BoolMode, ColdFetchMode, CompactionSettings, GcError, InfinoError, Metric, OptimizeError,
     OptimizeOptions as InfinoOptimizeOptions, VectorSearchOptions,
 };
 
@@ -83,6 +85,16 @@ fn optimize_err(e: OptimizeError) -> Error {
         OptimizeError::NoStorage => Error::new(
             Status::InvalidArg,
             "optimize requires durable storage (not memory://)",
+        ),
+        other => Error::new(Status::GenericFailure, other.to_string()),
+    }
+}
+
+fn gc_err(e: GcError) -> Error {
+    match e {
+        GcError::NoStorage => Error::new(
+            Status::InvalidArg,
+            "gc requires durable storage (not memory://)",
         ),
         other => Error::new(Status::GenericFailure, other.to_string()),
     }
@@ -188,11 +200,10 @@ fn parse_mode(mode: Option<&str>) -> Result<BoolMode> {
 /// disk cache.
 #[napi(object)]
 pub struct ConnectOptions {
-    /// S3-compatible endpoint; requires `region`, `accessKey`, `secretKey`.
-    pub endpoint: Option<String>,
-    pub region: Option<String>,
-    pub access_key: Option<String>,
-    pub secret_key: Option<String>,
+    /// Credentials/tuning for the URI-selected backend, keyed by
+    /// `object_store` config strings (`aws_*` / `azure_*` / `google_*`). An
+    /// unknown key is rejected at `connect`.
+    pub storage_options: Option<HashMap<String, String>>,
     /// Local disk-cache directory for remote-backed tables.
     pub cache_dir: Option<String>,
     /// Disk-cache budget in bytes (a JS number; up to 2^53).
@@ -200,6 +211,9 @@ pub struct ConnectOptions {
     /// Cold-miss strategy: `"hybrid_with_prefetch"` | `"range_only"` |
     /// `"lazy_foreground_with_background_fill"`.
     pub cold_fetch_mode: Option<String>,
+    /// Probe the object store at `connect` (default `false`). `true` fails
+    /// fast on bad credentials instead of on first use.
+    pub validate: Option<bool>,
 }
 
 /// Tuning for `optimize`; all fields optional (omitted ⇒ engine default).
@@ -230,6 +244,33 @@ impl From<infino::MutationStats> for MutationStats {
             matched: s.matched() as i64,
             n_tombstoned: s.n_tombstoned() as i64,
             n_not_found: s.n_not_found() as i64,
+        }
+    }
+}
+
+/// Counts from a `gc` sweep.
+#[napi(object)]
+pub struct GcReport {
+    /// Bytes reclaimed by deleting orphaned objects.
+    pub bytes_freed: i64,
+    /// Orphaned objects deleted.
+    pub objects_deleted: i64,
+    /// Objects kept because they are still referenced by the live set.
+    pub objects_skipped_live: i64,
+    /// Objects kept because they are younger than the grace period.
+    pub objects_skipped_too_new: i64,
+    /// Objects that failed to delete (left for the next sweep).
+    pub delete_errors: i64,
+}
+
+impl From<infino::GcReport> for GcReport {
+    fn from(r: infino::GcReport) -> Self {
+        Self {
+            bytes_freed: r.bytes_freed as i64,
+            objects_deleted: r.objects_deleted as i64,
+            objects_skipped_live: r.objects_skipped_live as i64,
+            objects_skipped_too_new: r.objects_skipped_too_new as i64,
+            delete_errors: r.delete_errors as i64,
         }
     }
 }
@@ -304,26 +345,20 @@ impl IndexSpec {
 }
 
 /// Open (or create) a catalog rooted at `uri` (local dir, `memory://`, or
-/// object-store prefix). S3-compatible static credentials are passed via
-/// `options` (the JS-idiomatic form of the Rust `ConnectOptions`).
+/// object-store prefix). Credentials are passed via `options.storageOptions`
+/// (the JS-idiomatic form of the Rust `ConnectOptions`). Pass `validate: true`
+/// to probe object stores at connect (off by default) so bad credentials fail
+/// there rather than on the first table operation.
 #[napi]
 pub fn connect(uri: String, options: Option<ConnectOptions>) -> Result<Connection> {
     let inner = match options {
         None => infino::connect(&uri),
         Some(o) => {
             let mut opts = infino::ConnectOptions::new();
-            // S3 endpoint: all four fields are required together.
-            if let Some(endpoint) = o.endpoint {
-                let region = o.region.ok_or_else(|| {
-                    Error::new(Status::InvalidArg, "region is required with endpoint")
-                })?;
-                let access_key = o.access_key.ok_or_else(|| {
-                    Error::new(Status::InvalidArg, "accessKey is required with endpoint")
-                })?;
-                let secret_key = o.secret_key.ok_or_else(|| {
-                    Error::new(Status::InvalidArg, "secretKey is required with endpoint")
-                })?;
-                opts = opts.with_s3_endpoint(endpoint, region, access_key, secret_key);
+            if let Some(map) = o.storage_options {
+                for (key, value) in map {
+                    opts = opts.with_storage_option(key, value);
+                }
             }
             if let Some(dir) = o.cache_dir {
                 opts = opts.with_cache_dir(dir);
@@ -333,6 +368,9 @@ pub fn connect(uri: String, options: Option<ConnectOptions>) -> Result<Connectio
             }
             if let Some(mode) = o.cold_fetch_mode {
                 opts = opts.with_cold_fetch_mode(cold_fetch_from_str(&mode)?);
+            }
+            if let Some(v) = o.validate {
+                opts = opts.with_validate(v);
             }
             infino::connect_with(&uri, opts)
         }
@@ -360,12 +398,7 @@ impl Connection {
     /// an empty `apache-arrow` table built with the schema) and an
     /// `IndexSpec`.
     #[napi]
-    pub fn create_table(
-        &self,
-        name: String,
-        schema: Buffer,
-        indexes: &IndexSpec,
-    ) -> Result<Table> {
+    pub fn create_table(&self, name: String, schema: Buffer, indexes: &IndexSpec) -> Result<Table> {
         let schema = read_schema_ipc(&schema)?;
         let spec = indexes.to_rust()?;
         let inner = self
@@ -385,7 +418,9 @@ impl Connection {
     /// Drop (unregister) a table.
     #[napi]
     pub fn drop_table(&self, name: String, purge: Option<bool>) -> Result<()> {
-        self.inner.drop_table(&name, purge.unwrap_or(false)).map_err(map_err)
+        self.inner
+            .drop_table(&name, purge.unwrap_or(false))
+            .map_err(map_err)
     }
 
     /// List the catalog's table names.
@@ -423,7 +458,9 @@ impl Table {
         if batches.is_empty() {
             return Ok(());
         }
-        self.inner.append(&self.align_batches(batches)?).map_err(map_err)
+        self.inner
+            .append(&self.align_batches(batches)?)
+            .map_err(map_err)
     }
 
     /// BM25 search over one FTS column. Returns matching rows as an Arrow
@@ -440,8 +477,9 @@ impl Table {
         projection: Option<Vec<String>>,
     ) -> Result<Buffer> {
         let mode = parse_mode(mode.as_deref())?;
-        let proj: Option<Vec<&str>> =
-            projection.as_ref().map(|v| v.iter().map(String::as_str).collect());
+        let proj: Option<Vec<&str>> = projection
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
         let batches = self
             .inner
             .bm25_search(&column, &query, k as usize, mode, proj.as_deref())
@@ -482,11 +520,19 @@ impl Table {
             }),
             None => None,
         };
-        let proj: Option<Vec<&str>> =
-            projection.as_ref().map(|v| v.iter().map(String::as_str).collect());
+        let proj: Option<Vec<&str>> = projection
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
         let batches = self
             .inner
-            .vector_search(&column, query.as_ref(), k as usize, opts, vfilter, proj.as_deref())
+            .vector_search(
+                &column,
+                query.as_ref(),
+                k as usize,
+                opts,
+                vfilter,
+                proj.as_deref(),
+            )
             .map_err(map_err)?;
         batches_to_ipc(&batches)
     }
@@ -504,8 +550,9 @@ impl Table {
         projection: Option<Vec<String>>,
     ) -> Result<Buffer> {
         let mode = parse_mode(mode.as_deref())?;
-        let proj: Option<Vec<&str>> =
-            projection.as_ref().map(|v| v.iter().map(String::as_str).collect());
+        let proj: Option<Vec<&str>> = projection
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
         let batches = self
             .inner
             .token_match(&column, &query, mode, proj.as_deref())
@@ -523,11 +570,63 @@ impl Table {
         value: String,
         projection: Option<Vec<String>>,
     ) -> Result<Buffer> {
-        let proj: Option<Vec<&str>> =
-            projection.as_ref().map(|v| v.iter().map(String::as_str).collect());
+        let proj: Option<Vec<&str>> = projection
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
         let batches = self
             .inner
             .exact_match(&column, &value, proj.as_deref())
+            .map_err(map_err)?;
+        batches_to_ipc(&batches)
+    }
+
+    /// Count rows matching a BM25 keyword `query` over `column`, without
+    /// fetching them. `mode` is `"or"` (default) or `"and"`.
+    #[napi]
+    pub fn count(&self, column: String, query: String, mode: Option<String>) -> Result<i64> {
+        let mode = parse_mode(mode.as_deref())?;
+        let n = self.inner.count(&column, &query, mode).map_err(map_err)?;
+        Ok(n as i64)
+    }
+
+    /// Hybrid BM25 + vector search fused with reciprocal-rank fusion.
+    /// `text_column`/`text_query` (under `mode`) drive BM25; `vector_column`/
+    /// `vector_query` (a `Float32Array`, with optional `nprobe`) drive vector
+    /// kNN. Returns Arrow rows like [`Table::bm25_search`], with `score` the
+    /// fused RRF score (higher is better); `projection` selects columns.
+    #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub fn hybrid_search(
+        &self,
+        text_column: String,
+        text_query: String,
+        vector_column: String,
+        vector_query: Float32Array,
+        k: u32,
+        mode: Option<String>,
+        nprobe: Option<u32>,
+        projection: Option<Vec<String>>,
+    ) -> Result<Buffer> {
+        let mode = parse_mode(mode.as_deref())?;
+        let mut opts = VectorSearchOptions::new();
+        if let Some(n) = nprobe {
+            opts = opts.with_nprobe(n as usize);
+        }
+        let proj: Option<Vec<&str>> = projection
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let batches = self
+            .inner
+            .hybrid_search(
+                &text_column,
+                &text_query,
+                mode,
+                &vector_column,
+                vector_query.as_ref(),
+                opts,
+                k as usize,
+                proj.as_deref(),
+            )
             .map_err(map_err)?;
         batches_to_ipc(&batches)
     }
@@ -577,6 +676,15 @@ impl Table {
         self.inner.optimize(&opts).map_err(optimize_err)
     }
 
+    /// Delete orphaned storage objects left by compaction or interrupted
+    /// writes. Only objects older than `graceSecs` (a safety window against
+    /// racing readers/writers) are removed. Requires durable storage.
+    #[napi]
+    pub fn gc(&self, grace_secs: f64) -> Result<GcReport> {
+        let grace = Duration::from_secs_f64(grace_secs.max(0.0));
+        self.inner.gc(grace).map(GcReport::from).map_err(gc_err)
+    }
+
     /// The user-facing Arrow schema, as an Arrow IPC `Buffer` (an empty
     /// table carrying the schema; read with `tableFromIPC`).
     #[napi]
@@ -611,7 +719,10 @@ impl Table {
         SessionContext::new()
             .parse_sql_expr(predicate, &df_schema)
             .map_err(|e| {
-                Error::new(Status::InvalidArg, format!("invalid predicate {predicate:?}: {e}"))
+                Error::new(
+                    Status::InvalidArg,
+                    format!("invalid predicate {predicate:?}: {e}"),
+                )
             })
     }
 }

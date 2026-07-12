@@ -42,6 +42,7 @@ use parquet::{
     errors::{ParquetError, Result as ParquetResult},
     file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader},
 };
+use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
 
@@ -1212,7 +1213,7 @@ impl SuperfileReader {
         k: usize,
         options: VectorSearchOptions,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        self.vector_hits_filtered_async(column, query, k, options, None, None)
+        self.vector_hits_filtered_async(column, query, k, options, None, None, None)
             .await
     }
 
@@ -1230,6 +1231,7 @@ impl SuperfileReader {
         options: VectorSearchOptions,
         allow: Option<Arc<RoaringBitmap>>,
         deny: Option<Arc<RoaringBitmap>>,
+        pool: Option<Arc<ThreadPool>>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let filtered = allow.is_some();
         let (nprobe, rerank_mult) = options.resolve(filtered);
@@ -1238,7 +1240,7 @@ impl SuperfileReader {
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
         let rerank_mult = v.public_rerank_mult(column, rerank_mult);
         Ok(
-            v.search_async(column, query, k, nprobe, rerank_mult, allow, deny)
+            v.search_async(column, query, k, nprobe, rerank_mult, allow, deny, pool)
                 .await?,
         )
     }
@@ -1256,7 +1258,7 @@ impl SuperfileReader {
         clusters: &[u32],
         options: VectorSearchOptions,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
-        self.vector_search_clusters_filtered(column, query, k, clusters, options, None, None)
+        self.vector_search_clusters_filtered(column, query, k, clusters, options, None, None, None)
             .await
     }
 
@@ -1273,6 +1275,7 @@ impl SuperfileReader {
         options: VectorSearchOptions,
         allow: Option<Arc<RoaringBitmap>>,
         deny: Option<Arc<RoaringBitmap>>,
+        pool: Option<Arc<ThreadPool>>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let filtered = allow.is_some();
         let (_, rerank_mult) = options.resolve(filtered);
@@ -1281,7 +1284,7 @@ impl SuperfileReader {
             .ok_or_else(|| ReadError::MissingKv(kv::VEC_OFFSET))?;
         let rerank_mult = v.public_rerank_mult(column, rerank_mult);
         Ok(
-            v.search_clusters_async(column, query, k, clusters, rerank_mult, allow, deny)
+            v.search_clusters_async(column, query, k, clusters, rerank_mult, allow, deny, pool)
                 .await?,
         )
     }

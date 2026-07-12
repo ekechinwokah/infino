@@ -1,8 +1,11 @@
 {
-  "name": "infino",
-  "version": "0.1.0",
+  "name": "@infino-ai/infino",
+  "version": "0.1.2",
   "description": "Fast search on object storage — SQL, full-text, and vector search.",
   "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "homepage": "https://github.com/infino-ai/infino#readme",
   "repository": {
     "type": "git",
@@ -14,18 +17,23 @@
   },
   "keywords": [
     "search",
+    "vector",
+    "database",
     "full-text-search",
     "vector-search",
     "vector-database",
     "hybrid-search",
     "semantic-search",
     "bm25",
+    "ann",
+    "knn",
     "sql",
+    "ai",
+    "llm",
     "rag",
     "agent-memory",
     "retrieval",
     "embeddings",
-    "knn",
     "embedded-database",
     "object-storage",
     "parquet",
@@ -36,15 +44,27 @@
   ],
   "main": "infino/index.js",
   "types": "infino/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./infino/index.d.ts",
+      "default": "./infino/index.js"
+    },
+    "./package.json": "./package.json"
+  },
   "napi": {
     "name": "infino",
+    "package": {
+      "name": "infx"
+    },
     "triples": {
       "defaults": false,
       "additional": [
         "x86_64-apple-darwin",
         "aarch64-apple-darwin",
         "x86_64-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu"
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl"
       ]
     }
   },
@@ -62,10 +82,12 @@
     "apache-arrow": "^17"
   },
   "optionalDependencies": {
-    "infino-darwin-x64": "0.1.0",
-    "infino-darwin-arm64": "0.1.0",
-    "infino-linux-x64-gnu": "0.1.0",
-    "infino-linux-arm64-gnu": "0.1.0"
+    "infx-darwin-x64": "0.1.2",
+    "infx-darwin-arm64": "0.1.2",
+    "infx-linux-x64-gnu": "0.1.2",
+    "infx-linux-arm64-gnu": "0.1.2",
+    "infx-linux-x64-musl": "0.1.2",
+    "infx-linux-arm64-musl": "0.1.2"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0",

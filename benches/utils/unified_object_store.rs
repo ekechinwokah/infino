@@ -511,8 +511,12 @@ async fn setup_bench_fixture(superfile: &Bytes) -> BenchFixture {
     if let Some(bucket) = real_s3_bucket_env() {
         let prefix = unique_bench_prefix(&real_s3_prefix_root_env());
         let storage: Arc<dyn StorageProvider> = Arc::new(
-            S3StorageProvider::new_with_prefix(&bucket, &prefix)
-                .expect("real S3 benchmark provider"),
+            S3StorageProvider::new_with_prefix(
+                &bucket,
+                &prefix,
+                &crate::storage_options::s3_storage_options_from_env(),
+            )
+            .expect("real S3 benchmark provider"),
         );
         let uri = SuperfileUri::new_v4();
         let path = uri.storage_path();
@@ -1542,7 +1546,12 @@ pub(crate) mod diag {
         );
 
         let raw_storage: Arc<dyn StorageProvider> = Arc::new(
-            S3StorageProvider::new_with_prefix(&bucket, &prefix).expect("real S3 provider"),
+            S3StorageProvider::new_with_prefix(
+                &bucket,
+                &prefix,
+                &crate::storage_options::s3_storage_options_from_env(),
+            )
+            .expect("real S3 provider"),
         );
         rt.block_on(raw_storage.put_atomic(&path, superfile.clone()))
             .expect("upload superfile to real S3");
@@ -1749,7 +1758,7 @@ pub(crate) mod diag {
                 let manifest = reader.manifest();
                 let mut keys = cleanup_keys_for_run.lock().unwrap();
                 keys.push("_supertable/current".to_string());
-                keys.push(infino::supertable::manifest::commit::list_uri(
+                keys.push(infino::supertable::manifest::commit::manifest_uri(
                     consumer.manifest_id(),
                 ));
                 let list_entries = manifest.get_all_list_entries();
@@ -1831,8 +1840,12 @@ pub(crate) mod diag {
             })
         }));
 
-        let cleanup_storage =
-            S3StorageProvider::new_with_prefix(&bucket, &prefix).expect("real S3 cleanup provider");
+        let cleanup_storage = S3StorageProvider::new_with_prefix(
+            &bucket,
+            &prefix,
+            &crate::storage_options::s3_storage_options_from_env(),
+        )
+        .expect("real S3 cleanup provider");
         let keys = cleanup_keys.lock().unwrap().clone();
         let cleanup_result = rt.block_on(async {
             for key in &keys {

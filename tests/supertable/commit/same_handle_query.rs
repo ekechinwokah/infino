@@ -5,7 +5,7 @@
 //!
 //! Regression coverage for the commit-path manifest the writer
 //! installs in `inner.manifest` after a commit (via
-//! `Manifest::rebalance`). The producer handle keeps querying its
+//! `ManifestSnapshot::rebalance`). The producer handle keeps querying its
 //! own committed state without reopening, so the post-commit
 //! manifest must be able to resolve the parts it just wrote:
 //!
@@ -328,7 +328,7 @@ impl StorageProvider for PartGetCounter {
         if uri.starts_with(MANIFEST_PARTS_PREFIX) || uri.starts_with("manifest-parts/") {
             self.part_gets.fetch_add(1, Ordering::AcqRel);
         }
-        if uri.starts_with("manifest-lists/") {
+        if uri.starts_with("manifest/") {
             self.list_gets.fetch_add(1, Ordering::AcqRel);
         }
         if uri == "_supertable/current" {

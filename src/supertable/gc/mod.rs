@@ -6,16 +6,18 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use tracing::{debug, warn};
+
 use crate::{
     Supertable,
     runtime_bridge::bridge_on_runtime,
     supertable::{
-        Manifest,
+        ManifestSnapshot,
         error::GcError,
         handle::SupertableInner,
         manifest::{
             SUPERFILE_DATA_DIR,
-            commit::{MANIFEST_LISTS_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, list_uri},
+            commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
         },
         slow_vector_state::STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX,
     },
@@ -36,23 +38,28 @@ pub struct GcReport {
     pub delete_errors: u64,
 }
 
-fn build_live_set(manifest: &Manifest) -> HashSet<String> {
+fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     let mut live = HashSet::new();
     live.insert(POINTER_PATH.to_string());
-    live.insert(list_uri(manifest.manifest_id));
+    live.insert(manifest_uri(manifest.manifest_id));
     for entry in manifest.get_all_list_entries() {
         live.insert(entry.uri.clone());
     }
-    for sf in manifest.get_all_superfiles() {
-        live.insert(sf.uri.storage_path());
-    }
+    let superfiles_complete = if let Some(superfiles) = manifest.complete_flat_superfiles() {
+        for sf in superfiles {
+            live.insert(sf.uri.storage_path());
+        }
+        true
+    } else {
+        false
+    };
     // Slow-CAS entry blob: the URI is read straight off the manifest-list
     // ref — sync, no fetch. Superseded blobs (older drains) are absent from
     // the current list and get swept once past the safety gap.
     if let Some((uri, _)) = manifest.slow_vector_state_blob() {
         live.insert(uri.to_owned());
     }
-    live
+    (live, superfiles_complete)
 }
 
 impl Supertable {
@@ -74,19 +81,22 @@ pub(super) async fn gc_storage_sweep_for_inner(
 ) -> Result<GcReport, GcError> {
     let storage = inner.options.storage.clone().ok_or(GcError::NoStorage)?;
     let manifest = inner.manifest.load_full();
-    let live = build_live_set(&manifest);
+    let (live, superfiles_complete) = build_live_set(&manifest);
     let cutoff = SystemTime::now()
         .checked_sub(safety_gap)
         .unwrap_or(SystemTime::UNIX_EPOCH);
 
     let mut report = GcReport::default();
 
-    for prefix in [
-        MANIFEST_LISTS_DIR,
+    let mut prefixes = vec![
+        MANIFEST_DIR,
         MANIFEST_PARTS_DIR,
-        SUPERFILE_DATA_DIR,
         SLOW_VECTOR_STATE_STORAGE_PREFIX,
-    ] {
+    ];
+    if superfiles_complete {
+        prefixes.push(SUPERFILE_DATA_DIR);
+    }
+    for prefix in prefixes {
         let entries = storage.list_with_prefix_metadata(prefix).await?;
         for (key, meta) in entries {
             if live.contains(&key) {
@@ -102,13 +112,21 @@ pub(super) async fn gc_storage_sweep_for_inner(
                     report.objects_deleted += 1;
                     report.bytes_freed += meta.size;
                 }
-                Err(_) => {
+                Err(e) => {
+                    warn!(object = %key, error = %e, "gc: failed to delete orphan object");
                     report.delete_errors += 1;
                 }
             }
         }
     }
 
+    debug!(
+        deleted = report.objects_deleted,
+        bytes_freed = report.bytes_freed,
+        delete_errors = report.delete_errors,
+        superfiles_complete,
+        "gc sweep complete"
+    );
     Ok(report)
 }
 
@@ -125,9 +143,9 @@ mod tests {
         supertable::{
             SupertableOptions,
             manifest::{
-                Manifest, SuperfileEntry, SuperfileUri,
-                list::{FORMAT_VERSION, ManifestList, PartitionStrategy},
-                part::ContentHash,
+                ManifestSnapshot, SuperfileEntry, SuperfileUri,
+                list::{FORMAT_VERSION, Manifest, ManifestPartEntry, PartitionStrategy},
+                part::{ContentHash, PartId},
             },
             slow_vector_state,
         },
@@ -137,7 +155,7 @@ mod tests {
     /// Bucket count for a minimal hash-partitioned manifest list fixture.
     const TEST_HASH_BUCKETS: u32 = 1;
 
-    /// Manifest id for a single-list live-set fixture.
+    /// ManifestSnapshot id for a single-list live-set fixture.
     const TEST_MANIFEST_ID: u64 = 0;
 
     fn opts() -> Arc<SupertableOptions> {
@@ -163,29 +181,79 @@ mod tests {
     }
 
     #[test]
-    fn build_live_set_contains_pointer_and_list_uri() {
-        let manifest = Manifest::empty(opts());
-        let live = build_live_set(&manifest);
+    fn build_live_set_contains_pointer_and_manifest_uri() {
+        let manifest = ManifestSnapshot::empty(opts());
+        let (live, superfiles_complete) = build_live_set(&manifest);
+        assert!(superfiles_complete);
         assert!(live.contains(POINTER_PATH));
-        assert!(live.contains(&list_uri(manifest.manifest_id)));
+        assert!(live.contains(&manifest_uri(manifest.manifest_id)));
     }
 
     #[test]
     fn build_live_set_contains_superfile_uris() {
         let uri = SuperfileUri::new_v4();
-        let manifest = Manifest::empty(opts()).with_appended(vec![sf_entry(uri)]);
-        let live = build_live_set(&manifest);
+        let manifest = ManifestSnapshot::empty(opts()).with_appended(vec![sf_entry(uri)]);
+        let (live, superfiles_complete) = build_live_set(&manifest);
+        assert!(superfiles_complete);
         assert!(live.contains(&uri.storage_path()));
     }
 
     #[test]
-    fn build_live_set_does_not_contain_older_list_uris() {
+    fn build_live_set_marks_lazy_part_membership_incomplete() {
+        let dir = tempdir().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let part_id = PartId::new_v4();
+        let manifest = ManifestSnapshot::new(
+            TEST_MANIFEST_ID,
+            opts(),
+            Vec::new(),
+            Some(storage),
+            Some(Manifest {
+                format_version: FORMAT_VERSION.into(),
+                manifest_id: TEST_MANIFEST_ID,
+                options_hash: ContentHash::of(b"options"),
+                schema: Vec::new(),
+                id_column: "_id".into(),
+                fts_columns: Vec::new(),
+                vector_columns: Vec::new(),
+                partition_strategy: PartitionStrategy::Hash {
+                    column: "_id".into(),
+                    n_buckets: TEST_HASH_BUCKETS,
+                },
+                vector_index_storage_prefix: None,
+                global_vector_index: None,
+                drained_ranges: Default::default(),
+                deleted_user_ids_inline: None,
+                slow_vector_state_uri: None,
+                slow_vector_state_content_hash: None,
+                parts: vec![ManifestPartEntry {
+                    part_id,
+                    uri: format!("manifest-parts/part-{part_id}.avro.zst"),
+                    n_superfiles: 1,
+                    size_bytes_compressed: 1,
+                    size_bytes_uncompressed: 1,
+                    content_hash: ContentHash::of(b"part"),
+                    id_range: (0, 0),
+                    scalar_stats_agg: HashMap::new(),
+                    fts_summary_agg: Default::default(),
+                }],
+            }),
+        );
+
+        let (_, superfiles_complete) = build_live_set(&manifest);
+        assert!(!superfiles_complete);
+    }
+
+    #[test]
+    fn build_live_set_does_not_contain_older_manifest_uris() {
         let uri = SuperfileUri::new_v4();
-        let manifest = Manifest::empty(opts()).with_appended(vec![sf_entry(uri)]);
+        let manifest = ManifestSnapshot::empty(opts()).with_appended(vec![sf_entry(uri)]);
         assert_eq!(manifest.manifest_id, 1);
-        let live = build_live_set(&manifest);
-        assert!(!live.contains(&list_uri(0)));
-        assert!(!live.contains(&list_uri(2)));
+        let (live, superfiles_complete) = build_live_set(&manifest);
+        assert!(superfiles_complete);
+        assert!(!live.contains(&manifest_uri(0)));
+        assert!(!live.contains(&manifest_uri(2)));
     }
 
     /// The slow-CAS entry blob referenced from the list is live; anything
@@ -200,12 +268,12 @@ mod tests {
         let hash = ContentHash::of(b"slow state");
         let uri = slow_vector_state::storage_path(&hash);
         let orphan = slow_vector_state::storage_path(&ContentHash::of(b"orphan"));
-        let manifest = Manifest::new(
+        let manifest = ManifestSnapshot::new(
             TEST_MANIFEST_ID,
             opts(),
             Vec::new(),
             Some(storage),
-            Some(ManifestList {
+            Some(Manifest {
                 format_version: FORMAT_VERSION.into(),
                 manifest_id: TEST_MANIFEST_ID,
                 options_hash: ContentHash::of(b"options"),
@@ -226,7 +294,8 @@ mod tests {
                 parts: Vec::new(),
             }),
         );
-        let live = build_live_set(&manifest);
+        let (live, superfiles_complete) = build_live_set(&manifest);
+        assert!(superfiles_complete);
         assert!(live.contains(&uri), "referenced blob must be live");
         assert!(
             !live.contains(&orphan),
@@ -234,8 +303,9 @@ mod tests {
         );
 
         // A manifest without a ref keeps nothing under the prefix live.
-        let bare = Manifest::empty(opts());
-        let live = build_live_set(&bare);
+        let bare = ManifestSnapshot::empty(opts());
+        let (live, superfiles_complete) = build_live_set(&bare);
+        assert!(superfiles_complete);
         assert!(!live.contains(&uri));
     }
 }

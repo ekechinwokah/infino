@@ -1,8 +1,8 @@
-.PHONY: check fmt test doctest \
+.PHONY: check fmt test doctest doc \
         coverage coverage-summary \
         bench bench-quick miri asan ci clean \
-        public-api public-api-update \
-        python-test python-wheel python-examples-test \
+        public-api public-api-update api-parity api-parity-update \
+        python-test python-typecheck python-wheel python-examples-test \
         node-test node-build node-verify node-example
 
 # Import layout: group into std / external / crate blocks and merge each
@@ -12,6 +12,7 @@ RUSTFMT_OPTS := imports_granularity=Crate,group_imports=StdExternalCrate
 check:
 	cargo fmt --all -- --check --config $(RUSTFMT_OPTS)
 	cargo clippy --all-targets --features test-helpers -- -D warnings
+	$(MAKE) api-parity
 
 # Apply formatting, including the import-layout rules above.
 fmt:
@@ -31,6 +32,16 @@ public-api:
 
 public-api-update:
 	cargo public-api --simplified > public-api.txt
+
+# Binding-parity guard: every public operation method in public-api.txt must be
+# wrapped by BOTH the Node and Python bindings, or be listed as exempt in
+# api-parity.txt. Catches a new engine method — or a changed signature — that
+# never reaches the bindings. Pure Python 3; no toolchain needed.
+api-parity:
+	python3 scripts/check_api_parity.py
+
+api-parity-update:
+	python3 scripts/check_api_parity.py --update
 
 test:
 	cargo test --features test-helpers
@@ -104,6 +115,13 @@ asan:
 doctest:
 	cargo test --doc
 
+# Build the API docs locally, exactly as docs.rs renders them: crate only
+# (`--no-deps`), default features, opened in a browser. The landing page is
+# the README (lib.rs pulls it in via `include_str!`); the rest is rustdoc
+# from the public items' doc comments. Output: target/doc/infino/index.html.
+doc:
+	cargo doc --no-deps --open
+
 # Python bindings (PyO3 + maturin). Built standalone — `infino-python` is
 # excluded from the cargo workspace, so the core crate never needs a
 # Python toolchain. These targets are self-contained: they create a
@@ -113,9 +131,22 @@ doctest:
 python-test:
 	python3 -m venv infino-python/.venv
 	infino-python/.venv/bin/pip install -q --upgrade pip
-	infino-python/.venv/bin/pip install -q maturin pytest pyarrow pandas
+	infino-python/.venv/bin/pip install -q maturin pytest pyarrow pandas duckdb
 	VIRTUAL_ENV=$(CURDIR)/infino-python/.venv infino-python/.venv/bin/maturin develop --locked -m infino-python/Cargo.toml
 	infino-python/.venv/bin/python -m pytest infino-python/tests/ -v
+
+# Type-check the package and a sample consumer under `mypy --strict`,
+# against the source stubs (no extension build needed). Checking
+# `__init__.py` verifies its re-exports match the `_infino` stub; checking
+# the sample fails the run if the surface drifts or a `Literal` argument
+# widens to plain `str`.
+python-typecheck:
+	python3 -m venv infino-python/.venv
+	infino-python/.venv/bin/pip install -q --upgrade pip mypy
+	MYPYPATH=infino-python/python infino-python/.venv/bin/mypy \
+		--config-file infino-python/pyproject.toml \
+		infino-python/python/infino/__init__.py \
+		infino-python/tests/typing/quickstart.py
 
 # Build a release abi3 wheel for the current platform into
 # `infino-python/dist/` (one wheel covers CPython >= 3.9).
@@ -124,9 +155,12 @@ python-wheel:
 	infino-python/.venv/bin/pip install -q --upgrade pip maturin
 	infino-python/.venv/bin/maturin build --release --locked --out infino-python/dist -m infino-python/Cargo.toml
 
-# Build the bindings from source, install the examples' deps, and run every
-# notebook with nbconvert (a failing cell fails the target). Scratch tables are
-# cleaned afterwards; the venv is a reused throwaway (gitignored).
+# Concurrent example notebooks; lower it on smaller runners.
+CONCURRENT_EXAMPLE_TESTS ?= 4
+
+# Build the bindings from source and execute every example notebook (a failing
+# cell fails the target). Notebooks run in parallel — each uses a distinct
+# scratch dir. The venv is a reused throwaway (gitignored).
 python-examples-test:
 	python3 -m venv infino-python/.venv
 	infino-python/.venv/bin/pip install -q --upgrade pip maturin
@@ -134,14 +168,31 @@ python-examples-test:
 	# Drop infino from the requirements; the from-source build above is what runs.
 	grep -v '^[[:space:]]*infino' infino-python/examples/requirements.txt \
 		| infino-python/.venv/bin/pip install -q -r /dev/stdin
+	# The langchain examples add the langchain-infino integration and its stack.
+	# Strip every infino line (incl. langchain-infino) so pip never pulls infino
+	# from PyPI over the from-source build; install langchain-infino with --no-deps
+	# so it links against the build above instead of dragging in its own infino.
+	grep -v 'infino' infino-python/examples/langchain/requirements.txt \
+		| infino-python/.venv/bin/pip install -q -r /dev/stdin
+	infino-python/.venv/bin/pip install -q --no-deps langchain-infino
+	# The crewai examples add crewai-infino the same way: strip every infino line,
+	# install the rest, then add crewai-infino --no-deps so it links against the
+	# from-source build instead of pulling its own infino.
+	grep -v 'infino' infino-python/examples/crewai/requirements.txt \
+		| infino-python/.venv/bin/pip install -q -r /dev/stdin
+	infino-python/.venv/bin/pip install -q --no-deps "crewai-infino>=0.1.0"
 	infino-python/.venv/bin/pip install -q nbconvert ipykernel
-	@status=0; \
-	for nb in infino-python/examples/[0-9]*.ipynb; do \
-		echo "executing $$nb"; \
-		infino-python/.venv/bin/python -m nbconvert --to notebook --execute \
-			--stdout --ExecutePreprocessor.timeout=900 "$$nb" >/dev/null || { status=1; break; }; \
-	done; \
-	rm -rf infino-python/examples/*_data infino-python/examples/_shared/__pycache__; \
+	# Warm the shared embedding model so parallel workers don't race the download.
+	PYTHONPATH=infino-python/examples infino-python/.venv/bin/python \
+		-c "from _shared.embedding import _get_model; _get_model()" >/dev/null
+	# Run every example notebook, including the langchain/ suite. Notebooks that
+	# need an LLM degrade to a printed note when no key is set (e.g. fork PRs).
+	@ls infino-python/examples/*/[0-9]*.ipynb | \
+	PY=infino-python/.venv/bin/python xargs -P $(CONCURRENT_EXAMPLE_TESTS) -I {} \
+		sh -c 'echo "executing {}"; "$$PY" -m nbconvert --to notebook --execute \
+			--stdout --ExecutePreprocessor.timeout=900 "{}" >/dev/null'; \
+	status=$$?; \
+	rm -rf infino-python/examples/*/*_data infino-python/examples/_shared/__pycache__; \
 	exit $$status
 
 # Node bindings (napi-rs). Built standalone — `infino-node` is excluded
