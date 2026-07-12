@@ -1697,7 +1697,15 @@ impl SupertableReader {
                         .is_some_and(|id| deleted.binary_search(&id).is_err())
                 })
                 .count();
-            let deleted_occupies_top_k = live < k && live < combined.len();
+            // Deletes shrink the candidate pool in two places: a deleted id
+            // can still occupy a combined slot (identity-filtered right
+            // here), or the per-superfile tombstone filter inside the
+            // fan-out already dropped it and the slot is simply missing.
+            // Either way, while the live prefix is short and deletes exist,
+            // grow the request toward the cap instead of returning an
+            // underfull top-k while more live rows exist. When the table has
+            // no deletes this stays the zero-extra-work fast path.
+            let deleted_occupies_top_k = live < k && !deleted.is_empty();
             if !deleted_occupies_top_k || requested >= refill_cap {
                 combined.retain(|hit| {
                     hit.stable_id
