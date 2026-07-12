@@ -117,6 +117,9 @@ and let you skip the sweep:
 - `INFINO_BENCH_VECTOR_NPROBE` — probe count for the `default` row (default 8).
 - `INFINO_BENCH_VECTOR_RERANK` — rerank multiplier for the `default` row
   (default 256 at the 1M×1024 bench scale; clears the 0.80 default-config gate).
+- `INFINO_BENCH_VECTOR_CODEC` — rerank payload codec: `sq8_fixed_residual`
+  (default, cosine-only), `sq8_residual`, `fp32`, or
+  `rabitq_only`.
 - `INFINO_BENCH_SKIP_CALIBRATION=1` — measure the fixed `(nprobe, rerank)`
   `default` row without the recall-target calibration sweep or the
   high-nprobe correctness gate. Brute-force ground truth for the

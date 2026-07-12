@@ -131,6 +131,11 @@ is built in the following stages:
   used to order candidates precisely. It is configurable per column:
   full-precision floats, a compact quantized code with a residual
   correction (the default), or none (binary codes only).
+  `Sq8FixedResidual` is an opt-in cosine-only residual codec using the
+  same two-byte row layout on a fixed absolute grid. Codec ID `3` and
+  v2 cell-directory metadata distinguish its divisor-256 semantics from
+  the locally fitted divisor-16 default, allowing maintenance to move the
+  rerank bytes between clusters without requantization.
 - **Cluster-contiguous storage.** A cluster's centroid metadata, binary
   codes, document identifiers, and rerank payloads are laid out
   together, so evaluating a cluster is a contiguous read.

@@ -33,7 +33,7 @@
 #[cfg(target_arch = "x86_64")]
 use std::ptr::write_unaligned;
 
-use crate::superfile::vector::distance::{SQ8_RESIDUAL_DIVISOR, dot};
+use crate::superfile::vector::distance::dot;
 #[cfg(target_arch = "x86_64")]
 use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
 
@@ -301,7 +301,7 @@ const SQ8_RESIDUAL_I8_CLAMP: f32 = 127.0;
 /// `(scale, offset)`, using the precomputed code-leg `consts` (build once
 /// per cluster, not per row). The Sq8 code leg uses the SIMD
 /// [`sq8_encode_row`]; the residual leg captures quantization error at
-/// `scale[d] / SQ8_RESIDUAL_DIVISOR` steps and reconstructs the corrected
+/// `scale[d] / residual_divisor` steps and reconstructs the corrected
 /// component into `recon` in the same pass.
 ///
 /// When `store_norm`, returns the residual-corrected `‖x‖²` via the SIMD
@@ -318,6 +318,7 @@ pub(super) fn encode_sq8_residual_row(
     residuals: &mut [u8],
     recon: &mut [f32],
     store_norm: bool,
+    residual_divisor: f32,
 ) -> Option<f32> {
     debug_assert_eq!(row.len(), scale.len());
     debug_assert_eq!(row.len(), offset.len());
@@ -325,7 +326,8 @@ pub(super) fn encode_sq8_residual_row(
     debug_assert_eq!(row.len(), residuals.len());
     debug_assert_eq!(row.len(), recon.len());
     sq8_encode_row(row, &consts.inv_scale, &consts.c2, codes);
-    let inv_div = 1.0 / SQ8_RESIDUAL_DIVISOR;
+    debug_assert!(residual_divisor > 0.0);
+    let inv_div = 1.0 / residual_divisor;
     for d in 0..row.len() {
         let base = (codes[d] as f32).mul_add(scale[d], offset[d]);
         let step = scale[d] * inv_div;
@@ -550,6 +552,9 @@ mod tests {
     use std::hint::black_box;
 
     use super::*;
+    use crate::superfile::vector::rerank_codec::{
+        SQ8_FIXED_OFFSET, SQ8_FIXED_RESIDUAL_DIVISOR, SQ8_FIXED_SCALE,
+    };
 
     /// Deterministic synthetic Sq8 encode inputs spanning a
     /// realistic dynamic range: per-dim mins / maxes drawn from
@@ -698,6 +703,43 @@ mod tests {
                 assert_eq!(dst_avx512, dst_ref, "avx512 path mismatch at dim {}", dim);
             }
         }
+    }
+
+    #[test]
+    fn fixed_residual_grid_round_trips_with_one_step_error() {
+        let row = [-1.0, 1.0, -0.5, 0.0, 0.5, 0.123_456, -0.987_654];
+        let dim = row.len();
+        let scale = vec![SQ8_FIXED_SCALE; dim];
+        let offset = vec![SQ8_FIXED_OFFSET; dim];
+        let consts = Sq8EncodeConsts::from_scale_offset(&scale, &offset);
+        let mut codes = vec![0; dim];
+        let mut residuals = vec![0; dim];
+        let mut recon = vec![0.0; dim];
+        let norm = encode_sq8_residual_row(
+            &row,
+            &consts,
+            &scale,
+            &offset,
+            &mut codes,
+            &mut residuals,
+            &mut recon,
+            true,
+            SQ8_FIXED_RESIDUAL_DIVISOR,
+        )
+        .expect("norm");
+        assert_eq!((codes[0], residuals[0]), (0, 0));
+        assert_eq!((codes[1], residuals[1]), (u8::MAX, 0));
+        let step = SQ8_FIXED_SCALE / SQ8_FIXED_RESIDUAL_DIVISOR;
+        for (actual, decoded) in row.iter().zip(&recon) {
+            assert!((actual - decoded).abs() <= step * 1.01);
+        }
+        let expected_norm: f32 = recon.iter().map(|value| value * value).sum();
+        assert!((norm - expected_norm).abs() <= f32::EPSILON * expected_norm.max(1.0));
+        assert!(
+            residuals
+                .iter()
+                .all(|byte| *byte != i8::MIN.to_le_bytes()[0])
+        );
     }
 
     /// Microbench: per-tier Sq8 encode throughput across the same

@@ -104,7 +104,7 @@ use infino::{
     superfile::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
         fts::reader::BoolMode,
-        vector::{distance::Metric, rerank_codec::RerankCodec},
+        vector::distance::Metric,
     },
     supertable::{
         SuperfileUri, Supertable, SupertableOptions,
@@ -118,6 +118,8 @@ use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use s3s_fs::FileSystem;
 use tempfile::TempDir;
 use tokio::{net::TcpListener, runtime::Runtime};
+
+use crate::corpus;
 
 // ─── Constants ───────────────────────────────────────────────────────
 
@@ -247,7 +249,7 @@ fn build_superfile_bytes() -> Bytes {
             n_cent,
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8Residual,
+            rerank_codec: corpus::bench_rerank_codec(Metric::Cosine),
         }],
         Some(default_tokenizer()),
     );
@@ -1908,7 +1910,7 @@ pub(crate) mod diag {
                 n_cent: crate::corpus::n_cent(quick_iter_n_docs()),
                 rot_seed: ROT_SEED,
                 metric: Metric::Cosine,
-                rerank_codec: RerankCodec::Sq8Residual,
+                rerank_codec: corpus::bench_rerank_codec(Metric::Cosine),
             }],
             Some(default_tokenizer()),
         )

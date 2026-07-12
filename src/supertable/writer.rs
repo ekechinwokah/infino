@@ -3223,15 +3223,20 @@ fn drain_pack_materialized_cell(
 fn drain_cell_vector_config(cfg: &VectorConfig, n_rows: usize) -> VectorConfig {
     debug_assert!(n_rows > 0);
     let dim = cfg.dim;
+    let rerank_codec = if cfg.rerank_codec.is_sq8_residual_family() {
+        cfg.rerank_codec
+    } else {
+        RerankCodec::Sq8Residual
+    };
     let rabitq_bytes = dim.div_ceil(u8::BITS as usize);
-    let rerank_bytes = RerankCodec::Sq8Residual.per_vector_bytes(dim);
+    let rerank_bytes = rerank_codec.per_vector_bytes(dim);
     let row_stride =
         rabitq_bytes + DOC_ID_BYTES + rerank_bytes + STABLE_ID_BYTES + mem::size_of::<f32>();
     let rows_per_run = (DRAIN_FINE_RUN_TARGET_BYTES / row_stride.max(1)).max(1);
     let n_cent = n_rows.div_ceil(rows_per_run).clamp(1, n_rows);
     VectorConfig {
         n_cent,
-        rerank_codec: RerankCodec::Sq8Residual,
+        rerank_codec,
         provided_centroids: None,
         ..cfg.clone()
     }

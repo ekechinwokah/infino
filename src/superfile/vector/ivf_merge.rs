@@ -44,6 +44,7 @@ pub(crate) struct Sq8IvfMergeInput {
     pub n_cent: usize,
     pub n_docs: u32,
     pub metric: Metric,
+    pub rerank_codec: RerankCodec,
     pub doc_id_offset: u32,
     pub cluster_idx_off: usize,
     pub centroids_off: usize,
@@ -65,6 +66,7 @@ pub(crate) struct MergedIvfSubsection {
     pub bytes: Vec<u8>,
     pub n_cent: usize,
     pub n_docs: u32,
+    pub rerank_codec: RerankCodec,
     pub summary_offset_in_sub: usize,
     pub codec_meta_offset_in_sub: usize,
     pub codec_meta_size: usize,
@@ -109,16 +111,21 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
     let dim = parsed[0].dim;
     let n_cent = parsed[0].n_cent;
     let metric = parsed[0].metric;
+    let codec = parsed[0].rerank_codec;
     for inp in &parsed[1..] {
-        if inp.dim != dim || inp.n_cent != n_cent || inp.metric != metric {
+        if inp.dim != dim
+            || inp.n_cent != n_cent
+            || inp.metric != metric
+            || inp.rerank_codec != codec
+        {
             return Err(BuildError::VectorSchemaMismatch(
-                "Sq8 IVF merge inputs must share dim, n_cent, and metric".into(),
+                "Sq8 IVF merge inputs must share dim, n_cent, metric, and codec".into(),
             ));
         }
     }
 
     let n_docs: u32 = parsed.iter().map(|p| p.n_docs).sum();
-    let codec = RerankCodec::Sq8Residual;
+    debug_assert!(codec.is_sq8_residual_family());
     let quant = BitQuantizer::new(dim);
     let code_bytes = quant.code_bytes();
     let per_vec_bytes = codec.per_vector_bytes(dim);
@@ -293,11 +300,15 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
                                     offset_c,
                                     &inp.sub[rowb..rowb + dim],
                                     &inp.sub[rowb + dim..rowb + dim + dim],
+                                    codec
+                                        .residual_divisor()
+                                        .expect("residual-family codec has divisor"),
                                 )
                             })
                         } else {
                             let encoded = EncodedCellRow {
                                 stable_id: 0,
+                                rerank_codec: inp.rerank_codec,
                                 scale: std::sync::Arc::from(src_scale),
                                 offset: std::sync::Arc::from(src_offset),
                                 codes: inp.sub[rowb..rowb + dim].to_vec(),
@@ -306,12 +317,13 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
                             };
                             let n = materialize_sq8_residual_row_into_cluster_quant(
                                 &encoded,
+                                codec,
                                 scale_c,
                                 offset_c,
                                 dim,
                                 &mut row_buf,
                                 store_norm,
-                            );
+                            )?;
                             bytes[full_off..full_off + dim * 2].copy_from_slice(&row_buf);
                             n
                         };
@@ -335,6 +347,7 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
         bytes,
         n_cent,
         n_docs,
+        rerank_codec: codec,
         summary_offset_in_sub: layout.summary_off,
         codec_meta_offset_in_sub: if codec_meta_size == 0 {
             0
@@ -390,10 +403,11 @@ pub(crate) fn splice_fragments_into_cell(
     }
     let dim = fragments[0].0.dim;
     let metric = fragments[0].0.metric;
+    let codec = fragments[0].0.rerank_codec;
     for (inp, _, _) in &fragments[1..] {
-        if inp.dim != dim || inp.metric != metric {
+        if inp.dim != dim || inp.metric != metric || inp.rerank_codec != codec {
             return Err(BuildError::VectorSchemaMismatch(
-                "fragment splice inputs must share dim and metric".into(),
+                "fragment splice inputs must share dim, metric, and codec".into(),
             ));
         }
     }
@@ -408,7 +422,7 @@ pub(crate) fn splice_fragments_into_cell(
         return Ok(None);
     }
 
-    let codec = RerankCodec::Sq8Residual;
+    debug_assert!(codec.is_sq8_residual_family());
     let quant = BitQuantizer::new(dim);
     let code_bytes = quant.code_bytes();
     let per_vec_bytes = codec.per_vector_bytes(dim);
@@ -514,6 +528,9 @@ pub(crate) fn splice_fragments_into_cell(
                         offset_c,
                         &inp.sub[rowb..rowb + dim],
                         &inp.sub[rowb + dim..rowb + dim + dim],
+                        codec
+                            .residual_divisor()
+                            .expect("residual-family codec has divisor"),
                     );
                     let n_off = norms_off + out_row * 4;
                     bytes[n_off..n_off + 4].copy_from_slice(&n_sq.to_le_bytes());
@@ -532,6 +549,7 @@ pub(crate) fn splice_fragments_into_cell(
             bytes,
             n_cent: out_n_cent,
             n_docs,
+            rerank_codec: codec,
             summary_offset_in_sub: layout.summary_off,
             codec_meta_offset_in_sub: if codec_meta_size == 0 {
                 0

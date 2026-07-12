@@ -42,12 +42,12 @@ use crate::superfile::{
     vector::{
         cell_posting::{EncodedCellRow, MaterializedIvfRow, sq8_residual_norm_sq},
         distance::{
-            Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualKernel, decode_f32_le_into, distance_bytes,
-            distance_bytes_codec, sum_f32,
+            Metric, Sq8ResidualKernel, decode_f32_le_into, distance_bytes, distance_bytes_codec,
+            sum_f32,
         },
         ivf_merge::Sq8IvfMergeInput,
         quant::BitQuantizer,
-        rerank_codec::RerankCodec,
+        rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
         rotation::RandomRotation,
     },
 };
@@ -846,14 +846,16 @@ impl VectorReader {
             let rerank_codec = RerankCodec::from_codec_id(codec_id).ok_or_else(|| {
                 VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' has unknown rerank-codec id {codec_id} \
-                     (known ids: 0=fp32, 1=sq8, 2=rabitq_only)",
+                     (known ids: 0=fp32, 1=sq8_residual, 2=rabitq_only, \
+                      3=sq8_fixed_residual)",
                     cfg.column
                 )))
             })?;
             if !rerank_codec.is_implemented() {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' uses rerank codec {} which is not implemented yet \
-                     (`fp32`, `sq8`, `rabitq_only` are the supported codecs)",
+                     (`fp32`, `sq8_residual`, `sq8_fixed_residual`, \
+                      `rabitq_only` are the supported codecs)",
                     cfg.column,
                     rerank_codec.name()
                 ))));
@@ -883,6 +885,13 @@ impl VectorReader {
                     ))));
                 }
             };
+            if !rerank_codec.supports_metric(metric) {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "column '{}' codec {} supports cosine metric only",
+                    cfg.column,
+                    rerank_codec.name()
+                ))));
+            }
 
             // Validate subsection bounds + magic.
             //
@@ -1074,7 +1083,7 @@ impl VectorReader {
                 ))));
             }
 
-            let sq8_meta = if matches!(rerank_codec, RerankCodec::Sq8Residual) {
+            let sq8_meta = if rerank_codec.is_sq8_residual_family() {
                 let meta_abs_start = subsection_off + codec_meta_off;
                 let meta_abs_end = meta_abs_start + actual_codec_meta_size;
                 let so_block_bytes = (n_cent as usize) * dim * 4;
@@ -1083,6 +1092,12 @@ impl VectorReader {
                 if let Some(meta_bytes) = source.try_get_range_sync(meta_abs_start..meta_abs_end) {
                     let scale = parse_f32_le_vec(&meta_bytes[0..scale_end]);
                     let offset = parse_f32_le_vec(&meta_bytes[scale_end..offset_end]);
+                    validate_fixed_quantizer_meta(
+                        rerank_codec,
+                        &scale,
+                        &offset,
+                        cfg.column.as_str(),
+                    )?;
                     let per_doc_norms: Option<Arc<[f32]>> =
                         if matches!(metric, Metric::L2Sq | Metric::Cosine) {
                             let norms_end = offset_end + (col_n_docs as usize) * 4;
@@ -1231,14 +1246,12 @@ impl VectorReader {
                 ))));
             }
         };
-        // Hidden multi-cell packs are Sq8 residual IVF cell subsections.
-        let rerank_codec = RerankCodec::Sq8Residual;
-
         let mut columns = Vec::with_capacity(n_cells);
         let mut cell_ids = Vec::with_capacity(n_cells);
         let mut flat_cluster_base = Vec::with_capacity(n_cells + 1);
         flat_cluster_base.push(0);
         let mut flat_total = 0u32;
+        let mut packed_codec = None;
 
         for i in 0..n_cells {
             let entry_off = i * CELL_DIR_ENTRY_SIZE;
@@ -1254,6 +1267,37 @@ impl VectorReader {
                 &dir_bytes[entry_off + cell_dir_entry::SUBSECTION_LEN_OFF
                     ..entry_off + cell_dir_entry::SUBSECTION_LEN_OFF + U64_BYTES],
             ) as usize;
+            let raw_codec = read_u32_le(
+                &dir_bytes[entry_off + cell_dir_entry::CODEC_ID_OFF
+                    ..entry_off + cell_dir_entry::CODEC_ID_OFF + U32_BYTES],
+            );
+            let rerank_codec = match raw_codec {
+                value if value == u32::from(RerankCodec::Sq8Residual.codec_id()) => {
+                    RerankCodec::Sq8Residual
+                }
+                value if value == u32::from(RerankCodec::Sq8FixedResidual.codec_id()) => {
+                    RerankCodec::Sq8FixedResidual
+                }
+                _ => {
+                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                        "multi-cell directory has unknown rerank codec id {raw_codec}"
+                    ))));
+                }
+            };
+            if let Some(expected) = packed_codec
+                && expected != rerank_codec
+            {
+                return Err(VectorError::Read(ReadError::MalformedVersion(
+                    "multi-cell directory mixes rerank codecs".into(),
+                )));
+            }
+            packed_codec = Some(rerank_codec);
+            if !rerank_codec.supports_metric(metric) {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "multi-cell codec {} supports cosine metric only",
+                    rerank_codec.name()
+                ))));
+            }
             if i > 0 && cell_id <= cell_ids[i - 1] {
                 return Err(VectorError::Read(ReadError::MalformedVersion(
                     "multi-cell directory cell_ids must be strictly ascending".into(),
@@ -1402,6 +1446,12 @@ impl VectorReader {
     ) -> Result<ColumnReader, VectorError> {
         let dim = cfg.dim;
         let rot_seed = cfg.rot_seed;
+        if !rerank_codec.supports_metric(metric) {
+            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                "cell codec {} supports cosine metric only",
+                rerank_codec.name()
+            ))));
+        }
         let sub_end = subsection_off + subsection_len;
         if sub_end > source.len() {
             return Err(VectorError::Read(ReadError::MalformedVersion(
@@ -1517,7 +1567,7 @@ impl VectorReader {
             ))));
         }
 
-        let sq8_meta = if matches!(rerank_codec, RerankCodec::Sq8Residual) {
+        let sq8_meta = if rerank_codec.is_sq8_residual_family() {
             let meta_abs_start = subsection_off + codec_meta_off;
             let meta_abs_end = meta_abs_start + codec_meta_size;
             let so_block_bytes = n_cent * dim * 4;
@@ -1526,6 +1576,7 @@ impl VectorReader {
             if let Some(meta_bytes) = source.try_get_range_sync(meta_abs_start..meta_abs_end) {
                 let scale = parse_f32_le_vec(&meta_bytes[0..scale_end]);
                 let offset = parse_f32_le_vec(&meta_bytes[scale_end..offset_end]);
+                validate_fixed_quantizer_meta(rerank_codec, &scale, &offset, cfg.column.as_str())?;
                 let per_doc_norms: Option<Arc<[f32]>> =
                     if matches!(metric, Metric::L2Sq | Metric::Cosine) {
                         let norms_end = offset_end + (col_n_docs as usize) * 4;
@@ -2041,7 +2092,7 @@ impl VectorReader {
         let col = self.columns.get(col_idx).ok_or_else(|| {
             BuildError::VectorSchemaMismatch(format!("cell column index {col_idx} out of range"))
         })?;
-        if col.rerank_codec != RerankCodec::Sq8Residual {
+        if !col.rerank_codec.is_sq8_residual_family() {
             return Err(BuildError::VectorRerankCodecUnimplemented {
                 column: col.name.clone(),
                 codec: col.rerank_codec.name(),
@@ -2093,6 +2144,7 @@ impl VectorReader {
             n_cent: col.n_cent as usize,
             n_docs: col.n_docs,
             metric: col.metric,
+            rerank_codec: col.rerank_codec,
             doc_id_offset,
             cluster_idx_off: col.cluster_idx_off,
             centroids_off: col.centroids_off,
@@ -2115,7 +2167,7 @@ impl VectorReader {
         let col = self.columns.get(col_idx).ok_or_else(|| {
             BuildError::VectorSchemaMismatch(format!("cell column index {col_idx} out of range"))
         })?;
-        if col.rerank_codec != RerankCodec::Sq8Residual {
+        if !col.rerank_codec.is_sq8_residual_family() {
             return Err(BuildError::VectorRerankCodecUnimplemented {
                 column: col.name.clone(),
                 codec: col.rerank_codec.name(),
@@ -2165,7 +2217,7 @@ impl VectorReader {
         col_idx: usize,
     ) -> Option<Vec<MaterializedIvfRow>> {
         let col = self.columns.get(col_idx)?;
-        if col.rerank_codec != RerankCodec::Sq8Residual {
+        if !col.rerank_codec.is_sq8_residual_family() {
             return None;
         }
         let dim = col.dim;
@@ -2348,8 +2400,17 @@ impl VectorReader {
                 let rowb = full_at + i * per_vec;
                 let codes = sub[rowb..rowb + dim].to_vec();
                 let residuals = sub[rowb + dim..rowb + dim + dim].to_vec();
-                let norm_sq =
-                    store_norm.then(|| sq8_residual_norm_sq(&sc, &of, &codes, &residuals));
+                let norm_sq = store_norm.then(|| {
+                    sq8_residual_norm_sq(
+                        &sc,
+                        &of,
+                        &codes,
+                        &residuals,
+                        col.rerank_codec
+                            .residual_divisor()
+                            .expect("materialized row uses residual-family codec"),
+                    )
+                });
                 let stable_id = stable_ids_rel
                     .map(|so| {
                         let p = so + (local_id as usize) * format::vec::STABLE_ID_BYTES;
@@ -2367,6 +2428,7 @@ impl VectorReader {
                     rabitq_code: rabitq,
                     encoded: EncodedCellRow {
                         stable_id,
+                        rerank_codec: col.rerank_codec,
                         scale: sc.clone(),
                         offset: of.clone(),
                         codes,
@@ -3140,10 +3202,11 @@ impl VectorReader {
         }
         match col.rerank_codec {
             RerankCodec::Fp32 => self.get_vectors_fp32(column),
-            RerankCodec::Sq8Residual => {
+            RerankCodec::Sq8Residual | RerankCodec::Sq8FixedResidual => {
                 Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                    "column '{}' uses Sq8Residual — merge via build_from_sq8_ivf_readers",
-                    col.name
+                    "column '{}' uses {} — merge via build_from_sq8_ivf_readers",
+                    col.name,
+                    col.rerank_codec.name()
                 ))))
             }
             other => Err(VectorError::Read(ReadError::MalformedVersion(format!(
@@ -3773,7 +3836,11 @@ async fn rerank_candidates_from_blocks(
                     .collect()
             }
         }
-        RerankCodec::Sq8Residual => {
+        RerankCodec::Sq8Residual | RerankCodec::Sq8FixedResidual => {
+            let residual_divisor = col
+                .rerank_codec
+                .residual_divisor()
+                .expect("residual-family codec has divisor");
             let meta = col
                 .sq8_meta
                 .as_ref()
@@ -3798,6 +3865,7 @@ async fn rerank_candidates_from_blocks(
                         scale,
                         offset,
                         per_doc_norms.clone(),
+                        residual_divisor,
                         pool.clone(),
                         stride,
                     )
@@ -3816,6 +3884,7 @@ async fn rerank_candidates_from_blocks(
                                 dim,
                                 col.n_docs as usize,
                                 norms_abs_off.is_some(),
+                                col.rerank_codec,
                             ))
                         }));
                         return Ok(finalize_reranked(
@@ -3829,6 +3898,7 @@ async fn rerank_candidates_from_blocks(
                                 parsed.scale.as_slice(),
                                 parsed.offset.as_slice(),
                                 parsed.per_doc_norms.clone(),
+                                residual_divisor,
                                 pool.clone(),
                                 stride,
                             )
@@ -3907,7 +3977,7 @@ async fn rerank_candidates_from_blocks(
                                     query,
                                     scale,
                                     offset,
-                                    SQ8_RESIDUAL_DIVISOR,
+                                    residual_divisor,
                                 ),
                             )
                         })
@@ -3966,6 +4036,7 @@ async fn score_sq8_residual_candidates(
     scale: &[f32],
     offset: &[f32],
     per_doc_norms: Option<Arc<[f32]>>,
+    residual_divisor: f32,
     pool: Option<Arc<ThreadPool>>,
     stride: usize,
 ) -> Vec<(u32, f32)> {
@@ -3980,7 +4051,7 @@ async fn score_sq8_residual_candidates(
             let offset_c = &offset[c * dim..(c + 1) * dim];
             (
                 cid,
-                Sq8ResidualKernel::new(metric, query, scale_c, offset_c, SQ8_RESIDUAL_DIVISOR),
+                Sq8ResidualKernel::new(metric, query, scale_c, offset_c, residual_divisor),
             )
         })
         .collect();
@@ -4035,12 +4106,16 @@ fn parse_sq8_meta_bytes(
     dim: usize,
     n_docs: usize,
     has_norms: bool,
+    rerank_codec: RerankCodec,
 ) -> Sq8ParsedMeta {
     let so_block_bytes = n_cent * dim * 4;
     let scale_end = so_block_bytes;
     let offset_end = scale_end + so_block_bytes;
     let scale = parse_f32_le_vec(&bytes[0..scale_end]);
     let offset = parse_f32_le_vec(&bytes[scale_end..offset_end]);
+    debug_assert!(
+        validate_fixed_quantizer_meta(rerank_codec, &scale, &offset, "lazy metadata").is_ok()
+    );
     let per_doc_norms = has_norms.then(|| {
         let norms_end = offset_end + n_docs * 4;
         Arc::from(parse_f32_le_vec(&bytes[offset_end..norms_end]))
@@ -4049,6 +4124,31 @@ fn parse_sq8_meta_bytes(
         scale,
         offset,
         per_doc_norms,
+    }
+}
+
+fn validate_fixed_quantizer_meta(
+    rerank_codec: RerankCodec,
+    scale: &[f32],
+    offset: &[f32],
+    column: &str,
+) -> Result<(), VectorError> {
+    if !rerank_codec.uses_fixed_quantizer() {
+        return Ok(());
+    }
+    let valid = scale
+        .iter()
+        .all(|value| value.to_bits() == SQ8_FIXED_SCALE.to_bits())
+        && offset
+            .iter()
+            .all(|value| value.to_bits() == SQ8_FIXED_OFFSET.to_bits());
+    if valid {
+        Ok(())
+    } else {
+        Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            "column {column:?} has non-fixed quantizer metadata for codec {}",
+            rerank_codec.name()
+        ))))
     }
 }
 
@@ -4284,6 +4384,9 @@ mod tests {
             &[1.0],
             &[0.0],
             None,
+            RerankCodec::Sq8Residual
+                .residual_divisor()
+                .expect("local residual divisor"),
             None,
             2,
         )
@@ -4683,7 +4786,7 @@ mod tests {
         for codec in [
             RerankCodec::Fp32,
             RerankCodec::Sq8Residual,
-            RerankCodec::Sq8Residual,
+            RerankCodec::Sq8FixedResidual,
             RerankCodec::RabitqOnly,
         ] {
             let mut b = VectorBuilder::new();
@@ -4692,7 +4795,11 @@ mod tests {
                 dim: 16,
                 n_cent: 4,
                 rot_seed: 7,
-                metric: Metric::L2Sq,
+                metric: if codec == RerankCodec::Sq8FixedResidual {
+                    Metric::Cosine
+                } else {
+                    Metric::L2Sq
+                },
                 rerank_codec: codec,
                 provided_centroids: None,
             })
@@ -4771,25 +4878,25 @@ mod tests {
         assert_eq!(norms.len(), col.n_docs as usize);
     }
 
-    /// `Sq8Residual` (the default codec) round-trips through the
+    /// `Sq8FixedResidual` (the default codec) round-trips through the
     /// reader. The on-disk `full[]` body is `n_docs × 2·dim` bytes
     /// (`[code dim u8 ‖ residual dim i8]`); codec_meta matches Sq8
     /// (per-cluster scale/offset + per-doc norms). The residual leg
     /// rides in `full[]`, not codec_meta.
     #[test]
-    fn open_round_trips_sq8_residual_codec_default() {
+    fn open_round_trips_sq8_fixed_residual_codec_default() {
         let dim = 32usize;
         let n_cent = 4usize;
         let n_docs = 64u32;
         let mut b = VectorBuilder::new();
         // Register via the struct default for rerank_codec to pin
-        // that the build default is Sq8Residual.
+        // that the build default is Sq8FixedResidual.
         b.register_column(VectorConfig {
             column: "v".into(),
             dim,
             n_cent,
             rot_seed: 7,
-            metric: Metric::L2Sq,
+            metric: Metric::Cosine,
             rerank_codec: RerankCodec::default(),
             provided_centroids: None,
         })
@@ -4801,13 +4908,13 @@ mod tests {
         let blob = b.finish().expect("finish");
 
         let json =
-            r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#.to_string();
+            r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":7,"metric":"cosine"}]"#.to_string();
         let r = VectorReader::open(Bytes::from(blob), &json).expect("open");
         let col = &r.columns[0];
-        assert_eq!(col.rerank_codec, RerankCodec::Sq8Residual);
+        assert_eq!(col.rerank_codec, RerankCodec::Sq8FixedResidual);
         assert_ne!(
             col.codec_meta_off, 0,
-            "Sq8Residual must declare codec_meta_off > 0"
+            "Sq8FixedResidual must declare codec_meta_off > 0"
         );
 
         // full[] is n_docs × 2·dim (code + residual sidecar).
@@ -4868,6 +4975,116 @@ mod tests {
             hits[0].0, 42,
             "Sq8Residual cosine self-query must recover self"
         );
+    }
+
+    #[tokio::test]
+    async fn sq8_fixed_residual_self_query_round_trips_top1_cosine() {
+        let dim = 32usize;
+        let n_cent = 4usize;
+        let n_docs = 64u32;
+        let mut builder = VectorBuilder::new();
+        builder
+            .register_column(VectorConfig {
+                column: "v".into(),
+                dim,
+                n_cent,
+                rot_seed: 29,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8FixedResidual,
+                provided_centroids: None,
+            })
+            .expect("register fixed residual column");
+        let make = |i: u32| -> Vec<f32> {
+            let raw: Vec<f32> = (0..dim)
+                .map(|j| {
+                    let hash =
+                        (i.wrapping_mul(0x9E37_79B9)) ^ ((j as u32).wrapping_mul(0x85EB_CA77));
+                    ((hash.wrapping_mul(0xC2B2_AE35) & 0xFFFF) as f32) / 65535.0
+                })
+                .collect();
+            let norm = raw.iter().map(|value| value * value).sum::<f32>().sqrt();
+            raw.into_iter().map(|value| value / norm).collect()
+        };
+        let mut vectors = Vec::with_capacity(n_docs as usize);
+        for i in 0..n_docs {
+            let vector = make(i);
+            builder.add(0, &vector).expect("add");
+            vectors.push(vector);
+        }
+        let blob = builder.finish().expect("finish");
+        let json = r#"[{"column":"v","dim":32,"n_cent":4,"rot_seed":29,"metric":"cosine"}]"#;
+        let reader = VectorReader::open(Bytes::from(blob), json).expect("open");
+        assert_eq!(
+            reader.columns[0].rerank_codec,
+            RerankCodec::Sq8FixedResidual
+        );
+        let hits = reader
+            .search("v", &vectors[42], 5, n_cent, 20)
+            .await
+            .expect("fixed residual search");
+        assert_eq!(hits[0].0, 42);
+    }
+
+    #[tokio::test]
+    async fn sq8_fixed_residual_lazy_search_matches_eager() {
+        let (blob, json, vectors) =
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8FixedResidual, Metric::Cosine);
+        let eager = VectorReader::open(blob.clone(), &json).expect("eager open");
+        let source = StdArc::new(CountingLazyByteSource::new(blob));
+        let lazy = VectorReader::open_lazy(
+            StdArc::clone(&source) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("lazy open");
+        let eager_hits = eager
+            .search_async("v", &vectors[17], 5, 4, 20, None, None, None)
+            .await
+            .expect("eager search");
+        let lazy_hits = lazy
+            .search_async("v", &vectors[17], 5, 4, 20, None, None, None)
+            .await
+            .expect("lazy search");
+        assert_eq!(eager_hits, lazy_hits);
+    }
+
+    #[test]
+    fn sq8_fixed_residual_rejects_non_fixed_metadata() {
+        let (blob, json, _) =
+            build_small_superfile(16, 2, 16, RerankCodec::Sq8FixedResidual, Metric::Cosine);
+        let opened = VectorReader::open(blob.clone(), &json).expect("open valid fixed blob");
+        let column = &opened.columns[0];
+        let scale_byte = column.subsection_range.start + column.codec_meta_off;
+        let mut corrupted = blob.to_vec();
+        corrupted[scale_byte] ^= 1;
+        let error = VectorReader::open_with(
+            Bytes::from(corrupted),
+            &json,
+            OpenOptions { verify_crc: false },
+        )
+        .expect_err("fixed codec must reject local quantizer metadata");
+        assert!(matches!(
+            error,
+            VectorError::Read(ReadError::MalformedVersion(_))
+        ));
+    }
+
+    #[test]
+    fn sq8_fixed_residual_rejects_non_cosine_metric() {
+        let mut builder = VectorBuilder::new();
+        let error = builder
+            .register_column(VectorConfig {
+                column: "v".into(),
+                dim: 16,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::L2Sq,
+                rerank_codec: RerankCodec::Sq8FixedResidual,
+                provided_centroids: None,
+            })
+            .expect_err("fixed residual must reject L2Sq");
+        assert!(matches!(error, BuildError::VectorSchemaMismatch(_)));
     }
 
     /// + Sq8PerCluster: cosine Sq8 columns carry the

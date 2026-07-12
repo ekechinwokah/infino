@@ -94,6 +94,9 @@ fn score_row_against_cell(
         &row.offset,
         &row.codes,
         &row.residuals,
+        row.rerank_codec
+            .residual_divisor()
+            .expect("encoded row uses residual-family codec"),
         &mut row_fp,
     );
     distance(metric, &row_fp, clusters.centroid(cell))
@@ -152,6 +155,9 @@ pub(crate) fn boundary_assignment_encoded_with_transposed(
         &row.offset,
         &row.codes,
         &row.residuals,
+        row.rerank_codec
+            .residual_divisor()
+            .expect("encoded row uses residual-family codec"),
         &mut row_fp,
     );
     boundary_assignment_decoded(clusters, Some(transposed_centroids), metric, &row_fp)
@@ -219,11 +225,30 @@ fn centroid_prototype_from_row(
 }
 
 fn fp32_distance_between_rows(metric: Metric, a: &EncodedCellRow, b: &EncodedCellRow) -> f32 {
+    debug_assert_eq!(a.rerank_codec, b.rerank_codec);
     let dim = a.scale.len();
     let mut af = vec![0f32; dim];
     let mut bf = vec![0f32; dim];
-    dequantize_sq8_residual_into(&a.scale, &a.offset, &a.codes, &a.residuals, &mut af);
-    dequantize_sq8_residual_into(&b.scale, &b.offset, &b.codes, &b.residuals, &mut bf);
+    let divisor = a
+        .rerank_codec
+        .residual_divisor()
+        .expect("encoded row uses residual-family codec");
+    dequantize_sq8_residual_into(
+        &a.scale,
+        &a.offset,
+        &a.codes,
+        &a.residuals,
+        divisor,
+        &mut af,
+    );
+    dequantize_sq8_residual_into(
+        &b.scale,
+        &b.offset,
+        &b.codes,
+        &b.residuals,
+        divisor,
+        &mut bf,
+    );
     distance(metric, &af, &bf)
 }
 
@@ -384,8 +409,13 @@ pub(crate) fn zero_cell_counts(clusters: &mut ClusterCentroids, cells: &[u32]) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use crate::superfile::vector::cell_posting::{encode_blob, load_encoded_rows_from_blob};
+    use crate::superfile::vector::{
+        cell_posting::{encode_blob, load_encoded_rows_from_blob},
+        rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
+    };
 
     fn synth_centroids(n_cent: u32, dim: u32) -> ClusterCentroids {
         let nc = n_cent as usize;
@@ -412,6 +442,22 @@ mod tests {
         let blob = encode_blob(Metric::L2Sq, dim, &ids, &vecs).expect("encode");
         let stable_ids: Vec<i128> = (0..n).map(|i| i as i128).collect();
         load_encoded_rows_from_blob(&blob, &stable_ids, None).expect("load")
+    }
+
+    fn synth_fixed_rows(dim: usize, n: usize, code: u8) -> Vec<EncodedCellRow> {
+        let scale: Arc<[f32]> = Arc::from(vec![SQ8_FIXED_SCALE; dim]);
+        let offset: Arc<[f32]> = Arc::from(vec![SQ8_FIXED_OFFSET; dim]);
+        (0..n)
+            .map(|id| EncodedCellRow {
+                stable_id: id as i128,
+                rerank_codec: RerankCodec::Sq8FixedResidual,
+                scale: Arc::clone(&scale),
+                offset: Arc::clone(&offset),
+                codes: vec![code; dim],
+                residuals: vec![0; dim],
+                norm_sq: None,
+            })
+            .collect()
     }
 
     #[test]
@@ -442,5 +488,25 @@ mod tests {
         assert_eq!(c1.len(), dim);
         let dist: f32 = (0..dim).map(|d| (c0[d] - c1[d]).abs()).sum();
         assert!(dist > 1.0, "split centroids should separate, got {dist}");
+    }
+
+    #[test]
+    fn plan_fixed_residual_split_preserves_payloads() {
+        let dim = 4usize;
+        let mut rows = synth_fixed_rows(dim, 10, 64);
+        rows.extend(synth_fixed_rows(dim, 10, 192));
+        let before: Vec<(Vec<u8>, Vec<u8>)> = rows
+            .iter()
+            .map(|row| (row.codes.clone(), row.residuals.clone()))
+            .collect();
+        let clusters = synth_centroids(4, dim as u32);
+        let (left, right) = plan_sq8_split(&rows, &clusters, 1, Metric::Cosine);
+        let separation: f32 = left.iter().zip(&right).map(|(a, b)| (a - b).abs()).sum();
+        assert!(separation > 1.0);
+        let after: Vec<(Vec<u8>, Vec<u8>)> = rows
+            .iter()
+            .map(|row| (row.codes.clone(), row.residuals.clone()))
+            .collect();
+        assert_eq!(after, before);
     }
 }

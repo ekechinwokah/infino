@@ -713,6 +713,25 @@ impl SuperfileBuilder {
                 "multi-cell pack requires at least one cell IVF".into(),
             ));
         }
+        let configured_codec = self
+            .opts
+            .vector_columns
+            .first()
+            .ok_or(BuildError::VectorReadError)?
+            .rerank_codec;
+        let expected_codec = if configured_codec.is_sq8_residual_family() {
+            configured_codec
+        } else {
+            RerankCodec::Sq8Residual
+        };
+        if cells
+            .iter()
+            .any(|(_, subsection)| subsection.rerank_codec != expected_codec)
+        {
+            return Err(BuildError::VectorSchemaMismatch(
+                "multi-cell subsection codec does not match builder options".into(),
+            ));
+        }
         cells.sort_unstable_by_key(|(cell, _)| *cell);
         for w in cells.windows(2) {
             if w[0].0 == w[1].0 {
@@ -740,7 +759,7 @@ impl SuperfileBuilder {
             .vec()
             .and_then(|v| v.vector_columns_config().next())
             .ok_or_else(|| BuildError::VectorReadError)?;
-        if vec_col.rerank_codec != RerankCodec::Sq8Residual {
+        if !vec_col.rerank_codec.is_sq8_residual_family() {
             return Err(BuildError::VectorReadError);
         }
         let column = vec_col.name.clone();
@@ -1357,7 +1376,7 @@ fn escape_json(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{Decimal128Array, LargeStringArray, UInt64Array};
     use arrow_schema::Field;
@@ -1366,9 +1385,11 @@ mod tests {
 
     use super::*;
     use crate::{
+        runtime_bridge::bridge_sync_to_async,
         superfile::{
-            format::footer::read_kv_metadata, fts::reader::BoolMode,
-            vector::rerank_codec::RerankCodec,
+            format::footer::read_kv_metadata,
+            fts::reader::BoolMode,
+            vector::rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
         },
         test_helpers::{decimal128_ids, default_tokenizer, default_vector_config},
     };
@@ -3069,7 +3090,11 @@ mod tests {
 
     /// Build one multi-cell packed superfile for merge tests; each spec is
     /// `(cell_id, n_rows, fine n_cent)`.
-    fn pack_cells_superfile(id_base: i128, cells: &[(u32, usize, usize)]) -> Arc<SuperfileReader> {
+    fn pack_cells_superfile_with_codec(
+        id_base: i128,
+        cells: &[(u32, usize, usize)],
+        rerank_codec: RerankCodec,
+    ) -> Arc<SuperfileReader> {
         use crate::superfile::vector::{
             builder::build_merged_subsection_from_materialized,
             cell_posting::{EncodedCellRow, MaterializedIvfRow},
@@ -3077,8 +3102,15 @@ mod tests {
 
         let dim = 16usize;
         let make_rows = |cell: u32, n: usize| -> Vec<MaterializedIvfRow> {
-            let scale: Arc<[f32]> = Arc::from(vec![1.0f32; dim]);
-            let offset: Arc<[f32]> = Arc::from(vec![0.0f32; dim]);
+            let (scale, offset): (Arc<[f32]>, Arc<[f32]>) =
+                if rerank_codec == RerankCodec::Sq8FixedResidual {
+                    (
+                        Arc::from(vec![SQ8_FIXED_SCALE; dim]),
+                        Arc::from(vec![SQ8_FIXED_OFFSET; dim]),
+                    )
+                } else {
+                    (Arc::from(vec![1.0f32; dim]), Arc::from(vec![0.0f32; dim]))
+                };
             (0..n)
                 .map(|i| {
                     let local = i as u32;
@@ -3092,6 +3124,7 @@ mod tests {
                         rabitq_code: vec![0u8; dim.div_ceil(8)],
                         encoded: EncodedCellRow {
                             stable_id,
+                            rerank_codec,
                             scale: Arc::clone(&scale),
                             offset: Arc::clone(&offset),
                             codes,
@@ -3107,8 +3140,12 @@ mod tests {
             dim,
             n_cent,
             rot_seed: 1,
-            metric: Metric::L2Sq,
-            rerank_codec: RerankCodec::Sq8Residual,
+            metric: if rerank_codec == RerankCodec::Sq8FixedResidual {
+                Metric::Cosine
+            } else {
+                Metric::L2Sq
+            },
+            rerank_codec,
             provided_centroids: None,
         };
         let mut ids: Vec<i128> = Vec::new();
@@ -3143,9 +3180,30 @@ mod tests {
         Arc::new(SuperfileReader::open(Bytes::from(bytes)).expect("open"))
     }
 
+    fn pack_cells_superfile(id_base: i128, cells: &[(u32, usize, usize)]) -> Arc<SuperfileReader> {
+        pack_cells_superfile_with_codec(id_base, cells, RerankCodec::Sq8Residual)
+    }
+
     /// Two cells (3 + 2 rows), both at fine width 2 — the common shape.
     fn pack_two_cell_superfile(id_base: i128) -> Arc<SuperfileReader> {
         pack_cells_superfile(id_base, &[(0, 3, 2), (1, 2, 2)])
+    }
+
+    fn rerank_payloads(reader: &SuperfileReader) -> HashMap<i128, Vec<u8>> {
+        let rows = bridge_sync_to_async(
+            reader
+                .vec()
+                .expect("vector reader")
+                .materialized_index_rows_async("emb"),
+        )
+        .expect("materialized rows");
+        rows.into_iter()
+            .map(|row| {
+                let mut payload = row.encoded.codes;
+                payload.extend_from_slice(&row.encoded.residuals);
+                (row.stable_id, payload)
+            })
+            .collect()
     }
 
     /// ManifestSnapshot / prepare path must publish the concatenated flat centroid
@@ -3227,6 +3285,27 @@ mod tests {
     }
 
     #[test]
+    fn fixed_multi_cell_mismatched_width_merge_preserves_payloads() {
+        let codec = RerankCodec::Sq8FixedResidual;
+        let a = pack_cells_superfile_with_codec(1_000, &[(0, 6, 4), (1, 2, 2)], codec);
+        let b = pack_cells_superfile_with_codec(2_000, &[(0, 2, 1), (1, 3, 2)], codec);
+        let mut expected = rerank_payloads(&a);
+        expected.extend(rerank_payloads(&b));
+        let (merged_bytes, _) =
+            SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(a, None), (b, None)])
+                .expect("fixed mismatch merge");
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open fixed merge");
+        assert_eq!(rerank_payloads(&merged), expected);
+        assert!(
+            merged
+                .vec()
+                .expect("vector reader")
+                .vector_columns_config()
+                .all(|column| column.rerank_codec == codec)
+        );
+    }
+
+    #[test]
     fn multi_cell_merge_drops_tombstoned_local_docs() {
         let a = pack_two_cell_superfile(1_000);
         // File-local doc ids: cell0 → 0,1,2; cell1 → 3,4. Drop local 1 and 3.
@@ -3245,5 +3324,30 @@ mod tests {
         let cols: Vec<_> = v.vector_columns_config().collect();
         assert_eq!(cols[0].n_docs, 2); // kept locals 0,2 from cell0
         assert_eq!(cols[1].n_docs, 1); // kept local 4 from cell1
+    }
+
+    #[test]
+    fn fixed_multi_cell_tombstone_rebuild_preserves_survivor_payloads() {
+        let codec = RerankCodec::Sq8FixedResidual;
+        let source = pack_cells_superfile_with_codec(1_000, &[(0, 3, 2), (1, 2, 2)], codec);
+        let before = rerank_payloads(&source);
+        let mut deny = RoaringBitmap::new();
+        deny.insert(1);
+        deny.insert(3);
+        let (merged_bytes, _) = SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(
+            source,
+            Some(Arc::new(deny)),
+        )])
+        .expect("fixed tombstone merge");
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open");
+        let after = rerank_payloads(&merged);
+        assert_eq!(after.len(), 3);
+        for (stable_id, payload) in after {
+            assert_eq!(
+                before.get(&stable_id),
+                Some(&payload),
+                "survivor payload changed"
+            );
+        }
     }
 }

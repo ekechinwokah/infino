@@ -48,7 +48,11 @@ use uuid::Uuid;
 use super::SuperfileHit;
 use crate::{
     storage::StorageProvider,
-    superfile::{SuperfileReader, vector::layout::VectorLayout},
+    superfile::{
+        SuperfileReader,
+        builder::VectorConfig,
+        vector::{layout::VectorLayout, rerank_codec::RerankCodec},
+    },
     supertable::{
         error::QueryError,
         handle::SupertableReader,
@@ -82,6 +86,49 @@ pub(crate) async fn open_reader(
     )
     .await
     .map_err(|e| QueryError::Store(e.to_string()))
+}
+
+/// Verify that parsed on-disk vector codecs match this table's write options.
+pub(crate) fn verify_superfile_vector_codecs(
+    reader: &SuperfileReader,
+    expected: &[VectorConfig],
+) -> Result<(), QueryError> {
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let vector = reader.vec().ok_or_else(|| {
+        QueryError::Execute("superfile is missing configured vector index".into())
+    })?;
+    for config in expected {
+        let expected_codec =
+            if vector.is_multi_cell() && !config.rerank_codec.is_sq8_residual_family() {
+                RerankCodec::Sq8Residual
+            } else {
+                config.rerank_codec
+            };
+        let mut matched = false;
+        for column in vector
+            .vector_columns_config()
+            .filter(|column| column.name == config.column)
+        {
+            matched = true;
+            if column.rerank_codec != expected_codec {
+                return Err(QueryError::Execute(format!(
+                    "vector codec mismatch for {:?}: table expects {}, superfile stores {}",
+                    config.column,
+                    expected_codec.name(),
+                    column.rerank_codec.name()
+                )));
+            }
+        }
+        if !matched {
+            return Err(QueryError::Execute(format!(
+                "superfile is missing configured vector column {:?}",
+                config.column
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Open one superfile for **compaction**, with its bytes locally available for
@@ -569,6 +616,7 @@ where
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
     let storage = manifest.options.storage.as_ref().map(Arc::clone);
+    let vector_columns = Arc::new(manifest.options.vector_columns.clone());
     let tombstone_cache = reader.tombstone_cache.clone();
     let now = Instant::now();
 
@@ -593,6 +641,7 @@ where
     if units.len() == 1 {
         let (entry, params) = units.into_iter().next().expect("len == 1");
         let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry).await?;
+        verify_superfile_vector_codecs(&r, &vector_columns)?;
         let out = body(r, entry, tombstone_cache, now, params).await?;
         return Ok(vec![out]);
     }
@@ -603,8 +652,10 @@ where
         let storage = storage.clone();
         let tombstone_cache = tombstone_cache.clone();
         let body = body.clone();
+        let vector_columns = Arc::clone(&vector_columns);
         let handle = tokio::spawn(async move {
             let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry).await?;
+            verify_superfile_vector_codecs(&r, &vector_columns)?;
             body(r, entry, tombstone_cache, now, params).await
         });
         // Flatten the join error into a QueryError so `try_join_all`

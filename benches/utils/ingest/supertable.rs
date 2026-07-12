@@ -14,7 +14,7 @@ use infino::{
     superfile::{
         builder::{FtsConfig, VectorConfig},
         fts::tokenize::Tokenizer,
-        vector::{distance::Metric, rerank_codec::RerankCodec},
+        vector::distance::Metric,
     },
     supertable::{Supertable, SupertableOptions, storage::StorageProvider},
     test_helpers::default_tokenizer,
@@ -83,8 +83,6 @@ const GIB_BYTES: u64 = 1u64 << 30;
 
 /// Distance metric for the bench vector index.
 const BENCH_METRIC: Metric = Metric::Cosine;
-/// Rerank residual codec for the bench vector index.
-const BENCH_RERANK: RerankCodec = RerankCodec::Sq8Residual;
 /// Writer auto-flush threshold (MiB) per superfile roll.
 const COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Producer memory budget in GiB — steers the attached disk cache's
@@ -230,7 +228,7 @@ pub fn options_for(
             n_cent: n_cent_per_superfile,
             rot_seed: ROT_SEED,
             metric: BENCH_METRIC,
-            rerank_codec: BENCH_RERANK,
+            rerank_codec: corpus::bench_rerank_codec(BENCH_METRIC),
         }]
     } else {
         vec![]
@@ -260,7 +258,7 @@ pub fn current_knobs(modality: Modality) -> crate::dataset::Knobs {
         text_seed: CORPUS_TEXT_SEED,
         rot_seed: ROT_SEED,
         metric: format!("{BENCH_METRIC:?}"),
-        rerank_codec: format!("{BENCH_RERANK:?}"),
+        rerank_codec: corpus::bench_rerank_codec(BENCH_METRIC).name().to_string(),
         modality: format!("{modality:?}"),
     }
 }

@@ -1050,6 +1050,15 @@ pub mod vector {
             ))
             .expect("superfile vector_search")
         }
+
+        fn search_params(&self, nprobe: usize, rerank: usize) -> String {
+            let codec = self
+                .vec()
+                .and_then(|vector| vector.vector_columns_config().next())
+                .map(|column| column.rerank_codec.name())
+                .unwrap_or("none");
+            format!("p={nprobe}, r={rerank}, codec={codec}")
+        }
     }
 
     /// Supertable recall through the public `vector_search` surface: hits come
@@ -1071,12 +1080,18 @@ pub mod vector {
                         manifest.get_partition_strategy()
                 {
                     return format!(
-                        "hidden: cells {}..{}, fine {}, r{rerank}",
-                        routing.nprobe_min, routing.nprobe_max, routing.fine_nprobe,
+                        "hidden: cells {}..{}, fine {}, {}, r{rerank}",
+                        routing.nprobe_min,
+                        routing.nprobe_max,
+                        routing.fine_nprobe,
+                        hidden.options().vector_columns[0].rerank_codec.name(),
                     );
                 }
             }
-            format!("user: cells {nprobe}+, fine all, r{rerank}")
+            format!(
+                "user: cells {nprobe}+, fine all, {}, r{rerank}",
+                self.table.options().vector_columns[0].rerank_codec.name(),
+            )
         }
     }
 

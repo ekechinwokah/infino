@@ -24,7 +24,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use std::{fs::File, io::Write, os::unix::fs::FileExt, sync::Arc, time::Instant};
+use std::{env, fs::File, io::Write, os::unix::fs::FileExt, sync::Arc, time::Instant};
 
 use arrow_array::{Decimal128Array, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -77,6 +77,27 @@ pub fn block_on_inmem<F: std::future::Future>(fut: F) -> F::Output {
 }
 
 // ─── Scale constants ──────────────────────────────────────────────────
+
+/// Codec selected for vector A/B benchmarks.
+pub fn bench_rerank_codec(metric: Metric) -> RerankCodec {
+    let codec = match env::var("INFINO_BENCH_VECTOR_CODEC").as_deref() {
+        Ok("fp32") => RerankCodec::Fp32,
+        Ok("sq8_residual") => RerankCodec::Sq8Residual,
+        Ok("sq8_fixed_residual") => RerankCodec::Sq8FixedResidual,
+        Ok("rabitq_only") => RerankCodec::RabitqOnly,
+        Ok(other) => panic!(
+            "unknown INFINO_BENCH_VECTOR_CODEC={other:?}; expected fp32, \
+             sq8_residual, sq8_fixed_residual, or rabitq_only"
+        ),
+        Err(_) => RerankCodec::default(),
+    };
+    assert!(
+        codec.supports_metric(metric),
+        "codec {} does not support metric {metric:?}",
+        codec.name()
+    );
+    codec
+}
 
 /// Tokens per doc — chosen to land in the same magnitude as a typical
 /// short article (~200 words). The product `n_docs * tokens_per_doc`
@@ -1203,7 +1224,7 @@ pub fn build_vector_index(
         n_cent,
         rot_seed: ROT_SEED,
         metric,
-        rerank_codec: RerankCodec::Sq8Residual,
+        rerank_codec: bench_rerank_codec(metric),
     })
     .expect("register column");
     for i in 0..n_docs {
@@ -1256,7 +1277,7 @@ pub fn build_superfile(docs: &[String], vectors: &[f32], n_cent: usize) -> Vec<u
             n_cent,
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
-            rerank_codec: RerankCodec::Sq8Residual,
+            rerank_codec: bench_rerank_codec(Metric::Cosine),
         }],
         Some(default_tokenizer()),
     );
@@ -1303,7 +1324,7 @@ pub fn build_superfile_with_metric(
             n_cent,
             rot_seed: ROT_SEED,
             metric,
-            rerank_codec: RerankCodec::Sq8Residual,
+            rerank_codec: bench_rerank_codec(metric),
         }],
         Some(default_tokenizer()),
     );

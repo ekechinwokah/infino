@@ -50,11 +50,11 @@ pub enum BuildError {
 
     /// The column requested a rerank codec that this build of infino
     /// does not implement. Supported codecs today: `fp32`,
-    /// `sq8`, `none` (see
+    /// `sq8_residual`, `sq8_fixed_residual`, `rabitq_only` (see
     /// [`crate::superfile::vector::rerank_codec::RerankCodec`]).
     #[error(
         "vector index {column:?}: rerank codec {codec:?} is not supported; \
-         supported codecs are fp32, sq8, none"
+         supported codecs are fp32, sq8_residual, sq8_fixed_residual, rabitq_only"
     )]
     VectorRerankCodecUnimplemented { column: String, codec: &'static str },
 

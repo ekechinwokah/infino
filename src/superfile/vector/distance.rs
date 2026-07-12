@@ -651,9 +651,9 @@ pub(crate) fn distance_bytes_codec(
 ) -> f32 {
     match codec {
         RerankCodec::Fp32 => distance_bytes(metric, query, bytes),
-        RerankCodec::Sq8Residual => {
+        RerankCodec::Sq8Residual | RerankCodec::Sq8FixedResidual => {
             unreachable!(
-                "distance_bytes_codec called with Sq8Residual — Sq8Residual rerank goes \
+                "distance_bytes_codec called with residual-family codec — rerank goes \
                  through dedicated kernels (need per-column scale/offset + per-doc \
                  norm context)"
             )
@@ -1114,7 +1114,7 @@ unsafe fn sq8_dot_avx512(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 
 }
 
 /// Dequantize one Sq8+ε vector: `out[d] = offset[d] + scale[d]·(code[d] +
-/// residual[d]/SQ8_RESIDUAL_DIVISOR)`. Dispatches AVX-512 → AVX2 →
+/// residual[d]/residual_divisor)`. Dispatches AVX-512 → AVX2 →
 /// `wide::f32x8` like [`dot`].
 #[inline]
 pub(crate) fn dequantize_sq8_residual_into(
@@ -1122,6 +1122,7 @@ pub(crate) fn dequantize_sq8_residual_into(
     offset: &[f32],
     codes: &[u8],
     residuals: &[u8],
+    residual_divisor: f32,
     out: &mut [f32],
 ) {
     let dim = out.len();
@@ -1134,24 +1135,46 @@ pub(crate) fn dequantize_sq8_residual_into(
         if avx512_enabled() {
             // SAFETY: gated on `avx512_enabled()` which requires `avx512f`.
             unsafe {
-                dequantize_sq8_residual_avx512(scale, offset, codes, residuals, out, dim);
+                dequantize_sq8_residual_avx512(
+                    scale,
+                    offset,
+                    codes,
+                    residuals,
+                    residual_divisor,
+                    out,
+                    dim,
+                );
             }
             return;
         }
         if avx2_enabled() {
             // SAFETY: gated on `avx2_enabled()` which requires `avx2`.
             unsafe {
-                dequantize_sq8_residual_avx2(scale, offset, codes, residuals, out, dim);
+                dequantize_sq8_residual_avx2(
+                    scale,
+                    offset,
+                    codes,
+                    residuals,
+                    residual_divisor,
+                    out,
+                    dim,
+                );
             }
             return;
         }
     }
-    dequantize_sq8_residual_wide(scale, offset, codes, residuals, out, dim);
+    dequantize_sq8_residual_wide(scale, offset, codes, residuals, residual_divisor, out, dim);
 }
 
 #[inline]
-fn sq8_residual_component_scalar(scale: f32, offset: f32, code: u8, residual_byte: u8) -> f32 {
-    let inv_div = 1.0 / SQ8_RESIDUAL_DIVISOR;
+fn sq8_residual_component_scalar(
+    scale: f32,
+    offset: f32,
+    code: u8,
+    residual_byte: u8,
+    residual_divisor: f32,
+) -> f32 {
+    let inv_div = 1.0 / residual_divisor;
     offset + scale * (code as f32 + (i8::from_le_bytes([residual_byte]) as f32) * inv_div)
 }
 
@@ -1161,10 +1184,11 @@ fn dequantize_sq8_residual_wide(
     offset: &[f32],
     codes: &[u8],
     residuals: &[u8],
+    residual_divisor: f32,
     out: &mut [f32],
     dim: usize,
 ) {
-    let inv_div = 1.0 / SQ8_RESIDUAL_DIVISOR;
+    let inv_div = 1.0 / residual_divisor;
     let inv_v = f32x8::splat(inv_div);
     let mut i = 0;
     while i + F32X8_LANES <= dim {
@@ -1190,7 +1214,13 @@ fn dequantize_sq8_residual_wide(
         i += F32X8_LANES;
     }
     while i < dim {
-        out[i] = sq8_residual_component_scalar(scale[i], offset[i], codes[i], residuals[i]);
+        out[i] = sq8_residual_component_scalar(
+            scale[i],
+            offset[i],
+            codes[i],
+            residuals[i],
+            residual_divisor,
+        );
         i += 1;
     }
 }
@@ -1206,13 +1236,14 @@ unsafe fn dequantize_sq8_residual_avx2(
     offset: &[f32],
     codes: &[u8],
     residuals: &[u8],
+    residual_divisor: f32,
     out: &mut [f32],
     dim: usize,
 ) {
     // SAFETY: each iteration reads/writes 8-element windows; `i + 8 <= dim`
     // keeps all pointers in bounds. Unaligned loads/stores throughout.
     unsafe {
-        let inv_div = _mm256_set1_ps(1.0 / SQ8_RESIDUAL_DIVISOR);
+        let inv_div = _mm256_set1_ps(1.0 / residual_divisor);
         let mut i = 0;
         while i + F32X8_LANES <= dim {
             let codes_u8 = _mm_loadl_epi64(codes.as_ptr().add(i) as *const __m128i);
@@ -1227,7 +1258,13 @@ unsafe fn dequantize_sq8_residual_avx2(
             i += F32X8_LANES;
         }
         while i < dim {
-            out[i] = sq8_residual_component_scalar(scale[i], offset[i], codes[i], residuals[i]);
+            out[i] = sq8_residual_component_scalar(
+                scale[i],
+                offset[i],
+                codes[i],
+                residuals[i],
+                residual_divisor,
+            );
             i += 1;
         }
     }
@@ -1244,13 +1281,14 @@ unsafe fn dequantize_sq8_residual_avx512(
     offset: &[f32],
     codes: &[u8],
     residuals: &[u8],
+    residual_divisor: f32,
     out: &mut [f32],
     dim: usize,
 ) {
     // SAFETY: each iteration reads/writes 16-element windows; `i + 16 <= dim`
     // keeps all pointers in bounds. Unaligned loads/stores throughout.
     unsafe {
-        let inv_div = _mm512_set1_ps(1.0 / SQ8_RESIDUAL_DIVISOR);
+        let inv_div = _mm512_set1_ps(1.0 / residual_divisor);
         let mut i = 0;
         while i + AVX512_F32_LANES <= dim {
             let codes_u8 = _mm_loadu_si128(codes.as_ptr().add(i) as *const __m128i);
@@ -1265,7 +1303,13 @@ unsafe fn dequantize_sq8_residual_avx512(
             i += AVX512_F32_LANES;
         }
         while i < dim {
-            out[i] = sq8_residual_component_scalar(scale[i], offset[i], codes[i], residuals[i]);
+            out[i] = sq8_residual_component_scalar(
+                scale[i],
+                offset[i],
+                codes[i],
+                residuals[i],
+                residual_divisor,
+            );
             i += 1;
         }
     }
@@ -1280,6 +1324,7 @@ pub(crate) fn sq8_residual_norm_sq(
     offset: &[f32],
     codes: &[u8],
     residuals: &[u8],
+    residual_divisor: f32,
 ) -> f32 {
     let dim = scale.len();
     debug_assert_eq!(offset.len(), dim);
@@ -1289,14 +1334,18 @@ pub(crate) fn sq8_residual_norm_sq(
     {
         if avx512_enabled() {
             // SAFETY: gated on `avx512_enabled()` which requires `avx512f`.
-            return unsafe { sq8_residual_norm_sq_avx512(scale, offset, codes, residuals, dim) };
+            return unsafe {
+                sq8_residual_norm_sq_avx512(scale, offset, codes, residuals, residual_divisor, dim)
+            };
         }
         if avx2_enabled() {
             // SAFETY: gated on `avx2_enabled()` which requires `avx2`.
-            return unsafe { sq8_residual_norm_sq_avx2(scale, offset, codes, residuals, dim) };
+            return unsafe {
+                sq8_residual_norm_sq_avx2(scale, offset, codes, residuals, residual_divisor, dim)
+            };
         }
     }
-    sq8_residual_norm_sq_wide(scale, offset, codes, residuals, dim)
+    sq8_residual_norm_sq_wide(scale, offset, codes, residuals, residual_divisor, dim)
 }
 
 #[inline]
@@ -1305,9 +1354,10 @@ fn sq8_residual_norm_sq_wide(
     offset: &[f32],
     codes: &[u8],
     residuals: &[u8],
+    residual_divisor: f32,
     dim: usize,
 ) -> f32 {
-    let inv_div = 1.0 / SQ8_RESIDUAL_DIVISOR;
+    let inv_div = 1.0 / residual_divisor;
     let inv_v = f32x8::splat(inv_div);
     let mut acc = f32x8::ZERO;
     let mut i = 0;
@@ -1335,7 +1385,13 @@ fn sq8_residual_norm_sq_wide(
     }
     let mut sum = acc.reduce_add();
     while i < dim {
-        let v = sq8_residual_component_scalar(scale[i], offset[i], codes[i], residuals[i]);
+        let v = sq8_residual_component_scalar(
+            scale[i],
+            offset[i],
+            codes[i],
+            residuals[i],
+            residual_divisor,
+        );
         sum += v * v;
         i += 1;
     }
@@ -1353,12 +1409,13 @@ unsafe fn sq8_residual_norm_sq_avx2(
     offset: &[f32],
     codes: &[u8],
     residuals: &[u8],
+    residual_divisor: f32,
     dim: usize,
 ) -> f32 {
     // SAFETY: each iteration reads 8-element windows; `i + 8 <= dim` keeps
     // all pointers in bounds.
     unsafe {
-        let inv_div = _mm256_set1_ps(1.0 / SQ8_RESIDUAL_DIVISOR);
+        let inv_div = _mm256_set1_ps(1.0 / residual_divisor);
         let mut acc = _mm256_setzero_ps();
         let mut i = 0;
         while i + F32X8_LANES <= dim {
@@ -1375,7 +1432,13 @@ unsafe fn sq8_residual_norm_sq_avx2(
         }
         let mut sum = horizontal_sum_avx256(acc);
         while i < dim {
-            let v = sq8_residual_component_scalar(scale[i], offset[i], codes[i], residuals[i]);
+            let v = sq8_residual_component_scalar(
+                scale[i],
+                offset[i],
+                codes[i],
+                residuals[i],
+                residual_divisor,
+            );
             sum += v * v;
             i += 1;
         }
@@ -1394,12 +1457,13 @@ unsafe fn sq8_residual_norm_sq_avx512(
     offset: &[f32],
     codes: &[u8],
     residuals: &[u8],
+    residual_divisor: f32,
     dim: usize,
 ) -> f32 {
     // SAFETY: each iteration reads 16-element windows; `i + 16 <= dim` keeps
     // all pointers in bounds.
     unsafe {
-        let inv_div = _mm512_set1_ps(1.0 / SQ8_RESIDUAL_DIVISOR);
+        let inv_div = _mm512_set1_ps(1.0 / residual_divisor);
         let mut acc = _mm512_setzero_ps();
         let mut i = 0;
         while i + AVX512_F32_LANES <= dim {
@@ -1416,7 +1480,13 @@ unsafe fn sq8_residual_norm_sq_avx512(
         }
         let mut sum = _mm512_reduce_add_ps(acc);
         while i < dim {
-            let v = sq8_residual_component_scalar(scale[i], offset[i], codes[i], residuals[i]);
+            let v = sq8_residual_component_scalar(
+                scale[i],
+                offset[i],
+                codes[i],
+                residuals[i],
+                residual_divisor,
+            );
             sum += v * v;
             i += 1;
         }
@@ -1894,10 +1964,17 @@ mod tests {
             .map(|i| ((i as i8).wrapping_mul(3)).to_le_bytes()[0])
             .collect();
         let mut decoded = vec![0f32; dim];
-        dequantize_sq8_residual_into(&scale, &offset, &codes, &residuals, &mut decoded);
+        dequantize_sq8_residual_into(
+            &scale,
+            &offset,
+            &codes,
+            &residuals,
+            SQ8_RESIDUAL_DIVISOR,
+            &mut decoded,
+        );
         let expected = dot(&decoded, &decoded);
         assert!(approx(
-            sq8_residual_norm_sq(&scale, &offset, &codes, &residuals),
+            sq8_residual_norm_sq(&scale, &offset, &codes, &residuals, SQ8_RESIDUAL_DIVISOR),
             expected,
             1e-4
         ));

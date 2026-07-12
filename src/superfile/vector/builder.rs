@@ -37,7 +37,7 @@ use crate::superfile::{
         ivf_merge::MergedIvfSubsection,
         kmeans::{assign_to_centroids, kmeans},
         quant::BitQuantizer,
-        rerank_codec::RerankCodec,
+        rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
         reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
         rotation::RandomRotation,
         spill::{ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter},
@@ -150,9 +150,8 @@ pub struct VectorConfig {
 }
 
 impl VectorConfig {
-    /// Construct a config with the default rerank codec
-    /// ([`RerankCodec::default()`]). Use [`Self::with_rerank_codec`]
-    /// to override.
+    /// Construct a config with fixed residual encoding for cosine and local
+    /// residual encoding for metrics whose values are not bounded to [-1, 1].
     pub fn new(column: String, dim: usize, n_cent: usize, rot_seed: u64, metric: Metric) -> Self {
         Self {
             column,
@@ -160,7 +159,11 @@ impl VectorConfig {
             n_cent,
             rot_seed,
             metric,
-            rerank_codec: RerankCodec::default(),
+            rerank_codec: if metric == Metric::Cosine {
+                RerankCodec::default()
+            } else {
+                RerankCodec::Sq8Residual
+            },
             provided_centroids: None,
         }
     }
@@ -370,6 +373,13 @@ impl VectorBuilder {
                 codec: config.rerank_codec.name(),
             });
         }
+        if !config.rerank_codec.supports_metric(config.metric) {
+            return Err(BuildError::VectorSchemaMismatch(format!(
+                "vector index {:?}: codec {} supports cosine metric only",
+                config.column,
+                config.rerank_codec.name()
+            )));
+        }
         let column_id = self.columns.len() as u32;
         let sample_size = default_kmeans_sample_size(config.n_cent);
         // Seed the reservoir RNG from `rot_seed ^ 0x5a5a` so it
@@ -410,7 +420,7 @@ impl VectorBuilder {
                 column: format!("(unregistered vector column_id {column_id})"),
                 actual: "n/a".to_string(),
             })?;
-        if !matches!(col.config.rerank_codec, RerankCodec::Sq8Residual) {
+        if !col.config.rerank_codec.is_sq8_residual_family() {
             return Err(BuildError::VectorRerankCodecUnimplemented {
                 column: col.config.column.clone(),
                 codec: col.config.rerank_codec.name(),
@@ -436,6 +446,13 @@ impl VectorBuilder {
                 column: format!("(unregistered vector column_id {column_id})"),
                 actual: "n/a".to_string(),
             })?;
+        if subsection.rerank_codec != col.config.rerank_codec {
+            return Err(BuildError::VectorSchemaMismatch(format!(
+                "prebuilt subsection codec {} does not match destination codec {}",
+                subsection.rerank_codec.name(),
+                col.config.rerank_codec.name()
+            )));
+        }
         col.n_docs = subsection.n_docs;
         col.materialized_rows = None;
         col.prebuilt_subsection = Some(SubsectionBytes {
@@ -741,6 +758,15 @@ pub(crate) fn finish_multi_cell_blob(
             "multi-cell vector blob requires at least one cell IVF".into(),
         ));
     }
+    let packed_codec = cells[0].1.rerank_codec;
+    if cells
+        .iter()
+        .any(|(_, subsection)| subsection.rerank_codec != packed_codec)
+    {
+        return Err(BuildError::VectorSchemaMismatch(
+            "multi-cell blob cannot mix rerank codecs".into(),
+        ));
+    }
     for w in cells.windows(2) {
         if w[0].0 >= w[1].0 {
             return Err(BuildError::VectorSchemaMismatch(
@@ -760,7 +786,7 @@ pub(crate) fn finish_multi_cell_blob(
         directory.extend_from_slice(&cell_id.to_le_bytes());
         directory.extend_from_slice(&subsection_start.to_le_bytes());
         directory.extend_from_slice(&(sub.bytes.len() as u64).to_le_bytes());
-        directory.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        directory.extend_from_slice(&u32::from(sub.rerank_codec.codec_id()).to_le_bytes());
         debug_assert_eq!(directory.len() % CELL_DIR_ENTRY_SIZE, 0);
         let _ = cell_dir_entry::CELL_ID_OFF;
         subsection_start += sub.bytes.len() as u64;
@@ -949,6 +975,27 @@ fn build_subsection_from_materialized(
         ));
     }
     let dim = cfg.dim;
+    let codec = cfg.rerank_codec;
+    if !codec.is_sq8_residual_family() || !codec.supports_metric(cfg.metric) {
+        return Err(BuildError::VectorSchemaMismatch(format!(
+            "materialized IVF rebuild does not support codec {} with metric {:?}",
+            codec.name(),
+            cfg.metric
+        )));
+    }
+    let source_codec = rows[0].encoded.rerank_codec;
+    if rows
+        .iter()
+        .any(|row| row.encoded.rerank_codec != source_codec)
+        || source_codec != codec
+    {
+        return Err(BuildError::VectorSchemaMismatch(
+            "materialized IVF rebuild requires one matching residual-family codec".into(),
+        ));
+    }
+    let source_divisor = source_codec
+        .residual_divisor()
+        .expect("residual-family source has divisor");
     let (n_cent, centroids) = build_phase_timers::timed(&build_phase_timers::TRAIN_US, || {
         if let Some(global) = cfg.provided_centroids.as_ref() {
             // Partition against the global cell centroids instead of training
@@ -986,6 +1033,7 @@ fn build_subsection_from_materialized(
                     &enc.offset,
                     &enc.codes,
                     &enc.residuals,
+                    source_divisor,
                     &mut sample[s * dim..(s + 1) * dim],
                 );
             }
@@ -998,8 +1046,7 @@ fn build_subsection_from_materialized(
 
     let quant = BitQuantizer::new(dim);
     let code_bytes = quant.code_bytes();
-    let codec = cfg.rerank_codec;
-    debug_assert!(matches!(codec, RerankCodec::Sq8Residual));
+    debug_assert!(codec.is_sq8_residual_family());
 
     let buckets: Vec<Vec<&MaterializedIvfRow>> =
         build_phase_timers::timed(&build_phase_timers::ASSIGN_US, || {
@@ -1015,6 +1062,7 @@ fn build_subsection_from_materialized(
                     &row.encoded.offset,
                     &row.encoded.codes,
                     &row.encoded.residuals,
+                    source_divisor,
                     &mut row_fp,
                 );
                 let mut best_c = 0usize;
@@ -1041,7 +1089,9 @@ fn build_subsection_from_materialized(
     // over `update_min_max`). This is O(rows · dim); the previous medoid-based
     // derivation was O(rows² · dim) (summed pairwise distances per cluster) and
     // single-threaded — it spun for minutes on a large post-routing cluster.
-    let sq8_quantizers: Vec<(Vec<f32>, Vec<f32>)> =
+    let sq8_quantizers: Vec<(Vec<f32>, Vec<f32>)> = if codec.uses_fixed_quantizer() {
+        (0..n_cent).map(|_| fixed_sq8_quantizer(dim)).collect()
+    } else {
         build_phase_timers::timed(&build_phase_timers::CALIB_US, || {
             buckets
                 .iter()
@@ -1058,6 +1108,7 @@ fn build_subsection_from_materialized(
                             &row.encoded.offset,
                             &row.encoded.codes,
                             &row.encoded.residuals,
+                            source_divisor,
                             &mut row_fp,
                         );
                         update_min_max(&row_fp, &mut min, &mut max);
@@ -1065,7 +1116,8 @@ fn build_subsection_from_materialized(
                     derive_sq8_quantizer_from_min_max(&min, &max)
                 })
                 .collect()
-        });
+        })
+    };
 
     let cluster_order = centroid_storage_order(&centroids, n_cent, dim);
     let codec_meta_size = codec.codec_meta_bytes(dim, n_docs, n_cent, cfg.metric);
@@ -1123,12 +1175,13 @@ fn build_subsection_from_materialized(
 
                 let norm_sq = materialize_sq8_residual_row_into_cluster_quant(
                     &row.encoded,
+                    codec,
                     scale_c,
                     offset_c,
                     dim,
                     &mut row_buf,
                     store_norm,
-                );
+                )?;
                 let full_off = blk.rerank_base + i * per_vec_bytes;
                 bytes[full_off..full_off + dim * 2].copy_from_slice(&row_buf);
                 if let (Some(norms_off), Some(n_sq)) = (sq8_norms_block_off, norm_sq) {
@@ -1179,11 +1232,13 @@ pub(crate) fn build_merged_subsection_from_materialized(
     rows: Vec<MaterializedIvfRow>,
 ) -> Result<MergedIvfSubsection, BuildError> {
     let n_docs = rows.len() as u32;
+    let rerank_codec = cfg.rerank_codec;
     let sub = build_subsection_from_materialized(cfg, rows)?;
     Ok(MergedIvfSubsection {
         bytes: sub.bytes,
         n_cent: sub.n_cent,
         n_docs,
+        rerank_codec,
         summary_offset_in_sub: sub.summary_offset_in_sub,
         codec_meta_offset_in_sub: sub.codec_meta_offset_in_sub,
         codec_meta_size: sub.codec_meta_size,
@@ -1204,6 +1259,7 @@ pub(crate) fn build_merged_subsection_from_fp32(
     stable_ids: &[i128],
 ) -> Result<MergedIvfSubsection, BuildError> {
     let dim = cfg.dim;
+    let rerank_codec = cfg.rerank_codec;
     if dim == 0 {
         return Err(BuildError::VectorSchemaMismatch(
             "fp32 cell IVF build requires dim > 0".into(),
@@ -1254,6 +1310,7 @@ pub(crate) fn build_merged_subsection_from_fp32(
         bytes: sub.bytes,
         n_cent: sub.n_cent,
         n_docs: n_docs as u32,
+        rerank_codec,
         summary_offset_in_sub: sub.summary_offset_in_sub,
         codec_meta_offset_in_sub: sub.codec_meta_offset_in_sub,
         codec_meta_size: sub.codec_meta_size,
@@ -1353,10 +1410,18 @@ fn build_subsection_streaming(
     //     the kernel page cache handling streaming reads.
     let chunk_rows = chunk_rows_for_dim(dim);
     let codec = cfg.rerank_codec;
-    // `Sq8Residual` uses per-cluster scale/offset codec_meta plus
+    if !codec.supports_metric(cfg.metric) {
+        return Err(BuildError::VectorSchemaMismatch(format!(
+            "vector index {:?}: codec {} supports cosine metric only",
+            cfg.column,
+            codec.name()
+        )));
+    }
+    // Residual-family codecs use per-cluster scale/offset codec_meta plus
     // an i8 residual sidecar in `full[]`.
-    let sq8_family = matches!(codec, RerankCodec::Sq8Residual);
-    let (mut sq8_min_arr, mut sq8_max_arr): (Vec<f32>, Vec<f32>) = if sq8_family {
+    let sq8_family = codec.is_sq8_residual_family();
+    let fit_sq8_quantizer = matches!(codec, RerankCodec::Sq8Residual);
+    let (mut sq8_min_arr, mut sq8_max_arr): (Vec<f32>, Vec<f32>) = if fit_sq8_quantizer {
         (
             vec![f32::INFINITY; n_cent * dim],
             vec![f32::NEG_INFINITY; n_cent * dim],
@@ -1388,7 +1453,7 @@ fn build_subsection_streaming(
             ))
         };
 
-        let sq8_acc: Option<(&mut [f32], &mut [f32])> = if sq8_family {
+        let sq8_acc: Option<(&mut [f32], &mut [f32])> = if fit_sq8_quantizer {
             Some((&mut sq8_min_arr, &mut sq8_max_arr))
         } else {
             None
@@ -1408,7 +1473,7 @@ fn build_subsection_streaming(
         )?;
     }
 
-    let sq8_quantizers: Vec<(Vec<f32>, Vec<f32>)> = if sq8_family {
+    let sq8_quantizers: Vec<(Vec<f32>, Vec<f32>)> = if fit_sq8_quantizer {
         (0..n_cent)
             .map(|c| {
                 let off = c * dim;
@@ -1418,6 +1483,8 @@ fn build_subsection_streaming(
                 )
             })
             .collect()
+    } else if codec.uses_fixed_quantizer() {
+        (0..n_cent).map(|_| fixed_sq8_quantizer(dim)).collect()
     } else {
         Vec::new()
     };
@@ -1582,7 +1649,7 @@ fn build_subsection_streaming(
                     bytes[blk.rerank_base..blk.rerank_base + blk.count * dim * 4]
                         .copy_from_slice(&full_block);
                 }
-                RerankCodec::Sq8Residual => {
+                RerankCodec::Sq8Residual | RerankCodec::Sq8FixedResidual => {
                     let cluster_rows: &[f32] = bytemuck::cast_slice(&full_block);
                     let (scale_c, offset_c) = &sq8_quantizers[centroid_id];
                     encode_sq8_residual_cluster_simd(
@@ -1595,6 +1662,9 @@ fn build_subsection_streaming(
                         scale_c,
                         offset_c,
                         bytes,
+                        codec
+                            .residual_divisor()
+                            .expect("residual-family codec has divisor"),
                     );
                 }
             }
@@ -1627,11 +1697,11 @@ fn build_subsection_streaming(
     })
 }
 
-/// `Sq8Residual` per-cluster encode. Writes a row-interleaved
+/// Residual-family per-cluster encode. Writes a row-interleaved
 /// `[code dim u8 ‖ residual dim i8]` body (`2 × dim` bytes per row)
 /// at `full_chunk_base + i × 2·dim`. The Sq8 code is the same
 /// `sq8_encode_row` quantization; the residual code captures the
-/// quantization error at `scale_c[d] / SQ8_RESIDUAL_DIVISOR`-sized
+/// quantization error at `scale_c[d] / residual_divisor`-sized
 /// signed steps. Per-doc norms are computed against the fully
 /// residual-corrected vector so the search-side kernel's
 /// Cosine/L2Sq normalization matches the bytes on disk.
@@ -1646,6 +1716,7 @@ fn encode_sq8_residual_cluster_simd(
     scale_c: &[f32],
     offset_c: &[f32],
     bytes: &mut [u8],
+    residual_divisor: f32,
 ) {
     debug_assert_eq!(cluster_rows.len(), cluster_count * dim);
     let row_bytes = dim * 2;
@@ -1662,7 +1733,15 @@ fn encode_sq8_residual_cluster_simd(
         let row_bytes_mut = &mut bytes[row_off..row_off + row_bytes];
         let (code_slice, res_slice) = row_bytes_mut.split_at_mut(dim);
         let norm = encode_sq8_residual_row(
-            src, &consts, scale_c, offset_c, code_slice, res_slice, &mut recon, store_norm,
+            src,
+            &consts,
+            scale_c,
+            offset_c,
+            code_slice,
+            res_slice,
+            &mut recon,
+            store_norm,
+            residual_divisor,
         );
         if let (Some(norms_off), Some(n_sq)) = (sq8_norms_block_off, norm) {
             let n_off = norms_off + pos * 4;
@@ -1690,6 +1769,11 @@ pub(crate) fn derive_sq8_quantizer_from_min_max(min: &[f32], max: &[f32]) -> (Ve
         }
     }
     (scale, offset)
+}
+
+/// Fixed absolute quantizer shared by every Sq8FixedResidual cluster.
+pub(crate) fn fixed_sq8_quantizer(dim: usize) -> (Vec<f32>, Vec<f32>) {
+    (vec![SQ8_FIXED_SCALE; dim], vec![SQ8_FIXED_OFFSET; dim])
 }
 
 /// Physical storage order for centroids: a recursive widest-span median split
@@ -1998,7 +2082,10 @@ fn run_pass2(
 mod tests {
     use std::fs::{read, write};
 
+    use bytes::Bytes;
+
     use super::*;
+    use crate::superfile::vector::{cell_posting::EncodedCellRow, reader::VectorReader};
 
     /// Drive an async reader call to completion. The materialized read-back is
     /// async (the drain fetches-on-miss); these tests use in-memory readers, so
@@ -2736,6 +2823,7 @@ mod tests {
                     codes[0] = (cell as u8).wrapping_add(i as u8);
                     let encoded = EncodedCellRow {
                         stable_id,
+                        rerank_codec: RerankCodec::Sq8Residual,
                         scale: Arc::clone(&scale),
                         offset: Arc::clone(&offset),
                         codes,
@@ -2768,7 +2856,7 @@ mod tests {
         let blob = finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack");
         let json =
             format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
-        let reader = VectorReader::open(Bytes::from(blob), &json).expect("open multi-cell");
+        let reader = VectorReader::open(Bytes::from(blob.clone()), &json).expect("open multi-cell");
         assert!(reader.is_multi_cell());
         assert_eq!(reader.packed_cell_ids(), &[0, 1]);
         assert_eq!(reader.n_docs(), 7);
@@ -2784,6 +2872,85 @@ mod tests {
         assert_eq!(reader.resolve_flat_cluster(0), Some((0, 0)));
         assert_eq!(reader.resolve_flat_cluster(2), Some((1, 0)));
         assert_eq!(reader.resolve_flat_cluster(3), Some((1, 1)));
+
+        let mut zero_codec = blob;
+        let directory_start = OUTER_HEADER_SIZE;
+        let directory_size = 2 * CELL_DIR_ENTRY_SIZE;
+        for entry in 0..2 {
+            let codec_off =
+                directory_start + entry * CELL_DIR_ENTRY_SIZE + cell_dir_entry::CODEC_ID_OFF;
+            zero_codec[codec_off..codec_off + U32_BYTES].copy_from_slice(&0u32.to_le_bytes());
+        }
+        let directory_crc = crc32c(&zero_codec[directory_start..directory_start + directory_size]);
+        let crc_off = directory_start + directory_size;
+        zero_codec[crc_off..crc_off + format::CRC_BYTES]
+            .copy_from_slice(&directory_crc.to_le_bytes());
+        assert!(
+            VectorReader::open(Bytes::from(zero_codec), &json).is_err(),
+            "zero codec id has no v2 compatibility fallback"
+        );
+    }
+
+    #[test]
+    fn fixed_residual_multi_cell_rebuild_preserves_payload_bytes() {
+        let dim = 16;
+        let make_rows = |cell: u32| -> Vec<MaterializedIvfRow> {
+            let scale: Arc<[f32]> = Arc::from(vec![SQ8_FIXED_SCALE; dim]);
+            let offset: Arc<[f32]> = Arc::from(vec![SQ8_FIXED_OFFSET; dim]);
+            (0..4)
+                .map(|i| {
+                    let stable_id = i128::from(cell) * 100 + i;
+                    MaterializedIvfRow {
+                        local_doc_id: i as u32,
+                        stable_id,
+                        cluster: 0,
+                        rabitq_code: vec![0; dim.div_ceil(8)],
+                        encoded: EncodedCellRow {
+                            stable_id,
+                            rerank_codec: RerankCodec::Sq8FixedResidual,
+                            scale: Arc::clone(&scale),
+                            offset: Arc::clone(&offset),
+                            codes: vec![64 + i as u8; dim],
+                            residuals: vec![i as i8 as u8; dim],
+                            norm_sq: None,
+                        },
+                    }
+                })
+                .collect()
+        };
+        let config = VectorConfig {
+            column: "emb".into(),
+            dim,
+            n_cent: 2,
+            rot_seed: 7,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8FixedResidual,
+            provided_centroids: None,
+        };
+        let source_rows: Vec<MaterializedIvfRow> = [make_rows(0), make_rows(1)].concat();
+        let sub0 = build_merged_subsection_from_materialized(config.clone(), make_rows(0))
+            .expect("fixed cell 0");
+        let sub1 =
+            build_merged_subsection_from_materialized(config, make_rows(1)).expect("fixed cell 1");
+        let blob = finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack fixed cells");
+        let json = r#"[{"column":"emb","dim":16,"n_cent":2,"rot_seed":7,"metric":"cosine"}]"#;
+        let reader = VectorReader::open(Bytes::from(blob), json).expect("open fixed multi-cell");
+        assert!(
+            reader
+                .vector_columns_config()
+                .all(|column| column.rerank_codec == RerankCodec::Sq8FixedResidual)
+        );
+        let mut rebuilt =
+            block_on(reader.materialized_index_rows_async("emb")).expect("materialize fixed rows");
+        rebuilt.sort_by_key(|row| row.stable_id);
+        let mut expected = source_rows;
+        expected.sort_by_key(|row| row.stable_id);
+        for (before, after) in expected.iter().zip(&rebuilt) {
+            assert_eq!(before.stable_id, after.stable_id);
+            assert_eq!(before.encoded.codes, after.encoded.codes);
+            assert_eq!(before.encoded.residuals, after.encoded.residuals);
+            assert_eq!(after.encoded.rerank_codec, RerankCodec::Sq8FixedResidual);
+        }
     }
 
     /// Multi-cell cluster search must return nearest-first. A descending
@@ -2817,6 +2984,7 @@ mod tests {
                         rabitq_code: vec![0u8; dim.div_ceil(8)],
                         encoded: EncodedCellRow {
                             stable_id,
+                            rerank_codec: RerankCodec::Sq8Residual,
                             scale: Arc::clone(&scale),
                             offset: Arc::clone(&offset),
                             codes,
@@ -2889,6 +3057,7 @@ mod tests {
                         rabitq_code: vec![0u8; dim.div_ceil(8)],
                         encoded: EncodedCellRow {
                             stable_id,
+                            rerank_codec: RerankCodec::Sq8Residual,
                             scale: Arc::clone(&scale),
                             offset: Arc::clone(&offset),
                             codes,
@@ -2977,6 +3146,7 @@ mod tests {
                         rabitq_code: vec![0u8; dim.div_ceil(8)],
                         encoded: EncodedCellRow {
                             stable_id,
+                            rerank_codec: RerankCodec::Sq8Residual,
                             scale: Arc::clone(&scale),
                             offset: Arc::clone(&offset),
                             codes: vec![cell as u8; dim],

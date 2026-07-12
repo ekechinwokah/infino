@@ -29,10 +29,7 @@ use crate::{
     Supertable,
     config::CompactionSettings,
     runtime_bridge::bridge_on_runtime,
-    superfile::{
-        builder::SuperfileBuilder,
-        vector::{layout::VectorLayout, rerank_codec::RerankCodec},
-    },
+    superfile::{builder::SuperfileBuilder, vector::layout::VectorLayout},
     supertable::{
         BuildError, CommitError, SuperfileEntry, SuperfileUri,
         error::CompactionError,
@@ -354,7 +351,7 @@ impl Supertable {
             let sq8_merge = first_vec.and_then(|v| {
                 v.vector_columns_config()
                     .next()
-                    .map(|c| c.rerank_codec == RerankCodec::Sq8Residual)
+                    .map(|c| c.rerank_codec.is_sq8_residual_family())
             });
             if multi_cell && sq8_merge == Some(true) {
                 SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&readers_with_tombstones)?

@@ -17,6 +17,7 @@ use crate::superfile::{
     vector::{
         builder::derive_sq8_quantizer_from_min_max,
         distance::{Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualKernel},
+        rerank_codec::RerankCodec,
     },
 };
 
@@ -602,6 +603,7 @@ fn metric_from_id(id: u8) -> Result<Metric, String> {
 #[derive(Debug, Clone)]
 pub struct EncodedCellRow {
     pub stable_id: i128,
+    pub rerank_codec: RerankCodec,
     pub scale: std::sync::Arc<[f32]>,
     pub offset: std::sync::Arc<[f32]>,
     pub codes: Vec<u8>,
@@ -646,23 +648,44 @@ pub(crate) fn sq8_quant_params_equal(
 /// Returns residual-corrected ||x||² when `store_norm` is true (L2Sq/Cosine).
 pub(crate) fn materialize_sq8_residual_row_into_cluster_quant(
     row: &EncodedCellRow,
+    dst_codec: RerankCodec,
     dst_scale: &[f32],
     dst_offset: &[f32],
     dim: usize,
     out: &mut [u8],
     store_norm: bool,
-) -> Option<f32> {
+) -> Result<Option<f32>, BuildError> {
     debug_assert_eq!(out.len(), dim * ROW_BYTES_PER_DIM);
+    if row.rerank_codec != dst_codec {
+        return Err(BuildError::VectorSchemaMismatch(format!(
+            "cannot transcode residual-family row from {} to {}",
+            row.rerank_codec.name(),
+            dst_codec.name()
+        )));
+    }
+    let src_divisor = row
+        .rerank_codec
+        .residual_divisor()
+        .expect("materialized row uses residual-family codec");
+    let dst_divisor = dst_codec
+        .residual_divisor()
+        .expect("destination uses residual-family codec");
     let code_off = 0;
     let res_off = dim;
     if sq8_quant_params_equal(&row.scale, &row.offset, dst_scale, dst_offset) {
         out[..dim].copy_from_slice(&row.codes);
         out[dim..].copy_from_slice(&row.residuals);
-        return store_norm.then(|| {
+        return Ok(store_norm.then(|| {
             row.norm_sq.unwrap_or_else(|| {
-                sq8_residual_norm_sq(dst_scale, dst_offset, &row.codes, &row.residuals)
+                sq8_residual_norm_sq(
+                    dst_scale,
+                    dst_offset,
+                    &row.codes,
+                    &row.residuals,
+                    dst_divisor,
+                )
             })
-        });
+        }));
     }
 
     let mut row_fp = vec![0f32; dim];
@@ -671,6 +694,7 @@ pub(crate) fn materialize_sq8_residual_row_into_cluster_quant(
         &row.offset,
         &row.codes,
         &row.residuals,
+        src_divisor,
         &mut row_fp,
     );
     let inv_scale: Vec<f32> = dst_scale.iter().map(|s| 1.0 / s).collect();
@@ -679,7 +703,6 @@ pub(crate) fn materialize_sq8_residual_row_into_cluster_quant(
         .zip(dst_offset.iter())
         .map(|(s, o)| (-o).mul_add(1.0 / s, 0.5))
         .collect();
-    let residual_divisor = SQ8_RESIDUAL_DIVISOR;
     let mut acc = 0.0f64;
     for d in 0..dim {
         let v = row_fp[d];
@@ -687,7 +710,7 @@ pub(crate) fn materialize_sq8_residual_row_into_cluster_quant(
         let code = q as u8;
         out[code_off + d] = code;
         let base = (code as f32).mul_add(dst_scale[d], dst_offset[d]);
-        let step = dst_scale[d] / residual_divisor;
+        let step = dst_scale[d] / dst_divisor;
         let rq = if step > 0.0 {
             ((v - base) / step)
                 .round()
@@ -701,7 +724,7 @@ pub(crate) fn materialize_sq8_residual_row_into_cluster_quant(
             acc += (x as f64) * (x as f64);
         }
     }
-    store_norm.then_some(acc as f32)
+    Ok(store_norm.then_some(acc as f32))
 }
 
 pub(crate) use crate::superfile::vector::distance::{
@@ -753,6 +776,9 @@ pub(crate) fn manifest_centroid_components_from_row(row: &EncodedCellRow, dim: u
         &row.offset,
         &row.codes,
         &row.residuals,
+        row.rerank_codec
+            .residual_divisor()
+            .expect("encoded row uses residual-family codec"),
         &mut out,
     );
     out
@@ -787,6 +813,7 @@ pub fn load_encoded_rows_from_blob(
             let norm_sq = posting.per_doc_norms.as_ref().map(|norms| norms[local_row]);
             out.push(EncodedCellRow {
                 stable_id: stable_ids[row_idx],
+                rerank_codec: RerankCodec::Sq8Residual,
                 scale: scale_arc.clone(),
                 offset: offset_arc.clone(),
                 codes,
@@ -810,7 +837,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::superfile::{builder::VectorConfig, vector::rerank_codec::RerankCodec};
+    use crate::superfile::{
+        builder::VectorConfig,
+        vector::rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
+    };
 
     #[test]
     fn roundtrip_and_search() {
@@ -879,6 +909,7 @@ mod tests {
     fn transcode_residual_and_norm_match_stored_code_bytes() {
         let row = EncodedCellRow {
             stable_id: 1,
+            rerank_codec: RerankCodec::Sq8Residual,
             scale: Arc::from([0.1, 0.01]),
             offset: Arc::from([-1.0, 0.5]),
             codes: vec![13, 200],
@@ -893,18 +924,21 @@ mod tests {
             &row.offset,
             &row.codes,
             &row.residuals,
+            SQ8_RESIDUAL_DIVISOR,
             &mut source,
         );
 
         let mut encoded = vec![0; 4];
         let encoded_norm = materialize_sq8_residual_row_into_cluster_quant(
             &row,
+            RerankCodec::Sq8Residual,
             &dst_scale,
             &dst_offset,
             2,
             &mut encoded,
             true,
         )
+        .expect("transcode")
         .expect("norm");
         let mut decoded = vec![0.0; 2];
         dequantize_sq8_residual_into(
@@ -912,6 +946,7 @@ mod tests {
             &dst_offset,
             &encoded[..2],
             &encoded[2..],
+            SQ8_RESIDUAL_DIVISOR,
             &mut decoded,
         );
 
@@ -926,6 +961,59 @@ mod tests {
         }
         let decoded_norm: f32 = decoded.iter().map(|value| value * value).sum();
         assert!((encoded_norm - decoded_norm).abs() <= f32::EPSILON * decoded_norm.max(1.0));
+    }
+
+    #[test]
+    fn fixed_to_fixed_repack_is_byte_identical() {
+        let dim = 4;
+        let row = EncodedCellRow {
+            stable_id: 7,
+            rerank_codec: RerankCodec::Sq8FixedResidual,
+            scale: Arc::from(vec![SQ8_FIXED_SCALE; dim]),
+            offset: Arc::from(vec![SQ8_FIXED_OFFSET; dim]),
+            codes: vec![1, 64, 128, 255],
+            residuals: vec![127, 3, (-9i8) as u8, 0],
+            norm_sq: None,
+        };
+        let mut output = vec![0; dim * 2];
+        materialize_sq8_residual_row_into_cluster_quant(
+            &row,
+            RerankCodec::Sq8FixedResidual,
+            &row.scale,
+            &row.offset,
+            dim,
+            &mut output,
+            true,
+        )
+        .expect("fixed repack")
+        .expect("norm");
+        assert_eq!(&output[..dim], row.codes);
+        assert_eq!(&output[dim..], row.residuals);
+    }
+
+    #[test]
+    fn mixed_residual_codecs_fail_even_with_equal_quantizer() {
+        let row = EncodedCellRow {
+            stable_id: 8,
+            rerank_codec: RerankCodec::Sq8FixedResidual,
+            scale: Arc::from([SQ8_FIXED_SCALE]),
+            offset: Arc::from([SQ8_FIXED_OFFSET]),
+            codes: vec![128],
+            residuals: vec![0],
+            norm_sq: None,
+        };
+        let mut output = vec![0; 2];
+        let error = materialize_sq8_residual_row_into_cluster_quant(
+            &row,
+            RerankCodec::Sq8Residual,
+            &row.scale,
+            &row.offset,
+            1,
+            &mut output,
+            true,
+        )
+        .expect_err("mixed codecs must fail");
+        assert!(matches!(error, BuildError::VectorSchemaMismatch(_)));
     }
 
     #[test]

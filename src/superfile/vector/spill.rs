@@ -41,7 +41,10 @@ use memmap2::Mmap;
 
 use crate::superfile::{
     BuildError,
-    vector::cell_posting::{EncodedCellRow, MaterializedIvfRow},
+    vector::{
+        cell_posting::{EncodedCellRow, MaterializedIvfRow},
+        rerank_codec::RerankCodec,
+    },
 };
 
 /// Append-only spill writer for f32 vectors. Backed by a
@@ -373,6 +376,7 @@ pub(crate) struct SpilledCellRows {
     n_quants: u32,
     dim: usize,
     rabitq_len: usize,
+    rerank_codec: RerankCodec,
 }
 
 impl SpilledCellRows {
@@ -540,6 +544,7 @@ pub(crate) struct MaterializedRowSpillWriter {
     rabitq_len: usize,
     n_rows: u32,
     n_quants: u32,
+    rerank_codec: Option<RerankCodec>,
     quant_idx_by_ptr: HashMap<usize, u32>,
 }
 
@@ -572,6 +577,7 @@ impl MaterializedRowSpillWriter {
             rabitq_len,
             n_rows: 0,
             n_quants: 0,
+            rerank_codec: None,
             quant_idx_by_ptr: HashMap::new(),
         })
     }
@@ -585,6 +591,15 @@ impl MaterializedRowSpillWriter {
     /// this batch).
     pub(crate) fn append(&mut self, row: &MaterializedIvfRow) -> Result<(), BuildError> {
         let enc = &row.encoded;
+        if let Some(codec) = self.rerank_codec {
+            if codec != enc.rerank_codec {
+                return Err(BuildError::VectorSchemaMismatch(
+                    "drain spill cannot mix rerank codecs".into(),
+                ));
+            }
+        } else {
+            self.rerank_codec = Some(enc.rerank_codec);
+        }
         if enc.codes.len() != self.dim
             || enc.residuals.len() != self.dim
             || row.rabitq_code.len() != self.rabitq_len
@@ -649,6 +664,9 @@ impl MaterializedRowSpillWriter {
             n_quants: self.n_quants,
             dim: self.dim,
             rabitq_len: self.rabitq_len,
+            rerank_codec: self
+                .rerank_codec
+                .expect("finished spill contains at least one row"),
         })
     }
 }
@@ -705,6 +723,7 @@ pub(crate) fn read_spilled_cell_rows(
             rabitq_code,
             encoded: EncodedCellRow {
                 stable_id,
+                rerank_codec: spill.rerank_codec,
                 scale,
                 offset,
                 codes,
@@ -735,6 +754,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::superfile::vector::rerank_codec::{SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE};
 
     /// Build a deterministic f32 corpus of `n_rows × dim`.
     /// Row `r` column `c` = `r * 1000.0 + c as f32` so any
@@ -834,6 +854,7 @@ mod tests {
                 rabitq_code: vec![id as u8, cluster as u8],
                 encoded: EncodedCellRow {
                     stable_id: id,
+                    rerank_codec: RerankCodec::Sq8Residual,
                     scale: Arc::clone(&q.0),
                     offset: Arc::clone(&q.1),
                     codes: vec![id as u8; DIM],
@@ -866,6 +887,7 @@ mod tests {
         for (got, want_id) in rows.iter().zip([1i128, 2, 3, 4]) {
             assert_eq!(got.stable_id, want_id);
             assert_eq!(got.encoded.stable_id, want_id);
+            assert_eq!(got.encoded.rerank_codec, RerankCodec::Sq8Residual);
             assert_eq!(got.rabitq_code.len(), RABITQ_LEN);
             assert_eq!(got.encoded.codes, vec![want_id as u8; DIM]);
         }
@@ -881,6 +903,24 @@ mod tests {
         );
         // Rows 0 and 1 share one quantizer Arc (same batch, same cluster).
         assert!(Arc::ptr_eq(&rows[0].encoded.scale, &rows[1].encoded.scale));
+
+        let fixed_quant: (Arc<[f32]>, Arc<[f32]>) = (
+            Arc::from(vec![SQ8_FIXED_SCALE; DIM]),
+            Arc::from(vec![SQ8_FIXED_OFFSET; DIM]),
+        );
+        let mut fixed = row(10, 13, &fixed_quant, None);
+        fixed.encoded.rerank_codec = RerankCodec::Sq8FixedResidual;
+        let mut fixed_writer =
+            MaterializedRowSpillWriter::create(tmp.path(), 9, DIM, RABITQ_LEN).expect("create");
+        fixed_writer.append(&fixed).expect("append fixed");
+        let fixed_spill = fixed_writer.finish().expect("finish fixed");
+        let fixed_rows = read_spilled_cell_rows(&fixed_spill).expect("read fixed");
+        assert_eq!(
+            fixed_rows[0].encoded.rerank_codec,
+            RerankCodec::Sq8FixedResidual
+        );
+        assert_eq!(fixed_rows[0].encoded.codes, fixed.encoded.codes);
+        assert_eq!(fixed_rows[0].encoded.residuals, fixed.encoded.residuals);
 
         // Shape mismatches are rejected.
         let mut w2 =
@@ -904,6 +944,7 @@ mod tests {
             rabitq_code: vec![id as u8],
             encoded: EncodedCellRow {
                 stable_id: id,
+                rerank_codec: RerankCodec::Sq8Residual,
                 scale: Arc::clone(&quant.0),
                 offset: Arc::clone(&quant.1),
                 codes: vec![id as u8; DIM],

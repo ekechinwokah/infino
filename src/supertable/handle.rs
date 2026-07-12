@@ -38,7 +38,10 @@ use super::{
 use crate::{
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     storage::{PrefixedStorageProvider, StorageError},
-    superfile::vector::kmeans::kmeans,
+    superfile::{
+        builder::VectorConfig,
+        vector::{kmeans::kmeans, rerank_codec::RerankCodec},
+    },
     supertable::{
         ManifestLoadError, SuperfileUri, SupertableStats,
         options::Consistency,
@@ -1060,14 +1063,18 @@ fn build_vector_index_options(
         )));
     }
     let hidden_schema = Arc::new(arrow_schema::Schema::new(fields));
-    // Hidden maintenance (incoming routing, cell split, compaction) reads Sq8+ε
-    // rerank rows without fp32 reconstruction. User-table rerank codec may be
-    // Fp32; the hidden index always stores Sq8+ε on disk.
-    let hidden_vector_columns: Vec<crate::superfile::builder::VectorConfig> = user_opts
+    // Hidden maintenance reads residual-family rows without fp32
+    // reconstruction. Preserve a fixed/local residual user codec; non-residual
+    // user codecs retain the existing local-residual hidden representation.
+    let hidden_vector_columns: Vec<VectorConfig> = user_opts
         .vector_columns
         .iter()
-        .map(|vc| crate::superfile::builder::VectorConfig {
-            rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Sq8Residual,
+        .map(|vc| VectorConfig {
+            rerank_codec: if vc.rerank_codec.is_sq8_residual_family() {
+                vc.rerank_codec
+            } else {
+                RerankCodec::Sq8Residual
+            },
             ..vc.clone()
         })
         .collect();
@@ -1450,14 +1457,44 @@ mod tests {
 
     use super::*;
     use crate::{
+        config::OptimizeOptions,
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{builder::FtsConfig, vector::layout::VectorLayout},
         supertable::{
             manifest::{SuperfileEntry, SuperfileUri},
             options::Consistency,
+            query::dispatch::open_reader,
         },
         test_helpers::default_tokenizer,
     };
+
+    fn rerank_payloads_by_stable_id(table: &Supertable) -> HashMap<i128, Vec<u8>> {
+        let table_reader = table.reader();
+        let manifest = table_reader.manifest();
+        let entries = bridge_sync_to_async(manifest.get_all_superfiles_loaded())
+            .expect("load superfile entries");
+        let mut payloads = HashMap::new();
+        for entry in entries {
+            let reader = bridge_sync_to_async(open_reader(
+                &manifest.options.store,
+                manifest.options.disk_cache.as_ref(),
+                manifest.options.storage.as_ref(),
+                &entry,
+            ))
+            .expect("open superfile");
+            let vector = reader.vec().expect("vector reader");
+            let rows = bridge_sync_to_async(vector.materialized_index_rows_async("emb"))
+                .expect("materialized residual rows");
+            for row in rows {
+                let mut bytes = row.encoded.codes;
+                bytes.extend_from_slice(&row.encoded.residuals);
+                if let Some(previous) = payloads.insert(row.stable_id, bytes.clone()) {
+                    assert_eq!(previous, bytes, "replica payload changed");
+                }
+            }
+        }
+        payloads
+    }
 
     fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
@@ -1807,7 +1844,7 @@ mod tests {
                     n_cent: 4,
                     rot_seed: 7,
                     metric: Metric::Cosine,
-                    rerank_codec: RerankCodec::Sq8Residual,
+                    rerank_codec: RerankCodec::Sq8FixedResidual,
                     provided_centroids: None,
                 }],
                 Some(crate::test_helpers::default_tokenizer()),
@@ -1839,11 +1876,17 @@ mod tests {
         w.commit().expect("commit");
 
         assert!(st.reader().n_superfiles() > 0);
+        let user_payloads = rerank_payloads_by_stable_id(&st);
         let hidden = st
             .reader()
             .vector_index_table()
             .expect("hidden index")
             .clone();
+        assert_eq!(
+            hidden.options().vector_columns[0].rerank_codec,
+            RerankCodec::Sq8FixedResidual,
+            "hidden table must inherit the fixed residual codec"
+        );
         // Phase B: the commit does NOT dual-write into the hidden table. It only
         // bootstraps the global cell grid into the hidden manifest; the cell
         // superfiles are drained from the user superfiles on demand.
@@ -1893,6 +1936,11 @@ mod tests {
         // Drain the parts-backed user superfiles into hidden cells; the query
         // is now served by the hidden cell index.
         st.drain_vectors_to_cells_sync().expect("drain to cells");
+        let hidden_payloads = rerank_payloads_by_stable_id(&hidden);
+        assert_eq!(
+            hidden_payloads, user_payloads,
+            "fixed residual payloads must survive default k-means drain"
+        );
         assert!(
             hidden.reader().n_superfiles() > 0,
             "drain must populate the hidden cell index"
@@ -1953,6 +2001,25 @@ mod tests {
                 .iter()
                 .all(|hit| !user_uris.contains(&hit.superfile)),
             "cold post-drain search must not read user superfiles"
+        );
+
+        reopened.append(&batch).expect("append fixed delta");
+        reopened
+            .drain_vectors_to_cells_sync()
+            .expect("drain fixed delta");
+        let hidden = reopened
+            .reader()
+            .vector_index_table()
+            .expect("hidden after second drain")
+            .clone();
+        let before_compaction = rerank_payloads_by_stable_id(&hidden);
+        reopened
+            .optimize(&OptimizeOptions::default())
+            .expect("compact fixed hidden index");
+        let after_compaction = rerank_payloads_by_stable_id(&hidden);
+        assert_eq!(
+            after_compaction, before_compaction,
+            "fixed residual payloads must survive compaction"
         );
     }
 

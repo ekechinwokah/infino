@@ -223,7 +223,7 @@ pub mod vec {
     pub const DIR_ENTRY_SIZE: usize = 64;
     /// Per-cell directory entry size in bytes (v2 multi-cell):
     /// `global_cell_id (u32) + subsection_off (u64) + subsection_len (u64)
-    /// + reserved (u32)` = 24 bytes.
+    /// + codec_id (u32)` = 24 bytes.
     pub const CELL_DIR_ENTRY_SIZE: usize = 24;
     /// Per-column sub-header size (inside each subsection).
     pub const SUB_HEADER_SIZE: usize = 56;
@@ -263,8 +263,10 @@ pub mod vec {
         pub const SUBSECTION_OFF_OFF: usize = 4;
         /// `[+12..+20]` subsection byte length (`u64` LE).
         pub const SUBSECTION_LEN_OFF: usize = 12;
-        /// `[+20..+24]` reserved (`u32` LE).
+        /// `[+20..+24]` rerank codec (`u32` LE).
         pub const RESERVED_OFF: usize = 20;
+        /// Semantic alias for [`RESERVED_OFF`] used by new readers/writers.
+        pub const CODEC_ID_OFF: usize = RESERVED_OFF;
     }
 
     /// Per-column directory-entry field offsets (64-byte entry).
