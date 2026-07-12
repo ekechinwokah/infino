@@ -91,7 +91,7 @@ use crate::{
     superfile::{SuperfileReader, fts::reader::BoolMode, vector::layout::VectorLayout},
     supertable::{
         error::QueryError,
-        handle::{Supertable, SupertableReader, is_hidden_vector_index_table},
+        handle::{Supertable, SupertableReader},
         manifest::{Manifest, SuperfileEntry, SuperfileUri, list::PartitionStrategy},
         tombstones::SidecarCache,
     },
@@ -405,6 +405,13 @@ fn projection_is_id_score_only(projection: Option<&[&str]>, id_column: &str) -> 
     }
 }
 
+fn is_hidden_vector_manifest(manifest: &Manifest) -> bool {
+    matches!(
+        manifest.get_partition_strategy(),
+        PartitionStrategy::VectorCell { .. }
+    )
+}
+
 /// Build `_id` + `score` directly from search-wave stable-ID stamps.
 ///
 /// Identity resolution belongs before this boundary. Reaching output
@@ -522,7 +529,7 @@ impl SupertableReader {
         let filtered = allow.is_some();
         let (nprobe, _) = options.resolve(filtered);
         let manifest = self.manifest();
-        let hidden_vector_index = is_hidden_vector_index_table(&manifest.options);
+        let hidden_vector_index = is_hidden_vector_manifest(manifest);
 
         // ---- Global cross-superfile cluster selection.
         //
@@ -1902,13 +1909,17 @@ mod tests {
     use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
 
-    use super::{VectorFilter, VectorSearchOptions};
+    use super::{VectorFilter, VectorSearchOptions, is_hidden_vector_manifest};
     use crate::{
         superfile::{
             builder::{FtsConfig, SuperfileBuilder, VectorConfig},
             vector::distance::Metric,
         },
-        supertable::{Supertable, SupertableOptions, error::QueryError},
+        supertable::{
+            Supertable, SupertableOptions,
+            error::QueryError,
+            manifest::{ClusterCentroids, list::PartitionStrategy},
+        },
         test_helpers::default_tokenizer as tok,
     };
 
@@ -1922,6 +1933,25 @@ mod tests {
             .build()
             .expect("test runtime")
             .block_on(fut)
+    }
+
+    #[test]
+    fn hidden_classification_uses_manifest_strategy_when_options_are_unstamped() {
+        let dim = 16;
+        let table = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
+        assert!(table.options().partition_strategy.is_none());
+        let mut centroid = vec![0.0; dim];
+        centroid[0] = 1.0;
+        let manifest =
+            table
+                .reader()
+                .manifest()
+                .with_partition_strategy(PartitionStrategy::VectorCell {
+                    column: "emb".into(),
+                    clusters: ClusterCentroids::from_fp32(1, dim as u32, &centroid, vec![1]),
+                    routing: Default::default(),
+                });
+        assert!(is_hidden_vector_manifest(&manifest));
     }
 
     fn fixed_list_f32(dim: usize) -> DataType {
