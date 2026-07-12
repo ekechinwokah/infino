@@ -530,6 +530,10 @@ impl SupertableReader {
         let (nprobe, _) = options.resolve(filtered);
         let manifest = self.manifest();
         let hidden_vector_index = is_hidden_vector_manifest(manifest);
+        let hidden_routing = match manifest.get_partition_strategy() {
+            PartitionStrategy::VectorCell { routing, .. } => Some(routing),
+            _ => None,
+        };
 
         // ---- Global cross-superfile cluster selection.
         //
@@ -642,6 +646,26 @@ impl SupertableReader {
                 }
             }
         }
+        let hidden_ranked_cells = if hidden_vector_index {
+            let mut best_by_cell: HashMap<u32, f32> = HashMap::new();
+            for &(_, _, score, cell, _) in &candidates {
+                if let Some(cell) = cell {
+                    best_by_cell
+                        .entry(cell)
+                        .and_modify(|best| *best = best.min(score))
+                        .or_insert(score);
+                }
+            }
+            let mut cells: Vec<(u32, f32)> = best_by_cell.into_iter().collect();
+            cells.sort_unstable_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            Some(cells)
+        } else {
+            None
+        };
 
         let candidate_counts: HashMap<(usize, u32), u64> = candidates
             .iter()
@@ -660,17 +684,26 @@ impl SupertableReader {
                         *postings_by_cell.entry(cell).or_default() += candidate.4;
                     }
                 }
-                let mut cutoff = nprobe.max(1).min(ranked.len());
-                let mut covered: u64 = ranked[..cutoff]
-                    .iter()
-                    .map(|cell| postings_by_cell.get(cell).copied().unwrap_or(0))
-                    .sum();
-                while cutoff < ranked.len() && covered < gated_target {
-                    covered += postings_by_cell.get(&ranked[cutoff]).copied().unwrap_or(0);
-                    cutoff += 1;
-                }
-                let selected_cells = &ranked[..cutoff];
-                if hidden_vector_index && !filtered {
+                if hidden_vector_index {
+                    let routing = hidden_routing.expect("hidden manifest carries routing");
+                    let ranked_hidden = hidden_ranked_cells
+                        .as_ref()
+                        .expect("hidden candidates carry ranked cells");
+                    let mut cutoff = routing.nprobe_min.max(1).min(ranked_hidden.len());
+                    let max_cells = routing
+                        .nprobe_max
+                        .max(routing.nprobe_min)
+                        .min(ranked_hidden.len());
+                    let nearest = ranked_hidden[0].1;
+                    let threshold =
+                        nearest + nearest.abs().max(f32::EPSILON) * routing.slack.max(0.0);
+                    while cutoff < max_cells && ranked_hidden[cutoff].1 <= threshold {
+                        cutoff += 1;
+                    }
+                    let selected_cells: HashSet<u32> = ranked_hidden[..cutoff]
+                        .iter()
+                        .map(|(cell, _)| *cell)
+                        .collect();
                     let mut fine = Vec::new();
                     for (si, cluster, score, cell, count) in candidates {
                         match cell {
@@ -686,7 +719,7 @@ impl SupertableReader {
                             .unwrap_or(Ordering::Equal)
                             .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
                     });
-                    let mut keep = nprobe.max(1).min(fine.len());
+                    let mut keep = routing.fine_nprobe.max(1).min(fine.len());
                     if keep < fine.len() {
                         let cutoff_score = fine[keep - 1].2;
                         while keep < fine.len()
@@ -721,6 +754,16 @@ impl SupertableReader {
                         }
                     }
                 } else {
+                    let mut cutoff = nprobe.max(1).min(ranked.len());
+                    let mut covered: u64 = ranked[..cutoff]
+                        .iter()
+                        .map(|cell| postings_by_cell.get(cell).copied().unwrap_or(0))
+                        .sum();
+                    while cutoff < ranked.len() && covered < gated_target {
+                        covered += postings_by_cell.get(&ranked[cutoff]).copied().unwrap_or(0);
+                        cutoff += 1;
+                    }
+                    let selected_cells = &ranked[..cutoff];
                     for (si, cluster, score, cell, _) in candidates {
                         match cell {
                             Some(cell) if selected_cells.contains(&cell) => {
@@ -740,10 +783,10 @@ impl SupertableReader {
             }
         }
 
-        // Unfiltered hidden search globally ranks fine centroids within the
-        // selected coarse cells. User/undrained and filtered paths retain
-        // complete cell-run coverage so fragment-local or selective matches
-        // are not starved.
+        // Every hidden-index search globally ranks fine centroids within the
+        // selected cells. Filtering changes only which rows survive each
+        // probe; user and undrained paths retain their own complete-cell
+        // routing.
         // Untagged legacy candidates still use the global fallback budget.
         let n_eligible = {
             let mut segs: Vec<usize> = scored
@@ -755,45 +798,32 @@ impl SupertableReader {
             segs.dedup();
             segs.len()
         };
-        // Inner-cluster budget: probe the globally-closest N fine IVF centroids
-        // across all eligible superfiles. The user/pre-drain path uses
-        // N = nprobe × eligible_superfiles. The hidden vector index defaults to a
-        // flat N = nprobe when UNFILTERED (fewer clusters → faster) — but a
-        // FILTERED hidden query drops ~(1 − selectivity) of candidates per
-        // cluster, so a flat budget starves recall (measured 0.68 vs 0.98 at
-        // 100K, ~10% selectivity). Filtered hidden search therefore scales to
-        // nprobe × eligible like the user path. `INFINO_HIDDEN_INNER_BUDGET`
-        // overrides the hidden default; `vector.inner_budget` (or legacy
-        // `INFINO_INNER_BUDGET`) overrides everything with an absolute count.
-        // Probe budget scaled by the eligible-superfile count. The
-        // user/pre-drain path always uses it; the hidden index uses it only
-        // for filtered search (a flat nprobe there starves filtered recall)
-        // and a flat nprobe when unfiltered.
+        // User/pre-drain keeps its existing nprobe × eligible-superfiles
+        // budget. Hidden coverage and fine depth were already applied from the
+        // persisted CellRoutingParams above.
         let scaled_budget = nprobe.saturating_mul(n_eligible.max(1)).max(nprobe);
         let default_budget = if hidden_vector_index {
-            let hidden_default = if filtered {
-                scaled_budget
-            } else {
-                nprobe.max(1)
-            };
-            std::env::var("INFINO_HIDDEN_INNER_BUDGET")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .map(|b| b.max(1))
-                .unwrap_or(hidden_default)
+            hidden_routing
+                .expect("hidden manifest carries routing")
+                .fine_nprobe
+                .max(1)
         } else {
             scaled_budget
         };
-        let budget = config::global()
-            .vector
-            .inner_budget
-            .or_else(|| {
-                std::env::var("INFINO_INNER_BUDGET")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-            })
-            .map(|b| b.max(1))
-            .unwrap_or(default_budget);
+        let budget = if hidden_vector_index {
+            default_budget
+        } else {
+            config::global()
+                .vector
+                .inner_budget
+                .or_else(|| {
+                    std::env::var("INFINO_INNER_BUDGET")
+                        .ok()
+                        .and_then(|value| value.parse::<usize>().ok())
+                })
+                .map(|value| value.max(1))
+                .unwrap_or(default_budget)
+        };
         let cluster_count = |&(si, cluster, _): &(usize, u32, f32)| -> u64 {
             candidate_counts.get(&(si, cluster)).copied().unwrap_or(0)
         };

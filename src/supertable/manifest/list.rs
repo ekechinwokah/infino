@@ -65,12 +65,12 @@ const DEFAULT_CELL_NPROBE_MIN: usize = 4;
 /// Default hard cap on cells probed per query (bounds the object-store GET fan).
 /// Held at the nprobe floor so adaptive expansion is off by default: with
 /// poorly-separated cells the ratio threshold otherwise widens to ~all cells,
-/// fanning every query out across the whole index. Raise it (or
-/// `INFINO_CELL_NPROBE_MAX`) once cells separate well enough that a few
-/// probes recall the neighbors.
+/// fanning every query out across the whole index.
 const DEFAULT_CELL_NPROBE_MAX: usize = 8;
 /// Default margin on the distance-ratio probe threshold (`τ = d*·(1+slack)`).
 const DEFAULT_CELL_SLACK: f32 = 1.0;
+/// Fine IVF centroids probed after hidden-cell coverage is selected.
+const DEFAULT_CELL_FINE_NPROBE: usize = 8;
 
 // ---------- Public in-memory shapes ----------
 
@@ -272,6 +272,8 @@ pub struct CellRoutingParams {
     pub nprobe_max: usize,
     /// Margin on the distance-ratio probe threshold (`τ = d*·(1+slack)`).
     pub slack: f32,
+    /// Fine IVF centroids probed across the selected hidden cells.
+    pub fine_nprobe: usize,
 }
 
 impl Default for CellRoutingParams {
@@ -280,6 +282,21 @@ impl Default for CellRoutingParams {
             nprobe_min: DEFAULT_CELL_NPROBE_MIN,
             nprobe_max: DEFAULT_CELL_NPROBE_MAX,
             slack: DEFAULT_CELL_SLACK,
+            fine_nprobe: DEFAULT_CELL_FINE_NPROBE,
+        }
+    }
+}
+
+impl CellRoutingParams {
+    /// Measured hidden-index routing: one nearest cell with eight fine
+    /// centroids inside it. Stored on new hidden manifests; legacy manifests
+    /// retain their decoded routing values.
+    pub(crate) fn bounded_hidden_default() -> Self {
+        Self {
+            nprobe_min: 1,
+            nprobe_max: 1,
+            slack: DEFAULT_CELL_SLACK,
+            fine_nprobe: DEFAULT_CELL_FINE_NPROBE,
         }
     }
 }
@@ -1046,6 +1063,8 @@ struct CellRoutingParamsDto {
     nprobe_max: usize,
     #[serde(default)]
     slack: f32,
+    #[serde(default)]
+    fine_nprobe: usize,
 }
 
 impl From<CellRoutingParams> for CellRoutingParamsDto {
@@ -1054,6 +1073,7 @@ impl From<CellRoutingParams> for CellRoutingParamsDto {
             nprobe_min: r.nprobe_min,
             nprobe_max: r.nprobe_max,
             slack: r.slack,
+            fine_nprobe: r.fine_nprobe,
         }
     }
 }
@@ -1069,6 +1089,9 @@ impl From<CellRoutingParamsDto> for CellRoutingParams {
         }
         if d.slack > 0.0 {
             r.slack = d.slack;
+        }
+        if d.fine_nprobe > 0 {
+            r.fine_nprobe = d.fine_nprobe;
         }
         r.nprobe_max = r.nprobe_max.max(r.nprobe_min);
         r
@@ -2260,7 +2283,7 @@ mod tests {
                 &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
                 vec![1, 1],
             ),
-            routing: Default::default(),
+            routing: CellRoutingParams::bounded_hidden_default(),
         };
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");

@@ -142,7 +142,7 @@ use crate::{
         manifest::{
             ClusterCentroids, Manifest,
             commit::get_current_manifest_etag,
-            list::PartitionStrategy,
+            list::{CellRoutingParams, PartitionStrategy},
             part::{self as part_mod, PartId},
         },
         query::{dispatch::open_reader, vector::stable_ids_by_local_for_routing},
@@ -2251,7 +2251,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // Preserve any existing hidden-side query tuning (`routing`) across drains.
     let routing = match hidden_inner.manifest.load_full().get_partition_strategy() {
         PartitionStrategy::VectorCell { routing, .. } => routing,
-        _ => Default::default(),
+        _ => CellRoutingParams::bounded_hidden_default(),
     };
 
     // Source: every user-table vector superfile, processed in BOUNDED BATCHES so

@@ -31,7 +31,7 @@ use tokio::runtime::Runtime;
 use super::{
     error::{BuildError, OpenError},
     hidden_deleted::{self, HiddenDeletedError},
-    manifest::Manifest,
+    manifest::{Manifest, list::CellRoutingParams},
     options::SupertableOptions,
 };
 use crate::{
@@ -1110,7 +1110,7 @@ fn build_vector_index_options(
             crate::supertable::manifest::list::PartitionStrategy::VectorCell {
                 column: user_opts.vector_columns[0].column.clone(),
                 clusters,
-                routing: Default::default(),
+                routing: CellRoutingParams::bounded_hidden_default(),
             },
         );
     }
