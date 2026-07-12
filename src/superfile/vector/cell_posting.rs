@@ -304,7 +304,6 @@ pub fn search_blob(bytes: &[u8], query: &[f32], k: usize) -> Result<Vec<(u32, f3
             &posting.scale,
             &posting.offset,
             SQ8_RESIDUAL_DIVISOR,
-            norms_for_kernel,
         );
         let dim = posting.dim;
         for row in 0..posting.ids.len() {
@@ -642,7 +641,7 @@ pub(crate) fn sq8_quant_params_equal(
 ///
 /// When source quant matches the destination cluster quantizer, copies bytes
 /// verbatim. Otherwise re-quantizes per dimension from the folded scalar
-/// component — no `dim`-length fp32 buffer.
+/// component one row at a time, without materializing a full fp32 corpus.
 ///
 /// Returns residual-corrected ||x||² when `store_norm` is true (L2Sq/Cosine).
 pub(crate) fn materialize_sq8_residual_row_into_cluster_quant(
@@ -685,8 +684,9 @@ pub(crate) fn materialize_sq8_residual_row_into_cluster_quant(
     for d in 0..dim {
         let v = row_fp[d];
         let q = v.mul_add(inv_scale[d], c2[d]).clamp(0.0, SQ8_CODE_MAX);
-        out[code_off + d] = q as u8;
-        let base = q.mul_add(dst_scale[d], dst_offset[d]);
+        let code = q as u8;
+        out[code_off + d] = code;
+        let base = (code as f32).mul_add(dst_scale[d], dst_offset[d]);
         let step = dst_scale[d] / residual_divisor;
         let rq = if step > 0.0 {
             ((v - base) / step)
@@ -807,6 +807,8 @@ pub fn load_encoded_rows_from_blob(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::superfile::{builder::VectorConfig, vector::rerank_codec::RerankCodec};
 
@@ -871,6 +873,59 @@ mod tests {
             distinct_offset.len(),
             rows.len()
         );
+    }
+
+    #[test]
+    fn transcode_residual_and_norm_match_stored_code_bytes() {
+        let row = EncodedCellRow {
+            stable_id: 1,
+            scale: Arc::from([0.1, 0.01]),
+            offset: Arc::from([-1.0, 0.5]),
+            codes: vec![13, 200],
+            residuals: vec![3i8.to_le_bytes()[0], (-5i8).to_le_bytes()[0]],
+            norm_sq: None,
+        };
+        let dst_scale = [0.01, 0.02];
+        let dst_offset = [-0.8, -1.0];
+        let mut source = vec![0.0; 2];
+        dequantize_sq8_residual_into(
+            &row.scale,
+            &row.offset,
+            &row.codes,
+            &row.residuals,
+            &mut source,
+        );
+
+        let mut encoded = vec![0; 4];
+        let encoded_norm = materialize_sq8_residual_row_into_cluster_quant(
+            &row,
+            &dst_scale,
+            &dst_offset,
+            2,
+            &mut encoded,
+            true,
+        )
+        .expect("norm");
+        let mut decoded = vec![0.0; 2];
+        dequantize_sq8_residual_into(
+            &dst_scale,
+            &dst_offset,
+            &encoded[..2],
+            &encoded[2..],
+            &mut decoded,
+        );
+
+        for d in 0..2 {
+            let residual_step = dst_scale[d] / SQ8_RESIDUAL_DIVISOR;
+            assert!(
+                (decoded[d] - source[d]).abs() <= residual_step * 0.51,
+                "dimension {d}: source {} decoded {} step {residual_step}",
+                source[d],
+                decoded[d],
+            );
+        }
+        let decoded_norm: f32 = decoded.iter().map(|value| value * value).sum();
+        assert!((encoded_norm - decoded_norm).abs() <= f32::EPSILON * decoded_norm.max(1.0));
     }
 
     #[test]

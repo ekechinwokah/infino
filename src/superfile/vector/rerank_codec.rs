@@ -9,9 +9,8 @@
 //!   per vector. Zero-copy on the rerank distance kernel.
 //! - [`RerankCodec::Sq8Residual`]: `Sq8` codes plus a signed
 //!   8-bit residual sidecar, `dim × 2` bytes per vector
-//!   (row-interleaved `[code dim u8 ‖ residual dim i8]`). The
-//!   Sq8 score selects a small final-refine set; the residual
-//!   correction is applied only to that set. Default codec.
+//!   (row-interleaved `[code dim u8 ‖ residual dim i8]`). Both bytes
+//!   score every RaBitQ shortlist survivor. Default codec.
 //! - [`RerankCodec::RabitqOnly`]: no rerank column at all. The
 //!   1-bit RaBitQ shortlist is the final ranking — opt-in,
 //!   recall-degraded, shrinks the superfile by ~30× at 1M × 384.
@@ -86,10 +85,9 @@ pub enum RerankCodec {
     /// `Sq8` plus a signed 8-bit residual sidecar. Per-vector
     /// body is `dim` u8 Sq8 codes followed by `dim` i8 residual
     /// codes (residual step = `scale_c[d] / SQ8_RESIDUAL_DIVISOR`).
-    /// Search uses the normal Sq8 score to choose a small
-    /// final-refine set, then applies the residual correction to
-    /// that set — closing the tight top-K cosine recall gap plain
-    /// Sq8 exhibits on production-shaped 384D corpora.
+    /// Search applies both bytes to every RaBitQ shortlist survivor, closing
+    /// the tight top-K cosine recall gap plain Sq8 exhibits on
+    /// production-shaped 384D corpora.
     Sq8Residual,
     /// No rerank column at all. The 1-bit RaBitQ shortlist is
     /// the final ranking. Opt-in — recall drops 0.05–0.15 on

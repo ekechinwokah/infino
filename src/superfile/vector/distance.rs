@@ -14,6 +14,7 @@
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+#[cfg(test)]
 use std::sync::Arc;
 
 use wide::f32x8;
@@ -638,11 +639,9 @@ fn l2_sq_le_bytes_unaligned(query: &[f32], bytes: &[u8]) -> f32 {
 /// Centroid scoring NEVER comes through here — centroids are always
 /// stored as fp32 regardless of the column's rerank codec.
 ///
-/// `Sq8` doesn't have a "flat" entry point because the decode needs
-/// the per-column scale/offset (and per-doc norm for L2Sq). Sq8
-/// callers go through [`Sq8Kernel`] which captures those once per
-/// query. `None` panics here — its column carries no `full[]` bytes
-/// to feed in.
+/// `Sq8Residual` doesn't have a "flat" entry point because decoding needs
+/// scale/offset and, for L2Sq/Cosine, a per-doc norm. Its callers use
+/// [`Sq8ResidualKernel`]. `RabitqOnly` carries no `full[]` bytes.
 #[inline]
 pub(crate) fn distance_bytes_codec(
     metric: Metric,
@@ -680,6 +679,7 @@ pub(crate) fn distance_bytes_codec(
 /// `q · offset`, plus `q · q` for L2Sq), amortized over
 /// `k × rerank_mult` candidates so it costs ≪ 1 % of search time
 /// at typical `rerank_mult = 256`.
+#[cfg(test)]
 pub(crate) struct Sq8Kernel {
     metric: Metric,
     dim: usize,
@@ -702,6 +702,7 @@ pub(crate) struct Sq8Kernel {
     per_doc_norms: Option<Arc<[f32]>>,
 }
 
+#[cfg(test)]
 impl Sq8Kernel {
     /// Build the per-query kernel. `scale` + `offset` are the
     /// per-dim quantizer arrays from the column's `codec_meta`.
@@ -803,16 +804,13 @@ impl Sq8Kernel {
     }
 }
 
-/// `Sq8Residual` rerank context — the residual-corrected sibling of
-/// [`Sq8Kernel`]. Captures the per-cluster quantizer (`scale[dim]`,
-/// `offset[dim]`) plus the query-side precomputes for both the Sq8
-/// code leg and the i8 residual leg, so the per-candidate inner loop
-/// is two u8/i8 → f32 widens + SIMD dot.
+/// `Sq8Residual` rerank context. Captures the per-cluster quantizer
+/// (`scale[dim]`, `offset[dim]`) plus query-side precomputes for both stored
+/// bytes, so the per-candidate inner loop is two u8/i8 → f32 widens + SIMD dot.
 ///
-/// Applied only to the small final-refine set the Sq8 score selects,
-/// so it never runs over the full shortlist. One kernel per query +
-/// cluster, reused across that cluster's refine candidates.
-pub(crate) struct Sq8ResidualKernel<'a> {
+/// One kernel is built per query + cluster and reused across every RaBitQ
+/// shortlist survivor assigned to that cluster.
+pub(crate) struct Sq8ResidualKernel {
     metric: Metric,
     dim: usize,
     /// `q_code[d] = query[d] * scale[d]`. Per-doc step is
@@ -825,23 +823,18 @@ pub(crate) struct Sq8ResidualKernel<'a> {
     q_dot_offset: f32,
     /// `Σ_d query[d]²`. L2Sq only.
     q_norm_sq: f32,
-    /// Per-doc `Σ_d x_corrected²` table (residual-corrected norms),
-    /// indexed by the shortlist's `pos`. `Some` for L2Sq + Cosine.
-    per_doc_norms: Option<&'a [f32]>,
 }
 
-impl<'a> Sq8ResidualKernel<'a> {
-    /// Build the per-query residual kernel. `scale` + `offset` are
-    /// the per-cluster quantizer arrays; `residual_divisor` is
-    /// [`SQ8_RESIDUAL_DIVISOR`]. `per_doc_norms` is `Some` for L2Sq
-    /// and Cosine columns.
+impl Sq8ResidualKernel {
+    /// Build the per-query residual kernel. `scale` + `offset` are the
+    /// per-cluster quantizer arrays; `residual_divisor` is
+    /// [`SQ8_RESIDUAL_DIVISOR`].
     pub fn new(
         metric: Metric,
         query: &[f32],
         scale: &[f32],
         offset: &[f32],
         residual_divisor: f32,
-        per_doc_norms: Option<&'a [f32]>,
     ) -> Self {
         let dim = query.len();
         debug_assert_eq!(scale.len(), dim);
@@ -888,22 +881,11 @@ impl<'a> Sq8ResidualKernel<'a> {
             q_residual,
             q_dot_offset,
             q_norm_sq,
-            per_doc_norms,
         }
     }
 
-    /// Distance for one refine candidate at position `pos`, with
-    /// `dim` u8 Sq8 codes at `code_bytes` and `dim` i8 residual
-    /// codes at `residual_bytes`. Smaller = closer for every metric.
-    #[inline]
-    pub fn distance_at(&self, pos: u32, code_bytes: &[u8], residual_bytes: &[u8]) -> f32 {
-        let norm = self.per_doc_norms.map(|norms| norms[pos as usize]);
-        self.distance_with_norm(code_bytes, residual_bytes, norm)
-    }
-
-    /// Like [`Self::distance_at`] but takes the per-doc decoded-norm
-    /// explicitly — for lazy object-store paths that fetch norms into
-    /// a sparse `pos → norm` map rather than a contiguous slice.
+    /// Score one candidate with both stored bytes and its decoded norm.
+    /// `norm` is absent only for NegDot, where the norm term cancels.
     #[inline]
     pub fn distance_with_norm(
         &self,
@@ -984,6 +966,7 @@ impl<'a> Sq8ResidualKernel<'a> {
 /// Inputs are pre-validated by `Sq8Kernel::distance_at`'s
 /// `debug_assert_eq!(code_bytes.len(), self.dim)`. `q_prime.len()`
 /// is guaranteed `== dim` by `Sq8Kernel::new`.
+#[cfg(test)]
 #[inline]
 pub(crate) fn sq8_dot(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -1005,6 +988,7 @@ pub(crate) fn sq8_dot(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
 /// with a per-lane scalar `u8 as f32` widen. Universal fallback
 /// for aarch64, SSE-only x86_64 hosts, and
 /// `INFINO_DISABLE_AVX2=1` / `INFINO_DISABLE_AVX512=1` A/B runs.
+#[cfg(test)]
 #[inline]
 fn sq8_dot_wide(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
     let mut acc = f32x8::ZERO;
@@ -1043,7 +1027,7 @@ fn sq8_dot_wide(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
 ///
 /// Callers must ensure the target supports `avx2`. `avx2_enabled()`
 /// guarantees this at the dispatch site.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(test, target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn sq8_dot_avx2(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
     debug_assert_eq!(q_prime.len(), dim);
@@ -1096,7 +1080,7 @@ unsafe fn sq8_dot_avx2(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
 ///
 /// Callers must ensure the target supports `avx512f`. `avx512_enabled()`
 /// guarantees this at the dispatch site.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(test, target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f")]
 unsafe fn sq8_dot_avx512(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 {
     debug_assert_eq!(q_prime.len(), dim);
@@ -1131,7 +1115,7 @@ unsafe fn sq8_dot_avx512(q_prime: &[f32], code_bytes: &[u8], dim: usize) -> f32 
 
 /// Dequantize one Sq8+ε vector: `out[d] = offset[d] + scale[d]·(code[d] +
 /// residual[d]/SQ8_RESIDUAL_DIVISOR)`. Dispatches AVX-512 → AVX2 →
-/// `wide::f32x8` like [`dot`] and [`sq8_dot`].
+/// `wide::f32x8` like [`dot`].
 #[inline]
 pub(crate) fn dequantize_sq8_residual_into(
     scale: &[f32],
@@ -2113,15 +2097,9 @@ mod tests {
                 Metric::Cosine | Metric::L2Sq => Some(&norms[..]),
                 Metric::NegDot => None,
             };
-            let kernel = Sq8ResidualKernel::new(
-                metric,
-                &query,
-                &scale,
-                &offset,
-                residual_divisor,
-                norms_arg,
-            );
-            let got = kernel.distance_at(0, &codes, &residuals);
+            let kernel = Sq8ResidualKernel::new(metric, &query, &scale, &offset, residual_divisor);
+            let got =
+                kernel.distance_with_norm(&codes, &residuals, norms_arg.map(|norms| norms[0]));
             let want = match metric {
                 Metric::Cosine => 1.0 - dot(&query, &corrected) / corrected_norm.sqrt(),
                 _ => distance(metric, &query, &corrected),
@@ -2146,15 +2124,9 @@ mod tests {
             .collect();
         let corrected =
             decode_sq8_residual(&codes, &residuals, dim, &scale, &offset, residual_divisor);
-        let kernel = Sq8ResidualKernel::new(
-            Metric::NegDot,
-            &query,
-            &scale,
-            &offset,
-            residual_divisor,
-            None,
-        );
-        let got = kernel.distance_at(0, &codes, &residuals);
+        let kernel =
+            Sq8ResidualKernel::new(Metric::NegDot, &query, &scale, &offset, residual_divisor);
+        let got = kernel.distance_with_norm(&codes, &residuals, None);
         let want = distance(Metric::NegDot, &query, &corrected);
         assert!(
             (want - got).abs() <= 1e-4,
