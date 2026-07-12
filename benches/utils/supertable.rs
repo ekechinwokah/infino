@@ -1105,8 +1105,6 @@ pub mod vector {
         hint::black_box,
     };
 
-    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch};
-    use arrow_schema::{DataType, Field};
     use infino::roaring::RoaringBitmap;
 
     use super::*;
@@ -1147,11 +1145,6 @@ pub mod vector {
     const FILTER_MAX_MULT: usize = 64;
     /// Repeated warm probes per routing-state transition.
     const ROUTING_STATE_WARM_ITERS: usize = 20;
-    /// Undrained follow-up commit size. Large enough that the selected cell's
-    /// postings cannot fit in manifest `open_blob`, forcing a real user-data
-    /// range GET on a cold mixed-residency query.
-    const ROUTING_DELTA_ROWS_PER_QUERY: usize = 1_024;
-    const ROUTING_DELTA_ROWS: usize = ROUTING_DELTA_ROWS_PER_QUERY * N_CORRECTNESS_QUERIES;
     /// Numerator/denominator for compact p90 drain diagnostics.
     const DRAIN_P90_NUMERATOR: usize = 9;
     const DRAIN_P90_DENOMINATOR: usize = 10;
@@ -1234,30 +1227,6 @@ pub mod vector {
         hidden_hits: usize,
     }
 
-    fn vector_delta_batch(table: &Supertable, queries: &[Vec<f32>]) -> RecordBatch {
-        assert_eq!(
-            queries.len(),
-            N_CORRECTNESS_QUERIES,
-            "one delta group per correctness query"
-        );
-        let mut flat = Vec::with_capacity(ROUTING_DELTA_ROWS * DIM);
-        for query in queries {
-            assert_eq!(query.len(), DIM, "delta vector dim");
-            for _ in 0..ROUTING_DELTA_ROWS_PER_QUERY {
-                flat.extend_from_slice(query);
-            }
-        }
-        let vectors = FixedSizeListArray::try_new(
-            Arc::new(Field::new("item", DataType::Float32, true)),
-            DIM as i32,
-            Arc::new(Float32Array::from(flat)) as ArrayRef,
-            None,
-        )
-        .expect("delta vector FixedSizeList");
-        RecordBatch::try_new(table.schema(), vec![Arc::new(vectors) as ArrayRef])
-            .expect("delta vector batch")
-    }
-
     fn hit_tier_counts(
         table: &Supertable,
         query: &[f32],
@@ -1309,9 +1278,9 @@ pub mod vector {
         let valid = match expected {
             ExpectedTiers::UserOnly => user_hits > 0 && hidden_hits == 0,
             ExpectedTiers::HiddenOnly => user_hits == 0 && hidden_hits > 0,
-            // Mixed routing is proven by per-class cold GETs below. All
-            // top-k rows may legitimately come from the exact-match delta.
-            ExpectedTiers::Both => user_hits > 0,
+            // Mixed routing is proven by per-class cold GETs below. A normal
+            // follow-up commit need not contribute a row to every top-k.
+            ExpectedTiers::Both => true,
         };
         assert!(
             valid,
@@ -1451,39 +1420,6 @@ pub mod vector {
                 Some((dense, h.score))
             })
             .collect()
-    }
-
-    fn delta_mean_recall(
-        table: &Supertable,
-        id_to_dense: &HashMap<i128, u32>,
-        queries: &[Vec<f32>],
-        base_docs: usize,
-        nprobe: usize,
-        rerank: usize,
-    ) -> f32 {
-        let reader = table.reader();
-        let mut total = 0.0f32;
-        for (query_index, query) in queries.iter().enumerate() {
-            let hits = reader
-                .vector_hits(
-                    supertable::VEC_COLUMN,
-                    query,
-                    TOP_K,
-                    exec_vec::search_opts(nprobe, rerank),
-                    None,
-                )
-                .expect("delta recall vector hits");
-            let dense = hits_to_dense_u32(table, id_to_dense, &hits);
-            let truth_start =
-                base_docs as u32 + (query_index * ROUTING_DELTA_ROWS_PER_QUERY) as u32;
-            let truth_end = truth_start + ROUTING_DELTA_ROWS_PER_QUERY as u32;
-            let recalled = dense
-                .iter()
-                .filter(|(id, _)| truth_start <= *id && *id < truth_end)
-                .count();
-            total += recalled as f32 / TOP_K as f32;
-        }
-        total / queries.len() as f32
     }
 
     fn distribution(values: &mut [u64]) -> Option<(u64, u64, u64, u64)> {
@@ -1777,7 +1713,8 @@ pub mod vector {
                 DIM
             ),
             note: format!(
-                "One (p, r) configuration across the full lifecycle. Data-path assertions use cold GET classes. Recall is the 20-query mean in every state; the delta adds {ROUTING_DELTA_ROWS_PER_QUERY} exact rows per correctness query and the augmented oracle follows those rows through user then hidden residency."
+                "One search configuration across the full lifecycle. Data-path assertions use cold GET classes. Recall is the same 20-query brute-force metric in every state; the follow-up commit adds {} normal rows from the corpus distribution.",
+                supertable::docs_per_commit(),
             ),
             blocks: vec![Block {
                 subtitle: String::new(),
@@ -1959,7 +1896,7 @@ pub mod vector {
 
         // Always prepare the corpus for vector benches so recall is always
         // measurable (including existing-prefix runs).
-        let corpus = Some(supertable::prepare_corpus(Modality::Vector));
+        let mut corpus = Some(supertable::prepare_corpus(Modality::Vector));
 
         let (built, ingest_metrics) = if let Some(fixture) = existing {
             (supertable::open_existing(Modality::Vector, fixture), None)
@@ -1999,12 +1936,13 @@ pub mod vector {
             let rerank = fixed_rerank_mult();
 
             #[allow(clippy::type_complexity)]
-            let (q_correct, q_cal, gt_correct, gt_cal, filtered_gt): (
+            let (q_correct, q_cal, gt_correct, gt_cal, filtered_gt, augmented_gt): (
                 Vec<Vec<f32>>,
                 Vec<Vec<f32>>,
                 Vec<Vec<u32>>,
                 Vec<Vec<u32>>,
                 Option<Vec<Vec<u32>>>,
+                Vec<Vec<u32>>,
             ) = {
                 let corpus = corpus
                     .as_ref()
@@ -2018,8 +1956,9 @@ pub mod vector {
                     .vectors()
                     .expect("vector modality prepared a vector corpus")
                     .as_slice();
+                let base_vectors = &vslice[..n_docs * DIM];
                 let q_correct = corpus::generate_realistic_queries(
-                    vslice,
+                    base_vectors,
                     n_docs,
                     N_CORRECTNESS_QUERIES,
                     QUERY_CORRECTNESS_SEED,
@@ -2027,30 +1966,34 @@ pub mod vector {
                     QUERY_SIGMA,
                 );
                 let q_cal = corpus::generate_realistic_queries(
-                    vslice,
+                    base_vectors,
                     n_docs,
                     N_CALIBRATION_QUERIES,
                     QUERY_CALIBRATION_SEED,
                     true,
                     QUERY_SIGMA,
                 );
-                let (gt_correct, gt_cal, filtered_gt): (
+                let augmented_docs = n_docs + supertable::docs_per_commit();
+                let (gt_correct, gt_cal, filtered_gt, augmented_gt): (
                     Vec<Vec<u32>>,
                     Vec<Vec<u32>>,
                     Option<Vec<Vec<u32>>>,
+                    Vec<Vec<u32>>,
                 ) = if skip_cal {
                     eprintln!(
                         "[supertable_vector] brute-force ground truth: correctness/default only ({} queries)...",
                         q_correct.len(),
                     );
-                    let gt_correct = corpus::ground_truth(vslice, n_docs, &q_correct, TOP_K);
+                    let gt_correct = corpus::ground_truth(base_vectors, n_docs, &q_correct, TOP_K);
                     let mut allow = RoaringBitmap::new();
                     for i in (0..n_docs as u32).step_by(FILTER_KEEP_EVERY) {
                         allow.insert(i);
                     }
                     let filtered_gt =
-                        corpus::filtered_ground_truth(vslice, &allow, &q_correct, TOP_K);
-                    (gt_correct, Vec::new(), Some(filtered_gt))
+                        corpus::filtered_ground_truth(base_vectors, &allow, &q_correct, TOP_K);
+                    let augmented_gt =
+                        corpus::ground_truth(vslice, augmented_docs, &q_correct, TOP_K);
+                    (gt_correct, Vec::new(), Some(filtered_gt), augmented_gt)
                 } else {
                     eprintln!(
                         "[supertable_vector] brute-force ground truth: one streamed pass, {} queries...",
@@ -2058,22 +2001,37 @@ pub mod vector {
                     );
                     let all_queries: Vec<Vec<f32>> =
                         q_correct.iter().chain(q_cal.iter()).cloned().collect();
-                    let mut gt_all = corpus::ground_truth(vslice, n_docs, &all_queries, TOP_K);
+                    let mut gt_all =
+                        corpus::ground_truth(base_vectors, n_docs, &all_queries, TOP_K);
                     let gt_cal = gt_all.split_off(q_correct.len());
                     let mut allow = RoaringBitmap::new();
                     for i in (0..n_docs as u32).step_by(FILTER_KEEP_EVERY) {
                         allow.insert(i);
                     }
                     let filtered_gt =
-                        corpus::filtered_ground_truth(vslice, &allow, &q_correct, TOP_K);
-                    (gt_all, gt_cal, Some(filtered_gt))
+                        corpus::filtered_ground_truth(base_vectors, &allow, &q_correct, TOP_K);
+                    let augmented_gt =
+                        corpus::ground_truth(vslice, augmented_docs, &q_correct, TOP_K);
+                    (gt_all, gt_cal, Some(filtered_gt), augmented_gt)
                 };
-                (q_correct, q_cal, gt_correct, gt_cal, filtered_gt)
+                (
+                    q_correct,
+                    q_cal,
+                    gt_correct,
+                    gt_cal,
+                    filtered_gt,
+                    augmented_gt,
+                )
             };
-            // Queries + ground truth extracted; free the corpus pages
-            // + temp file so the warm/cold samplers measure the engine
-            // only.
-            drop(corpus);
+            // Queries + ground truth extracted. Keep the mapping for the
+            // normal follow-up commit, but evict its pages while measuring
+            // pre/post-drain search.
+            if let Some(vectors) = corpus
+                .as_ref()
+                .and_then(supertable::PreparedCorpus::vectors)
+            {
+                vectors.advise_consumed(0, vectors.n_docs());
+            }
 
             const PRE_DRAIN_NOTE: &str = "Pre-drain (incoming staging): hidden IVF commit shards still in INCOMING; every query includes INCOMING plus nprobe-routed cells. Warm = query-driven cache fill; cold = fresh cache per iteration. Δ vs previous run.";
             const POST_DRAIN_NOTE: &str = "Post-drain (routed cells): incoming empty after OPANN route; queries hit ~nprobe cell-local IVF superfiles only. Warm = query-driven cache fill; cold = fresh cache per iteration. Δ vs previous run.";
@@ -2461,26 +2419,33 @@ pub mod vector {
                     (io, q_correct.len() as u64)
                 });
 
-                // Add a query-identical delta after the fully-drained
-                // measurement. The selected user-cell postings exceed the
-                // manifest open blob, so a cold mixed-residency query must
-                // issue both user-data and hidden-data GETs.
+                // Add one normal follow-up commit after the fully-drained
+                // measurement. Recall remains comparable because its rows
+                // come from the same generated distribution and the oracle
+                // covers the augmented corpus.
                 if pre_post_drain {
+                    let delta_rows = supertable::docs_per_commit();
                     eprintln!(
-                        "[supertable_vector] committing {ROUTING_DELTA_ROWS} undrained vector rows..."
+                        "[supertable_vector] committing {delta_rows} normal undrained vector rows..."
+                    );
+                    let delta_batch = supertable::vector_delta_batch(
+                        corpus
+                            .as_ref()
+                            .expect("vector corpus retained for follow-up commit"),
                     );
                     let before = consumer_meter.snapshot();
                     let sampler = PeakSampler::start_default();
-                    let (result, wall, cpu_s) =
-                        cpu::timed(|| consumer.append(&vector_delta_batch(&consumer, &q_correct)));
+                    let (result, wall, cpu_s) = cpu::timed(|| consumer.append(&delta_batch));
                     result.expect("commit undrained vector delta");
+                    drop(delta_batch);
+                    drop(corpus.take());
                     let wall_s = wall.as_secs_f64();
                     let wall_ns = wall_s * 1e9;
                     let peak_rss = sampler.stop_stats().peak_rss_bytes;
                     let io = consumer_meter.snapshot().since(&before);
                     eprintln!(
                         "[supertable_vector] delta commit: {} rows, {} PUT ({} up), {} GET ({} down), wall {}, peak RSS {}",
-                        ROUTING_DELTA_ROWS,
+                        delta_rows,
                         io.put_count,
                         rss::fmt_bytes(io.put_bytes),
                         io.get_count,
@@ -2495,12 +2460,20 @@ pub mod vector {
                         peak_rss_bytes: Some(peak_rss),
                     });
                     delta_stats = Some((wall_s, io, peak_rss, cpu_s));
-                    let delta_map = Arc::new(corpus::engine_id_to_dense(
-                        &consumer,
-                        n_docs + ROUTING_DELTA_ROWS,
-                    ));
-                    let post_delta_recall = delta_mean_recall(
-                        &consumer, &delta_map, &q_correct, n_docs, nprobe, rerank,
+                    let delta_map =
+                        Arc::new(corpus::engine_id_to_dense(&consumer, n_docs + delta_rows));
+                    let delta_reader = SupertableVectorRead {
+                        table: &consumer,
+                        id_to_dense: Arc::clone(&delta_map),
+                    };
+                    let post_delta_recall = exec_vec::mean_recall(
+                        &delta_reader,
+                        supertable::VEC_COLUMN,
+                        &q_correct,
+                        &augmented_gt,
+                        TOP_K,
+                        nprobe,
+                        rerank,
                     );
                     delta_id_to_dense = Some(Arc::clone(&delta_map));
                     routing_states.push(measure_routing_state(
@@ -2562,8 +2535,19 @@ pub mod vector {
                     let delta_map = delta_id_to_dense
                         .as_ref()
                         .expect("delta id map exists after delta commit");
-                    let post_compact_recall =
-                        delta_mean_recall(&consumer, delta_map, &q_correct, n_docs, nprobe, rerank);
+                    let compact_reader = SupertableVectorRead {
+                        table: &consumer,
+                        id_to_dense: Arc::clone(delta_map),
+                    };
+                    let post_compact_recall = exec_vec::mean_recall(
+                        &compact_reader,
+                        supertable::VEC_COLUMN,
+                        &q_correct,
+                        &augmented_gt,
+                        TOP_K,
+                        nprobe,
+                        rerank,
+                    );
                     let post_compact = measure_routing_state(
                         "post-compact",
                         ExpectedTiers::HiddenOnly,
@@ -2671,7 +2655,7 @@ pub mod vector {
                     .unwrap_or_default();
                 let cost_n_docs = n_docs
                     + if pre_post_drain {
-                        ROUTING_DELTA_ROWS
+                        supertable::docs_per_commit()
                     } else {
                         0
                     };

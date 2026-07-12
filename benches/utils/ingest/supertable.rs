@@ -56,6 +56,11 @@ pub fn n_commits() -> usize {
         .max(MIN_COMMIT_CHUNKS)
 }
 
+/// Rows in one normal ingest commit at the configured scale.
+pub fn docs_per_commit() -> usize {
+    n_docs().div_ceil(n_commits())
+}
+
 /// Writer-pool thread count for ingest — the machine's logical core
 /// count by default, overridable with `INFINO_BENCH_WRITERS` (same
 /// knob the superfile build honors). Each commit's per-shard build
@@ -288,7 +293,7 @@ impl PreparedCorpus {
         let vec = self
             .vectors
             .as_ref()
-            .map(|v| std::mem::size_of_val(v.as_slice()) as u64)
+            .map(|_| (n_docs() * DIM * std::mem::size_of::<f32>()) as u64)
             .unwrap_or(0);
         text + vec
     }
@@ -298,6 +303,11 @@ impl PreparedCorpus {
 /// Call this BEFORE starting the build RSS sampler.
 pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
     let n_docs = n_docs();
+    let vector_docs = if modality == Modality::Vector {
+        n_docs + docs_per_commit()
+    } else {
+        n_docs
+    };
     let text = modality.has_text().then(|| {
         eprintln!(
             "[supertable_ingest] generating {} -doc text corpus (mmap-backed)...",
@@ -308,11 +318,26 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
     let vectors = modality.has_vector().then(|| {
         eprintln!(
             "[supertable_ingest] generating {} ×{DIM} vector corpus (mmap-backed)...",
-            fmt_count(n_docs)
+            fmt_count(vector_docs)
         );
-        MmapVectorCorpus::generate(n_docs, corpus::n_cent(n_docs), CORPUS_VEC_SEED, true)
+        MmapVectorCorpus::generate(vector_docs, corpus::n_cent(n_docs), CORPUS_VEC_SEED, true)
     });
     PreparedCorpus { text, vectors }
+}
+
+/// The next normal vector commit after the measured base ingest.
+pub fn vector_delta_batch(corpus: &PreparedCorpus) -> RecordBatch {
+    let start = n_docs();
+    let len = docs_per_commit();
+    let end = start + len;
+    chunk_batch(
+        Modality::Vector,
+        corpus,
+        &schema_for(Modality::Vector),
+        start,
+        end,
+        len,
+    )
 }
 
 /// Stream the prepared on-disk corpus → append → commit → object
