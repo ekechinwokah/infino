@@ -100,6 +100,44 @@ use crate::{
 /// Candidate growth when a deleted row occupies a current top-k slot.
 const DELETE_REFILL_GROWTH_FACTOR: usize = 2;
 
+type FineCandidate = (usize, u32, f32, u64);
+
+/// Rank fine centroids globally across selected coarse cells, keep a bounded
+/// prefix (including exact score ties), then refill only when the retained
+/// runs contain too few rows to produce top-k.
+fn select_bounded_fine_candidates(
+    mut fine: Vec<FineCandidate>,
+    fine_nprobe: usize,
+    postings_target: u64,
+) -> Vec<(usize, u32, f32)> {
+    fine.sort_unstable_by(|a, b| {
+        a.2.partial_cmp(&b.2)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
+    });
+    let mut keep = fine_nprobe.max(1).min(fine.len());
+    if keep < fine.len() {
+        let cutoff_score = fine[keep - 1].2;
+        while keep < fine.len() && fine[keep].2.total_cmp(&cutoff_score) == Ordering::Equal {
+            keep += 1;
+        }
+    }
+    let mut remaining = fine.split_off(keep);
+    let mut postings: u64 = fine.iter().map(|candidate| candidate.3).sum();
+    if postings < postings_target {
+        for candidate in remaining.drain(..) {
+            postings += candidate.3;
+            fine.push(candidate);
+            if postings >= postings_target {
+                break;
+            }
+        }
+    }
+    fine.into_iter()
+        .map(|(superfile, cluster, score, _)| (superfile, cluster, score))
+        .collect()
+}
+
 /// An optional text-predicate filter for vector kNN search. When
 /// supplied, kNN is ranked only among rows matching the predicate
 /// (pushdown, not post-filter). Built from an FTS-indexed column, a
@@ -714,45 +752,7 @@ impl SupertableReader {
                             None => scored.push((si, cluster, score)),
                         }
                     }
-                    fine.sort_unstable_by(|a, b| {
-                        a.2.partial_cmp(&b.2)
-                            .unwrap_or(Ordering::Equal)
-                            .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
-                    });
-                    let mut keep = routing.fine_nprobe.max(1).min(fine.len());
-                    if keep < fine.len() {
-                        let cutoff_score = fine[keep - 1].2;
-                        while keep < fine.len()
-                            && fine[keep].2.total_cmp(&cutoff_score) == Ordering::Equal
-                        {
-                            keep += 1;
-                        }
-                    }
-                    let mut remaining = fine.split_off(keep);
-                    gated.extend(
-                        fine.into_iter()
-                            .map(|(si, cluster, score, _)| (si, cluster, score)),
-                    );
-                    let mut postings: u64 = gated
-                        .iter()
-                        .map(|(si, cluster, _)| {
-                            candidate_counts.get(&(*si, *cluster)).copied().unwrap_or(0)
-                        })
-                        .sum();
-                    if postings < gated_target {
-                        remaining.sort_unstable_by(|a, b| {
-                            a.2.partial_cmp(&b.2)
-                                .unwrap_or(Ordering::Equal)
-                                .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
-                        });
-                        for (si, cluster, score, count) in remaining {
-                            gated.push((si, cluster, score));
-                            postings += count;
-                            if postings >= gated_target {
-                                break;
-                            }
-                        }
-                    }
+                    gated = select_bounded_fine_candidates(fine, routing.fine_nprobe, gated_target);
                 } else {
                     let mut cutoff = nprobe.max(1).min(ranked.len());
                     let mut covered: u64 = ranked[..cutoff]
@@ -1167,10 +1167,17 @@ impl SupertableReader {
             .vector_index_table()
             .map(|hidden| hidden.pinned_reader().manifest().get_drained_ranges())
             .unwrap_or_default();
-        let undrained_user: Vec<Arc<SuperfileEntry>> = user_superfiles
-            .into_iter()
-            .filter(|entry| !drained.contains(entry.birth_version))
-            .collect();
+        let mut drained_allow = HashMap::new();
+        let mut undrained_user = Vec::new();
+        for entry in user_superfiles {
+            if drained.contains(entry.birth_version) {
+                if let Some(bitmap) = user_allow.get(&entry.uri) {
+                    drained_allow.insert(entry.uri, Arc::clone(bitmap));
+                }
+            } else {
+                undrained_user.push(entry);
+            }
+        }
         let user_hits = if undrained_user.is_empty() {
             Vec::new()
         } else {
@@ -1184,19 +1191,24 @@ impl SupertableReader {
             )
             .await?
         };
-        let stable_ids = self.stable_ids_from_user_allow_async(&user_allow).await?;
+        let stable_ids = self
+            .stable_ids_from_user_allow_async(&drained_allow)
+            .await?;
         let hidden_hits = if stable_ids.is_empty() {
             Vec::new()
         } else {
             let prepared = self
                 .prepare_vector_stable_allow_async(Arc::new(stable_ids))
                 .await?;
-            if prepared.use_hidden_index {
-                self.vector_hits_prepared_global_allow_async(column, query, k, options, &prepared)
-                    .await?
-            } else {
-                Vec::new()
+            if !prepared.use_hidden_index {
+                return Err(QueryError::Execute(
+                    "drained filtered-vector ids resolved to a user allow-set instead of the \
+                     hidden index"
+                        .into(),
+                ));
             }
+            self.vector_hits_prepared_global_allow_async(column, query, k, options, &prepared)
+                .await?
         };
         Ok(top_k_ascending(vec![hidden_hits, user_hits], k))
     }
@@ -1239,6 +1251,7 @@ impl SupertableReader {
         if let Some(vit) = self.vector_index_table() {
             let hidden_reader = vit.pinned_reader();
             let hidden_manifest = Arc::clone(hidden_reader.manifest());
+            let drained = hidden_manifest.get_drained_ranges();
             let superfiles = hidden_manifest
                 .get_all_superfiles_loaded()
                 .await
@@ -1266,12 +1279,22 @@ impl SupertableReader {
                         }
                     })
                     .await?;
-                if !allow_by_uri.is_empty() {
-                    return Ok(PreparedGlobalAllow {
-                        use_hidden_index: true,
-                        allow_by_uri,
-                    });
+                if allow_by_uri.is_empty() {
+                    return Err(QueryError::Execute(
+                        "global allow ids for drained filtered-vector rows did not map to any \
+                         hidden superfile"
+                            .into(),
+                    ));
                 }
+                return Ok(PreparedGlobalAllow {
+                    use_hidden_index: true,
+                    allow_by_uri,
+                });
+            }
+            if !drained.is_empty() {
+                return Err(QueryError::Execute(
+                    "hidden vector manifest has drained ranges but no hidden superfiles".into(),
+                ));
             }
         }
 
@@ -1313,9 +1336,10 @@ impl SupertableReader {
 
     /// Build a per-superfile allow-set from stable `_id` values.
     ///
-    /// Post-drain: map against hidden-cell stable ids and return a
-    /// hidden-index allow-set. Pre-drain / no hidden overlap: map against
-    /// the user table.
+    /// Post-drain: every supplied id is expected to describe a drained row and
+    /// must map against hidden-cell stable ids; an empty mapping is an
+    /// invariant error. Pre-drain (empty hidden membership and drained range)
+    /// maps against the user table.
     #[cfg(feature = "test-helpers")]
     pub async fn prepare_vector_stable_allow_async(
         &self,
@@ -1349,6 +1373,7 @@ impl SupertableReader {
         if let Some(vit) = self.vector_index_table() {
             let hidden_reader = vit.pinned_reader();
             let hidden_manifest = Arc::clone(hidden_reader.manifest());
+            let drained = hidden_manifest.get_drained_ranges();
             let superfiles = hidden_manifest
                 .get_all_superfiles_loaded()
                 .await
@@ -1374,12 +1399,22 @@ impl SupertableReader {
                         }
                     })
                     .await?;
-                if !allow_by_uri.is_empty() {
-                    return Ok(PreparedGlobalAllow {
-                        use_hidden_index: true,
-                        allow_by_uri,
-                    });
+                if allow_by_uri.is_empty() {
+                    return Err(QueryError::Execute(
+                        "stable ids for drained filtered-vector rows did not map to any hidden \
+                         superfile"
+                            .into(),
+                    ));
                 }
+                return Ok(PreparedGlobalAllow {
+                    use_hidden_index: true,
+                    allow_by_uri,
+                });
+            }
+            if !drained.is_empty() {
+                return Err(QueryError::Execute(
+                    "hidden vector manifest has drained ranges but no hidden superfiles".into(),
+                ));
             }
         }
         let manifest = self.manifest();
@@ -1941,7 +1976,10 @@ mod tests {
     use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
 
-    use super::{VectorFilter, VectorSearchOptions, is_hidden_vector_manifest};
+    use super::{
+        VectorFilter, VectorSearchOptions, is_hidden_vector_manifest,
+        select_bounded_fine_candidates,
+    };
     use crate::{
         superfile::{
             builder::{FtsConfig, SuperfileBuilder, VectorConfig},
@@ -1954,6 +1992,9 @@ mod tests {
         },
         test_helpers::default_tokenizer as tok,
     };
+
+    const TEST_FINE_NPROBE: usize = 2;
+    const TEST_FINE_POSTINGS_TARGET: u64 = 10;
 
     /// Drive an async future to completion on a throwaway current-thread
     /// runtime. Used only for the single-superfile `SuperfileReader`
@@ -1984,6 +2025,24 @@ mod tests {
                     routing: Default::default(),
                 });
         assert!(is_hidden_vector_manifest(&manifest));
+    }
+
+    #[test]
+    fn bounded_fine_selection_keeps_ties_and_refills_postings() {
+        let selected = select_bounded_fine_candidates(
+            vec![
+                (3, 30, 0.3, 6),
+                (1, 10, 0.1, 2),
+                (2, 20, 0.2, 1),
+                (4, 40, 0.2, 1),
+            ],
+            TEST_FINE_NPROBE,
+            TEST_FINE_POSTINGS_TARGET,
+        );
+        assert_eq!(
+            selected,
+            vec![(1, 10, 0.1), (2, 20, 0.2), (4, 40, 0.2), (3, 30, 0.3)]
+        );
     }
 
     fn fixed_list_f32(dim: usize) -> DataType {
@@ -2637,6 +2696,17 @@ mod tests {
                 "post-drain filtered hits must not come from user superfiles"
             );
         }
+
+        let mapping_error =
+            block_on(reader.prepare_vector_stable_allow_async(Arc::new(vec![i128::MAX])))
+                .err()
+                .expect("unknown drained id must fail hidden mapping");
+        assert!(
+            mapping_error
+                .to_string()
+                .contains("did not map to any hidden superfile"),
+            "unexpected mapping error: {mapping_error}"
+        );
     }
 
     /// Commit writes user superfiles in the cell-packed (MultiCellIvf) layout,
