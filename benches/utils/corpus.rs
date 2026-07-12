@@ -24,7 +24,18 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use std::{env, fs::File, io::Write, os::unix::fs::FileExt, sync::Arc, time::Instant};
+use std::{
+    cmp::Ordering,
+    env,
+    fs::File,
+    io::Write,
+    os::unix::fs::FileExt,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    },
+    time::Instant,
+};
 
 use arrow_array::{Decimal128Array, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -812,6 +823,132 @@ pub fn brute_force_topk_cosine(
 /// big enough to amortize per-chunk heap setup, small enough to
 /// load-balance the tail across the rayon pool.
 const GT_DOC_CHUNK: usize = 8192;
+/// Number of progress updates emitted by a large exact-oracle pass.
+const GT_PROGRESS_STEPS: usize = 20;
+/// Small oracles finish quickly enough that progress output is noise.
+const GT_PROGRESS_MIN_DOCS: usize = 1_000_000;
+
+type GroundTruthCandidate = (f32, u32);
+
+/// Exact top-k labels for the three logical corpus views exercised by the
+/// supertable vector lifecycle.
+#[derive(Debug)]
+pub struct LifecycleGroundTruth {
+    pub base: Vec<Vec<u32>>,
+    pub filtered: Vec<Vec<u32>>,
+    pub augmented: Vec<Vec<u32>>,
+}
+
+struct LifecycleTopLists {
+    base: Vec<Vec<GroundTruthCandidate>>,
+    filtered: Vec<Vec<GroundTruthCandidate>>,
+    augmented: Vec<Vec<GroundTruthCandidate>>,
+}
+
+impl LifecycleTopLists {
+    fn empty(n_queries: usize, n_correctness_queries: usize) -> Self {
+        Self {
+            base: vec![Vec::new(); n_queries],
+            filtered: vec![Vec::new(); n_correctness_queries],
+            augmented: vec![Vec::new(); n_correctness_queries],
+        }
+    }
+
+    fn merge(self, other: Self, k: usize) -> Self {
+        Self {
+            base: merge_ground_truth_tops(self.base, other.base, k),
+            filtered: merge_ground_truth_tops(self.filtered, other.filtered, k),
+            augmented: merge_ground_truth_tops(self.augmented, other.augmented, k),
+        }
+    }
+}
+
+fn compare_ground_truth_candidates(a: &GroundTruthCandidate, b: &GroundTruthCandidate) -> Ordering {
+    a.0.total_cmp(&b.0).then(a.1.cmp(&b.1))
+}
+
+fn insert_ground_truth_candidate(
+    top: &mut Vec<GroundTruthCandidate>,
+    candidate: GroundTruthCandidate,
+    k: usize,
+) {
+    if top.len() == k
+        && compare_ground_truth_candidates(
+            &candidate,
+            top.last().expect("ground-truth top-k is non-empty"),
+        )
+        .is_ge()
+    {
+        return;
+    }
+    let position =
+        top.partition_point(|entry| compare_ground_truth_candidates(entry, &candidate).is_lt());
+    top.insert(position, candidate);
+    top.truncate(k);
+}
+
+fn merge_ground_truth_tops(
+    mut accumulated: Vec<Vec<GroundTruthCandidate>>,
+    partial: Vec<Vec<GroundTruthCandidate>>,
+    k: usize,
+) -> Vec<Vec<GroundTruthCandidate>> {
+    for (top, candidates) in accumulated.iter_mut().zip(partial) {
+        top.extend(candidates);
+        top.sort_unstable_by(compare_ground_truth_candidates);
+        top.truncate(k);
+    }
+    accumulated
+}
+
+fn ground_truth_ids(tops: Vec<Vec<GroundTruthCandidate>>) -> Vec<Vec<u32>> {
+    tops.into_iter()
+        .map(|top| top.into_iter().map(|(_, id)| id).collect())
+        .collect()
+}
+
+fn transpose_queries(queries: &[Vec<f32>]) -> Vec<f32> {
+    let mut transposed = vec![0.0; DIM * queries.len()];
+    for (query_index, query) in queries.iter().enumerate() {
+        assert_eq!(query.len(), DIM);
+        for (dimension, value) in query.iter().enumerate() {
+            transposed[dimension * queries.len() + query_index] = *value;
+        }
+    }
+    transposed
+}
+
+fn report_ground_truth_progress(
+    processed: &AtomicUsize,
+    next_report: &AtomicUsize,
+    total: usize,
+    stride: usize,
+    chunk_docs: usize,
+) {
+    let done = processed.fetch_add(chunk_docs, AtomicOrdering::Relaxed) + chunk_docs;
+    loop {
+        let threshold = next_report.load(AtomicOrdering::Relaxed);
+        if done < threshold {
+            return;
+        }
+        let next = threshold.saturating_add(stride);
+        if next_report
+            .compare_exchange(
+                threshold,
+                next,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            )
+            .is_ok()
+        {
+            let bounded = done.min(total);
+            eprintln!(
+                "[vector ground truth] {bounded}/{total} docs ({:.0}%)",
+                bounded as f64 * 100.0 / total as f64
+            );
+            return;
+        }
+    }
+}
 
 /// Brute-force exact top-k for a whole query batch in ONE streaming
 /// pass over the corpus.
@@ -832,31 +969,18 @@ pub fn ground_truth(
     queries: &[Vec<f32>],
     k: usize,
 ) -> Vec<Vec<u32>> {
-    use rayon::prelude::*;
-
     assert_eq!(vectors.len(), n_docs * DIM);
     if queries.is_empty() || n_docs == 0 || k == 0 {
         return vec![Vec::new(); queries.len()];
     }
 
-    // Per-query candidate lists sorted ascending by (neg_dot, id) —
-    // best first, worst last, at most k entries.
-    let better = |a: &(f32, u32), b: &(f32, u32)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
-    let merge = |mut acc: Vec<Vec<(f32, u32)>>, part: Vec<Vec<(f32, u32)>>| {
-        for (a, p) in acc.iter_mut().zip(part) {
-            a.extend(p);
-            a.sort_unstable_by(better);
-            a.truncate(k);
-        }
-        acc
-    };
-
-    vectors
+    let tops = vectors
         .par_chunks(GT_DOC_CHUNK * DIM)
         .enumerate()
         .map(|(chunk_idx, chunk)| {
             let base = (chunk_idx * GT_DOC_CHUNK) as u32;
-            let mut tops: Vec<Vec<(f32, u32)>> = vec![Vec::with_capacity(k + 1); queries.len()];
+            let mut tops: Vec<Vec<GroundTruthCandidate>> =
+                vec![Vec::with_capacity(k + 1); queries.len()];
             for (j, doc) in chunk.chunks_exact(DIM).enumerate() {
                 let id = base + j as u32;
                 for (top, q) in tops.iter_mut().zip(queries) {
@@ -864,22 +988,122 @@ pub fn ground_truth(
                     for d in 0..DIM {
                         dot += doc[d] * q[d];
                     }
-                    let cand = (-dot, id);
-                    if top.len() == k && better(&cand, top.last().expect("non-empty at k")).is_ge()
-                    {
-                        continue;
-                    }
-                    let pos = top.partition_point(|e| better(e, &cand).is_lt());
-                    top.insert(pos, cand);
-                    top.truncate(k);
+                    insert_ground_truth_candidate(top, (-dot, id), k);
                 }
             }
             tops
         })
-        .reduce(|| vec![Vec::new(); queries.len()], merge)
-        .into_iter()
-        .map(|top| top.into_iter().map(|(_, id)| id).collect())
-        .collect()
+        .reduce(
+            || vec![Vec::new(); queries.len()],
+            |accumulated, partial| merge_ground_truth_tops(accumulated, partial, k),
+        );
+    ground_truth_ids(tops)
+}
+
+/// Compute exact base, filtered, and post-delta top-k labels in one
+/// document-major pass.
+///
+/// Every base row is scored once against all `queries`; delta-only rows are
+/// scored only against the first `n_correctness_queries`, because calibration
+/// never runs against the augmented corpus. The same score updates the
+/// relevant base, filtered, and augmented top-k lists, avoiding the previous
+/// two full corpus passes plus one filtered pass.
+pub fn lifecycle_ground_truth(
+    vectors: &[f32],
+    n_docs: usize,
+    augmented_docs: usize,
+    queries: &[Vec<f32>],
+    n_correctness_queries: usize,
+    filter_keep_every: usize,
+    k: usize,
+) -> LifecycleGroundTruth {
+    assert_eq!(vectors.len(), augmented_docs * DIM);
+    assert!(n_docs <= augmented_docs);
+    assert!(augmented_docs <= u32::MAX as usize);
+    assert!(n_correctness_queries <= queries.len());
+    assert!(filter_keep_every > 0);
+    if queries.is_empty() || augmented_docs == 0 || k == 0 {
+        return LifecycleGroundTruth {
+            base: vec![Vec::new(); queries.len()],
+            filtered: vec![Vec::new(); n_correctness_queries],
+            augmented: vec![Vec::new(); n_correctness_queries],
+        };
+    }
+
+    let transposed_queries = transpose_queries(queries);
+    let processed = AtomicUsize::new(0);
+    let progress_stride = (augmented_docs >= GT_PROGRESS_MIN_DOCS)
+        .then(|| augmented_docs.div_ceil(GT_PROGRESS_STEPS));
+    let next_report = AtomicUsize::new(progress_stride.unwrap_or(usize::MAX));
+    let tops = vectors
+        .par_chunks(GT_DOC_CHUNK * DIM)
+        .enumerate()
+        .map(|(chunk_index, chunk)| {
+            let base = chunk_index * GT_DOC_CHUNK;
+            let mut tops = LifecycleTopLists::empty(queries.len(), n_correctness_queries);
+            let mut dots = vec![0.0f32; queries.len()];
+            for (local_doc, doc) in chunk.chunks_exact(DIM).enumerate() {
+                let doc_id = base + local_doc;
+                let query_count = if doc_id < n_docs {
+                    queries.len()
+                } else {
+                    n_correctness_queries
+                };
+                dots[..query_count].fill(0.0);
+                for (dimension, value) in doc.iter().enumerate() {
+                    let query_offset = dimension * queries.len();
+                    for (dot, query_value) in dots[..query_count]
+                        .iter_mut()
+                        .zip(&transposed_queries[query_offset..query_offset + query_count])
+                    {
+                        *dot += *value * *query_value;
+                    }
+                }
+                let id = doc_id as u32;
+                for (query_index, dot) in dots[..query_count].iter().enumerate() {
+                    let candidate = (-*dot, id);
+                    if doc_id < n_docs {
+                        insert_ground_truth_candidate(&mut tops.base[query_index], candidate, k);
+                        if query_index < n_correctness_queries
+                            && doc_id.is_multiple_of(filter_keep_every)
+                        {
+                            insert_ground_truth_candidate(
+                                &mut tops.filtered[query_index],
+                                candidate,
+                                k,
+                            );
+                        }
+                    }
+                    if query_index < n_correctness_queries {
+                        insert_ground_truth_candidate(
+                            &mut tops.augmented[query_index],
+                            candidate,
+                            k,
+                        );
+                    }
+                }
+            }
+            if let Some(stride) = progress_stride {
+                report_ground_truth_progress(
+                    &processed,
+                    &next_report,
+                    augmented_docs,
+                    stride,
+                    chunk.len() / DIM,
+                );
+            }
+            tops
+        })
+        .reduce(
+            || LifecycleTopLists::empty(queries.len(), n_correctness_queries),
+            |accumulated, partial| accumulated.merge(partial, k),
+        );
+
+    LifecycleGroundTruth {
+        base: ground_truth_ids(tops.base),
+        filtered: ground_truth_ids(tops.filtered),
+        augmented: ground_truth_ids(tops.augmented),
+    }
 }
 
 /// Brute-force *filtered* top-k: exact nearest neighbors by NegDot, restricted
@@ -1349,6 +1573,8 @@ pub fn open_superfile(bytes: Vec<u8>) -> SuperfileReader {
 
 #[cfg(test)]
 mod tests {
+    use rand::RngExt;
+
     use super::*;
 
     /// Corpus size for the oracle-equivalence test — a few parallel
@@ -1360,10 +1586,17 @@ mod tests {
     const GT_TEST_K: usize = 10;
     /// Seed for the test's corpus + queries.
     const GT_TEST_SEED: u64 = 42;
+    /// Base corpus rows for the lifecycle-oracle equivalence test.
+    const LIFECYCLE_GT_TEST_DOCS: usize = 512;
+    /// Post-delta corpus rows for the lifecycle-oracle equivalence test.
+    const LIFECYCLE_GT_TEST_AUGMENTED_DOCS: usize = 576;
+    /// Correctness-query prefix graded against filtered and augmented views.
+    const LIFECYCLE_GT_TEST_CORRECTNESS_QUERIES: usize = 3;
+    /// Deterministic allow-set stride for the filtered lifecycle view.
+    const LIFECYCLE_GT_TEST_FILTER_KEEP_EVERY: usize = 7;
 
     #[test]
     fn transposed_ground_truth_matches_reference() {
-        use rand::prelude::*;
         let mut rng = StdRng::seed_from_u64(GT_TEST_SEED);
         let mut vectors = vec![0f32; GT_TEST_DOCS * DIM];
         for v in vectors.iter_mut() {
@@ -1381,5 +1614,48 @@ mod tests {
                 "transposed oracle diverged from the per-query reference"
             );
         }
+    }
+
+    #[test]
+    fn lifecycle_ground_truth_matches_three_reference_oracles() {
+        let mut rng = StdRng::seed_from_u64(GT_TEST_SEED);
+        let mut vectors = vec![0f32; LIFECYCLE_GT_TEST_AUGMENTED_DOCS * DIM];
+        for value in &mut vectors {
+            *value = rng.random::<f32>() - 0.5;
+        }
+        let queries: Vec<Vec<f32>> = (0..GT_TEST_QUERIES)
+            .map(|_| (0..DIM).map(|_| rng.random::<f32>() - 0.5).collect())
+            .collect();
+        let base_vectors = &vectors[..LIFECYCLE_GT_TEST_DOCS * DIM];
+        let base = ground_truth(base_vectors, LIFECYCLE_GT_TEST_DOCS, &queries, GT_TEST_K);
+        let mut allow = RoaringBitmap::new();
+        for id in (0..LIFECYCLE_GT_TEST_DOCS as u32).step_by(LIFECYCLE_GT_TEST_FILTER_KEEP_EVERY) {
+            allow.insert(id);
+        }
+        let filtered = filtered_ground_truth(
+            base_vectors,
+            &allow,
+            &queries[..LIFECYCLE_GT_TEST_CORRECTNESS_QUERIES],
+            GT_TEST_K,
+        );
+        let augmented = ground_truth(
+            &vectors,
+            LIFECYCLE_GT_TEST_AUGMENTED_DOCS,
+            &queries[..LIFECYCLE_GT_TEST_CORRECTNESS_QUERIES],
+            GT_TEST_K,
+        );
+
+        let combined = lifecycle_ground_truth(
+            &vectors,
+            LIFECYCLE_GT_TEST_DOCS,
+            LIFECYCLE_GT_TEST_AUGMENTED_DOCS,
+            &queries,
+            LIFECYCLE_GT_TEST_CORRECTNESS_QUERIES,
+            LIFECYCLE_GT_TEST_FILTER_KEEP_EVERY,
+            GT_TEST_K,
+        );
+        assert_eq!(combined.base, base);
+        assert_eq!(combined.filtered, filtered);
+        assert_eq!(combined.augmented, augmented);
     }
 }

@@ -73,7 +73,7 @@ pub const VEC_COLUMN: &str = "emb";
 pub const SQL_CATEGORY_COLUMN: &str = "category";
 pub const SQL_RATING_COLUMN: &str = "rating";
 
-const CORPUS_VEC_SEED: u64 = 1;
+pub(crate) const CORPUS_VEC_SEED: u64 = 1;
 const CORPUS_TEXT_SEED: u64 = 1;
 
 /// Random-rotation RNG seed for the bench vector index.

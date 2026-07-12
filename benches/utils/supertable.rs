@@ -1105,8 +1105,6 @@ pub mod vector {
         hint::black_box,
     };
 
-    use infino::roaring::RoaringBitmap;
-
     use super::*;
     use crate::{
         corpus,
@@ -1935,15 +1933,7 @@ pub mod vector {
             let nprobe = fixed_nprobe();
             let rerank = fixed_rerank_mult();
 
-            #[allow(clippy::type_complexity)]
-            let (q_correct, q_cal, gt_correct, gt_cal, filtered_gt, augmented_gt): (
-                Vec<Vec<f32>>,
-                Vec<Vec<f32>>,
-                Vec<Vec<u32>>,
-                Vec<Vec<u32>>,
-                Option<Vec<Vec<u32>>>,
-                Vec<Vec<u32>>,
-            ) = {
+            let (q_correct, q_cal, gt_correct, gt_cal, filtered_gt, augmented_gt) = {
                 let corpus = corpus
                     .as_ref()
                     .expect("vector benches always prepare a corpus");
@@ -1974,53 +1964,36 @@ pub mod vector {
                     QUERY_SIGMA,
                 );
                 let augmented_docs = n_docs + supertable::docs_per_commit();
-                let (gt_correct, gt_cal, filtered_gt, augmented_gt): (
-                    Vec<Vec<u32>>,
-                    Vec<Vec<u32>>,
-                    Option<Vec<Vec<u32>>>,
-                    Vec<Vec<u32>>,
-                ) = if skip_cal {
-                    eprintln!(
-                        "[supertable_vector] brute-force ground truth: correctness/default only ({} queries)...",
-                        q_correct.len(),
-                    );
-                    let gt_correct = corpus::ground_truth(base_vectors, n_docs, &q_correct, TOP_K);
-                    let mut allow = RoaringBitmap::new();
-                    for i in (0..n_docs as u32).step_by(FILTER_KEEP_EVERY) {
-                        allow.insert(i);
-                    }
-                    let filtered_gt =
-                        corpus::filtered_ground_truth(base_vectors, &allow, &q_correct, TOP_K);
-                    let augmented_gt =
-                        corpus::ground_truth(vslice, augmented_docs, &q_correct, TOP_K);
-                    (gt_correct, Vec::new(), Some(filtered_gt), augmented_gt)
+                let all_queries: Vec<Vec<f32>> = if skip_cal {
+                    q_correct.clone()
                 } else {
-                    eprintln!(
-                        "[supertable_vector] brute-force ground truth: one streamed pass, {} queries...",
-                        q_correct.len() + q_cal.len(),
-                    );
-                    let all_queries: Vec<Vec<f32>> =
-                        q_correct.iter().chain(q_cal.iter()).cloned().collect();
-                    let mut gt_all =
-                        corpus::ground_truth(base_vectors, n_docs, &all_queries, TOP_K);
-                    let gt_cal = gt_all.split_off(q_correct.len());
-                    let mut allow = RoaringBitmap::new();
-                    for i in (0..n_docs as u32).step_by(FILTER_KEEP_EVERY) {
-                        allow.insert(i);
-                    }
-                    let filtered_gt =
-                        corpus::filtered_ground_truth(base_vectors, &allow, &q_correct, TOP_K);
-                    let augmented_gt =
-                        corpus::ground_truth(vslice, augmented_docs, &q_correct, TOP_K);
-                    (gt_all, gt_cal, Some(filtered_gt), augmented_gt)
+                    q_correct.iter().chain(&q_cal).cloned().collect()
+                };
+                let mut labels = corpus::grading::lifecycle_ground_truth_cached(
+                    corpus::grading::LifecycleGradingOptions {
+                        vectors: vslice,
+                        n_docs,
+                        augmented_docs,
+                        corpus_seed: supertable::CORPUS_VEC_SEED,
+                        normalized_vectors: true,
+                        filter_keep_every: FILTER_KEEP_EVERY,
+                        top_k: TOP_K,
+                        correctness_query_count: q_correct.len(),
+                        queries: &all_queries,
+                    },
+                );
+                let gt_cal = if skip_cal {
+                    Vec::new()
+                } else {
+                    labels.base.split_off(q_correct.len())
                 };
                 (
                     q_correct,
                     q_cal,
-                    gt_correct,
+                    labels.base,
                     gt_cal,
-                    filtered_gt,
-                    augmented_gt,
+                    Some(labels.filtered),
+                    labels.augmented,
                 )
             };
             // Queries + ground truth extracted. Keep the mapping for the
