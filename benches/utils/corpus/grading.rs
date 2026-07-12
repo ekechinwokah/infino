@@ -19,6 +19,8 @@ use crate::corpus::{self, DIM, LifecycleGroundTruth};
 
 const CACHE_MAGIC: &[u8; 8] = b"INFLGT02";
 const CACHE_VERSION: u32 = 2;
+/// Existing lifecycle oracle loaded without fallback or recomputation.
+const GROUND_TRUTH_PATH_ENV: &str = "INFINO_BENCH_VECTOR_GROUND_TRUTH_PATH";
 /// FNV-1a offset basis used only for deterministic cache filenames.
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 /// FNV-1a prime used only for deterministic cache filenames.
@@ -73,6 +75,20 @@ impl CacheKey {
 pub fn lifecycle_ground_truth_cached(options: LifecycleGradingOptions<'_>) -> LifecycleGroundTruth {
     validate_options(&options);
     let key = CacheKey::from_options(&options);
+    if let Some(path) = env::var_os(GROUND_TRUTH_PATH_ENV).map(PathBuf::from) {
+        let labels = read_cache(&path, key, options.queries).unwrap_or_else(|error| {
+            panic!(
+                "failed to load or validate {GROUND_TRUTH_PATH_ENV}={}: {error}",
+                path.display()
+            )
+        });
+        eprintln!(
+            "[vector ground truth] loaded exact lifecycle oracle from {}",
+            path.display()
+        );
+        return labels;
+    }
+
     let path = cache_path(&key, options.queries);
     match read_cache(&path, key, options.queries) {
         Ok(labels) => {
@@ -91,6 +107,12 @@ pub fn lifecycle_ground_truth_cached(options: LifecycleGradingOptions<'_>) -> Li
         }
     }
 
+    assert_eq!(
+        options.vectors.len(),
+        options.augmented_docs * DIM,
+        "cannot recompute lifecycle ground truth from a base-only vector corpus; \
+         set {GROUND_TRUTH_PATH_ENV} to a valid existing oracle cache"
+    );
     eprintln!(
         "[vector ground truth] computing one exact pass over {} docs for {} queries...",
         options.augmented_docs,
@@ -123,7 +145,11 @@ pub fn lifecycle_ground_truth_cached(options: LifecycleGradingOptions<'_>) -> Li
 fn validate_options(options: &LifecycleGradingOptions<'_>) {
     assert!(options.n_docs > 0);
     assert!(options.n_docs <= options.augmented_docs);
-    assert_eq!(options.vectors.len(), options.augmented_docs * DIM);
+    assert!(
+        options.vectors.len() == options.n_docs * DIM
+            || options.vectors.len() == options.augmented_docs * DIM,
+        "lifecycle vector corpus must contain either the base or augmented row count"
+    );
     assert!(options.filter_keep_every > 0);
     assert!(options.top_k > 0);
     assert!(options.correctness_query_count <= options.queries.len());

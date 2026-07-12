@@ -28,8 +28,10 @@ use std::{
     cmp::Ordering,
     env,
     fs::File,
-    io::Write,
+    io::{Error, ErrorKind, Result as IoResult, Write},
+    mem::size_of,
     os::unix::fs::FileExt,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
@@ -577,7 +579,7 @@ pub fn generate_vector_corpus(
 /// ingestion, query generation, and brute-force recall share one deterministic
 /// corpus without keeping the whole corpus on the heap.
 pub struct MmapVectorCorpus {
-    _tmp: TempDir,
+    _tmp: Option<TempDir>,
     map: Mmap,
     n_docs: usize,
     dim: usize,
@@ -585,8 +587,23 @@ pub struct MmapVectorCorpus {
 
 impl MmapVectorCorpus {
     pub fn generate(n_docs: usize, n_cent: usize, seed: u64, normalize_each: bool) -> Self {
+        Self::generate_range(0, n_docs, n_cent, seed, normalize_each)
+    }
+
+    /// Generate only `[start_doc, start_doc + n_docs)` while preserving the
+    /// same global chunk seeds and RNG positions as a full corpus.
+    pub fn generate_range(
+        start_doc: usize,
+        n_docs: usize,
+        n_cent: usize,
+        seed: u64,
+        normalize_each: bool,
+    ) -> Self {
         let tmp = TempDir::new().expect("create MmapVectorCorpus tempdir");
         let path = tmp.path().join("corpus.bin");
+        let end_doc = start_doc
+            .checked_add(n_docs)
+            .expect("vector corpus document range overflow");
 
         // Centers are derived from `seed` exactly as the sequential
         // builder did, so the planted IVF cluster structure — and hence
@@ -609,27 +626,26 @@ impl MmapVectorCorpus {
             })
             .collect();
 
-        let row_bytes = DIM * std::mem::size_of::<f32>();
-        let total = (n_docs as u64) * (row_bytes as u64);
+        let row_bytes = DIM * size_of::<f32>();
+        let total = vector_corpus_byte_len(n_docs).expect("vector corpus byte length");
         let file = File::create(&path).expect("create corpus file");
         file.set_len(total).expect("set_len vector corpus");
 
         // rayon fans the chunks across all cores; each writes a fixed-stride
         // row range via a positioned write and draws noise from its own
         // deterministic per-chunk RNG (shared centers keep clusters intact).
-        let n_chunks = n_docs.div_ceil(VECTOR_CORPUS_CHUNK_DOCS).max(1);
+        let first_chunk = start_doc / VECTOR_CORPUS_CHUNK_DOCS;
+        let end_chunk = end_doc.div_ceil(VECTOR_CORPUS_CHUNK_DOCS);
         let centers_ref = &centers;
         let file_ref = &file;
-        (0..n_chunks).into_par_iter().for_each(|c| {
-            let start = c * VECTOR_CORPUS_CHUNK_DOCS;
-            if start >= n_docs {
-                return;
-            }
-            let end = ((c + 1) * VECTOR_CORPUS_CHUNK_DOCS).min(n_docs);
+        (first_chunk..end_chunk).into_par_iter().for_each(|c| {
+            let chunk_start = c * VECTOR_CORPUS_CHUNK_DOCS;
+            let start = chunk_start.max(start_doc);
+            let end = ((c + 1) * VECTOR_CORPUS_CHUNK_DOCS).min(end_doc);
             let mut rng = StdRng::seed_from_u64(chunk_seed(seed, c));
             let dist = StandardNormal;
             let mut buf: Vec<u8> = Vec::with_capacity(PARALLEL_CORPUS_WRITE_BUF_CAPACITY);
-            let base = (start as u64) * (row_bytes as u64);
+            let base = ((start - start_doc) as u64) * (row_bytes as u64);
             let expected = (end - start) * row_bytes;
             let mut written = 0usize;
             let flush = |buf: &mut Vec<u8>, written: &mut usize| {
@@ -642,6 +658,15 @@ impl MmapVectorCorpus {
                 *written += buf.len();
                 buf.clear();
             };
+            // The first requested row may begin partway through a global
+            // chunk. Advance that chunk's noise stream without materializing
+            // any preceding vectors so the requested rows remain bit-identical
+            // to a full corpus generated with the same knobs.
+            for _ in chunk_start..start {
+                for _ in 0..DIM {
+                    let _: f64 = dist.sample(&mut rng);
+                }
+            }
             let mut row = vec![0.0f32; DIM];
             for i in start..end {
                 let center = &centers_ref[i % n_cent];
@@ -665,15 +690,36 @@ impl MmapVectorCorpus {
         drop(file);
 
         let file = File::open(&path).expect("reopen corpus");
-        // SAFETY: this helper owns the temp file and never writes to it after
-        // the fsync above, so the read-only mmap cannot observe mutation.
-        let map = unsafe { Mmap::map(&file).expect("mmap corpus") };
-        Self {
+        Self::from_file(file, n_docs, Some(tmp)).expect("mmap generated vector corpus")
+    }
+
+    /// Open an existing raw f32 corpus without copying or modifying it.
+    ///
+    /// The file must contain exactly `n_docs * DIM` native-endian f32 values.
+    pub fn open(path: &Path, n_docs: usize) -> IoResult<Self> {
+        let file = File::open(path)?;
+        Self::from_file(file, n_docs, None)
+    }
+
+    fn from_file(file: File, n_docs: usize, tmp: Option<TempDir>) -> IoResult<Self> {
+        let expected = vector_corpus_byte_len(n_docs)?;
+        let actual = file.metadata()?.len();
+        if actual != expected {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("vector corpus size is {actual} bytes; expected exactly {expected} bytes"),
+            ));
+        }
+        // SAFETY: the mapping is read-only. Generated files are never written
+        // after their fsync; persisted benchmark inputs must likewise remain
+        // immutable while the benchmark owns this mapping.
+        let map = unsafe { Mmap::map(&file)? };
+        Ok(Self {
             _tmp: tmp,
             map,
             n_docs,
             dim: DIM,
-        }
+        })
     }
 
     pub fn as_slice(&self) -> &[f32] {
@@ -696,7 +742,7 @@ impl MmapVectorCorpus {
         if start >= end {
             return;
         }
-        let row_bytes = self.dim * std::mem::size_of::<f32>();
+        let row_bytes = self.dim * size_of::<f32>();
         let lo = page_floor(start * row_bytes);
         let hi = end * row_bytes;
         // SAFETY: read-only shared file mapping — `MADV_DONTNEED` only
@@ -708,6 +754,24 @@ impl MmapVectorCorpus {
                     .unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, lo, hi - lo);
         }
     }
+}
+
+fn vector_corpus_byte_len(n_docs: usize) -> IoResult<u64> {
+    let row_bytes = DIM
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "vector corpus row size overflow"))?;
+    let total = n_docs.checked_mul(row_bytes).ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "vector corpus byte length overflow",
+        )
+    })?;
+    u64::try_from(total).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "vector corpus byte length exceeds u64",
+        )
+    })
 }
 
 // ─── Query batteries ──────────────────────────────────────────────────
@@ -1573,6 +1637,8 @@ pub fn open_superfile(bytes: Vec<u8>) -> SuperfileReader {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, io::ErrorKind};
+
     use rand::RngExt;
 
     use super::*;
@@ -1594,6 +1660,70 @@ mod tests {
     const LIFECYCLE_GT_TEST_CORRECTNESS_QUERIES: usize = 3;
     /// Deterministic allow-set stride for the filtered lifecycle view.
     const LIFECYCLE_GT_TEST_FILTER_KEEP_EVERY: usize = 7;
+    /// Rows in the persisted mmap open/size validation fixture.
+    const MMAP_OPEN_TEST_DOCS: usize = 3;
+    /// First global row generated by the range-equivalence fixture.
+    const MMAP_RANGE_TEST_START: usize = 13;
+    /// Rows generated by the range-equivalence fixture.
+    const MMAP_RANGE_TEST_DOCS: usize = 19;
+    /// Planted centers in the range-equivalence fixture.
+    const MMAP_RANGE_TEST_CENTERS: usize = 8;
+    /// Corpus seed in the range-equivalence fixture.
+    const MMAP_RANGE_TEST_SEED: u64 = 91;
+
+    #[test]
+    fn mmap_vector_corpus_opens_only_the_exact_expected_size() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("vectors.bin");
+        let values: Vec<f32> = (0..MMAP_OPEN_TEST_DOCS * DIM)
+            .map(|value| value as f32)
+            .collect();
+        let bytes: &[u8] = bytemuck::cast_slice(&values);
+        fs::write(&path, bytes).expect("write exact corpus");
+
+        let corpus = MmapVectorCorpus::open(&path, MMAP_OPEN_TEST_DOCS).expect("open exact corpus");
+        assert_eq!(corpus.n_docs(), MMAP_OPEN_TEST_DOCS);
+        assert_eq!(corpus.dim(), DIM);
+        assert_eq!(corpus.as_slice(), values);
+
+        let wrong_path = directory.path().join("wrong-size.bin");
+        fs::write(&wrong_path, &bytes[..bytes.len() - 1]).expect("write wrong-size corpus");
+        let wrong_size = MmapVectorCorpus::open(&wrong_path, MMAP_OPEN_TEST_DOCS)
+            .err()
+            .expect("wrong-size corpus must fail");
+        assert_eq!(wrong_size.kind(), ErrorKind::InvalidData);
+
+        let missing =
+            MmapVectorCorpus::open(&directory.path().join("missing.bin"), MMAP_OPEN_TEST_DOCS)
+                .err()
+                .expect("missing corpus must fail");
+        assert_eq!(missing.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn mmap_vector_corpus_generated_range_matches_full_corpus_slice() {
+        let full_docs = MMAP_RANGE_TEST_START + MMAP_RANGE_TEST_DOCS;
+        let full = MmapVectorCorpus::generate(
+            full_docs,
+            MMAP_RANGE_TEST_CENTERS,
+            MMAP_RANGE_TEST_SEED,
+            true,
+        );
+        let tail = MmapVectorCorpus::generate_range(
+            MMAP_RANGE_TEST_START,
+            MMAP_RANGE_TEST_DOCS,
+            MMAP_RANGE_TEST_CENTERS,
+            MMAP_RANGE_TEST_SEED,
+            true,
+        );
+        let start = MMAP_RANGE_TEST_START * DIM;
+        let end = full_docs * DIM;
+        let tail_bytes: &[u8] = bytemuck::cast_slice(tail.as_slice());
+        let expected_bytes: &[u8] = bytemuck::cast_slice(&full.as_slice()[start..end]);
+
+        assert_eq!(tail.n_docs(), MMAP_RANGE_TEST_DOCS);
+        assert_eq!(tail_bytes, expected_bytes);
+    }
 
     #[test]
     fn transposed_ground_truth_matches_reference() {

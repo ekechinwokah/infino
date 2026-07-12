@@ -3,7 +3,7 @@
 
 //! Combined FTS + vector supertable ingest to object storage.
 
-use std::sync::Arc;
+use std::{env, mem::size_of, path::PathBuf, sync::Arc};
 
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
@@ -75,6 +75,8 @@ pub const SQL_RATING_COLUMN: &str = "rating";
 
 pub(crate) const CORPUS_VEC_SEED: u64 = 1;
 const CORPUS_TEXT_SEED: u64 = 1;
+/// Existing base-only vector corpus used instead of synthetic generation.
+const VECTOR_CORPUS_PATH_ENV: &str = "INFINO_BENCH_VECTOR_CORPUS_PATH";
 
 /// Random-rotation RNG seed for the bench vector index.
 const ROT_SEED: u64 = 7;
@@ -291,7 +293,7 @@ impl PreparedCorpus {
         let vec = self
             .vectors
             .as_ref()
-            .map(|_| (n_docs() * DIM * std::mem::size_of::<f32>()) as u64)
+            .map(|_| (n_docs() * DIM * size_of::<f32>()) as u64)
             .unwrap_or(0);
         text + vec
     }
@@ -301,6 +303,7 @@ impl PreparedCorpus {
 /// Call this BEFORE starting the build RSS sampler.
 pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
     let n_docs = n_docs();
+    let explicit_vector_path = env::var_os(VECTOR_CORPUS_PATH_ENV).map(PathBuf::from);
     let vector_docs = if modality == Modality::Vector {
         n_docs + docs_per_commit()
     } else {
@@ -314,11 +317,25 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
         MmapTextCorpus::generate(n_docs, CORPUS_TEXT_SEED)
     });
     let vectors = modality.has_vector().then(|| {
-        eprintln!(
-            "[supertable_ingest] generating {} ×{DIM} vector corpus (mmap-backed)...",
-            fmt_count(vector_docs)
-        );
-        MmapVectorCorpus::generate(vector_docs, corpus::n_cent(n_docs), CORPUS_VEC_SEED, true)
+        if let Some(path) = explicit_vector_path.as_deref() {
+            eprintln!(
+                "[supertable_ingest] opening persisted {} ×{DIM} vector corpus from {}...",
+                fmt_count(n_docs),
+                path.display()
+            );
+            MmapVectorCorpus::open(path, n_docs).unwrap_or_else(|error| {
+                panic!(
+                    "failed to open {VECTOR_CORPUS_PATH_ENV}={}: {error}",
+                    path.display()
+                )
+            })
+        } else {
+            eprintln!(
+                "[supertable_ingest] generating {} ×{DIM} vector corpus (mmap-backed)...",
+                fmt_count(vector_docs)
+            );
+            MmapVectorCorpus::generate(vector_docs, corpus::n_cent(n_docs), CORPUS_VEC_SEED, true)
+        }
     });
     PreparedCorpus { text, vectors }
 }
@@ -328,14 +345,22 @@ pub fn vector_delta_batch(corpus: &PreparedCorpus) -> RecordBatch {
     let start = n_docs();
     let len = docs_per_commit();
     let end = start + len;
-    chunk_batch(
-        Modality::Vector,
-        corpus,
-        &schema_for(Modality::Vector),
+    let vectors = corpus
+        .vectors()
+        .expect("vector delta requires a prepared vector corpus");
+    let schema = schema_for(Modality::Vector);
+    if vectors.n_docs() >= end {
+        return chunk_batch(Modality::Vector, corpus, &schema, start, end, len);
+    }
+    assert_eq!(
+        vectors.n_docs(),
         start,
-        end,
-        len,
-    )
+        "base-only persisted vector corpus must contain exactly n_docs rows"
+    );
+    let tail =
+        MmapVectorCorpus::generate_range(start, len, corpus::n_cent(start), CORPUS_VEC_SEED, true);
+    RecordBatch::try_new(schema, vec![vector_array(tail.as_slice())])
+        .expect("vector delta RecordBatch")
 }
 
 /// Stream the prepared on-disk corpus → append → commit → object
@@ -666,17 +691,21 @@ fn chunk_batch(
             .expect("vector modality has a vector corpus")
             .as_slice();
         let flat = &all[start * DIM..end * DIM];
-        columns.push(Arc::new(
-            FixedSizeListArray::try_new(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                DIM as i32,
-                Arc::new(Float32Array::from(flat.to_vec())) as Arc<dyn Array>,
-                None,
-            )
-            .expect("FSL"),
-        ));
+        columns.push(vector_array(flat));
     }
     RecordBatch::try_new(schema.clone(), columns).expect("batch")
+}
+
+fn vector_array(flat: &[f32]) -> Arc<dyn Array> {
+    Arc::new(
+        FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            DIM as i32,
+            Arc::new(Float32Array::from(flat.to_vec())) as Arc<dyn Array>,
+            None,
+        )
+        .expect("FSL"),
+    )
 }
 
 /// Combined FTS + vector build (search consumer + combined ingest row).
