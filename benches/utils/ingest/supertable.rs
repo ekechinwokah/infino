@@ -534,14 +534,9 @@ pub(crate) fn open_existing(modality: Modality, fixture: tiers::StorageFixture) 
     let st =
         Supertable::open(opts).expect("open existing supertable at INFINO_BENCH_EXISTING_PREFIX");
     let reader = st.reader();
-    let n_superfiles = reader.n_superfiles();
-    let total_index_bytes: u64 = reader
-        .manifest()
-        .superfiles
-        .iter()
-        .filter_map(|e| e.subsection_offsets.as_ref())
-        .map(|off| off.total_size)
-        .sum();
+    let (n_superfiles, total_index_bytes) = reader
+        .load_superfile_storage_stats()
+        .expect("load existing supertable manifest entries");
     drop(reader);
     drop(st);
     drop(cache_dir);

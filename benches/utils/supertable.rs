@@ -2326,8 +2326,8 @@ pub mod vector {
                             subtitle: String::new(),
                             headers: vec![
                                 "Filter".into(),
-                                "(p, r)".into(),
-                                "effective (p, r)".into(),
+                                "Requested".into(),
+                                "Actual routing".into(),
                                 "selectivity".into(),
                                 "recall@10".into(),
                                 "p50".into(),
@@ -2337,7 +2337,10 @@ pub mod vector {
                                 text(format!(
                                     "p={FILTERED_DEFAULT_NPROBE}, r={FILTERED_DEFAULT_RERANK_MULT}"
                                 )),
-                                text(format!("p={effective_nprobe}, r={effective_rerank}")),
+                                text(warm_reader.routing_label(
+                                    effective_nprobe,
+                                    effective_rerank,
+                                )),
                                 text(format!("{:.1}%", selectivity * 100.0)),
                                 text(format!("{mean_recall:.3}")),
                                 metric(p50_ns, fmt_time(p50_ns), Better::Lower),

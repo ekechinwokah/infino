@@ -734,7 +734,10 @@ pub mod fts {
 pub mod vector {
     use std::{collections::HashMap, hint::black_box};
 
-    use infino::superfile::{SuperfileReader, reader::VectorSearchOptions};
+    use infino::{
+        superfile::{SuperfileReader, reader::VectorSearchOptions},
+        supertable::manifest::list::PartitionStrategy,
+    };
 
     use super::*;
     use crate::{
@@ -793,6 +796,12 @@ pub mod vector {
             rerank: usize,
         ) -> Vec<(u32, f32)>;
 
+        /// Parameters the reader actually applies. Supertables may translate
+        /// the requested IVF probe count into table-level cell routing.
+        fn search_params(&self, nprobe: usize, rerank: usize) -> String {
+            format!("p={nprobe}, r={rerank}")
+        }
+
         /// Time the PUBLIC `vector_search` path (routing + rerank + stable
         /// `_id` resolution + Arrow materialization) — the surface a real
         /// caller uses. Returns p50 nanoseconds, or `None` for readers that
@@ -840,6 +849,25 @@ pub mod vector {
         pub id_to_dense: Arc<HashMap<i128, u32>>,
     }
 
+    impl SupertableVectorRead<'_> {
+        pub fn routing_label(&self, nprobe: usize, rerank: usize) -> String {
+            if let Some(hidden) = self.table.vector_index_table() {
+                let reader = hidden.pinned_reader();
+                let manifest = reader.manifest();
+                if !manifest.get_all_superfiles().is_empty()
+                    && let PartitionStrategy::VectorCell { routing, .. } =
+                        manifest.get_partition_strategy()
+                {
+                    return format!(
+                        "hidden: cells {}..{}, fine {}, r{rerank}",
+                        routing.nprobe_min, routing.nprobe_max, routing.fine_nprobe,
+                    );
+                }
+            }
+            format!("user: cells {nprobe}+, fine all, r{rerank}")
+        }
+    }
+
     impl VectorRead for SupertableVectorRead<'_> {
         fn topk_global(
             &self,
@@ -864,6 +892,10 @@ pub mod vector {
                     (dense, score)
                 })
                 .collect()
+        }
+
+        fn search_params(&self, nprobe: usize, rerank: usize) -> String {
+            self.routing_label(nprobe, rerank)
         }
     }
 
@@ -1200,7 +1232,7 @@ pub mod vector {
     }
 
     /// Render the recall/latency table (same columns for both tiers):
-    /// `Recall target | (p, r) | recall | [warm | Peak/Median/P90 RSS] | [cold]`.
+    /// `Recall target | Search parameters | recall | [warm | Peak/Median/P90 RSS] | [cold]`.
     pub fn emit_recall_table(
         report: &mut Report,
         anchor: &str,
@@ -1212,7 +1244,7 @@ pub mod vector {
     ) {
         let mut headers = vec![
             "Recall target".to_string(),
-            "(p, r)".to_string(),
+            "Search parameters".to_string(),
             "recall".to_string(),
         ];
         if include_warm {
@@ -1310,7 +1342,8 @@ pub mod vector {
                 default_recall = None;
             } else {
                 eprintln!(
-                    "[{log_prefix}] skip-calibration: VectorSearchOptions::default() → unfiltered p={default_nprobe}, r={default_rerank} ({} queries)...",
+                    "[{log_prefix}] skip-calibration: {} ({} queries)...",
+                    warm_reader.search_params(default_nprobe, default_rerank),
                     q_correct.len(),
                 );
                 let default = mean_recall(
@@ -1329,8 +1362,9 @@ pub mod vector {
             }
         } else {
             eprintln!(
-                "[{log_prefix}] correctness: recall@{k} on {} queries (nprobe={CORRECTNESS_NPROBE}, rerank={CORRECTNESS_RERANK_MULT})...",
+                "[{log_prefix}] correctness: recall@{k} on {} queries ({})...",
                 q_correct.len(),
+                warm_reader.search_params(CORRECTNESS_NPROBE, CORRECTNESS_RERANK_MULT),
             );
             let recall = mean_recall(
                 warm_reader,
@@ -1393,7 +1427,7 @@ pub mod vector {
                 match cal[i] {
                     Some(c) => rows.push(RecallRow {
                         target: format!("{target:.2}"),
-                        params: format!("p={}, r={}", c.probe, c.refine),
+                        params: warm_reader.search_params(c.probe, c.refine),
                         recall: format!("{:.3}", c.recall),
                         warm: include_warm
                             .then(|| measure_warm(warm_reader, column, q0, k, c.probe, c.refine)),
@@ -1413,7 +1447,7 @@ pub mod vector {
         }
         rows.push(RecallRow {
             target: "default".into(),
-            params: format!("p={default_nprobe}, r={default_rerank}"),
+            params: warm_reader.search_params(default_nprobe, default_rerank),
             recall: default_recall
                 .map(|r| format!("{r:.3}"))
                 .unwrap_or_else(|| "—".into()),

@@ -1296,6 +1296,21 @@ impl SupertableReader {
         self.manifest.superfiles.len()
     }
 
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_visible! {
+    /// Load every lazy manifest part and return `(superfiles, index bytes)`.
+    /// Benchmarks use this to size a cache when reopening a retained table.
+    fn load_superfile_storage_stats(&self) -> Result<(usize, u64), ManifestLoadError> {
+        let entries = self.block_on(self.manifest.get_all_superfiles_loaded())?;
+        let total_index_bytes = entries
+            .iter()
+            .filter_map(|entry| entry.subsection_offsets.as_ref())
+            .map(|offsets| offsets.total_size)
+            .sum();
+        Ok((entries.len(), total_index_bytes))
+    }
+    }
+
     /// Total documents across all superfiles visible to this reader.
     pub fn n_docs_total(&self) -> u64 {
         self.manifest.n_docs_total()
