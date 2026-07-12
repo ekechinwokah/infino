@@ -1494,6 +1494,36 @@ pub mod vector {
         }
     }
 
+    /// Observable routing phase of an already-built table — which tier(s) a
+    /// vector query fans out over right now. Derived purely from manifest
+    /// state so read-only (existing-prefix / dataset) runs report the same
+    /// phase names as lifecycle runs without performing any transition:
+    /// no hidden superfiles ⇒ pre-drain; hidden present with every user
+    /// commit drained ⇒ post-drain; hidden present with an undrained user
+    /// tail ⇒ post-delta.
+    fn current_routing_phase(consumer: &Supertable) -> &'static str {
+        let Some(hidden) = consumer.vector_index_table() else {
+            return "pre-drain";
+        };
+        let hidden_reader = hidden.pinned_reader();
+        let hidden_manifest = hidden_reader.manifest();
+        if hidden_manifest.get_all_superfiles().is_empty() {
+            return "pre-drain";
+        }
+        let drained = hidden_manifest.get_drained_ranges();
+        let user_reader = consumer.reader();
+        let user_manifest = user_reader.manifest();
+        if user_manifest
+            .get_all_superfiles()
+            .iter()
+            .any(|entry| !drained.contains(entry.birth_version))
+        {
+            "post-delta"
+        } else {
+            "post-drain"
+        }
+    }
+
     fn log_hidden_open_stats(hidden: &Supertable, label: &str) {
         let reader = hidden.pinned_reader();
         let manifest = reader.manifest();
@@ -2008,7 +2038,7 @@ pub mod vector {
 
             const PRE_DRAIN_NOTE: &str = "Pre-drain (incoming staging): hidden IVF commit shards still in INCOMING; every query includes INCOMING plus nprobe-routed cells. Warm = query-driven cache fill; cold = fresh cache per iteration. Δ vs previous run.";
             const POST_DRAIN_NOTE: &str = "Post-drain (routed cells): incoming empty after OPANN route; queries hit ~nprobe cell-local IVF superfiles only. Warm = query-driven cache fill; cold = fresh cache per iteration. Δ vs previous run.";
-            const LEGACY_NOTE: &str = "Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = shared disk cache; each row runs one untimed query then timed iterations (only probed superfiles are cached). Cold = fresh disk cache + consumer per iteration. Δ is vs the previous run.";
+            const POST_DELTA_NOTE: &str = "Post-delta (hidden + undrained tail): drained rows rank on cell-local hidden IVF superfiles; undrained user commits fan out directly and merge by distance. Warm = query-driven cache fill; cold = fresh cache per iteration. Δ vs previous run.";
 
             // Fresh ingest leaves hidden IVF in INCOMING; dataset / existing-prefix
             // tables may already be post-drain — run the two-phase comparison only
@@ -2190,9 +2220,22 @@ pub mod vector {
                 ));
                 post_drain_rows
             } else {
+                // Read-only path (existing-prefix / dataset): no transitions
+                // run here, but the phase is still observable from manifest
+                // state — report it under the same names and anchors as the
+                // lifecycle branch so runs against the same table state
+                // compare directly.
+                let phase = current_routing_phase(&consumer);
                 if phases.warm {
-                    log_hidden_stats(&consumer, "at warm open");
+                    log_hidden_stats(&consumer, &format!("at warm open ({phase})"));
                 }
+                let log_prefix = format!("supertable_vector/{phase}");
+                let anchor = format!("bench/vector/supertable/search/{phase}");
+                let note = match phase {
+                    "pre-drain" => PRE_DRAIN_NOTE,
+                    "post-drain" => POST_DRAIN_NOTE,
+                    _ => POST_DELTA_NOTE,
+                };
                 exec_vec::run_search(
                     &mut report,
                     &warm_reader,
@@ -2210,10 +2253,10 @@ pub mod vector {
                     phases.cold,
                     COLD_ITERS,
                     skip_cal,
-                    "supertable_vector",
-                    "bench/vector/supertable/search",
-                    search_title(""),
-                    LEGACY_NOTE,
+                    &log_prefix,
+                    &anchor,
+                    search_title(phase),
+                    note,
                 )
             };
             // Filtered vector recall + latency mirrors the superfile tier:
