@@ -49,10 +49,11 @@
 
 use std::{
     cmp,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     fmt, io,
     marker::PhantomData,
     mem,
+    path::Path,
     sync::{Arc, atomic::Ordering},
     time,
 };
@@ -133,7 +134,7 @@ use crate::{
             layout::VectorLayout,
             reader::VectorReader,
             rerank_codec::RerankCodec,
-            spill::CellRowAccumulator,
+            spill::{MaterializedRowSpillWriter, SpilledCellRows, read_spilled_cell_rows},
         },
     },
     supertable::{
@@ -2149,10 +2150,29 @@ fn drain_batch_superfiles(opts: &SupertableOptions) -> i64 {
 /// Working-set cap for one wave of the drain's end-of-run per-cell builds.
 const DRAIN_BUILD_GROUP_BYTES: u64 = 4 * (1 << 30);
 
-/// Rough per-row byte estimate for wave sizing when rows are already in RAM
-/// (prefix + RaBitQ + Sq8 codes/residuals). Matches the spill layout's
-/// variable payload closely enough for the 4 GiB wave budget.
-const DRAIN_MEMORY_ROW_BYTES_ESTIMATE: u64 = 29 + 128 + 2 * 1024;
+/// Append one materialized row to `cell`'s spill, creating the cell writer on
+/// first touch.
+fn spill_row_to_cell(
+    spills: &mut HashMap<u32, MaterializedRowSpillWriter>,
+    added: &mut HashMap<u32, u32>,
+    scratch: &Path,
+    cell: u32,
+    row: &MaterializedIvfRow,
+) -> Result<(), BuildError> {
+    let writer = match spills.entry(cell) {
+        Entry::Occupied(o) => o.into_mut(),
+        Entry::Vacant(v) => v.insert(MaterializedRowSpillWriter::create(
+            scratch,
+            cell,
+            row.encoded.codes.len(),
+            row.rabitq_code.len(),
+        )?),
+    };
+    writer.append(row)?;
+    let n = added.entry(cell).or_insert(0);
+    *n = n.saturating_add(1);
+    Ok(())
+}
 
 /// Drain replica factor at or below which no boundary replicas are added.
 const DEFAULT_DRAIN_REPLICA_TARGET_FACTOR: f32 = 1.0;
@@ -2383,12 +2403,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // are immutable (owned by the user manifest), so each batch's
     // `apply_cell_updates` builds on the prior batches' running totals.
     let mut running_clusters = clusters;
-    // Keep the trusted drain semantics: every bounded materialize batch gets
-    // its own assignment + boundary-replica budget, then its assigned rows are
-    // accumulated by cell. Packing/publish still happens once after the final
-    // batch. A single batch stays in RAM; multi-batch drains spill to scratch.
-    let prefer_memory_accum = !is_splice && n_batches <= 1;
-    let drain_scratch = if is_splice || prefer_memory_accum {
+    // kmeans mode decouples the batch budget (a memory bound on how many user
+    // superfiles are materialized at once) from the published layout: every
+    // batch spills rows per cell to scratch, then packs cell IVFs into ≤N
+    // shard objects after the last batch.
+    let drain_scratch = if is_splice {
         None
     } else {
         Some(
@@ -2396,13 +2415,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 .map_err(|e| BuildError::Store(format!("drain spill scratch dir: {e}")))?,
         )
     };
-    let mut cell_rows: CellRowAccumulator = if prefer_memory_accum {
-        CellRowAccumulator::memory()
-    } else if let Some(ref scratch) = drain_scratch {
-        CellRowAccumulator::disk(scratch.path().to_path_buf())
-    } else {
-        CellRowAccumulator::memory()
-    };
+    let mut cell_spills: HashMap<u32, MaterializedRowSpillWriter> = HashMap::new();
     let mut added_per_cell: HashMap<u32, u32> = HashMap::new();
 
     for (batch_idx, (batch_versions, batch_sources)) in batches.iter().enumerate() {
@@ -2567,8 +2580,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 n_objects,
             );
         } else {
-            // kmeans: materialize THIS batch, assign with the shared core, then
-            // accumulate the assigned (primary + replica) postings by cell.
+            // kmeans: materialize THIS batch's rows, assign each to its nearest
+            // global cell (or group by row.cluster when global-aligned), then
+            // spill the assigned (primary + replica) postings per cell. The
+            // spill is unconditional — the drain's memory bound is O(batch)
+            // regardless of batch count, codec, or pack shape.
             let column_for_mat = column_name.clone();
             let tombstone_cache = user_inner.tombstone_cache.clone();
             let now = time::Instant::now();
@@ -2603,47 +2619,93 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
 
             let all_rows: Vec<MaterializedIvfRow> = row_sets.into_iter().flatten().collect();
             let n_batch_rows = all_rows.len();
-            // Batch boundary: reset disk writers' Arc-pointer dedup (no-op in RAM).
-            cell_rows.begin_batch();
+            let scratch = drain_scratch
+                .as_ref()
+                .expect("kmeans drain owns a scratch dir")
+                .path();
+            // Batch boundary: reset spill writers' Arc-pointer dedup.
+            for writer in cell_spills.values_mut() {
+                writer.begin_batch();
+            }
             let replica_target = drain_replica_target_factor();
-            let assigned_groups = hidden_inner.options.writer_pool.install(|| {
-                let row_refs: Vec<PackRow<'_>> =
-                    all_rows.iter().map(PackRow::Materialized).collect();
-                assign_cells(
-                    &row_refs,
-                    &running_clusters,
-                    metric,
-                    assign_skip,
-                    replica_target,
-                )
-            })?;
-            for group in assigned_groups {
-                let added = u32::try_from(group.members.len()).unwrap_or(u32::MAX);
-                let count = added_per_cell.entry(group.cell_id).or_insert(0);
-                *count = count.saturating_add(added);
-                for (_, _, row) in group.members {
-                    let PackRow::Materialized(row) = row else {
-                        unreachable!("drain assignment contains only materialized rows");
-                    };
-                    cell_rows.append(group.cell_id, row)?;
+            let replica_extra_budget = drain_replica_extra_budget(all_rows.len(), replica_target);
+            if replica_extra_budget == 0 && assign_skip {
+                for row in &all_rows {
+                    spill_row_to_cell(
+                        &mut cell_spills,
+                        &mut added_per_cell,
+                        scratch,
+                        row.cluster,
+                        row,
+                    )?;
+                }
+            } else {
+                let clusters_ref = &running_clusters;
+                let transposed_centroids = transpose_centroids_cluster_major(
+                    &clusters_ref.centroids,
+                    clusters_ref.n_cent as usize,
+                    clusters_ref.dim as usize,
+                );
+                let assignments: Vec<opann::BoundaryAssignment> =
+                    hidden_inner.options.writer_pool.install(|| {
+                        all_rows
+                            .par_iter()
+                            .map(|row| {
+                                opann::boundary_assignment_encoded_with_transposed(
+                                    clusters_ref,
+                                    &transposed_centroids,
+                                    metric,
+                                    &row.encoded,
+                                )
+                            })
+                            .collect()
+                    });
+                let mut replica_candidates: Vec<(usize, u32, f32)> = assignments
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row_idx, assignment)| {
+                        assignment
+                            .neighbor
+                            .map(|(neighbor, margin)| (row_idx, neighbor, margin))
+                    })
+                    .collect();
+                replica_candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
+                // Boundary replicas: append the same row bytes to neighbor cells.
+                for (row_idx, cell, _) in replica_candidates.into_iter().take(replica_extra_budget)
+                {
+                    spill_row_to_cell(
+                        &mut cell_spills,
+                        &mut added_per_cell,
+                        scratch,
+                        cell,
+                        &all_rows[row_idx],
+                    )?;
+                }
+                for (row, assignment) in all_rows.iter().zip(&assignments) {
+                    spill_row_to_cell(
+                        &mut cell_spills,
+                        &mut added_per_cell,
+                        scratch,
+                        assignment.primary,
+                        row,
+                    )?;
                 }
             }
-            let t_accum = batch_t0.elapsed().as_secs_f64() * 1e3;
-            let accum_label = if cell_rows.prefer_memory() {
-                "memory"
-            } else {
-                "spill"
-            };
+            let t_spill = batch_t0.elapsed().as_secs_f64() * 1e3;
             eprintln!(
-                "[supertable drain] batch {}/{} ({} sf, kmeans): materialize {:.1}ms + assign+accum {:.1}ms, {} batch row(s) -> {} {} cell store(s)",
+                "[supertable drain] batch {}/{} ({} sf, kmeans): materialize {:.1}ms + {} {:.1}ms, {} batch row(s) -> {} cell spill(s)",
                 batch_idx + 1,
                 n_batches,
                 batch_sources.len(),
                 t_mat,
-                t_accum - t_mat,
+                if assign_skip {
+                    "group(assign-skip)+spill"
+                } else {
+                    "assign+spill"
+                },
+                t_spill - t_mat,
                 n_batch_rows,
-                cell_rows.len(),
-                accum_label,
+                cell_spills.len(),
             );
         }
 
@@ -2741,12 +2803,18 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         }
     }
 
-    // kmeans: rows were assigned per bounded batch above (trusted drain
-    // semantics). Pack their per-cell accumulators in memory-bounded waves.
-    if !cell_rows.is_empty() {
+    // kmeans cell build: turn per-cell spills into shard-packed superfiles in
+    // memory-bounded waves (rehydrate a wave, build, publish, delete its spill
+    // files), then advance the manifest in one atomic CAS.
+    if !cell_spills.is_empty() {
         let build_t0 = time::Instant::now();
-        let total_rows: u64 = added_per_cell.values().map(|rows| u64::from(*rows)).sum();
-        let n_cells_total = cell_rows.len();
+        let mut spilled: Vec<(u32, SpilledCellRows)> = cell_spills
+            .into_iter()
+            .map(|(cell, writer)| writer.finish().map(|s| (cell, s)).map_err(BuildError::from))
+            .collect::<Result<Vec<_>, BuildError>>()?;
+        spilled.sort_unstable_by_key(|(cell, _)| *cell);
+        let n_cells_total = spilled.len();
+        let total_rows: u64 = spilled.iter().map(|(_, s)| s.n_rows() as u64).sum();
         let vc = hidden_inner
             .options
             .vector_columns
@@ -2756,25 +2824,34 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
 
         crate::superfile::vector::builder::build_phase_timers::reset();
         let mut new_entries: Vec<Arc<SuperfileEntry>> = Vec::with_capacity(n_cells_total);
-        let mut wave: Vec<(u32, Vec<MaterializedIvfRow>)> = Vec::new();
-        let mut wave_bytes = 0u64;
+        let mut wave: Vec<(u32, SpilledCellRows)> = Vec::new();
+        let mut wave_bytes: u64 = 0;
         let mut n_waves = 0usize;
-        let cells_iter = cell_rows.into_cell_rows_iter();
-        for (cell_index, cell) in cells_iter.enumerate() {
-            let (cell_id, rows) = cell?;
-            wave_bytes += rows.len() as u64 * DRAIN_MEMORY_ROW_BYTES_ESTIMATE;
-            wave.push((cell_id, rows));
-            let flush = wave_bytes >= DRAIN_BUILD_GROUP_BYTES || cell_index + 1 == n_cells_total;
+        let mut spilled_iter = spilled.into_iter().peekable();
+        while let Some((cell, spill)) = spilled_iter.next() {
+            wave_bytes += spill.row_bytes();
+            wave.push((cell, spill));
+            let flush = wave_bytes >= DRAIN_BUILD_GROUP_BYTES || spilled_iter.peek().is_none();
             if !flush {
                 continue;
             }
             n_waves += 1;
-            let wave_cells = std::mem::take(&mut wave);
-            wave_bytes = 0;
+            let cells_rows: Vec<(u32, Vec<MaterializedIvfRow>)> = wave
+                .iter()
+                .map(|(cell, spill)| {
+                    read_spilled_cell_rows(spill)
+                        .map(|rows| (*cell, rows))
+                        .map_err(BuildError::from)
+                })
+                .collect::<Result<Vec<_>, BuildError>>()?;
             let prepared_wave: Vec<PreparedSuperfile> =
                 hidden_inner.options.writer_pool.install(|| {
                     let n_shards = packed_cell_shard_count(&hidden_inner.options);
-                    let packed_shards = group_cells_by_packed_shard(wave_cells, n_shards);
+                    let non_empty: Vec<(u32, Vec<MaterializedIvfRow>)> = cells_rows
+                        .into_iter()
+                        .filter(|(_, rows)| !rows.is_empty())
+                        .collect();
+                    let packed_shards = group_cells_by_packed_shard(non_empty, n_shards);
                     packed_shards
                         .into_par_iter()
                         .map(|(shard_id, cells)| {
@@ -2802,6 +2879,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
             new_entries.extend(publish.new_entries);
+            for (_, spill) in wave.drain(..) {
+                spill.remove_files();
+            }
+            wave_bytes = 0;
         }
         let mut cell_updates: HashMap<u32, u32> = HashMap::new();
         for (cell, added) in &added_per_cell {
@@ -3058,9 +3139,11 @@ fn group_cells_by_packed_shard<T>(
         .collect()
 }
 
+/// One commit-buffer row for the shared assign+pack core. The drain does not
+/// come through here: its rows are spilled per cell and packed from
+/// [`SpilledCellRows`] via [`drain_pack_materialized_cell`].
 #[derive(Clone, Copy)]
 enum PackRow<'a> {
-    Materialized(&'a MaterializedIvfRow),
     Fp32 { stable_id: i128, vector: &'a [f32] },
 }
 
@@ -3090,62 +3173,36 @@ impl PackedCellGroup {
 
 fn pack_row_stable_id(row: PackRow<'_>) -> i128 {
     match row {
-        PackRow::Materialized(row) => row.stable_id,
         PackRow::Fp32 { stable_id, .. } => stable_id,
     }
 }
 
-/// Shared drain/commit assignment core: rows in, boundary assignment and
-/// replica budget applied once, cell buckets out. Does **not** build IVF
-/// subsections — that runs in the shard-stage pack (parallel). Boundary
-/// replicas are vector postings only; callers decide which primaries become
-/// Parquet rows.
+/// Commit assignment core: fp32 rows in, boundary assignment and replica
+/// budget applied once, cell buckets out. Does **not** build IVF subsections —
+/// that runs in the shard-stage pack (parallel). Boundary replicas are vector
+/// postings only; callers decide which primaries become Parquet rows.
 fn assign_cells<'a>(
     rows: &[PackRow<'a>],
     clusters: &ClusterCentroids,
     metric: Metric,
-    assign_skip: bool,
     replica_target_factor: f32,
 ) -> Result<Vec<AssignedCellGroup<'a>>, BuildError> {
     if rows.is_empty() {
         return Ok(Vec::new());
     }
     let replica_extra_budget = drain_replica_extra_budget(rows.len(), replica_target_factor);
-    let needs_boundary = replica_extra_budget > 0 || !assign_skip;
-    let transposed = needs_boundary.then(|| {
-        transpose_centroids_cluster_major(
-            &clusters.centroids,
-            clusters.n_cent as usize,
-            clusters.dim as usize,
-        )
-    });
+    let transposed = transpose_centroids_cluster_major(
+        &clusters.centroids,
+        clusters.n_cent as usize,
+        clusters.dim as usize,
+    );
+    // Per-row nearest-cell scoring is the commit CPU wave: run it on the
+    // ambient rayon pool (callers wrap this in `writer_pool.install`).
     let assignments: Vec<opann::BoundaryAssignment> = rows
-        .iter()
+        .par_iter()
         .map(|row| match *row {
-            PackRow::Materialized(row) if assign_skip && replica_extra_budget == 0 => {
-                opann::BoundaryAssignment {
-                    primary: row.cluster,
-                    neighbor: None,
-                }
-            }
-            PackRow::Materialized(row) if assign_skip => {
-                let mut assignment = opann::boundary_assignment_encoded_with_transposed(
-                    clusters,
-                    transposed.as_deref().unwrap_or(&[]),
-                    metric,
-                    &row.encoded,
-                );
-                assignment.primary = row.cluster;
-                assignment
-            }
-            PackRow::Materialized(row) => opann::boundary_assignment_encoded_with_transposed(
-                clusters,
-                transposed.as_deref().unwrap_or(&[]),
-                metric,
-                &row.encoded,
-            ),
             PackRow::Fp32 { vector, .. } => {
-                opann::boundary_assignment_fp32(clusters, transposed.as_deref(), metric, vector)
+                opann::boundary_assignment_fp32(clusters, Some(&transposed), metric, vector)
             }
         })
         .collect();
@@ -3254,29 +3311,14 @@ fn drain_pack_assigned_cell(
     let dim = cfg.dim;
     let cell_cfg = drain_cell_vector_config(cfg, members.len());
     let stable_ids: Vec<i128> = members.iter().map(|(stable_id, _, _)| *stable_id).collect();
-    let subsection = match members[0].2 {
-        PackRow::Materialized(_) => {
-            let materialized: Vec<MaterializedIvfRow> = members
-                .iter()
-                .map(|(_, _, row)| match *row {
-                    PackRow::Materialized(row) => row.clone(),
-                    PackRow::Fp32 { .. } => unreachable!("mixed pack row kinds"),
-                })
-                .collect();
-            return drain_pack_materialized_cell(cell_id, materialized, cfg);
+    let mut corpus = Vec::with_capacity(members.len() * dim);
+    for (_, _, row) in &members {
+        match *row {
+            PackRow::Fp32 { vector, .. } => corpus.extend_from_slice(vector),
         }
-        PackRow::Fp32 { .. } => {
-            let mut corpus = Vec::with_capacity(members.len() * dim);
-            for (_, _, row) in &members {
-                match *row {
-                    PackRow::Fp32 { vector, .. } => corpus.extend_from_slice(vector),
-                    PackRow::Materialized(_) => unreachable!("mixed pack row kinds"),
-                }
-            }
-            // Drain's fp32 in-memory stream pack (why fp32 support exists).
-            build_merged_subsection_from_fp32(cell_cfg, Arc::new(corpus), &stable_ids)?
-        }
-    };
+    }
+    // Drain's fp32 in-memory stream pack (why fp32 support exists).
+    let subsection = build_merged_subsection_from_fp32(cell_cfg, Arc::new(corpus), &stable_ids)?;
     Ok(PackedCellGroup {
         cell_id,
         subsection,
@@ -3455,7 +3497,7 @@ fn commit_shards_via_drain(
     let assigned = inner
         .options
         .writer_pool
-        .install(|| assign_cells(&rows, clusters, metric, false, replica_target))?;
+        .install(|| assign_cells(&rows, clusters, metric, replica_target))?;
     let assign_elapsed = stage_t0.elapsed().saturating_sub(flatten_elapsed);
     let assigned_cells: Vec<(u32, AssignedCellGroup<'_>)> = assigned
         .into_iter()
@@ -5059,14 +5101,8 @@ mod tests {
             .zip(stable_ids)
             .map(|(vector, stable_id)| PackRow::Fp32 { stable_id, vector })
             .collect();
-        let assigned = assign_cells(
-            &rows,
-            &clusters,
-            Metric::L2Sq,
-            false,
-            BOUNDARY_STUB_TARGET_FACTOR,
-        )
-        .expect("assign");
+        let assigned = assign_cells(&rows, &clusters, Metric::L2Sq, BOUNDARY_STUB_TARGET_FACTOR)
+            .expect("assign");
 
         let postings: usize = assigned.iter().map(|group| group.members.len()).sum();
         let primaries: usize = assigned
