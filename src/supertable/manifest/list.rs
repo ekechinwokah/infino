@@ -59,17 +59,19 @@ pub(crate) const BIRTH_VERSION_AGGREGATE_COLUMN: &str = "__infino_birth_version"
 /// bounded manifest cost.
 const MAX_EXACT_VALUE_COUNTS: usize = 256;
 
-/// Default nearest cells always probed by the hidden VectorCell index — the
-/// recall floor before the distance-ratio threshold widens the probe set.
-const DEFAULT_CELL_NPROBE_MIN: usize = 4;
-/// Default hard cap on cells probed per query (bounds the object-store GET fan).
-/// Held at the nprobe floor so adaptive expansion is off by default: with
-/// poorly-separated cells the ratio threshold otherwise widens to ~all cells,
-/// fanning every query out across the whole index.
-const DEFAULT_CELL_NPROBE_MAX: usize = 8;
-/// Default margin on the distance-ratio probe threshold (`τ = d*·(1+slack)`).
+/// Cells probed per query — exactly one, the grid-nearest. The p=1 read
+/// shape is the design point (one cell fetch, ~fine_nprobe × 2 MiB runs);
+/// recall past its coverage ceiling is bought with boundary replication at
+/// drain time, never by widening the probe set.
+const DEFAULT_CELL_NPROBE_MIN: usize = 1;
+/// Hard cap on cells probed per query. Equal to the floor: adaptive
+/// widening is off — coverage is a drain-side (replication) concern.
+const DEFAULT_CELL_NPROBE_MAX: usize = 1;
+/// Margin on the distance-ratio probe threshold (`τ = d*·(1+slack)`).
+/// Inert while `nprobe_max == nprobe_min`; acts only when a table
+/// explicitly widens its persisted routing.
 const DEFAULT_CELL_SLACK: f32 = 1.0;
-/// Fine IVF centroids probed after hidden-cell coverage is selected.
+/// Fine IVF centroids probed inside the selected cell.
 const DEFAULT_CELL_FINE_NPROBE: usize = 8;
 
 // ---------- Public in-memory shapes ----------
@@ -287,19 +289,6 @@ impl Default for CellRoutingParams {
     }
 }
 
-impl CellRoutingParams {
-    /// Measured hidden-index routing: one nearest cell with eight fine
-    /// centroids inside it. Stored on new hidden manifests; legacy manifests
-    /// retain their decoded routing values.
-    pub(crate) fn bounded_hidden_default() -> Self {
-        Self {
-            nprobe_min: 1,
-            nprobe_max: 1,
-            slack: DEFAULT_CELL_SLACK,
-            fine_nprobe: DEFAULT_CELL_FINE_NPROBE,
-        }
-    }
-}
 
 /// How superfiles are routed into manifest parts. Stamped into
 /// the list on first commit; immutable thereafter (changes
@@ -2299,7 +2288,7 @@ mod tests {
                 &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
                 vec![1, 1],
             ),
-            routing: CellRoutingParams::bounded_hidden_default(),
+            routing: CellRoutingParams::default(),
         };
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");

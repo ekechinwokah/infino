@@ -718,27 +718,6 @@ impl SupertableReader {
                 }
             }
         }
-        let hidden_ranked_cells = if hidden_vector_index {
-            let mut best_by_cell: HashMap<u32, f32> = HashMap::new();
-            for &(_, _, score, cell, _) in &candidates {
-                if let Some(cell) = cell {
-                    best_by_cell
-                        .entry(cell)
-                        .and_modify(|best| *best = best.min(score))
-                        .or_insert(score);
-                }
-            }
-            let mut cells: Vec<(u32, f32)> = best_by_cell.into_iter().collect();
-            cells.sort_unstable_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            Some(cells)
-        } else {
-            None
-        };
-
         // Cell cutoff shared by the hidden and user branches: probe the
         // `nprobe_min` nearest cells under GRID ranking, widening toward
         // `nprobe_max` while a cell's score stays within the slack threshold
@@ -786,22 +765,30 @@ impl SupertableReader {
                     // followed the fine-ranked curve exactly). Fine centroids
                     // still rank the within-cell probe below; cells absent
                     // from the candidate set (no committed superfiles) are
-                    // skipped. Legacy hidden manifests without a grid keep the
-                    // fine-min ranking.
-                    let grid_ranked_hidden: Option<Vec<(u32, f32)>> =
-                        ranked_cells_scored.as_ref().map(|cells| {
-                            cells
-                                .iter()
-                                .filter(|(cell, _)| postings_by_cell.contains_key(cell))
-                                .copied()
-                                .collect()
-                        });
-                    let ranked_hidden = grid_ranked_hidden
+                    // skipped. No fallback ranking: a hidden manifest without
+                    // its cell grid is malformed and errors loudly.
+                    let ranked_hidden: Vec<(u32, f32)> = ranked_cells_scored
                         .as_ref()
-                        .filter(|cells| !cells.is_empty())
-                        .or(hidden_ranked_cells.as_ref())
-                        .expect("hidden candidates carry ranked cells");
-                    let cutoff = grid_cell_cutoff(ranked_hidden, &routing);
+                        .ok_or_else(|| {
+                            QueryError::Execute(
+                                "hidden vector-index manifest carries no cell grid — \
+                                 malformed manifest; refusing to rank cells by fine \
+                                 centroids"
+                                    .into(),
+                            )
+                        })?
+                        .iter()
+                        .filter(|(cell, _)| postings_by_cell.contains_key(cell))
+                        .copied()
+                        .collect();
+                    if ranked_hidden.is_empty() {
+                        return Err(QueryError::Execute(
+                            "hidden vector-index candidates name no cell present in the \
+                             grid — malformed cell tags"
+                                .into(),
+                        ));
+                    }
+                    let cutoff = grid_cell_cutoff(&ranked_hidden, &routing);
                     let selected_cells: HashSet<u32> = ranked_hidden[..cutoff]
                         .iter()
                         .map(|(cell, _)| *cell)
@@ -832,10 +819,10 @@ impl SupertableReader {
                         CellRoutingParams {
                             nprobe_min: nprobe.max(1),
                             nprobe_max: nprobe.max(1),
-                            ..CellRoutingParams::bounded_hidden_default()
+                            ..CellRoutingParams::default()
                         }
                     } else {
-                        CellRoutingParams::bounded_hidden_default()
+                        CellRoutingParams::default()
                     };
                     let ranked_scored = ranked_cells_scored
                         .as_ref()

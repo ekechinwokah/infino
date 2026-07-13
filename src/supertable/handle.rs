@@ -1162,7 +1162,7 @@ fn build_vector_index_options(
             crate::supertable::manifest::list::PartitionStrategy::VectorCell {
                 column: user_opts.vector_columns[0].column.clone(),
                 clusters,
-                routing: CellRoutingParams::bounded_hidden_default(),
+                routing: CellRoutingParams::default(),
             },
         );
     }
