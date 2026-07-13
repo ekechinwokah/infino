@@ -21,6 +21,7 @@ use std::{
 
 use rayon::prelude::*;
 
+use crate::config;
 use crate::superfile::{
     BuildError,
     format::{
@@ -150,8 +151,10 @@ pub struct VectorConfig {
 }
 
 impl VectorConfig {
-    /// Construct a config with fixed residual encoding for cosine and local
-    /// residual encoding for metrics whose values are not bounded to [-1, 1].
+    /// Construct a config with the configured cosine default codec
+    /// ([`crate::config::VectorSettings::rerank_codec`], usually
+    /// [`RerankCodec::Sq8FixedResidual`]) and locally fitted residual
+    /// encoding for metrics whose values are not bounded to [-1, 1].
     pub fn new(column: String, dim: usize, n_cent: usize, rot_seed: u64, metric: Metric) -> Self {
         Self {
             column,
@@ -160,7 +163,7 @@ impl VectorConfig {
             rot_seed,
             metric,
             rerank_codec: if metric == Metric::Cosine {
-                RerankCodec::default()
+                config::global().vector.rerank_codec
             } else {
                 RerankCodec::Sq8Residual
             },

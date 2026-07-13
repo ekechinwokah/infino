@@ -56,7 +56,7 @@ use super::{
     },
 };
 use crate::{
-    config::{Config, StorageBackend, StorageColdFetchMode, ThreadCount},
+    config::{Config, DrainConsolidate, StorageBackend, StorageColdFetchMode, ThreadCount},
     memory::ConnectionMemoryBudget,
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
@@ -389,6 +389,11 @@ pub struct SupertableOptions {
     /// [`SupertableOptions::apply_config`] copies `vector.drain_batch_superfiles`
     /// into this field; [`Self::with_drain_batch_superfiles`] overrides per table.
     pub drain_batch_superfiles: i64,
+    /// Per-cell consolidation op for the hidden-index drain. Default
+    /// [`DrainConsolidate::Kmeans`]. [`SupertableOptions::apply_config`] copies
+    /// `vector.drain_consolidate`; [`Self::with_drain_consolidate`] overrides
+    /// per table (identity tests use splice).
+    pub drain_consolidate: DrainConsolidate,
     /// Eager-load threshold for manifest parts at
     /// [`Supertable::open`] time. When the manifest list
     /// references this many parts or fewer, open parallel-
@@ -602,6 +607,7 @@ impl SupertableOptions {
             target_superfiles_per_part: DEFAULT_TARGET_SUPERFILES_PER_PART,
             part_size_threshold_bytes: DEFAULT_PART_SIZE_THRESHOLD_BYTES,
             drain_batch_superfiles: DEFAULT_DRAIN_BATCH_SUPERFILES,
+            drain_consolidate: DrainConsolidate::Kmeans,
             eager_load_threshold_parts: DEFAULT_EAGER_LOAD_THRESHOLD_PARTS,
             max_commit_retries: DEFAULT_MAX_COMMIT_RETRIES,
             commit_threshold_size_mb: DEFAULT_COMMIT_THRESHOLD_SIZE_MB,
@@ -794,6 +800,13 @@ impl SupertableOptions {
         self
     }
 
+    /// Override the hidden-index drain consolidation op. See
+    /// [`Self::drain_consolidate`].
+    pub fn with_drain_consolidate(mut self, mode: DrainConsolidate) -> Self {
+        self.drain_consolidate = mode;
+        self
+    }
+
     /// Override the soft cap on a manifest part's compressed
     /// size in bytes. Default `10 MiB`.
     pub fn with_part_size_threshold_bytes(mut self, n: u64) -> Self {
@@ -899,6 +912,7 @@ impl SupertableOptions {
         self.commit_threshold_size_mb = cfg.supertable.commit_threshold_size_mb;
         self.verify_crc_on_open = cfg.supertable.verify_crc_on_open;
         self.drain_batch_superfiles = cfg.vector.drain_batch_superfiles;
+        self.drain_consolidate = cfg.vector.drain_consolidate;
         // The `config.yaml` source for the connection budget; the connect path
         // uses `ConnectOptions` instead. 0, the shipped default, is measure-only.
         // Note this replaces the budget outright: don't call `apply_config` on

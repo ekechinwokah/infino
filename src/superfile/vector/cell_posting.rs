@@ -16,8 +16,8 @@ use crate::superfile::{
     format::vec::{METRIC_ID_COSINE, METRIC_ID_L2SQ, METRIC_ID_NEGDOT},
     vector::{
         builder::derive_sq8_quantizer_from_min_max,
-        distance::{Metric, SQ8_RESIDUAL_DIVISOR, Sq8ResidualKernel},
-        rerank_codec::RerankCodec,
+        distance::{Metric, Sq8ResidualKernel},
+        rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
     },
 };
 
@@ -28,6 +28,31 @@ const EPSILON_I8_CLAMP: f32 = 127.0;
 /// Symmetric clamp bound for the Sq8+ε i8 residual leg (matches IVF builder).
 const SQ8_RESIDUAL_I8_CLAMP: f32 = 127.0;
 const ROW_BYTES_PER_DIM: usize = 2;
+
+/// Resolve the residual-family codec from stored scale/offset. Fixed residual
+/// writes the pinned absolute grid; every other quantizer is local residual.
+fn residual_family_codec_for_quantizer(scale: &[f32], offset: &[f32]) -> RerankCodec {
+    let is_fixed = scale
+        .iter()
+        .all(|value| value.to_bits() == SQ8_FIXED_SCALE.to_bits())
+        && offset
+            .iter()
+            .all(|value| value.to_bits() == SQ8_FIXED_OFFSET.to_bits());
+    if is_fixed {
+        RerankCodec::Sq8FixedResidual
+    } else {
+        RerankCodec::Sq8Residual
+    }
+}
+
+fn residual_divisor_for_codec(codec: RerankCodec) -> Result<f32, String> {
+    codec.residual_divisor().ok_or_else(|| {
+        format!(
+            "cell posting requires an Sq8 residual-family codec, got {}",
+            codec.name()
+        )
+    })
+}
 
 fn u32_le(body: &[u8]) -> Result<u32, String> {
     let arr: [u8; 4] = body.try_into().map_err(|_| "truncated u32".to_string())?;
@@ -122,8 +147,14 @@ impl CellPostingBuilder {
             ));
         }
         let col = &self.columns[0];
-        encode_blob(col.config.metric, col.config.dim, &col.ids, &col.vectors)
-            .map_err(BuildError::VectorSchemaMismatch)
+        encode_blob(
+            col.config.metric,
+            col.config.dim,
+            &col.ids,
+            &col.vectors,
+            col.config.rerank_codec,
+        )
+        .map_err(BuildError::VectorSchemaMismatch)
     }
 }
 
@@ -132,6 +163,7 @@ pub fn encode_blob(
     dim: usize,
     ids: &[u32],
     vectors: &[f32],
+    codec: RerankCodec,
 ) -> Result<Vec<u8>, String> {
     if dim == 0 {
         return Err("cell posting dim must be > 0".into());
@@ -139,8 +171,20 @@ pub fn encode_blob(
     if vectors.len() != ids.len() * dim {
         return Err("cell posting vector length mismatch".into());
     }
+    if !codec.is_sq8_residual_family() {
+        return Err(format!(
+            "cell posting encode requires an Sq8 residual-family codec, got {}",
+            codec.name()
+        ));
+    }
+    if !codec.supports_metric(metric) {
+        return Err(format!(
+            "cell posting codec {} does not support metric {metric:?}",
+            codec.name()
+        ));
+    }
     let rows: Vec<usize> = (0..ids.len()).collect();
-    let posting = encode_rows(metric, vectors, ids, dim, &rows);
+    let posting = encode_rows(metric, vectors, ids, dim, &rows, codec)?;
     let mut out = MAGIC.to_vec();
     out.extend_from_slice(&(dim as u32).to_le_bytes());
     out.push(metric_id(metric));
@@ -304,7 +348,10 @@ pub fn search_blob(bytes: &[u8], query: &[f32], k: usize) -> Result<Vec<(u32, f3
             query,
             &posting.scale,
             &posting.offset,
-            SQ8_RESIDUAL_DIVISOR,
+            residual_divisor_for_codec(residual_family_codec_for_quantizer(
+                &posting.scale,
+                &posting.offset,
+            ))?,
         );
         let dim = posting.dim;
         for row in 0..posting.ids.len() {
@@ -448,6 +495,11 @@ fn encode_segmented_blob(
 
 fn compute_encoded_norms(p: &DecodedPosting) -> Vec<f32> {
     let dim = p.dim;
+    let residual_divisor = residual_divisor_for_codec(residual_family_codec_for_quantizer(
+        &p.scale,
+        &p.offset,
+    ))
+    .expect("decoded posting always carries a residual-family quantizer");
     let mut norms = Vec::with_capacity(p.ids.len());
     for row in 0..p.ids.len() {
         let base = row * dim * ROW_BYTES_PER_DIM;
@@ -455,7 +507,7 @@ fn compute_encoded_norms(p: &DecodedPosting) -> Vec<f32> {
         for d in 0..dim {
             let code = p.rows[base + d] as f32;
             let eps = i8::from_le_bytes([p.rows[base + dim + d]]) as f32;
-            let step = p.scale[d] / SQ8_RESIDUAL_DIVISOR;
+            let step = p.scale[d] / residual_divisor;
             let x = p.offset[d] + code * p.scale[d] + eps * step;
             acc += (x as f64) * (x as f64);
         }
@@ -488,26 +540,39 @@ fn encode_rows(
     ids: &[u32],
     dim: usize,
     rows: &[usize],
-) -> EncodedRows {
+    codec: RerankCodec,
+) -> Result<EncodedRows, String> {
     if rows.is_empty() {
-        return EncodedRows {
+        return Ok(EncodedRows {
             ids: Vec::new(),
             scale: vec![1.0; dim],
             offset: vec![0.0; dim],
             rows: Vec::new(),
             per_doc_norms: None,
-        };
+        });
     }
-    let mut min = vec![f32::INFINITY; dim];
-    let mut max = vec![f32::NEG_INFINITY; dim];
-    for &row in rows {
-        let src = &vectors[row * dim..(row + 1) * dim];
-        for d in 0..dim {
-            min[d] = min[d].min(src[d]);
-            max[d] = max[d].max(src[d]);
+    let residual_divisor = residual_divisor_for_codec(codec)?;
+    let (scale, offset) = match codec {
+        RerankCodec::Sq8FixedResidual => (vec![SQ8_FIXED_SCALE; dim], vec![SQ8_FIXED_OFFSET; dim]),
+        RerankCodec::Sq8Residual => {
+            let mut min = vec![f32::INFINITY; dim];
+            let mut max = vec![f32::NEG_INFINITY; dim];
+            for &row in rows {
+                let src = &vectors[row * dim..(row + 1) * dim];
+                for d in 0..dim {
+                    min[d] = min[d].min(src[d]);
+                    max[d] = max[d].max(src[d]);
+                }
+            }
+            derive_sq8_quantizer_from_min_max(&min, &max)
         }
-    }
-    let (scale, offset) = derive_sq8_quantizer_from_min_max(&min, &max);
+        RerankCodec::Fp32 | RerankCodec::RabitqOnly => {
+            return Err(format!(
+                "cell posting encode requires an Sq8 residual-family codec, got {}",
+                codec.name()
+            ));
+        }
+    };
     let store_norms = matches!(metric, Metric::L2Sq | Metric::Cosine);
     let mut out_ids = Vec::with_capacity(rows.len());
     let mut encoded = Vec::with_capacity(rows.len() * dim * ROW_BYTES_PER_DIM);
@@ -528,7 +593,7 @@ fn encode_rows(
                 0
             };
             let base = offset[d] + q as f32 * scale[d];
-            let step = scale[d] / SQ8_RESIDUAL_DIVISOR;
+            let step = scale[d] / residual_divisor;
             let eps = if step > 0.0 {
                 ((src[d] - base) / step)
                     .round()
@@ -547,13 +612,13 @@ fn encode_rows(
             norms.push(acc as f32);
         }
     }
-    EncodedRows {
+    Ok(EncodedRows {
         ids: out_ids,
         scale,
         offset,
         rows: encoded,
         per_doc_norms,
-    }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -813,7 +878,7 @@ pub fn load_encoded_rows_from_blob(
             let norm_sq = posting.per_doc_norms.as_ref().map(|norms| norms[local_row]);
             out.push(EncodedCellRow {
                 stable_id: stable_ids[row_idx],
-                rerank_codec: RerankCodec::Sq8Residual,
+                rerank_codec: residual_family_codec_for_quantizer(&posting.scale, &posting.offset),
                 scale: scale_arc.clone(),
                 offset: offset_arc.clone(),
                 codes,
@@ -839,7 +904,10 @@ mod tests {
     use super::*;
     use crate::superfile::{
         builder::VectorConfig,
-        vector::rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
+        vector::{
+            distance::SQ8_RESIDUAL_DIVISOR,
+            rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
+        },
     };
 
     #[test]
@@ -853,7 +921,8 @@ mod tests {
                 vecs.push(if d == 0 { i as f32 * 0.01 } else { 0.0 });
             }
         }
-        let blob = encode_blob(Metric::L2Sq, dim, &ids, &vecs).expect("encode");
+        let blob = encode_blob(Metric::L2Sq, dim, &ids, &vecs, RerankCodec::Sq8Residual)
+            .expect("encode");
         let mut q = vec![0f32; dim];
         q[0] = 0.31;
         let hits = search_blob(&blob, &q, 5).expect("search");
@@ -877,7 +946,8 @@ mod tests {
                 vecs.push(if d == 0 { i as f32 * 0.01 } else { 0.0 });
             }
         }
-        let blob = encode_blob(Metric::L2Sq, dim, &ids, &vecs).expect("encode");
+        let blob = encode_blob(Metric::L2Sq, dim, &ids, &vecs, RerankCodec::Sq8Residual)
+            .expect("encode");
         let stable_ids: Vec<i128> = (0..n as i128).collect();
         let rows = load_encoded_rows_from_blob(&blob, &stable_ids, None).expect("load");
         assert_eq!(rows.len(), n as usize);
@@ -1023,8 +1093,22 @@ mod tests {
         let ids_b = vec![0u32, 1];
         let vecs_a = vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
         let vecs_b = vec![0.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0];
-        let blob_a = encode_blob(Metric::L2Sq, dim, &ids_a, &vecs_a).expect("encode a");
-        let blob_b = encode_blob(Metric::L2Sq, dim, &ids_b, &vecs_b).expect("encode b");
+        let blob_a = encode_blob(
+            Metric::L2Sq,
+            dim,
+            &ids_a,
+            &vecs_a,
+            RerankCodec::Sq8Residual,
+        )
+        .expect("encode a");
+        let blob_b = encode_blob(
+            Metric::L2Sq,
+            dim,
+            &ids_b,
+            &vecs_b,
+            RerankCodec::Sq8Residual,
+        )
+        .expect("encode b");
         let mut deleted = RoaringBitmap::new();
         deleted.insert(1);
 
@@ -1052,7 +1136,7 @@ mod tests {
             n_cent: 1,
             rot_seed: 1,
             metric: Metric::L2Sq,
-            rerank_codec: RerankCodec::Fp32,
+            rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
         };
         let mut b = CellPostingBuilder::new();

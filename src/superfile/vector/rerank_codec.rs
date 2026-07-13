@@ -88,6 +88,7 @@ pub(crate) const SQ8_FIXED_RESIDUAL_DIVISOR: f32 = 256.0;
 ///
 /// See the module docs for the on-disk discriminator + lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RerankCodec {
     /// fp32 little-endian, `dim` contiguous f32s per vector.
     /// The rerank distance kernel reads it via

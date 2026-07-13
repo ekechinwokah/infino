@@ -2039,6 +2039,106 @@ mod tests {
         );
     }
 
+    /// Plan contract: splice-mode drain is a separate identity path. Routing
+    /// keeps each local cluster verbatim (no re-kmeans); fixed residual
+    /// payloads must match the user-side bytes by stable `_id`.
+    #[test]
+    fn splice_drain_preserves_fixed_residual_payloads() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            config::DrainConsolidate,
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8FixedResidual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool)
+        .with_drain_consolidate(DrainConsolidate::Splice)
+        .with_drain_batch_superfiles(-1);
+
+        let st = Supertable::create(options).expect("create");
+        let titles = LargeStringArray::from(vec!["a", "b", "c", "d"]);
+        // Distinct axis-aligned vectors so local clusters are non-trivial.
+        let mut flat_vals = vec![0.0f32; 4 * dim];
+        for (row, axis) in [0usize, 1, 2, 3].into_iter().enumerate() {
+            flat_vals[row * dim + axis] = 1.0;
+        }
+        let flat = Float32Array::from(flat_vals);
+        let fsl = FixedSizeListArray::new(item_field, dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        let user_payloads = rerank_payloads_by_stable_id(&st);
+        assert!(!user_payloads.is_empty(), "user rows must have payloads");
+        st.drain_vectors_to_cells_sync().expect("splice drain");
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        assert!(
+            hidden.reader().n_superfiles() > 0,
+            "splice drain must populate hidden cells"
+        );
+        let hidden_payloads = rerank_payloads_by_stable_id(&hidden);
+        assert_eq!(
+            hidden_payloads, user_payloads,
+            "fixed residual payloads must survive splice drain byte-for-byte"
+        );
+    }
+
     /// An engine-managed (auto-sized) cache budget must be raised at open
     /// to the table's real on-storage footprint — user superfiles plus the
     /// hidden vector index — while an explicit budget is never changed.

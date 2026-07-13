@@ -7,13 +7,19 @@
 //! and Sq8-transcodes rerank rows only when a source cluster's quantizer
 //! differs from the destination — no fp32 corpus buffer and no re-kmeans.
 
+use std::collections::HashMap;
+
 use bytemuck::cast_slice;
+use rayon::prelude::*;
 
 use crate::superfile::{
     BuildError,
     format::{
-        checksum::crc32c,
-        vec::{DOC_ID_BYTES, STABLE_ID_BYTES},
+        CRC_BYTES, checksum::crc32c,
+        vec::{
+            CLUSTER_IDX_ENTRY_BYTES, DOC_ID_BYTES, STABLE_ID_BYTES, SUB_HEADER_SIZE, U32_BYTES,
+            U64_BYTES, sub_hdr,
+        },
     },
     vector::{
         builder::{
@@ -25,8 +31,8 @@ use crate::superfile::{
             sq8_quant_params_equal, sq8_residual_norm_sq,
         },
         distance::{
-            Metric, add_weighted_f32_to_f64_acc, decode_f32_le_into, f64_acc_mean_into_f32,
-            mean_f32_cluster_major,
+            Metric, add_weighted_f32_to_f64_acc, decode_f32_le_into, decode_f32_le_vec,
+            f64_acc_mean_into_f32, mean_f32_cluster_major,
         },
         quant::BitQuantizer,
         reader::{VectorReader, read_cluster_entry},
@@ -378,4 +384,417 @@ pub(crate) fn stable_ids_in_merged_local_order(
         }
     }
     Ok(ids)
+}
+
+/// Splice routed source clusters into one hidden-cell superfile as a
+/// **multi-cluster** IVF: each fragment (one source cluster from one input)
+/// becomes its own output cluster, copied **verbatim** — its centroid, its Sq8
+/// calibration, its code+rerank block. This is what restores *inner pruning*:
+/// a query scores the fragment centroids and scans only the near ones. No
+/// averaging, no transcode, no decode — each output cluster reuses its own
+/// fragment's calibration, so rerank rows copy byte-for-byte.
+///
+/// Output local doc ids are fresh + contiguous (`0..n`) in cluster-storage
+/// order; identity rides the inline stable-`_id` region and is also returned in
+/// id-column order. `fragments` empty (or all-empty) ⇒ `None`. Each fragment is
+/// `(input, source-cluster index within that input, that input's stable ids)`.
+pub(crate) fn splice_fragments_into_cell(
+    fragments: &[(&Sq8IvfMergeInput, usize, &[i128])],
+) -> Result<Option<(MergedIvfSubsection, Vec<i128>)>, BuildError> {
+    if fragments.is_empty() {
+        return Ok(None);
+    }
+    let dim = fragments[0].0.dim;
+    let metric = fragments[0].0.metric;
+    let codec = fragments[0].0.rerank_codec;
+    for (inp, _, _) in &fragments[1..] {
+        if inp.dim != dim || inp.metric != metric || inp.rerank_codec != codec {
+            return Err(BuildError::VectorSchemaMismatch(
+                "fragment splice inputs must share dim, metric, and codec".into(),
+            ));
+        }
+    }
+
+    let out_n_cent = fragments.len();
+    let counts: Vec<u32> = fragments
+        .iter()
+        .map(|(inp, c, _)| cluster_entry(&inp.sub, inp.cluster_idx_off, *c).1 as u32)
+        .collect();
+    let n_docs: u32 = counts.iter().sum();
+    if n_docs == 0 {
+        return Ok(None);
+    }
+
+    debug_assert!(codec.is_sq8_residual_family());
+    let quant = BitQuantizer::new(dim);
+    let code_bytes = quant.code_bytes();
+    let per_vec_bytes = codec.per_vector_bytes(dim);
+    let store_norm = matches!(metric, Metric::L2Sq | Metric::Cosine);
+    let id_bytes = DOC_ID_BYTES;
+
+    // Output cluster k = fragment k: copy its centroid + Sq8 calibration verbatim.
+    let mut out_centroids = vec![0.0f32; out_n_cent * dim];
+    let mut dst_scale = vec![1.0f32; out_n_cent * dim];
+    let mut dst_offset = vec![0.0f32; out_n_cent * dim];
+    for (k, (inp, c, _)) in fragments.iter().enumerate() {
+        let co = inp.centroids_off + c * dim * 4;
+        decode_f32_le_into(
+            &inp.sub[co..co + dim * 4],
+            &mut out_centroids[k * dim..(k + 1) * dim],
+        );
+        dst_scale[k * dim..(k + 1) * dim].copy_from_slice(&inp.scale[c * dim..c * dim + dim]);
+        dst_offset[k * dim..(k + 1) * dim].copy_from_slice(&inp.offset[c * dim..c * dim + dim]);
+    }
+
+    // Summary centroid = mean of fragment centroids.
+    let summary_centroid = mean_f32_cluster_major(&out_centroids, dim, out_n_cent);
+
+    let codec_meta_size = codec.codec_meta_bytes(dim, n_docs as usize, out_n_cent, metric);
+    let cluster_stride = code_bytes + id_bytes + per_vec_bytes;
+    let stable_ids_region_bytes = n_docs as usize * STABLE_ID_BYTES;
+    let layout = IvfSubsectionLayout::compute(
+        dim,
+        out_n_cent,
+        n_docs as usize,
+        cluster_stride,
+        codec_meta_size,
+        stable_ids_region_bytes,
+    );
+
+    let mut bytes = alloc_ivf_subsection_with_header(
+        &layout,
+        codec_meta_size,
+        &summary_centroid,
+        &out_centroids,
+    );
+
+    // Sq8 scale/offset blocks: one (dim) slot per output cluster.
+    let sq8_scale_block_off = layout.codec_meta_off;
+    let sq8_offset_block_off = sq8_scale_block_off + out_n_cent * dim * 4;
+    let sq8_norms_block_off = store_norm.then_some(sq8_offset_block_off + out_n_cent * dim * 4);
+    bytes[sq8_scale_block_off..sq8_scale_block_off + out_n_cent * dim * 4]
+        .copy_from_slice(cast_slice(&dst_scale));
+    bytes[sq8_offset_block_off..sq8_offset_block_off + out_n_cent * dim * 4]
+        .copy_from_slice(cast_slice(&dst_offset));
+
+    let stable_ids_region_off = layout.stable_ids_off;
+    let mut out_stable_ids = vec![0i128; n_docs as usize];
+    let cluster_order = centroid_storage_order(&out_centroids, out_n_cent, dim);
+
+    write_ivf_cluster_blocks(
+        &mut bytes,
+        &layout,
+        &cluster_order,
+        &counts,
+        code_bytes,
+        per_vec_bytes,
+        |bytes, centroid_id, blk| {
+            // Output cluster `centroid_id` = fragment `centroid_id`, verbatim.
+            let (inp, src_cluster, sids) = fragments[centroid_id];
+            let scale_c = &dst_scale[centroid_id * dim..centroid_id * dim + dim];
+            let offset_c = &dst_offset[centroid_id * dim..centroid_id * dim + dim];
+            let (doc_off, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, src_cluster);
+            let block = inp.per_cluster_blocks_off + doc_off * inp.stride;
+            let doc_ids_at = block + count * inp.code_bytes;
+            let full_at = block + count * (inp.code_bytes + id_bytes);
+            for i in 0..count {
+                let out_row = blk.first_row + i; // fresh global local doc id
+                bytes[blk.codes_base + i * code_bytes..blk.codes_base + (i + 1) * code_bytes]
+                    .copy_from_slice(
+                        &inp.sub[block + i * inp.code_bytes..block + (i + 1) * inp.code_bytes],
+                    );
+                let id_off = blk.ids_base + i * id_bytes;
+                bytes[id_off..id_off + id_bytes].copy_from_slice(&(out_row as u32).to_le_bytes());
+
+                let idb = doc_ids_at + i * id_bytes;
+                let src_local = u32::from_le_bytes([
+                    inp.sub[idb],
+                    inp.sub[idb + 1],
+                    inp.sub[idb + 2],
+                    inp.sub[idb + 3],
+                ]);
+                let sid = sids[src_local as usize];
+                out_stable_ids[out_row] = sid;
+                if let Some(region_off) = stable_ids_region_off {
+                    let p = region_off + out_row * STABLE_ID_BYTES;
+                    bytes[p..p + STABLE_ID_BYTES].copy_from_slice(&sid.to_le_bytes());
+                }
+
+                // Rerank: verbatim — the output cluster uses this fragment's own
+                // calibration, so no transcode is ever needed.
+                let rowb = full_at + i * inp.per_vec_bytes;
+                let full_off = blk.rerank_base + i * per_vec_bytes;
+                bytes[full_off..full_off + dim * 2].copy_from_slice(&inp.sub[rowb..rowb + dim * 2]);
+                if store_norm && let Some(norms_off) = sq8_norms_block_off {
+                    let n_sq = sq8_residual_norm_sq(
+                        scale_c,
+                        offset_c,
+                        &inp.sub[rowb..rowb + dim],
+                        &inp.sub[rowb + dim..rowb + dim + dim],
+                        codec
+                            .residual_divisor()
+                            .expect("residual-family codec has divisor"),
+                    );
+                    let n_off = norms_off + out_row * 4;
+                    bytes[n_off..n_off + 4].copy_from_slice(&n_sq.to_le_bytes());
+                }
+            }
+            debug_assert_eq!(count, blk.count);
+            Ok(())
+        },
+    )?;
+
+    let crc = crc32c(&bytes);
+    bytes.extend_from_slice(&crc.to_le_bytes());
+
+    Ok(Some((
+        MergedIvfSubsection {
+            bytes,
+            n_cent: out_n_cent,
+            n_docs,
+            rerank_codec: codec,
+            summary_offset_in_sub: layout.summary_off,
+            codec_meta_offset_in_sub: if codec_meta_size == 0 {
+                0
+            } else {
+                layout.codec_meta_off
+            },
+            codec_meta_size,
+        },
+        out_stable_ids,
+    )))
+}
+
+/// Route each input's local clusters to their nearest global cell(s) and splice
+/// the routed clusters into per-cell **multi-cluster (fragment)** subsections —
+/// the structure that preserves inner pruning (vs the flat concat that lost it).
+///
+/// `route_cluster(local_centroid_fp32) -> dest cells` is caller-supplied (one
+/// cell for an interior cluster; several for SPANN boundary replication), so
+/// this stays free of the global-cell-grid types. Parses inputs once; the
+/// per-cell splice runs in parallel; results are in-memory (no spool).
+///
+/// Multi-cell (v2) user superfiles expand to one merge input per packed cell.
+/// Those subsections carry inline stable-`_id`s; the caller slice is only used
+/// for single-cell (v1) inputs that lack an inline region.
+pub(crate) fn route_clusters_into_cells<F>(
+    inputs: &[(&VectorReader, &str)],
+    stable_ids_per_input: &[Vec<i128>],
+    route_cluster: F,
+) -> Result<HashMap<u32, (MergedIvfSubsection, Vec<i128>)>, BuildError>
+where
+    F: Fn(&[f32]) -> Vec<u32> + Sync,
+{
+    if inputs.is_empty() {
+        return Err(BuildError::VectorSchemaMismatch(
+            "route_clusters_into_cells requires at least one IVF input".into(),
+        ));
+    }
+    if stable_ids_per_input.len() != inputs.len() {
+        return Err(BuildError::VectorSchemaMismatch(
+            "route_clusters_into_cells: stable_ids_per_input must match inputs len".into(),
+        ));
+    }
+
+    // One parse entry per IVF subsection. Multi-cell packs contribute one entry
+    // per packed cell; v1 contributes one. Stable ids ride the subsection's
+    // inline region when present (required for multi-cell), else the caller's
+    // per-superfile slice (v1 streaming / no-region).
+    let mut parsed: Vec<Sq8IvfMergeInput> = Vec::new();
+    let mut stable_ids: Vec<Vec<i128>> = Vec::new();
+    for (reader_i, (reader, col)) in inputs.iter().enumerate() {
+        if reader.is_multi_cell() {
+            let n_cells = reader.packed_cell_ids().len();
+            for cell_idx in 0..n_cells {
+                let inp = reader.sq8_ivf_merge_input_at(cell_idx, 0)?;
+                let ids = inp.stable_ids.clone().ok_or_else(|| {
+                    BuildError::VectorSchemaMismatch(format!(
+                        "route_clusters_into_cells: multi-cell packed cell {cell_idx} missing inline stable ids"
+                    ))
+                })?;
+                parsed.push(inp);
+                stable_ids.push(ids);
+            }
+        } else {
+            let inp = reader.sq8_ivf_merge_input(col, 0)?;
+            let ids = match inp.stable_ids.clone() {
+                Some(ids) => ids,
+                None => stable_ids_per_input[reader_i].clone(),
+            };
+            parsed.push(inp);
+            stable_ids.push(ids);
+        }
+    }
+    if parsed.is_empty() {
+        return Err(BuildError::VectorSchemaMismatch(
+            "route_clusters_into_cells: no IVF subsections to route".into(),
+        ));
+    }
+    let dim = parsed[0].dim;
+
+    // Route each non-empty (input, local cluster) by its centroid → dest cell(s).
+    let mut cell_frags: HashMap<u32, Vec<(usize, usize)>> = HashMap::new();
+    let mut centroid_buf = vec![0f32; dim];
+    for (ii, inp) in parsed.iter().enumerate() {
+        for c in 0..inp.n_cent {
+            let (_, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
+            if count == 0 {
+                continue;
+            }
+            let co = inp.centroids_off + c * dim * 4;
+            decode_f32_le_into(&inp.sub[co..co + dim * 4], &mut centroid_buf);
+            for cell in route_cluster(&centroid_buf) {
+                cell_frags.entry(cell).or_default().push((ii, c));
+            }
+        }
+    }
+
+    // Splice each cell's fragments in parallel into a multi-cluster subsection.
+    let cells: Vec<(u32, Vec<(usize, usize)>)> = cell_frags.into_iter().collect();
+    let out: Vec<(u32, (MergedIvfSubsection, Vec<i128>))> = cells
+        .par_iter()
+        .filter_map(|(cell, frags)| {
+            let fragments: Vec<(&Sq8IvfMergeInput, usize, &[i128])> = frags
+                .iter()
+                .map(|&(ii, c)| (&parsed[ii], c, stable_ids[ii].as_slice()))
+                .collect();
+            match splice_fragments_into_cell(&fragments) {
+                Ok(Some(res)) => Some(Ok((*cell, res))),
+                Ok(None) => None,
+                Err(e) => Some(Err(e)),
+            }
+        })
+        .collect::<Result<Vec<_>, BuildError>>()?;
+    Ok(out.into_iter().collect())
+}
+
+/// Parse a fragment-style (or any Sq8 residual-family) IVF subsection into a
+/// merge input. Used when the splice drain accumulates the same cell across
+/// batches and must concatenate prior spilled clusters with a new batch's.
+pub(crate) fn sq8_ivf_merge_input_from_subsection(
+    sub: &[u8],
+    dim: usize,
+    n_cent: usize,
+    n_docs: u32,
+    metric: Metric,
+    rerank_codec: RerankCodec,
+    stable_ids: Option<Vec<i128>>,
+) -> Result<Sq8IvfMergeInput, BuildError> {
+    if !rerank_codec.is_sq8_residual_family() {
+        return Err(BuildError::VectorSchemaMismatch(
+            "fragment merge requires an Sq8 residual-family subsection".into(),
+        ));
+    }
+    if sub.len() < SUB_HEADER_SIZE + CRC_BYTES {
+        return Err(BuildError::VectorSchemaMismatch(
+            "subsection too short for fragment merge".into(),
+        ));
+    }
+    let centroids_off = u64::from_le_bytes(
+        sub[sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES]
+            .try_into()
+            .expect("8-byte centroids off"),
+    ) as usize;
+    let cluster_idx_off = u64::from_le_bytes(
+        sub[sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES]
+            .try_into()
+            .expect("8-byte cluster idx off"),
+    ) as usize;
+    let per_cluster_blocks_off = u64::from_le_bytes(
+        sub[sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES]
+            .try_into()
+            .expect("8-byte per-cluster blocks off"),
+    ) as usize;
+    let codec_meta_size = u32::from_le_bytes(
+        sub[sub_hdr::CODEC_META_SIZE_OFF..sub_hdr::CODEC_META_SIZE_OFF + U32_BYTES]
+            .try_into()
+            .expect("4-byte codec meta size"),
+    ) as usize;
+    let codec_meta_off = cluster_idx_off + n_cent * CLUSTER_IDX_ENTRY_BYTES;
+    let so_bytes = n_cent * dim * 4;
+    if codec_meta_size < 2 * so_bytes {
+        return Err(BuildError::VectorSchemaMismatch(
+            "subsection codec meta too small for scale/offset blocks".into(),
+        ));
+    }
+    if sub.len() < codec_meta_off + 2 * so_bytes {
+        return Err(BuildError::VectorSchemaMismatch(
+            "subsection truncated before scale/offset blocks".into(),
+        ));
+    }
+    let scale = decode_f32_le_vec(&sub[codec_meta_off..codec_meta_off + so_bytes]);
+    let offset =
+        decode_f32_le_vec(&sub[codec_meta_off + so_bytes..codec_meta_off + 2 * so_bytes]);
+    let quant = BitQuantizer::new(dim);
+    let code_bytes = quant.code_bytes();
+    let per_vec_bytes = rerank_codec.per_vector_bytes(dim);
+    Ok(Sq8IvfMergeInput {
+        sub: sub.to_vec(),
+        dim,
+        n_cent,
+        n_docs,
+        metric,
+        rerank_codec,
+        doc_id_offset: 0,
+        cluster_idx_off,
+        centroids_off,
+        per_cluster_blocks_off,
+        code_bytes,
+        per_vec_bytes,
+        stride: code_bytes + DOC_ID_BYTES + per_vec_bytes,
+        scale,
+        offset,
+        stable_ids,
+    })
+}
+
+/// Concatenate two fragment-style cell subsections by copying every cluster
+/// verbatim (multi-batch splice drain).
+pub(crate) fn merge_fragment_subsections(
+    left: &MergedIvfSubsection,
+    left_ids: &[i128],
+    right: &MergedIvfSubsection,
+    right_ids: &[i128],
+    dim: usize,
+    metric: Metric,
+) -> Result<(MergedIvfSubsection, Vec<i128>), BuildError> {
+    if left.rerank_codec != right.rerank_codec {
+        return Err(BuildError::VectorSchemaMismatch(
+            "fragment merge inputs must share rerank codec".into(),
+        ));
+    }
+    if left_ids.len() != left.n_docs as usize || right_ids.len() != right.n_docs as usize {
+        return Err(BuildError::VectorSchemaMismatch(
+            "fragment merge stable_ids length must match n_docs".into(),
+        ));
+    }
+    let left_inp = sq8_ivf_merge_input_from_subsection(
+        &left.bytes,
+        dim,
+        left.n_cent,
+        left.n_docs,
+        metric,
+        left.rerank_codec,
+        Some(left_ids.to_vec()),
+    )?;
+    let right_inp = sq8_ivf_merge_input_from_subsection(
+        &right.bytes,
+        dim,
+        right.n_cent,
+        right.n_docs,
+        metric,
+        right.rerank_codec,
+        Some(right_ids.to_vec()),
+    )?;
+    let mut fragments: Vec<(&Sq8IvfMergeInput, usize, &[i128])> =
+        Vec::with_capacity(left.n_cent + right.n_cent);
+    for c in 0..left.n_cent {
+        fragments.push((&left_inp, c, left_ids));
+    }
+    for c in 0..right.n_cent {
+        fragments.push((&right_inp, c, right_ids));
+    }
+    splice_fragments_into_cell(&fragments)?.ok_or_else(|| {
+        BuildError::VectorSchemaMismatch("fragment merge produced an empty cell".into())
+    })
 }

@@ -112,7 +112,7 @@ use super::{
 use crate::superfile::ReadError;
 use crate::{
     InfinoError,
-    config::{self, CentroidAlignment, ThreadCount},
+    config::{self, CentroidAlignment, DrainConsolidate, ThreadCount},
     runtime_bridge::bridge_on_runtime,
     storage::{StorageError, StorageProvider},
     superfile::{
@@ -137,7 +137,9 @@ use crate::{
             },
             cell_posting::{EncodedCellRow, MaterializedIvfRow},
             distance::{Metric, transpose_centroids_cluster_major},
-            ivf_merge::MergedIvfSubsection,
+            ivf_merge::{
+                MergedIvfSubsection, merge_fragment_subsections, route_clusters_into_cells,
+            },
             kmeans::kmeans_with_assignments,
             layout::VectorLayout,
             reader::VectorReader,
@@ -2339,11 +2341,17 @@ fn drain_epoch_id(
     sources: &[DrainCheckpointSource],
     batch_layout: &[Vec<u64>],
     shard_count: usize,
+    consolidate: DrainConsolidate,
 ) -> String {
     let mut hasher = Blake3Hasher::new();
     hasher.update(&DRAIN_CHECKPOINT_SCHEMA.to_le_bytes());
     hasher.update(&(shard_count as u64).to_le_bytes());
     hasher.update(options_hash.as_bytes());
+    // Consolidate mode changes the packed-cell bytes; pin it in the epoch.
+    hasher.update(match consolidate {
+        DrainConsolidate::Kmeans => b"kmeans",
+        DrainConsolidate::Splice => b"splice",
+    });
     for source in sources {
         hasher.update(source.superfile_id.as_bytes());
         hasher.update(source.uri.as_bytes());
@@ -2684,6 +2692,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         .clone()
         .ok_or_else(|| BuildError::Store("hidden drain requires storage".into()))?;
     let shard_count = packed_cell_shard_count(&hidden_inner.options);
+    let consolidate = user_inner.options.drain_consolidate;
     let budget = if batch_cfg < 0 {
         usize::MAX
     } else {
@@ -2768,6 +2777,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             &remote_state.checkpoint.sources,
             &batch_layout,
             shard_count,
+            consolidate,
         );
         if epoch_id != remote_state.checkpoint.epoch_id {
             return Err(BuildError::Store(
@@ -2804,6 +2814,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             &source_refs,
             &batch_layout,
             shard_count,
+            consolidate,
         );
         let checkpoint = DrainRemoteCheckpoint {
             schema: DRAIN_CHECKPOINT_SCHEMA,
@@ -3035,134 +3046,205 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             );
         }
 
-        // Materialize THIS batch's rows, assign each to its nearest global
-        // cell (or group by row.cluster when global-aligned), then spill the
-        // assigned primary + replica postings per cell. This is the sole drain
-        // path; batch size changes memory use only, never output layout.
-        let column_for_mat = column_name.clone();
-        let tombstone_cache = user_inner.tombstone_cache.clone();
-        let now = time::Instant::now();
-        let row_sets: Vec<Vec<MaterializedIvfRow>> =
-            stream::iter(readers.iter().zip(batch_sources.iter()).map(
-                |((reader, stable_ids), entry)| {
-                    let column_for_mat = column_for_mat.clone();
-                    let tombstone_cache = tombstone_cache.clone();
-                    let entry = Arc::clone(entry);
-                    async move {
-                        let bitmap = tombstone_cache
-                            .as_ref()
-                            .map(|t| t.bitmap_for(entry.superfile_id, now))
-                            .transpose()
-                            .map_err(|e| BuildError::Store(e.to_string()))?;
-                        materialized_user_rows_for_drain(
-                            reader,
-                            &column_for_mat,
-                            stable_ids,
-                            bitmap.as_deref(),
-                        )
-                        .await
-                    }
-                },
-            ))
-            .buffered(commit_write_concurrency())
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, BuildError>>()?;
-        let t_mat = batch_t0.elapsed().as_secs_f64() * 1e3;
-
-        let all_rows: Vec<MaterializedIvfRow> = row_sets.into_iter().flatten().collect();
-        let n_batch_rows = all_rows.len();
-        let scratch = drain_scratch.as_path();
-        // Batch boundary: reset spill writers' Arc-pointer dedup.
-        for writer in cell_spills.values_mut() {
-            writer.begin_batch();
-        }
-        let replica_target = drain_replica_target_factor();
-        let replica_extra_budget = drain_replica_extra_budget(all_rows.len(), replica_target);
-        if replica_extra_budget == 0 && assign_skip {
-            for row in &all_rows {
-                spill_unfinished_shard_row(
-                    &mut cell_spills,
-                    &mut added_per_cell,
-                    &completed_shards,
-                    shard_count,
-                    scratch,
-                    row.cluster,
-                    row,
-                )?;
-            }
-        } else {
-            let clusters_ref = &running_clusters;
-            let transposed_centroids = transpose_centroids_cluster_major(
-                &clusters_ref.centroids,
-                clusters_ref.n_cent as usize,
-                clusters_ref.dim as usize,
-            );
-            let assignments: Vec<opann::BoundaryAssignment> =
-                hidden_inner.options.writer_pool.install(|| {
-                    all_rows
-                        .par_iter()
-                        .map(|row| {
-                            opann::boundary_assignment_encoded_with_transposed(
-                                clusters_ref,
-                                &transposed_centroids,
-                                metric,
-                                &row.encoded,
+        // One consolidate mode, one shared checkpoint + pack/upload tail.
+        // `drain_consolidate` selects how cells are produced — never a fallback.
+        let batch_log = match consolidate {
+            DrainConsolidate::Splice => {
+                let column_name_ref = column_name.as_str();
+                let stable_ids_per_input: Vec<Vec<i128>> =
+                    readers.iter().map(|(_, ids)| ids.clone()).collect();
+                let routed: HashMap<u32, (MergedIvfSubsection, Vec<i128>)> =
+                    hidden_inner.options.writer_pool.install(
+                        || -> Result<HashMap<u32, (MergedIvfSubsection, Vec<i128>)>, BuildError> {
+                            let inputs: Vec<(&VectorReader, &str)> = readers
+                                .iter()
+                                .map(|(r, _)| {
+                                    r.vec()
+                                        .ok_or_else(|| {
+                                            BuildError::Store(
+                                                "user superfile missing vector index".into(),
+                                            )
+                                        })
+                                        .map(|vr| (vr, column_name_ref))
+                                })
+                                .collect::<Result<_, _>>()?;
+                            let clusters_ref = &running_clusters;
+                            route_clusters_into_cells(
+                                &inputs,
+                                &stable_ids_per_input,
+                                |centroid: &[f32]| {
+                                    let mut assign = [0u32];
+                                    clusters_ref.assign_rows(metric, centroid, &mut assign);
+                                    vec![assign[0]]
+                                },
                             )
+                            .map_err(|e| e.into())
+                        },
+                    )?;
+                let n_cells = routed.len();
+                let dim = running_clusters.dim as usize;
+                for (cell_id, (subsection, stable_ids)) in routed {
+                    accumulate_splice_cell(
+                        &mut packed_cells,
+                        &mut local_checkpoint,
+                        &mut added_per_cell,
+                        &completed_shards,
+                        shard_count,
+                        drain_scratch.as_path(),
+                        cell_id,
+                        subsection,
+                        stable_ids,
+                        dim,
+                        metric,
+                    )?;
+                }
+                format!(
+                    "splice: route+accumulate {:.1}ms, {n_cells} cell(s)",
+                    batch_t0.elapsed().as_secs_f64() * 1e3,
+                )
+            }
+            DrainConsolidate::Kmeans => {
+                let column_for_mat = column_name.clone();
+                let tombstone_cache = user_inner.tombstone_cache.clone();
+                let now = time::Instant::now();
+                let row_sets: Vec<Vec<MaterializedIvfRow>> =
+                    stream::iter(readers.iter().zip(batch_sources.iter()).map(
+                        |((reader, stable_ids), entry)| {
+                            let column_for_mat = column_for_mat.clone();
+                            let tombstone_cache = tombstone_cache.clone();
+                            let entry = Arc::clone(entry);
+                            async move {
+                                let bitmap = tombstone_cache
+                                    .as_ref()
+                                    .map(|t| t.bitmap_for(entry.superfile_id, now))
+                                    .transpose()
+                                    .map_err(|e| BuildError::Store(e.to_string()))?;
+                                materialized_user_rows_for_drain(
+                                    reader,
+                                    &column_for_mat,
+                                    stable_ids,
+                                    bitmap.as_deref(),
+                                )
+                                .await
+                            }
+                        },
+                    ))
+                    .buffered(commit_write_concurrency())
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>, BuildError>>()?;
+                let t_mat = batch_t0.elapsed().as_secs_f64() * 1e3;
+
+                let all_rows: Vec<MaterializedIvfRow> = row_sets.into_iter().flatten().collect();
+                let n_batch_rows = all_rows.len();
+                let scratch = drain_scratch.as_path();
+                for writer in cell_spills.values_mut() {
+                    writer.begin_batch();
+                }
+                let replica_target = drain_replica_target_factor();
+                let replica_extra_budget =
+                    drain_replica_extra_budget(all_rows.len(), replica_target);
+                if replica_extra_budget == 0 && assign_skip {
+                    for row in &all_rows {
+                        spill_unfinished_shard_row(
+                            &mut cell_spills,
+                            &mut added_per_cell,
+                            &completed_shards,
+                            shard_count,
+                            scratch,
+                            row.cluster,
+                            row,
+                        )?;
+                    }
+                } else {
+                    let clusters_ref = &running_clusters;
+                    let transposed_centroids = transpose_centroids_cluster_major(
+                        &clusters_ref.centroids,
+                        clusters_ref.n_cent as usize,
+                        clusters_ref.dim as usize,
+                    );
+                    let assignments: Vec<opann::BoundaryAssignment> =
+                        hidden_inner.options.writer_pool.install(|| {
+                            all_rows
+                                .par_iter()
+                                .map(|row| {
+                                    opann::boundary_assignment_encoded_with_transposed(
+                                        clusters_ref,
+                                        &transposed_centroids,
+                                        metric,
+                                        &row.encoded,
+                                    )
+                                })
+                                .collect()
+                        });
+                    let mut replica_candidates: Vec<(usize, u32, f32)> = assignments
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(row_idx, assignment)| {
+                            assignment
+                                .neighbor
+                                .map(|(neighbor, margin)| (row_idx, neighbor, margin))
                         })
-                        .collect()
-                });
-            let mut replica_candidates: Vec<(usize, u32, f32)> = assignments
-                .iter()
-                .enumerate()
-                .filter_map(|(row_idx, assignment)| {
-                    assignment
-                        .neighbor
-                        .map(|(neighbor, margin)| (row_idx, neighbor, margin))
-                })
-                .collect();
-            replica_candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
-            // Boundary replicas: append the same row bytes to neighbor cells.
-            for (row_idx, cell, _) in replica_candidates.into_iter().take(replica_extra_budget) {
-                spill_unfinished_shard_row(
-                    &mut cell_spills,
-                    &mut added_per_cell,
-                    &completed_shards,
-                    shard_count,
-                    scratch,
-                    cell,
-                    &all_rows[row_idx],
-                )?;
+                        .collect();
+                    replica_candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
+                    for (row_idx, cell, _) in
+                        replica_candidates.into_iter().take(replica_extra_budget)
+                    {
+                        spill_unfinished_shard_row(
+                            &mut cell_spills,
+                            &mut added_per_cell,
+                            &completed_shards,
+                            shard_count,
+                            scratch,
+                            cell,
+                            &all_rows[row_idx],
+                        )?;
+                    }
+                    for (row, assignment) in all_rows.iter().zip(&assignments) {
+                        spill_unfinished_shard_row(
+                            &mut cell_spills,
+                            &mut added_per_cell,
+                            &completed_shards,
+                            shard_count,
+                            scratch,
+                            assignment.primary,
+                            row,
+                        )?;
+                    }
+                }
+                let mut checkpointed_spills = HashMap::with_capacity(cell_spills.len());
+                for (&cell, writer) in &mut cell_spills {
+                    let state = writer.checkpoint().map_err(BuildError::from)?;
+                    checkpointed_spills.insert(
+                        cell,
+                        DrainLocalSpill {
+                            n_rows: state.n_rows,
+                            n_quants: state.n_quants,
+                            dim: state.dim,
+                            rabitq_len: state.rabitq_len,
+                            rerank_codec_id: state.rerank_codec.codec_id(),
+                        },
+                    );
+                }
+                local_checkpoint.spills = checkpointed_spills;
+                let t_spill = batch_t0.elapsed().as_secs_f64() * 1e3;
+                format!(
+                    "kmeans: materialize {:.1}ms + {} {:.1}ms, {} batch row(s) -> {} cell spill(s)",
+                    t_mat,
+                    if assign_skip {
+                        "group(assign-skip)+spill"
+                    } else {
+                        "assign+spill"
+                    },
+                    t_spill - t_mat,
+                    n_batch_rows,
+                    cell_spills.len(),
+                )
             }
-            for (row, assignment) in all_rows.iter().zip(&assignments) {
-                spill_unfinished_shard_row(
-                    &mut cell_spills,
-                    &mut added_per_cell,
-                    &completed_shards,
-                    shard_count,
-                    scratch,
-                    assignment.primary,
-                    row,
-                )?;
-            }
-        }
-        let mut checkpointed_spills = HashMap::with_capacity(cell_spills.len());
-        for (&cell, writer) in &mut cell_spills {
-            let state = writer.checkpoint().map_err(BuildError::from)?;
-            checkpointed_spills.insert(
-                cell,
-                DrainLocalSpill {
-                    n_rows: state.n_rows,
-                    n_quants: state.n_quants,
-                    dim: state.dim,
-                    rabitq_len: state.rabitq_len,
-                    rerank_codec_id: state.rerank_codec.codec_id(),
-                },
-            );
-        }
+        };
+
         local_checkpoint.batches_done = batch_idx + 1;
-        local_checkpoint.spills = checkpointed_spills;
         local_checkpoint.added_per_cell = added_per_cell.clone();
         save_drain_local_checkpoint(&drain_scratch, &local_checkpoint)?;
         #[cfg(test)]
@@ -3171,106 +3253,117 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             DrainTestFailurePhase::AfterBatch,
             local_checkpoint.batches_done,
         )?;
-        let t_spill = batch_t0.elapsed().as_secs_f64() * 1e3;
         eprintln!(
-            "[supertable drain] batch {}/{} ({} sf, kmeans): materialize {:.1}ms + {} {:.1}ms, {} batch row(s) -> {} cell spill(s)",
+            "[supertable drain] batch {}/{} ({} sf, {batch_log})",
             batch_idx + 1,
             n_batches,
             batch_sources.len(),
-            t_mat,
-            if assign_skip {
-                "group(assign-skip)+spill"
-            } else {
-                "assign+spill"
-            },
-            t_spill - t_mat,
-            n_batch_rows,
-            cell_spills.len(),
         );
     }
 
-    // Kmeans cell build: rehydrate + build cells in memory-bounded waves, but
-    // spill each completed cell-IVF back to disk. Only after every cell is
-    // complete do we group the whole drain by `cell % writer_pool_width` and
-    // stream exactly one packed superfile per non-empty worker shard.
-    //
-    // The previous implementation grouped and published each wave
-    // independently, multiplying the object count by the number of waves
-    // (`waves × workers`) and violating the packed-drain contract at scale.
+    // Produce packed cell-IVFs (mode-specific), then one shared pack/upload:
+    // group by `cell % writer_pool_width` and stream exactly one packed
+    // superfile per non-empty worker shard.
     {
         let build_t0 = time::Instant::now();
         let scratch = drain_scratch.as_path();
         let n_cells_total = added_per_cell.len();
         let total_rows: u64 = added_per_cell.values().map(|count| u64::from(*count)).sum();
-        let vc = hidden_inner
-            .options
-            .vector_columns
-            .first()
-            .cloned()
-            .ok_or_else(|| BuildError::Store("drain pack requires a vector column".into()))?;
         let mut n_waves = 0usize;
         let mut cells_built = packed_cells.len();
 
-        if !cell_spills.is_empty() {
-            let mut spilled: Vec<(u32, SpilledCellRows)> = cell_spills
-                .into_iter()
-                .map(|(cell, writer)| writer.finish().map(|s| (cell, s)).map_err(BuildError::from))
-                .collect::<Result<Vec<_>, BuildError>>()?;
-            spilled.sort_unstable_by_key(|(cell, _)| *cell);
+        match consolidate {
+            DrainConsolidate::Splice => {
+                if !cell_spills.is_empty() {
+                    return Err(BuildError::Store(
+                        "splice drain must not leave kmeans row spills".into(),
+                    ));
+                }
+                if packed_cells.is_empty() && !added_per_cell.is_empty() {
+                    return Err(BuildError::Store(
+                        "splice drain has cell counts but no packed cell-IVFs".into(),
+                    ));
+                }
+            }
+            DrainConsolidate::Kmeans => {
+                let vc = hidden_inner
+                    .options
+                    .vector_columns
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| BuildError::Store("drain pack requires a vector column".into()))?;
+                if !cell_spills.is_empty() {
+                    let mut spilled: Vec<(u32, SpilledCellRows)> = cell_spills
+                        .into_iter()
+                        .map(|(cell, writer)| {
+                            writer.finish().map(|s| (cell, s)).map_err(BuildError::from)
+                        })
+                        .collect::<Result<Vec<_>, BuildError>>()?;
+                    spilled.sort_unstable_by_key(|(cell, _)| *cell);
 
-            crate::superfile::vector::builder::build_phase_timers::reset();
-            let mut wave: Vec<(u32, SpilledCellRows)> = Vec::new();
-            let mut wave_bytes: u64 = 0;
-            let mut spilled_iter = spilled.into_iter().peekable();
-            while let Some((cell, spill)) = spilled_iter.next() {
-                wave_bytes += spill.row_bytes();
-                wave.push((cell, spill));
-                let flush = wave_bytes >= DRAIN_BUILD_GROUP_BYTES || spilled_iter.peek().is_none();
-                if !flush {
-                    continue;
-                }
-                n_waves += 1;
-                let cells_rows: Vec<(u32, Vec<MaterializedIvfRow>)> = wave
-                    .iter()
-                    .map(|(cell, spill)| {
-                        read_spilled_cell_rows(spill)
-                            .map(|rows| (*cell, rows))
-                            .map_err(BuildError::from)
-                    })
-                    .collect::<Result<Vec<_>, BuildError>>()?;
-                let built_wave: Vec<SpilledPackedCell> =
-                    hidden_inner.options.writer_pool.install(|| {
-                        cells_rows
-                            .into_par_iter()
-                            .filter(|(_, rows)| !rows.is_empty())
-                            .map(|(cell_id, rows)| {
-                                let packed = drain_pack_materialized_cell(cell_id, rows, &vc)?;
-                                let (cell_id, subsection, stable_ids) = packed.into_hidden_triple();
-                                spill_packed_cell(scratch, cell_id, subsection, &stable_ids)
+                    crate::superfile::vector::builder::build_phase_timers::reset();
+                    let mut wave: Vec<(u32, SpilledCellRows)> = Vec::new();
+                    let mut wave_bytes: u64 = 0;
+                    let mut spilled_iter = spilled.into_iter().peekable();
+                    while let Some((cell, spill)) = spilled_iter.next() {
+                        wave_bytes += spill.row_bytes();
+                        wave.push((cell, spill));
+                        let flush =
+                            wave_bytes >= DRAIN_BUILD_GROUP_BYTES || spilled_iter.peek().is_none();
+                        if !flush {
+                            continue;
+                        }
+                        n_waves += 1;
+                        let cells_rows: Vec<(u32, Vec<MaterializedIvfRow>)> = wave
+                            .iter()
+                            .map(|(cell, spill)| {
+                                read_spilled_cell_rows(spill)
+                                    .map(|rows| (*cell, rows))
+                                    .map_err(BuildError::from)
                             })
-                            .collect::<Result<Vec<_>, BuildError>>()
-                    })?;
-                cells_built += built_wave.len();
-                for cell in built_wave {
-                    local_checkpoint.spills.remove(&cell.cell_id);
-                    local_checkpoint.built_cells.insert(
-                        cell.cell_id,
-                        DrainLocalCell {
-                            n_docs: cell.n_docs,
-                            subsection_len: cell.subsection_len,
-                            rerank_codec_id: cell.rerank_codec.codec_id(),
-                        },
-                    );
-                    packed_cells.push(cell);
+                            .collect::<Result<Vec<_>, BuildError>>()?;
+                        let built_wave: Vec<SpilledPackedCell> =
+                            hidden_inner.options.writer_pool.install(|| {
+                                cells_rows
+                                    .into_par_iter()
+                                    .filter(|(_, rows)| !rows.is_empty())
+                                    .map(|(cell_id, rows)| {
+                                        let packed =
+                                            drain_pack_materialized_cell(cell_id, rows, &vc)?;
+                                        let (cell_id, subsection, stable_ids) =
+                                            packed.into_hidden_triple();
+                                        spill_packed_cell(
+                                            scratch,
+                                            cell_id,
+                                            subsection,
+                                            &stable_ids,
+                                        )
+                                    })
+                                    .collect::<Result<Vec<_>, BuildError>>()
+                            })?;
+                        cells_built += built_wave.len();
+                        for cell in built_wave {
+                            local_checkpoint.spills.remove(&cell.cell_id);
+                            local_checkpoint.built_cells.insert(
+                                cell.cell_id,
+                                DrainLocalCell {
+                                    n_docs: cell.n_docs,
+                                    subsection_len: cell.subsection_len,
+                                    rerank_codec_id: cell.rerank_codec.codec_id(),
+                                },
+                            );
+                            packed_cells.push(cell);
+                        }
+                        for (_, spill) in wave.drain(..) {
+                            spill.remove_files();
+                        }
+                        save_drain_local_checkpoint(&drain_scratch, &local_checkpoint)?;
+                        eprintln!(
+                            "[supertable drain] pack wave {n_waves}: {cells_built}/{n_cells_total} cell-IVFs built to scratch"
+                        );
+                        wave_bytes = 0;
+                    }
                 }
-                for (_, spill) in wave.drain(..) {
-                    spill.remove_files();
-                }
-                save_drain_local_checkpoint(&drain_scratch, &local_checkpoint)?;
-                eprintln!(
-                    "[supertable drain] pack wave {n_waves}: {cells_built}/{n_cells_total} cell-IVFs built to scratch"
-                );
-                wave_bytes = 0;
             }
         }
 
@@ -3467,7 +3560,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     }
 
     eprintln!(
-        "[supertable drain] done ({} batch(es), budget {} sf): total {:.1}ms; RSS {} -> {} MiB",
+        "[supertable drain] done ({}, {} batch(es), budget {} sf): total {:.1}ms; RSS {} -> {} MiB",
+        match consolidate {
+            DrainConsolidate::Kmeans => "kmeans",
+            DrainConsolidate::Splice => "splice",
+        },
         n_batches,
         batch_cfg,
         drain_t0.elapsed().as_secs_f64() * 1e3,
@@ -3779,6 +3876,124 @@ fn restore_spilled_packed_cell(
 fn remove_spilled_packed_cell(cell: &SpilledPackedCell) {
     let _ = fs::remove_file(&cell.subsection_path);
     let _ = fs::remove_file(&cell.stable_ids_path);
+}
+
+fn load_merged_from_spilled(
+    cell: &SpilledPackedCell,
+    dim: usize,
+) -> Result<(MergedIvfSubsection, Vec<i128>), BuildError> {
+    let bytes = fs::read(&cell.subsection_path)
+        .map_err(|error| BuildError::Store(format!("cell subsection spill read: {error}")))?;
+    if bytes.len() as u64 != cell.subsection_len {
+        return Err(BuildError::Store(format!(
+            "cell {}: spill length {} != expected {}",
+            cell.cell_id,
+            bytes.len(),
+            cell.subsection_len
+        )));
+    }
+    if bytes.len() < SUB_HEADER_SIZE + CRC_BYTES {
+        return Err(BuildError::Store(format!(
+            "cell {}: spilled subsection too short",
+            cell.cell_id
+        )));
+    }
+    let centroids_off = u64::from_le_bytes(
+        bytes[sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + 8]
+            .try_into()
+            .expect("8-byte centroids off"),
+    ) as usize;
+    let cluster_idx_off = u64::from_le_bytes(
+        bytes[sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + 8]
+            .try_into()
+            .expect("8-byte cluster idx off"),
+    ) as usize;
+    let summary_off = u64::from_le_bytes(
+        bytes[sub_hdr::SUMMARY_OFF_OFF..sub_hdr::SUMMARY_OFF_OFF + 8]
+            .try_into()
+            .expect("8-byte summary off"),
+    ) as usize;
+    let codec_meta_size = u32::from_le_bytes(
+        bytes[sub_hdr::CODEC_META_SIZE_OFF..sub_hdr::CODEC_META_SIZE_OFF + U32_BYTES]
+            .try_into()
+            .expect("4-byte codec meta size"),
+    ) as usize;
+    if cluster_idx_off < centroids_off || (cluster_idx_off - centroids_off) % (dim * 4) != 0 {
+        return Err(BuildError::Store(format!(
+            "cell {}: invalid centroid region for dim {dim}",
+            cell.cell_id
+        )));
+    }
+    let n_cent = (cluster_idx_off - centroids_off) / (dim * 4);
+    let codec_meta_off = cluster_idx_off + n_cent * CLUSTER_IDX_ENTRY_BYTES;
+    let ids = read_spilled_stable_ids(cell)?;
+    Ok((
+        MergedIvfSubsection {
+            bytes,
+            n_cent,
+            n_docs: cell.n_docs,
+            rerank_codec: cell.rerank_codec,
+            summary_offset_in_sub: summary_off,
+            codec_meta_offset_in_sub: if codec_meta_size == 0 {
+                0
+            } else {
+                codec_meta_off
+            },
+            codec_meta_size,
+        },
+        ids,
+    ))
+}
+
+/// Accumulate one splice-routed cell into the shared packed-cell scratch.
+///
+/// First touch spills the routed subsection. A later batch that routes into
+/// the same cell concatenates clusters with [`merge_fragment_subsections`]
+/// (the same verbatim `splice_fragments_into_cell` primitive) — not a second
+/// consolidate mode and not a silent fallback.
+fn accumulate_splice_cell(
+    packed_cells: &mut Vec<SpilledPackedCell>,
+    local_checkpoint: &mut DrainLocalCheckpoint,
+    added_per_cell: &mut HashMap<u32, u32>,
+    completed_shards: &HashSet<u32>,
+    shard_count: usize,
+    scratch: &Path,
+    cell_id: u32,
+    subsection: MergedIvfSubsection,
+    stable_ids: Vec<i128>,
+    dim: usize,
+    metric: Metric,
+) -> Result<(), BuildError> {
+    let shard = packed_cell_shard(cell_id, shard_count) as u32;
+    if completed_shards.contains(&shard) {
+        return Ok(());
+    }
+
+    let (subsection, stable_ids) = match packed_cells.iter().position(|cell| cell.cell_id == cell_id)
+    {
+        Some(idx) => {
+            let existing = packed_cells.swap_remove(idx);
+            let (left, left_ids) = load_merged_from_spilled(&existing, dim)?;
+            remove_spilled_packed_cell(&existing);
+            local_checkpoint.built_cells.remove(&cell_id);
+            merge_fragment_subsections(&left, &left_ids, &subsection, &stable_ids, dim, metric)?
+        }
+        None => (subsection, stable_ids),
+    };
+
+    let n_docs = subsection.n_docs;
+    let packed = spill_packed_cell(scratch, cell_id, subsection, &stable_ids)?;
+    local_checkpoint.built_cells.insert(
+        cell_id,
+        DrainLocalCell {
+            n_docs: packed.n_docs,
+            subsection_len: packed.subsection_len,
+            rerank_codec_id: packed.rerank_codec.codec_id(),
+        },
+    );
+    packed_cells.push(packed);
+    added_per_cell.insert(cell_id, n_docs);
+    Ok(())
 }
 
 fn read_spilled_stable_ids(cell: &SpilledPackedCell) -> Result<Vec<i128>, BuildError> {
@@ -5581,7 +5796,13 @@ mod tests {
         let options_hash = "options".to_string();
         let checkpoint = DrainRemoteCheckpoint {
             schema: DRAIN_CHECKPOINT_SCHEMA,
-            epoch_id: drain_epoch_id(&options_hash, &sources, &batch_layout, 2),
+            epoch_id: drain_epoch_id(
+                &options_hash,
+                &sources,
+                &batch_layout,
+                2,
+                DrainConsolidate::Kmeans,
+            ),
             options_hash,
             sources,
             batch_layout,
@@ -5896,7 +6117,13 @@ mod tests {
         let shard_count = packed_cell_shard_count(&hidden.inner().options);
         (
             hidden,
-            drain_epoch_id(&options_hash, &source_refs, &batch_layout, shard_count),
+            drain_epoch_id(
+                &options_hash,
+                &source_refs,
+                &batch_layout,
+                shard_count,
+                table.inner().options.drain_consolidate,
+            ),
         )
     }
 

@@ -51,6 +51,8 @@ use serde::{
     ser::Serializer,
 };
 
+use crate::superfile::vector::rerank_codec::RerankCodec;
+
 /// Embedded baseline. Compiled in via `include_str!`.
 const EMBEDDED_DEFAULT: &str = include_str!("config.yaml");
 
@@ -261,6 +263,21 @@ pub enum CentroidAlignment {
     Global,
 }
 
+/// Per-cell consolidation op the hidden-index drain applies. Selected
+/// by `vector.drain_consolidate`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DrainConsolidate {
+    /// Materialize each superfile's rows, assign to the nearest global
+    /// cell, and re-cluster per cell (default).
+    #[default]
+    Kmeans,
+    /// Route each superfile's local clusters to their nearest global
+    /// cell and keep them verbatim as multi-cluster fragments (no
+    /// re-cluster).
+    Splice,
+}
+
 /// Vector-index build / search / drain tuning knobs. Grouped so the
 /// vector-specific levers don't crowd the top-level namespace. All
 /// have defaults equal to the engine's built-in behavior; a fresh
@@ -273,6 +290,11 @@ pub struct VectorSettings {
     /// number of eligible superfiles at query time; `Some(n)` forces
     /// exactly `n`.
     pub inner_budget: Option<usize>,
+    /// Default rerank codec for cosine vector columns. Non-cosine
+    /// metrics still use locally fitted [`RerankCodec::Sq8Residual`]
+    /// at column construction time. Per-column overrides at table
+    /// create win over this default.
+    pub rerank_codec: RerankCodec,
     /// K-means training points per centroid for the drain's per-cell
     /// sub-builds. Higher trains on more points (slower, tighter
     /// clusters).
@@ -292,6 +314,8 @@ pub struct VectorSettings {
     /// extra copies of rows near a Voronoi boundary; `<= 1.0` disables
     /// replication.
     pub drain_replica_target_factor: f32,
+    /// Per-cell consolidation op the drain applies.
+    pub drain_consolidate: DrainConsolidate,
     /// Read fan-out for the drain's superfile opens. `auto` resolves
     /// to one in-flight read per hardware thread, floored at the
     /// background-fill default and capped at 64.
@@ -302,11 +326,13 @@ impl Default for VectorSettings {
     fn default() -> Self {
         Self {
             inner_budget: None,
+            rerank_codec: RerankCodec::default(),
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,
             user_centroids: CentroidAlignment::Local,
             drain_batch_superfiles: DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES,
             drain_replica_target_factor: DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR,
+            drain_consolidate: DrainConsolidate::Kmeans,
             drain_read_concurrency: ThreadCount::Auto,
         }
     }
@@ -1047,6 +1073,8 @@ supertable:
         assert_eq!(cfg.vector.inner_budget, None);
         assert_eq!(cfg.vector.cell_split_doc_cap, 50_000);
         assert_eq!(cfg.vector.user_centroids, CentroidAlignment::Local);
+        assert_eq!(cfg.vector.drain_consolidate, DrainConsolidate::Kmeans);
+        assert_eq!(cfg.vector.rerank_codec, RerankCodec::Sq8FixedResidual);
         assert_eq!(cfg.vector.drain_read_concurrency, ThreadCount::Auto);
     }
 
@@ -1065,6 +1093,8 @@ vector:
   inner_budget: 4096
   cell_split_doc_cap: 100000
   user_centroids: global
+  drain_consolidate: splice
+  rerank_codec: sq8_residual
   drain_replica_target_factor: 1.25
   drain_read_concurrency: 12
 "#;
@@ -1075,6 +1105,8 @@ vector:
         assert_eq!(cfg.vector.inner_budget, Some(4096));
         assert_eq!(cfg.vector.cell_split_doc_cap, 100_000);
         assert_eq!(cfg.vector.user_centroids, CentroidAlignment::Global);
+        assert_eq!(cfg.vector.drain_consolidate, DrainConsolidate::Splice);
+        assert_eq!(cfg.vector.rerank_codec, RerankCodec::Sq8Residual);
         assert_eq!(cfg.vector.drain_replica_target_factor, 1.25);
         assert_eq!(cfg.vector.drain_read_concurrency, ThreadCount::Fixed(12));
         // Untouched keys fall through to the embedded default.
