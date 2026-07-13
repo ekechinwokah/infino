@@ -988,14 +988,25 @@ pub mod vector {
 
     const NS_PER_SEC: f64 = 1e9;
 
+    /// `nprobe` / `rerank` sentinel meaning "engine default — do not
+    /// override". Rows measured with this value run
+    /// `VectorSearchOptions::default()` exactly, so recorded numbers always
+    /// reflect shipped defaults rather than bench-side overrides.
+    pub const ENGINE_DEFAULT: usize = 0;
+
     pub fn default_search_opts() -> VectorSearchOptions {
         VectorSearchOptions::default()
     }
 
     pub fn search_opts(nprobe: usize, rerank_mult: usize) -> VectorSearchOptions {
-        VectorSearchOptions::default()
-            .with_nprobe(nprobe)
-            .with_rerank_mult(rerank_mult)
+        let mut opts = VectorSearchOptions::default();
+        if nprobe != ENGINE_DEFAULT {
+            opts = opts.with_nprobe(nprobe);
+        }
+        if rerank_mult != ENGINE_DEFAULT {
+            opts = opts.with_rerank_mult(rerank_mult);
+        }
+        opts
     }
 
     /// A reader the vector executor runs kNN against, returning global
@@ -1074,6 +1085,11 @@ pub mod vector {
 
     impl SupertableVectorRead<'_> {
         pub fn routing_label(&self, nprobe: usize, rerank: usize) -> String {
+            let rerank_label = if rerank == ENGINE_DEFAULT {
+                "r=default".to_string()
+            } else {
+                format!("r{rerank}")
+            };
             if let Some(hidden) = self.table.vector_index_table() {
                 let reader = hidden.pinned_reader();
                 let manifest = reader.manifest();
@@ -1082,7 +1098,7 @@ pub mod vector {
                         manifest.get_partition_strategy()
                 {
                     return format!(
-                        "hidden: cells {}..{}, fine {}, {}, r{rerank}",
+                        "hidden: cells {}..{}, fine {}, {}, {rerank_label}",
                         routing.nprobe_min,
                         routing.nprobe_max,
                         routing.fine_nprobe,
@@ -1090,8 +1106,13 @@ pub mod vector {
                     );
                 }
             }
+            let cells_label = if nprobe == ENGINE_DEFAULT {
+                "routed 1 (default)".to_string()
+            } else {
+                format!("{nprobe}+")
+            };
             format!(
-                "user: cells {nprobe}+, fine {USER_FINE_RUNS_PER_FRAGMENT}/fragment, {}, r{rerank}",
+                "user: cells {cells_label}, fine {USER_FINE_RUNS_PER_FRAGMENT}/fragment, {}, {rerank_label}",
                 self.table.options().vector_columns[0].rerank_codec.name(),
             )
         }
@@ -1565,8 +1586,8 @@ pub mod vector {
                 // No brute-force ground truth was built (skip-calibration / no
                 // corpus). Recall is not measured — render "—", not a bogus 0.000.
                 eprintln!(
-                    "[{log_prefix}] skip-calibration: p={default_nprobe}, r={default_rerank} \
-                     — no ground truth, recall not measured",
+                    "[{log_prefix}] skip-calibration: {} — no ground truth, recall not measured",
+                    warm_reader.search_params(default_nprobe, default_rerank),
                 );
                 default_recall = None;
             } else {

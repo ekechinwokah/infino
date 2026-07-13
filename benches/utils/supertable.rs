@@ -47,7 +47,10 @@ use std::{
 
 use infino::{
     OptimizeOptions,
-    supertable::{Supertable, manifest::SuperfileEntry},
+    supertable::{
+        Supertable,
+        manifest::{ClusterCentroids, SuperfileEntry},
+    },
 };
 use tempfile::TempDir;
 
@@ -1125,24 +1128,14 @@ pub mod vector {
     /// budget post-drain, and the resulting evictions re-fetch on every query
     /// (measured 62 GET/query on a supposedly warm consumer at 100K).
     const SHARED_CONSUMER_CACHE_INDEX_FACTOR: u64 = 2;
-    // Sourced from the engine's own defaults so the bench can't drift from
-    // what an unfiltered default query resolves to on the supertable user
-    // path (which owns its coarse default independently of the superfile
-    // tier's `VectorSearchOptions::DEFAULT_NPROBE`).
-    const DEFAULT_NPROBE: usize = infino::supertable::query::vector::USER_COARSE_CELLS;
-    const DEFAULT_RERANK_MULT: usize = infino::superfile::reader::VectorSearchOptions::RERANK_MULT;
+    // The default rows never override engine settings: they run
+    // `VectorSearchOptions::default()` via the `ENGINE_DEFAULT` sentinel, so
+    // the recorded numbers always measure shipped routing defaults.
     const QUERY_CORRECTNESS_SEED: u64 = 17;
     const QUERY_CALIBRATION_SEED: u64 = 99;
     const QUERY_SIGMA: f32 = 0.05;
     /// Filtered vector bench allow-set density: keep every Nth row.
     const FILTER_KEEP_EVERY: usize = 10;
-    /// Filtered-search base config (mirrors the superfile tier): the engine
-    /// applies its own selectivity boost on top of these nominal values.
-    const FILTERED_DEFAULT_NPROBE: usize = 8;
-    const FILTERED_DEFAULT_RERANK_MULT: usize = 256;
-    /// Cap on the selectivity boost the vector reader applies to filtered
-    /// search — used only to report the *effective* `(nprobe, rerank)`.
-    const FILTER_MAX_MULT: usize = 64;
     /// Repeated warm probes per routing-state transition.
     const ROUTING_STATE_WARM_ITERS: usize = 20;
     /// Explicitly discard only the derived hidden vector-index sibling before
@@ -1154,6 +1147,10 @@ pub mod vector {
     /// Numerator/denominator for compact p90 drain diagnostics.
     const DRAIN_P90_NUMERATOR: usize = 9;
     const DRAIN_P90_DENOMINATOR: usize = 10;
+    /// Cell-probe depths reported by the post-drain assignment audit.
+    const DRAIN_DIAG_PROBE_DEPTHS: [usize; 6] = [1, 2, 4, 8, 16, 64];
+    /// Stored rows self-queried by the post-drain assignment audit.
+    const DRAIN_DIAG_SELF_QUERY_SAMPLE: usize = 500;
 
     /// Calibration policy for supertable vector benches:
     /// - force off when `INFINO_BENCH_SKIP_CALIBRATION=1`
@@ -1167,16 +1164,16 @@ pub mod vector {
             || n_docs > exec_vec::FULL_CALIBRATION_MAX_DOCS
     }
 
-    /// Fixed probe count for the `default` row. Not env-tunable: the
-    /// default row must measure the engine's default behavior, so a
-    /// leaked per-shell override can never skew recorded numbers.
+    /// Probe count for the `default` row: the engine default, never a bench
+    /// override, so a leaked per-shell setting can never skew recorded
+    /// numbers.
     fn fixed_nprobe() -> usize {
-        DEFAULT_NPROBE
+        exec_vec::ENGINE_DEFAULT
     }
-    /// Fixed rerank multiplier for the `default` row. Same policy as
+    /// Rerank multiplier for the `default` row. Same policy as
     /// [`fixed_nprobe`].
     fn fixed_rerank_mult() -> usize {
-        DEFAULT_RERANK_MULT
+        exec_vec::ENGINE_DEFAULT
     }
 
     #[derive(Clone, Copy)]
@@ -1439,6 +1436,261 @@ pub mod vector {
             values[p90_index],
             values[values.len() - 1],
         ))
+    }
+
+    /// Post-drain assignment audit: separates "the drain stored rows in the
+    /// wrong cells" from "the query's nearest cell doesn't contain the true
+    /// neighbors". Three measurements against the user table's global grid:
+    ///
+    /// 1. row conservation — stored rows vs corpus rows (drops/duplicates);
+    /// 2. assignment agreement — % of stored rows whose cell IS their exact
+    ///    nearest grid centroid (fp32 corpus math, no decode involved);
+    /// 3. neighbor coverage — for each ground-truth neighbor, the rank of its
+    ///    STORED cell (and separately its geometrically-nearest cell) in the
+    ///    query's cell ordering; `p1` is the ceiling of `cells 1..1` recall.
+    fn report_post_drain_assignment_audit(
+        consumer: &Supertable,
+        vectors: &[f32],
+        queries: &[Vec<f32>],
+        ground_truth: &[Vec<u32>],
+        id_to_dense: &HashMap<i128, u32>,
+    ) {
+        use rayon::prelude::*;
+
+        let Some(cells) = consumer.hidden_cell_stable_id_sets() else {
+            eprintln!("[drain-diag] no packed hidden cells to audit");
+            return;
+        };
+        let reader = consumer.pinned_reader();
+        let manifest = reader.manifest();
+        let Some(global) = manifest.get_global_vector_index() else {
+            eprintln!("[drain-diag] user manifest has no global cell grid");
+            return;
+        };
+        let grid = global.grid;
+        let metric = consumer.options().vector_columns[0].metric;
+        let n_cells = grid.n_cent as usize;
+        let n_rows = vectors.len() / DIM;
+
+        let stored_total: usize = cells.iter().map(|(_, ids)| ids.len()).sum();
+        let mut stored_by_dense: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut unmapped = 0usize;
+        for (cell, ids) in &cells {
+            for id in ids {
+                match id_to_dense.get(id) {
+                    Some(dense) => stored_by_dense.entry(*dense).or_default().push(*cell),
+                    None => unmapped += 1,
+                }
+            }
+        }
+        eprintln!(
+            "[drain-diag] stored rows: {stored_total} across {} cells (distinct rows {}, corpus rows {n_rows}, unmapped ids {unmapped})",
+            cells.len(),
+            stored_by_dense.len(),
+        );
+
+        let nearest_cell = |vector: &[f32]| -> u32 {
+            let mut best = 0u32;
+            let mut best_score = f32::INFINITY;
+            for cell in 0..n_cells {
+                let score = grid.score_one(metric, cell, vector);
+                if score < best_score {
+                    best_score = score;
+                    best = cell as u32;
+                }
+            }
+            best
+        };
+
+        let audited: Vec<(u32, &Vec<u32>)> = stored_by_dense
+            .iter()
+            .filter(|(dense, _)| ((**dense as usize + 1) * DIM) <= vectors.len())
+            .map(|(dense, stored)| (*dense, stored))
+            .collect();
+        let agree = audited
+            .par_iter()
+            .filter(|(dense, stored)| {
+                let start = *dense as usize * DIM;
+                stored.contains(&nearest_cell(&vectors[start..start + DIM]))
+            })
+            .count();
+        eprintln!(
+            "[drain-diag] assignment agreement: {agree}/{} stored rows sit in their exact nearest grid cell ({:.3})",
+            audited.len(),
+            agree as f64 / audited.len().max(1) as f64,
+        );
+
+        // Fine-centroid routing replica: the hidden query path ranks cells by
+        // the best (minimum) score over each cell's summary fine centroids,
+        // not by the grid centroid the drain assigned against. Collect every
+        // packed cell's fine centroids from the hidden manifest summaries so
+        // coverage can be measured under the ranking the query actually uses.
+        let fine_by_cell: HashMap<u32, Vec<ClusterCentroids>> = {
+            let mut out: HashMap<u32, Vec<_>> = HashMap::new();
+            if let Some(hidden) = consumer.vector_index_table() {
+                let hidden_reader = hidden.pinned_reader();
+                for entry in hidden_reader.manifest().get_all_superfiles() {
+                    for summary in entry.vector_summary.values() {
+                        for cell in &summary.cells {
+                            if let Some(cell_id) = cell.cell_id {
+                                out.entry(cell_id).or_default().push(cell.clusters.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        };
+
+        let mut cov_stored = [0usize; DRAIN_DIAG_PROBE_DEPTHS.len()];
+        let mut cov_geom = [0usize; DRAIN_DIAG_PROBE_DEPTHS.len()];
+        let mut cov_routed = [0usize; DRAIN_DIAG_PROBE_DEPTHS.len()];
+        let mut total = 0usize;
+        let mut missing = 0usize;
+        for (query, truth) in queries.iter().zip(ground_truth) {
+            let mut ranked: Vec<(u32, f32)> = (0..n_cells)
+                .map(|cell| (cell as u32, grid.score_one(metric, cell, query)))
+                .collect();
+            ranked.sort_unstable_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            let mut rank_by_cell = vec![usize::MAX; n_cells];
+            for (rank, (cell, _)) in ranked.iter().enumerate() {
+                rank_by_cell[*cell as usize] = rank + 1;
+            }
+            // Query-path replica: rank cells by min fine-centroid score.
+            let mut routed: Vec<(u32, f32)> = fine_by_cell
+                .iter()
+                .map(|(cell_id, cluster_sets)| {
+                    let mut best = f32::INFINITY;
+                    for clusters in cluster_sets {
+                        clusters.score_clusters_into(metric, query, |_, score| {
+                            best = best.min(score);
+                        });
+                    }
+                    (*cell_id, best)
+                })
+                .collect();
+            routed.sort_unstable_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            let mut routed_rank_by_cell = vec![usize::MAX; n_cells];
+            for (rank, (cell, _)) in routed.iter().enumerate() {
+                routed_rank_by_cell[*cell as usize] = rank + 1;
+            }
+            for id in truth {
+                let start = *id as usize * DIM;
+                if start + DIM > vectors.len() {
+                    continue;
+                }
+                total += 1;
+                let geom_rank = rank_by_cell[nearest_cell(&vectors[start..start + DIM]) as usize];
+                let (stored_rank, routed_rank) = stored_by_dense
+                    .get(id)
+                    .map(|stored| {
+                        let grid_rank = stored
+                            .iter()
+                            .map(|cell| rank_by_cell[*cell as usize])
+                            .min()
+                            .unwrap_or(usize::MAX);
+                        let routed = stored
+                            .iter()
+                            .map(|cell| routed_rank_by_cell[*cell as usize])
+                            .min()
+                            .unwrap_or(usize::MAX);
+                        (grid_rank, routed)
+                    })
+                    .unwrap_or_else(|| {
+                        missing += 1;
+                        (usize::MAX, usize::MAX)
+                    });
+                for (i, probe) in DRAIN_DIAG_PROBE_DEPTHS.iter().enumerate() {
+                    cov_geom[i] += usize::from(geom_rank <= *probe);
+                    cov_stored[i] += usize::from(stored_rank <= *probe);
+                    cov_routed[i] += usize::from(routed_rank <= *probe);
+                }
+            }
+        }
+        let fmt_curve = |cov: &[usize]| {
+            DRAIN_DIAG_PROBE_DEPTHS
+                .iter()
+                .zip(cov)
+                .map(|(probe, count)| {
+                    format!("p{probe}={:.3}", *count as f64 / total.max(1) as f64)
+                })
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
+        eprintln!(
+            "[drain-diag] GT neighbor coverage by STORED cell ({total} occurrences, {missing} not stored): {}",
+            fmt_curve(&cov_stored),
+        );
+        eprintln!(
+            "[drain-diag] GT neighbor coverage by NEAREST cell (perfect assignment): {}",
+            fmt_curve(&cov_geom),
+        );
+        eprintln!(
+            "[drain-diag] GT neighbor coverage under FINE-centroid routing (query path): {}",
+            fmt_curve(&cov_routed),
+        );
+
+        // Self-query probe: search the post-drain index with stored rows' own
+        // vectors. Coverage is guaranteed (a row's cell IS its nearest cell,
+        // verified above), so any miss is a within-cell defect — id/code/rerank
+        // pairing or shortlist scoring — not routing.
+        let dense_ids: Vec<u32> = {
+            let mut ids: Vec<u32> = stored_by_dense.keys().copied().collect();
+            ids.sort_unstable();
+            let step = (ids.len() / DRAIN_DIAG_SELF_QUERY_SAMPLE).max(1);
+            ids.into_iter()
+                .step_by(step)
+                .take(DRAIN_DIAG_SELF_QUERY_SAMPLE)
+                .collect()
+        };
+        let dense_to_id: HashMap<u32, i128> = id_to_dense
+            .iter()
+            .map(|(stable, dense)| (*dense, *stable))
+            .collect();
+        let mut self_top1 = 0usize;
+        let mut self_top10 = 0usize;
+        let mut sampled = 0usize;
+        for dense in &dense_ids {
+            let start = *dense as usize * DIM;
+            if start + DIM > vectors.len() {
+                continue;
+            }
+            let Some(&stable) = dense_to_id.get(dense) else {
+                continue;
+            };
+            sampled += 1;
+            let batches = consumer
+                .reader()
+                .vector_search(
+                    supertable::VEC_COLUMN,
+                    &vectors[start..start + DIM],
+                    TOP_K,
+                    exec_vec::default_search_opts(),
+                    None,
+                    None,
+                )
+                .expect("drain-diag self-query");
+            let ids = corpus::id_scores_from_vector_search(&batches);
+            if ids.first().is_some_and(|(id, _)| *id == stable) {
+                self_top1 += 1;
+            }
+            if ids.iter().any(|(id, _)| *id == stable) {
+                self_top10 += 1;
+            }
+        }
+        eprintln!(
+            "[drain-diag] self-query on stored rows ({sampled} sampled): top-1 self-hit {:.3}, top-10 self-hit {:.3}",
+            self_top1 as f64 / sampled.max(1) as f64,
+            self_top10 as f64 / sampled.max(1) as f64,
+        );
     }
 
     fn log_hidden_stats(consumer: &Supertable, label: &str) {
@@ -2254,6 +2506,18 @@ pub mod vector {
                 if phases.warm {
                     log_hidden_stats(&consumer, "at warm open (post-drain)");
                 }
+                if let Some(vectors) = corpus
+                    .as_ref()
+                    .and_then(supertable::PreparedCorpus::vectors)
+                {
+                    report_post_drain_assignment_audit(
+                        &consumer,
+                        &vectors.as_slice()[..n_docs * DIM],
+                        &q_correct,
+                        &gt_correct,
+                        &id_to_dense,
+                    );
+                }
                 eprintln!("[supertable_vector] === post-drain search (routed cells) ===");
                 let post_drain_rows = exec_vec::run_search(
                     &mut report,
@@ -2366,10 +2630,7 @@ pub mod vector {
                             supertable::VEC_COLUMN,
                             q,
                             TOP_K,
-                            exec_vec::search_opts(
-                                FILTERED_DEFAULT_NPROBE,
-                                FILTERED_DEFAULT_RERANK_MULT,
-                            ),
+                            exec_vec::default_search_opts(),
                             &prepared_allow,
                         ))
                         .expect("filtered prewarm query");
@@ -2382,10 +2643,7 @@ pub mod vector {
                             supertable::VEC_COLUMN,
                             q,
                             TOP_K,
-                            exec_vec::search_opts(
-                                FILTERED_DEFAULT_NPROBE,
-                                FILTERED_DEFAULT_RERANK_MULT,
-                            ),
+                            exec_vec::default_search_opts(),
                             &prepared_allow,
                         ))
                         .expect("filtered recall query");
@@ -2412,12 +2670,6 @@ pub mod vector {
                     latencies.sort_unstable();
                     let p50_ns = latencies[latencies.len() / 2].as_secs_f64() * 1e9;
                     let selectivity = 1.0 / FILTER_KEEP_EVERY as f64;
-                    // Effective config the engine actually runs after its
-                    // bounded selectivity boost (mirrors the superfile tier):
-                    // boost both dims by the clamped filter multiplier.
-                    let filter_mult = FILTER_KEEP_EVERY.min(FILTER_MAX_MULT);
-                    let effective_nprobe = FILTERED_DEFAULT_NPROBE.saturating_mul(filter_mult);
-                    let effective_rerank = FILTERED_DEFAULT_RERANK_MULT.saturating_mul(filter_mult);
 
                     eprintln!(
                         "[supertable_vector] filtered recall@{TOP_K} ({} queries, ~10% selectivity): {mean_recall:.3}, p50={:.2}ms",
@@ -2448,12 +2700,10 @@ pub mod vector {
                             ],
                             rows: vec![vec![
                                 text("filtered (~10%)"),
-                                text(format!(
-                                    "p={FILTERED_DEFAULT_NPROBE}, r={FILTERED_DEFAULT_RERANK_MULT}"
-                                )),
+                                text("engine default"),
                                 text(warm_reader.routing_label(
-                                    effective_nprobe,
-                                    effective_rerank,
+                                    exec_vec::ENGINE_DEFAULT,
+                                    exec_vec::ENGINE_DEFAULT,
                                 )),
                                 text(format!("{:.1}%", selectivity * 100.0)),
                                 text(format!("{mean_recall:.3}")),

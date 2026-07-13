@@ -810,6 +810,59 @@ impl Supertable {
 
     #[cfg(any(test, feature = "test-helpers"))]
     test_visible! {
+    /// Diagnostic: for every packed hidden cell, the stable `_id`s stored in
+    /// it (merged across shard superfiles, sorted by cell id). `None` when
+    /// there is no hidden table or a hidden blob has no packed cells. Used by
+    /// tests/benches to audit drain assignment against the global cell grid.
+    fn hidden_cell_stable_id_sets(&self) -> Option<Vec<(u32, Vec<i128>)>> {
+        let hidden = self.inner.vector_index_table.as_ref()?;
+        let hidden_manifest = hidden.inner.manifest.load_full();
+        let store = hidden_manifest.options.store.clone();
+        let disk_cache = hidden_manifest.options.disk_cache.clone();
+        let storage = hidden_manifest.options.storage.clone()?;
+        let targets: Vec<_> = hidden_manifest
+            .superfiles
+            .iter()
+            .map(|e| (e.uri, e.subsection_offsets.clone()))
+            .collect();
+        let merged = self
+            .block_on_query(async move {
+                let mut by_cell: HashMap<u32, Vec<i128>> = HashMap::new();
+                for (uri, offsets) in targets {
+                    let reader = crate::supertable::query::superfile_reader::superfile_reader(
+                        &store,
+                        disk_cache.as_ref(),
+                        Some(&storage),
+                        &uri,
+                        offsets.as_ref(),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    let Some(vec_reader) = reader.vec() else {
+                        continue;
+                    };
+                    let Some(cells) = vec_reader
+                        .packed_cell_stable_ids_async()
+                        .await
+                        .map_err(|e| e.to_string())?
+                    else {
+                        continue;
+                    };
+                    for (cell_id, ids) in cells {
+                        by_cell.entry(cell_id).or_default().extend(ids);
+                    }
+                }
+                Ok::<_, String>(by_cell)
+            })
+            .ok()?;
+        let mut out: Vec<(u32, Vec<i128>)> = merged.into_iter().collect();
+        out.sort_unstable_by_key(|(cell, _)| *cell);
+        Some(out)
+    }
+    }
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_visible! {
     /// Diagnostic: `(total_hidden_superfiles, max_superfiles_in_one_cell)` for
     /// the hidden vector-index table, or `None` when there is no hidden table.
     /// Used by benches to observe how compacted the hidden cell index is.

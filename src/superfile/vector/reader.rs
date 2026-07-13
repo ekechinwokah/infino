@@ -2297,6 +2297,45 @@ impl VectorReader {
         }
     }
 
+    /// Per packed cell: `(global_cell_id, inline stable ids in cell-local
+    /// order)`. Diagnostic read for tests/benches auditing which cell the
+    /// drain stored each row in. Multi-cell (v2) blobs only — returns `None`
+    /// for v1 blobs or when any cell lacks an inline stable-id region.
+    pub(crate) async fn packed_cell_stable_ids_async(
+        &self,
+    ) -> Result<Option<Vec<(u32, Vec<i128>)>>, VectorError> {
+        if !self.is_multi_cell() {
+            return Ok(None);
+        }
+        let mut out = Vec::with_capacity(self.cell_ids.len());
+        for (ci, &cell_id) in self.cell_ids.iter().enumerate() {
+            let col = &self.columns[ci];
+            let Some(range) = col.stable_ids_region_range() else {
+                return Ok(None);
+            };
+            let region = self
+                .source
+                .range_async(range)
+                .await
+                .map_err(|e| VectorError::LazySource(e.to_string()))?;
+            let mut ids = Vec::with_capacity(col.n_docs as usize);
+            for chunk in region
+                .as_ref()
+                .chunks_exact(format::vec::STABLE_ID_BYTES)
+                .take(col.n_docs as usize)
+            {
+                let arr: [u8; format::vec::STABLE_ID_BYTES] = chunk.try_into().map_err(|_| {
+                    VectorError::Read(ReadError::MalformedVersion(
+                        "inline stable_id region slice".into(),
+                    ))
+                })?;
+                ids.push(i128::from_le_bytes(arr));
+            }
+            out.push((cell_id, ids));
+        }
+        Ok(Some(out))
+    }
+
     /// Doc count for packed cell `cell_id`, or `None` if this blob does not
     /// contain that cell (v1 always returns column-0 `n_docs` when `cell_id`
     /// matches the caller's expected single cell — use [`Self::n_docs`] for
