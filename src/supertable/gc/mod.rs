@@ -19,7 +19,7 @@ use crate::{
             SUPERFILE_DATA_DIR,
             commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
         },
-        slow_vector_state::STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX,
+        slow_vector_state::{self, STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX},
     },
 };
 
@@ -81,7 +81,15 @@ pub(super) async fn gc_storage_sweep_for_inner(
 ) -> Result<GcReport, GcError> {
     let storage = inner.options.storage.clone().ok_or(GcError::NoStorage)?;
     let manifest = inner.manifest.load_full();
-    let (live, superfiles_complete) = build_live_set(&manifest);
+    let (mut live, superfiles_complete) = build_live_set(&manifest);
+    if let Some((uri, hash)) = manifest.slow_vector_state_blob() {
+        let state = slow_vector_state::load_full_state(storage.as_ref(), uri, &hash)
+            .await
+            .map_err(|error| GcError::DrainCheckpoint(error.to_string()))?;
+        if let Some(pending) = state.pending_drain {
+            live.extend(pending.entries.iter().map(|entry| entry.uri.storage_path()));
+        }
+    }
     let cutoff = SystemTime::now()
         .checked_sub(safety_gap)
         .unwrap_or(SystemTime::UNIX_EPOCH);

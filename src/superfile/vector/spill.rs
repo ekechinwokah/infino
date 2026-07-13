@@ -380,11 +380,6 @@ pub(crate) struct SpilledCellRows {
 }
 
 impl SpilledCellRows {
-    /// Rows recorded in this spill.
-    pub(crate) fn n_rows(&self) -> u32 {
-        self.n_rows
-    }
-
     /// On-disk size of the row-record file — the working-set estimate the
     /// drain uses to group cells into memory-bounded build waves.
     pub(crate) fn row_bytes(&self) -> u64 {
@@ -429,6 +424,18 @@ pub(crate) struct MaterializedRowSpillWriter {
     quant_idx_by_ptr: HashMap<usize, u32>,
 }
 
+/// Durable counters needed to reopen one per-cell row spill at a checkpointed
+/// batch boundary. File lengths are derived from these values and truncated on
+/// resume, discarding any partial next-batch tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MaterializedRowSpillState {
+    pub(crate) n_rows: u32,
+    pub(crate) n_quants: u32,
+    pub(crate) dim: usize,
+    pub(crate) rabitq_len: usize,
+    pub(crate) rerank_codec: RerankCodec,
+}
+
 impl MaterializedRowSpillWriter {
     /// Create the row + quantizer spill files for `cell` under `dir`.
     pub(crate) fn create(
@@ -466,6 +473,38 @@ impl MaterializedRowSpillWriter {
     /// Reset the pointer-identity dedup at a batch boundary.
     pub(crate) fn begin_batch(&mut self) {
         self.quant_idx_by_ptr.clear();
+    }
+
+    /// Reopen one checkpointed cell spill for append. Both files are
+    /// truncated to the exact durable lengths implied by `state` before the
+    /// writer seeks to the end, so a crash during the next batch is replayable.
+    pub(crate) fn resume(
+        dir: &Path,
+        cell: u32,
+        state: MaterializedRowSpillState,
+    ) -> Result<Self, BuildError> {
+        let rows_path = dir.join(format!("cell-{cell}.rows"));
+        let quants_path = dir.join(format!("cell-{cell}.quants"));
+        let rows_len = u64::from(state.n_rows) * record_bytes(state.dim, state.rabitq_len) as u64;
+        let quants_len = u64::from(state.n_quants) * (2 * state.dim * size_of::<f32>()) as u64;
+
+        let rows_file = OpenOptions::new().append(true).open(&rows_path)?;
+        rows_file.set_len(rows_len)?;
+        let quants_file = OpenOptions::new().append(true).open(&quants_path)?;
+        quants_file.set_len(quants_len)?;
+
+        Ok(Self {
+            rows: BufWriter::with_capacity(SpillWriter::BUF_CAPACITY, rows_file),
+            quants: BufWriter::with_capacity(SpillWriter::BUF_CAPACITY, quants_file),
+            rows_path,
+            quants_path,
+            dim: state.dim,
+            rabitq_len: state.rabitq_len,
+            n_rows: state.n_rows,
+            n_quants: state.n_quants,
+            rerank_codec: Some(state.rerank_codec),
+            quant_idx_by_ptr: HashMap::new(),
+        })
     }
 
     /// Append one row's encoded bytes (and its quantizer when first seen in
@@ -532,6 +571,22 @@ impl MaterializedRowSpillWriter {
         self.rows.write_all(&enc.residuals)?;
         self.n_rows += 1;
         Ok(())
+    }
+
+    /// Flush one durable batch boundary and return the counters needed to
+    /// reopen it after a process restart.
+    pub(crate) fn checkpoint(&mut self) -> Result<MaterializedRowSpillState, BuildError> {
+        self.rows.flush()?;
+        self.quants.flush()?;
+        Ok(MaterializedRowSpillState {
+            n_rows: self.n_rows,
+            n_quants: self.n_quants,
+            dim: self.dim,
+            rabitq_len: self.rabitq_len,
+            rerank_codec: self
+                .rerank_codec
+                .expect("checkpointed spill contains at least one row"),
+        })
     }
 
     /// Flush both files and return the readable spill handle.
@@ -757,7 +812,7 @@ mod tests {
         w.append(&row(4, 10, &quant_a, Some(9.0))).expect("append");
         let spill = w.finish().expect("finish");
 
-        assert_eq!(spill.n_rows(), 4);
+        assert_eq!(spill.n_rows, 4);
         assert_eq!(
             spill.row_bytes(),
             4 * (ROW_SPILL_PREFIX_BYTES + RABITQ_LEN + 2 * DIM) as u64
@@ -810,6 +865,53 @@ mod tests {
         bad.encoded.codes = vec![0u8; DIM - 1];
         assert!(w2.append(&bad).is_err(), "shape mismatch must be rejected");
 
+        spill.remove_files();
+    }
+
+    #[test]
+    fn materialized_row_spill_resume_truncates_partial_batch() {
+        const DIM: usize = 8;
+        const RABITQ_LEN: usize = 2;
+        const CELL: u32 = 3;
+        let tmp = tempdir().expect("tempdir");
+        let scale: Arc<[f32]> = Arc::from(vec![1.0f32; DIM]);
+        let offset: Arc<[f32]> = Arc::from(vec![0.0f32; DIM]);
+        let row = |stable_id: i128| MaterializedIvfRow {
+            local_doc_id: 0,
+            stable_id,
+            cluster: CELL,
+            rabitq_code: vec![stable_id as u8; RABITQ_LEN],
+            encoded: EncodedCellRow {
+                stable_id,
+                rerank_codec: RerankCodec::Sq8FixedResidual,
+                scale: Arc::clone(&scale),
+                offset: Arc::clone(&offset),
+                codes: vec![stable_id as u8; DIM],
+                residuals: vec![0; DIM],
+                norm_sq: Some(1.0),
+            },
+        };
+
+        let mut writer =
+            MaterializedRowSpillWriter::create(tmp.path(), CELL, DIM, RABITQ_LEN).expect("create");
+        writer.append(&row(1)).expect("append 1");
+        writer.append(&row(2)).expect("append 2");
+        let state = writer.checkpoint().expect("checkpoint");
+        writer.begin_batch();
+        writer.append(&row(3)).expect("uncommitted append");
+        drop(writer);
+
+        let mut resumed =
+            MaterializedRowSpillWriter::resume(tmp.path(), CELL, state).expect("resume");
+        resumed.begin_batch();
+        resumed.append(&row(4)).expect("replayed batch");
+        let spill = resumed.finish().expect("finish");
+        let rows = read_spilled_cell_rows(&spill).expect("read");
+        assert_eq!(
+            rows.iter().map(|row| row.stable_id).collect::<Vec<_>>(),
+            vec![1, 2, 4],
+            "partial post-checkpoint row must be truncated before replay"
+        );
         spill.remove_files();
     }
 

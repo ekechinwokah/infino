@@ -47,15 +47,17 @@
 //! per-shard `SuperfileBuilder::add_batch` call. No bytes copied;
 //! just Arc reference counts.
 
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
 use std::{
     cmp,
     collections::{HashMap, HashSet, hash_map::Entry},
-    fmt,
+    env, fmt, fs,
     fs::File,
     io::{self, BufReader, BufWriter, Read, Write},
     marker::PhantomData,
     mem,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering},
     time,
 };
@@ -67,6 +69,7 @@ use arrow::{
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array,
 };
+use blake3::Hasher as Blake3Hasher;
 use bytes::Bytes;
 use chrono::Utc;
 use datafusion::prelude::Expr;
@@ -76,7 +79,8 @@ use futures::{
 };
 use object_store::{MultipartUpload, PutPayload, UploadPart};
 use rayon::prelude::*;
-use tempfile::{NamedTempFile, TempPath, tempdir};
+use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 use tokio::time::sleep;
 use tracing::{debug, error};
 
@@ -138,7 +142,10 @@ use crate::{
             layout::VectorLayout,
             reader::VectorReader,
             rerank_codec::RerankCodec,
-            spill::{MaterializedRowSpillWriter, SpilledCellRows, read_spilled_cell_rows},
+            spill::{
+                MaterializedRowSpillState, MaterializedRowSpillWriter, SpilledCellRows,
+                read_spilled_cell_rows,
+            },
         },
     },
     supertable::{
@@ -149,6 +156,7 @@ use crate::{
             ClusterCentroids,
             commit::get_current_manifest_etag,
             list::{CellRoutingParams, PartitionStrategy},
+            options_hash,
             part::{self as part_mod, PartId},
         },
         query::{dispatch::open_reader, vector::stable_ids_by_local_for_routing},
@@ -163,6 +171,129 @@ use crate::{
 const DRAIN_FINE_RUN_TARGET_BYTES: usize = 2 * 1024 * 1024;
 /// Multipart chunk size for large superfile uploads.
 const SUPERFILE_MULTIPART_PART_BYTES: usize = 8 * (1 << 20);
+/// Checkpoint schema for the resumable drain state machine.
+const DRAIN_CHECKPOINT_SCHEMA: u32 = 1;
+/// Local checkpoint filename inside one epoch scratch directory.
+const DRAIN_LOCAL_CHECKPOINT_FILE: &str = "checkpoint.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DrainCheckpointSource {
+    superfile_id: String,
+    uri: String,
+    birth_version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DrainRemoteShard {
+    shard_id: u32,
+    superfile_id: String,
+    cell_counts: Vec<(u32, u32)>,
+}
+
+/// Object-storage state: intentionally small. It preserves completed output
+/// shards across node replacement, while unfinished shards are recomputed from
+/// immutable user superfiles instead of uploading corpus-sized scratch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DrainRemoteCheckpoint {
+    schema: u32,
+    epoch_id: String,
+    options_hash: String,
+    sources: Vec<DrainCheckpointSource>,
+    batch_layout: Vec<Vec<u64>>,
+    shard_count: usize,
+    completed_shards: Vec<DrainRemoteShard>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DrainLocalSpill {
+    n_rows: u32,
+    n_quants: u32,
+    dim: usize,
+    rabitq_len: usize,
+    rerank_codec_id: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DrainLocalCell {
+    n_docs: u32,
+    subsection_len: u64,
+    rerank_codec_id: u8,
+}
+
+/// Same-node state: exact spill offsets at the last completed source batch and
+/// completed cell-IVF files. Every update is fsync + atomic rename.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DrainLocalCheckpoint {
+    schema: u32,
+    epoch_id: String,
+    batches_done: usize,
+    spills: HashMap<u32, DrainLocalSpill>,
+    built_cells: HashMap<u32, DrainLocalCell>,
+    added_per_cell: HashMap<u32, u32>,
+}
+
+impl DrainLocalCheckpoint {
+    fn new(epoch_id: String) -> Self {
+        Self {
+            schema: DRAIN_CHECKPOINT_SCHEMA,
+            epoch_id,
+            batches_done: 0,
+            spills: HashMap::new(),
+            built_cells: HashMap::new(),
+            added_per_cell: HashMap::new(),
+        }
+    }
+}
+
+struct DrainRemoteState {
+    checkpoint: DrainRemoteCheckpoint,
+    entries: Vec<Arc<SuperfileEntry>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainTestFailurePhase {
+    AfterBatch,
+    AfterShard,
+}
+
+#[cfg(test)]
+struct DrainTestFailure {
+    epoch_id: String,
+    phase: DrainTestFailurePhase,
+    completed: usize,
+}
+
+#[cfg(test)]
+static DRAIN_TEST_FAILURE: StdMutex<Option<DrainTestFailure>> = StdMutex::new(None);
+
+#[cfg(test)]
+fn inject_drain_test_failure(epoch_id: String, phase: DrainTestFailurePhase, completed: usize) {
+    *DRAIN_TEST_FAILURE.lock().expect("drain test failure lock") = Some(DrainTestFailure {
+        epoch_id,
+        phase,
+        completed,
+    });
+}
+
+#[cfg(test)]
+fn maybe_fail_drain_for_test(
+    epoch_id: &str,
+    phase: DrainTestFailurePhase,
+    completed: usize,
+) -> Result<(), BuildError> {
+    let mut guard = DRAIN_TEST_FAILURE.lock().expect("drain test failure lock");
+    let should_fail = guard.as_ref().is_some_and(|failure| {
+        failure.epoch_id == epoch_id && failure.phase == phase && completed >= failure.completed
+    });
+    if should_fail {
+        guard.take();
+        return Err(BuildError::Store(format!(
+            "injected drain failure after {phase:?} {completed}"
+        )));
+    }
+    Ok(())
+}
 
 pub struct SupertableWriter {
     inner: Arc<SupertableInner>,
@@ -2179,6 +2310,236 @@ fn spill_row_to_cell(
     Ok(())
 }
 
+fn spill_unfinished_shard_row(
+    spills: &mut HashMap<u32, MaterializedRowSpillWriter>,
+    added: &mut HashMap<u32, u32>,
+    completed_shards: &HashSet<u32>,
+    shard_count: usize,
+    scratch: &Path,
+    cell: u32,
+    row: &MaterializedIvfRow,
+) -> Result<(), BuildError> {
+    let shard = packed_cell_shard(cell, shard_count) as u32;
+    if completed_shards.contains(&shard) {
+        return Ok(());
+    }
+    spill_row_to_cell(spills, added, scratch, cell, row)
+}
+
+fn drain_checkpoint_source(entry: &SuperfileEntry) -> DrainCheckpointSource {
+    DrainCheckpointSource {
+        superfile_id: entry.superfile_id.to_string(),
+        uri: entry.uri.0.to_string(),
+        birth_version: entry.birth_version,
+    }
+}
+
+fn drain_epoch_id(
+    options_hash: &str,
+    sources: &[DrainCheckpointSource],
+    batch_layout: &[Vec<u64>],
+    shard_count: usize,
+) -> String {
+    let mut hasher = Blake3Hasher::new();
+    hasher.update(&DRAIN_CHECKPOINT_SCHEMA.to_le_bytes());
+    hasher.update(&(shard_count as u64).to_le_bytes());
+    hasher.update(options_hash.as_bytes());
+    for source in sources {
+        hasher.update(source.superfile_id.as_bytes());
+        hasher.update(source.uri.as_bytes());
+        hasher.update(&source.birth_version.to_le_bytes());
+    }
+    for batch in batch_layout {
+        hasher.update(&(batch.len() as u64).to_le_bytes());
+        for version in batch {
+            hasher.update(&version.to_le_bytes());
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn drain_scratch_dir(epoch_id: &str) -> PathBuf {
+    env::temp_dir().join("infino-drain").join(epoch_id)
+}
+
+fn drain_local_checkpoint_path(scratch: &Path) -> PathBuf {
+    scratch.join(DRAIN_LOCAL_CHECKPOINT_FILE)
+}
+
+fn load_drain_local_checkpoint(
+    scratch: &Path,
+    epoch_id: &str,
+) -> Result<Option<DrainLocalCheckpoint>, BuildError> {
+    let path = drain_local_checkpoint_path(scratch);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(BuildError::Store(format!(
+                "drain local checkpoint read {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let checkpoint: DrainLocalCheckpoint = serde_json::from_slice(&bytes)
+        .map_err(|error| BuildError::Store(format!("drain local checkpoint decode: {error}")))?;
+    if checkpoint.schema != DRAIN_CHECKPOINT_SCHEMA || checkpoint.epoch_id != epoch_id {
+        return Err(BuildError::Store(format!(
+            "drain local checkpoint at {} is incompatible (schema {}, epoch {})",
+            path.display(),
+            checkpoint.schema,
+            checkpoint.epoch_id
+        )));
+    }
+    Ok(Some(checkpoint))
+}
+
+fn save_drain_local_checkpoint(
+    scratch: &Path,
+    checkpoint: &DrainLocalCheckpoint,
+) -> Result<(), BuildError> {
+    fs::create_dir_all(scratch)
+        .map_err(|error| BuildError::Store(format!("drain scratch create: {error}")))?;
+    let bytes = serde_json::to_vec(checkpoint)
+        .map_err(|error| BuildError::Store(format!("drain local checkpoint encode: {error}")))?;
+    let final_path = drain_local_checkpoint_path(scratch);
+    let temp_path = scratch.join(format!("{DRAIN_LOCAL_CHECKPOINT_FILE}.tmp"));
+    {
+        let mut file = File::create(&temp_path)
+            .map_err(|error| BuildError::Store(format!("drain checkpoint create: {error}")))?;
+        file.write_all(&bytes)
+            .map_err(|error| BuildError::Store(format!("drain checkpoint write: {error}")))?;
+        file.sync_all()
+            .map_err(|error| BuildError::Store(format!("drain checkpoint fsync: {error}")))?;
+    }
+    fs::rename(&temp_path, &final_path)
+        .map_err(|error| BuildError::Store(format!("drain checkpoint rename: {error}")))?;
+    File::open(scratch)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| BuildError::Store(format!("drain checkpoint dir fsync: {error}")))?;
+    Ok(())
+}
+
+async fn load_drain_remote_checkpoint(
+    inner: &SupertableInner,
+) -> Result<Option<DrainRemoteState>, BuildError> {
+    let manifest = inner.manifest.load_full();
+    let Some((uri, hash)) = manifest.slow_vector_state_blob() else {
+        return Ok(None);
+    };
+    let storage = inner
+        .options
+        .storage
+        .as_ref()
+        .ok_or_else(|| BuildError::Store("drain checkpoint requires storage".into()))?;
+    let state = slow_vector_state::load_full_state(storage.as_ref(), uri, &hash)
+        .await
+        .map_err(|error| BuildError::Store(format!("drain slow-CAS load: {error}")))?;
+    let Some(pending) = state.pending_drain else {
+        return Ok(None);
+    };
+    let checkpoint: DrainRemoteCheckpoint = serde_json::from_slice(&pending.metadata)
+        .map_err(|error| BuildError::Store(format!("drain remote checkpoint decode: {error}")))?;
+    if checkpoint.schema != DRAIN_CHECKPOINT_SCHEMA {
+        return Err(BuildError::Store(format!(
+            "drain remote checkpoint schema {} != supported {}",
+            checkpoint.schema, DRAIN_CHECKPOINT_SCHEMA
+        )));
+    }
+    if pending.entries.len() != checkpoint.completed_shards.len() {
+        return Err(BuildError::Store(format!(
+            "drain slow-CAS has {} pending entries for {} completed shards",
+            pending.entries.len(),
+            checkpoint.completed_shards.len()
+        )));
+    }
+    let entry_ids: HashSet<String> = pending
+        .entries
+        .iter()
+        .map(|entry| entry.superfile_id.to_string())
+        .collect();
+    if checkpoint
+        .completed_shards
+        .iter()
+        .any(|shard| !entry_ids.contains(&shard.superfile_id))
+    {
+        return Err(BuildError::Store(
+            "drain slow-CAS checkpoint references a missing pending entry".into(),
+        ));
+    }
+    Ok(Some(DrainRemoteState {
+        checkpoint,
+        entries: pending.entries,
+    }))
+}
+
+async fn save_drain_remote_checkpoint(
+    inner: &SupertableInner,
+    state: &mut DrainRemoteState,
+) -> Result<(), BuildError> {
+    let metadata = serde_json::to_vec(&state.checkpoint)
+        .map_err(|error| BuildError::Store(format!("drain checkpoint encode: {error}")))?;
+    stamp_slow_vector_state(
+        inner,
+        Some(slow_vector_state::PendingDrainState {
+            metadata,
+            entries: state.entries.clone(),
+        }),
+    )
+    .await
+}
+
+async fn create_drain_remote_checkpoint(
+    inner: &SupertableInner,
+    checkpoint: DrainRemoteCheckpoint,
+) -> Result<DrainRemoteState, BuildError> {
+    let mut state = DrainRemoteState {
+        checkpoint,
+        entries: Vec::new(),
+    };
+    save_drain_remote_checkpoint(inner, &mut state).await?;
+    Ok(state)
+}
+
+fn make_drain_batches(
+    sources: Vec<Arc<SuperfileEntry>>,
+    budget: usize,
+) -> Vec<(Vec<u64>, Vec<Arc<SuperfileEntry>>)> {
+    let mut by_version = std::collections::BTreeMap::<u64, Vec<Arc<SuperfileEntry>>>::new();
+    for source in sources {
+        by_version
+            .entry(source.birth_version)
+            .or_default()
+            .push(source);
+    }
+    let mut batches = Vec::new();
+    let mut versions = Vec::new();
+    let mut superfiles = Vec::new();
+    for (version, mut version_superfiles) in by_version {
+        if !superfiles.is_empty()
+            && superfiles.len().saturating_add(version_superfiles.len()) > budget
+        {
+            batches.push((mem::take(&mut versions), mem::take(&mut superfiles)));
+        }
+        versions.push(version);
+        superfiles.append(&mut version_superfiles);
+        if superfiles.len() >= budget {
+            batches.push((mem::take(&mut versions), mem::take(&mut superfiles)));
+        }
+    }
+    if !superfiles.is_empty() {
+        batches.push((versions, superfiles));
+    }
+    batches
+}
+
+fn drain_batch_layout(batches: &[(Vec<u64>, Vec<Arc<SuperfileEntry>>)]) -> Vec<Vec<u64>> {
+    batches
+        .iter()
+        .map(|(versions, _)| versions.clone())
+        .collect()
+}
+
 /// Drain replica factor at or below which no boundary replicas are added.
 const DEFAULT_DRAIN_REPLICA_TARGET_FACTOR: f32 = 1.0;
 
@@ -2317,68 +2678,148 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         return Ok(());
     }
 
-    // INCREMENTAL: skip user commits already consumed into cells. The hidden
-    // manifest's `drained_ranges` records drained user `birth_version`s — and
-    // because the manifest-pointer CAS serializes every commit (across all
-    // writers/hosts) into one gap-free version sequence, that's the only total
-    // order safe to filter on under concurrent ingest. Group the undrained
-    // superfiles by birth_version: a commit is atomic and indivisible, so the
-    // version is the unit a batch must never split.
-    let drained = hidden_inner.manifest.load_full().get_drained_ranges();
-    let mut by_version: std::collections::BTreeMap<u64, Vec<Arc<SuperfileEntry>>> =
-        std::collections::BTreeMap::new();
-    for sf in &sources {
-        if drained.contains(sf.birth_version) {
-            continue;
-        }
-        by_version
-            .entry(sf.birth_version)
-            .or_default()
-            .push(Arc::clone(sf));
-    }
-    if by_version.is_empty() {
-        eprintln!(
-            "[supertable drain] nothing to drain: all {} user superfile(s) already drained",
-            sources.len()
-        );
-        return Ok(());
-    }
-
-    // Version-aligned BOUNDED batches: accumulate WHOLE versions until the
-    // superfile budget is reached, then cut at the version boundary — so the
-    // watermark only ever advances on a commit boundary (never mid-commit,
-    // which would risk re-drain or exclusion on crash). `drain_batch_superfiles`
-    // is thus a TARGET, not a hard cap: a single commit larger than the budget
-    // becomes its own oversized batch. `-1` → everything in one batch.
-    let budget = if batch_cfg < 0 {
-        usize::MAX
-    } else {
-        (batch_cfg as usize).max(1)
-    };
-    let mut batches: Vec<(Vec<u64>, Vec<Arc<SuperfileEntry>>)> = Vec::new();
-    let mut cur_v: Vec<u64> = Vec::new();
-    let mut cur_sf: Vec<Arc<SuperfileEntry>> = Vec::new();
-    for (version, sfs) in by_version {
-        if !cur_sf.is_empty() && cur_sf.len().saturating_add(sfs.len()) > budget {
-            batches.push((std::mem::take(&mut cur_v), std::mem::take(&mut cur_sf)));
-        }
-        cur_v.push(version);
-        cur_sf.extend(sfs);
-        if cur_sf.len() >= budget {
-            batches.push((std::mem::take(&mut cur_v), std::mem::take(&mut cur_sf)));
-        }
-    }
-    if !cur_sf.is_empty() {
-        batches.push((cur_v, cur_sf));
-    }
-
-    let store = user_inner.options.store.clone();
-    let storage_opt = user_inner.options.storage.clone();
     let storage = hidden_inner
         .options
         .storage
         .clone()
         .ok_or_else(|| BuildError::Store("hidden drain requires storage".into()))?;
+    let shard_count = packed_cell_shard_count(&hidden_inner.options);
+    let budget = if batch_cfg < 0 {
+        usize::MAX
+    } else {
+        (batch_cfg as usize).max(1)
+    };
+
+    // A remote checkpoint pins the exact source epoch. New user commits can
+    // land while it is in progress; they are intentionally left for the next
+    // drain instead of invalidating or silently replacing this epoch.
+    let drained = hidden_inner.manifest.load_full().get_drained_ranges();
+    let user_strategy = user_manifest.get_partition_strategy();
+    let current_options_hash =
+        options_hash::compute_options_hash(user_inner.options.as_ref(), &user_strategy).to_hex();
+    let (batches, mut remote_state) = if let Some(remote_state) =
+        load_drain_remote_checkpoint(&hidden_inner).await?
+    {
+        if remote_state.checkpoint.shard_count != shard_count {
+            return Err(BuildError::Store(format!(
+                "drain checkpoint shard count {} != configured writer width {shard_count}",
+                remote_state.checkpoint.shard_count
+            )));
+        }
+        if remote_state.checkpoint.options_hash != current_options_hash {
+            return Err(BuildError::Store(format!(
+                "drain checkpoint options hash {} != current {}",
+                remote_state.checkpoint.options_hash, current_options_hash
+            )));
+        }
+        let n_drained = remote_state
+            .checkpoint
+            .sources
+            .iter()
+            .filter(|source| drained.contains(source.birth_version))
+            .count();
+        if n_drained == remote_state.checkpoint.sources.len() {
+            let scratch = drain_scratch_dir(&remote_state.checkpoint.epoch_id);
+            if let Err(error) = fs::remove_dir_all(&scratch)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                tracing::warn!("drain local checkpoint cleanup failed: {error}");
+            }
+            refresh_slow_vector_state(&hidden_inner).await?;
+            schedule_background_storage_reclaim(Arc::clone(&hidden_inner));
+            return Ok(());
+        }
+        if n_drained != 0 {
+            return Err(BuildError::Store(
+                "drain checkpoint source versions are only partially committed".into(),
+            ));
+        }
+
+        let source_by_id: HashMap<String, Arc<SuperfileEntry>> = sources
+            .iter()
+            .map(|entry| (entry.superfile_id.to_string(), Arc::clone(entry)))
+            .collect();
+        let mut selected = Vec::with_capacity(remote_state.checkpoint.sources.len());
+        for source in &remote_state.checkpoint.sources {
+            let entry = source_by_id.get(&source.superfile_id).ok_or_else(|| {
+                BuildError::Store(format!(
+                    "drain checkpoint source {} is missing from the user manifest",
+                    source.superfile_id
+                ))
+            })?;
+            if entry.uri.0.to_string() != source.uri || entry.birth_version != source.birth_version
+            {
+                return Err(BuildError::Store(format!(
+                    "drain checkpoint source {} no longer matches the user manifest",
+                    source.superfile_id
+                )));
+            }
+            selected.push(Arc::clone(entry));
+        }
+        let batches = make_drain_batches(selected, budget);
+        let batch_layout = drain_batch_layout(&batches);
+        if batch_layout != remote_state.checkpoint.batch_layout {
+            return Err(BuildError::Store(
+                "drain checkpoint batch layout differs from current configuration".into(),
+            ));
+        }
+        let epoch_id = drain_epoch_id(
+            &current_options_hash,
+            &remote_state.checkpoint.sources,
+            &batch_layout,
+            shard_count,
+        );
+        if epoch_id != remote_state.checkpoint.epoch_id {
+            return Err(BuildError::Store(
+                "drain checkpoint epoch hash is invalid".into(),
+            ));
+        }
+        (batches, remote_state)
+    } else {
+        let mut selected: Vec<Arc<SuperfileEntry>> = sources
+            .iter()
+            .filter(|entry| !drained.contains(entry.birth_version))
+            .cloned()
+            .collect();
+        if selected.is_empty() {
+            eprintln!(
+                "[supertable drain] nothing to drain: all {} user superfile(s) already drained",
+                sources.len()
+            );
+            return Ok(());
+        }
+        selected.sort_unstable_by(|left, right| {
+            left.birth_version
+                .cmp(&right.birth_version)
+                .then_with(|| left.superfile_id.cmp(&right.superfile_id))
+        });
+        let source_refs: Vec<DrainCheckpointSource> = selected
+            .iter()
+            .map(|entry| drain_checkpoint_source(entry))
+            .collect();
+        let batches = make_drain_batches(selected, budget);
+        let batch_layout = drain_batch_layout(&batches);
+        let epoch_id = drain_epoch_id(
+            &current_options_hash,
+            &source_refs,
+            &batch_layout,
+            shard_count,
+        );
+        let checkpoint = DrainRemoteCheckpoint {
+            schema: DRAIN_CHECKPOINT_SCHEMA,
+            epoch_id,
+            options_hash: current_options_hash,
+            sources: source_refs,
+            batch_layout,
+            shard_count,
+            completed_shards: Vec::new(),
+        };
+        let remote_state = create_drain_remote_checkpoint(&hidden_inner, checkpoint).await?;
+        (batches, remote_state)
+    };
+
+    let store = user_inner.options.store.clone();
+    let storage_opt = user_inner.options.storage.clone();
     let metric = hidden_inner
         .options
         .vector_columns
@@ -2402,12 +2843,111 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // superfiles are materialized at once) from the published layout: every
     // batch spills rows per cell to scratch, then packs cell IVFs into ≤N
     // shard objects after the last batch.
-    let drain_scratch =
-        tempdir().map_err(|e| BuildError::Store(format!("drain spill scratch dir: {e}")))?;
-    let mut cell_spills: HashMap<u32, MaterializedRowSpillWriter> = HashMap::new();
-    let mut added_per_cell: HashMap<u32, u32> = HashMap::new();
+    let drain_scratch = drain_scratch_dir(&remote_state.checkpoint.epoch_id);
+    fs::create_dir_all(&drain_scratch)
+        .map_err(|error| BuildError::Store(format!("drain scratch create: {error}")))?;
+    let mut local_checkpoint =
+        load_drain_local_checkpoint(&drain_scratch, &remote_state.checkpoint.epoch_id)?
+            .unwrap_or_else(|| DrainLocalCheckpoint::new(remote_state.checkpoint.epoch_id.clone()));
+    if local_checkpoint.batches_done > n_batches {
+        return Err(BuildError::Store(format!(
+            "drain local checkpoint completed {} of only {n_batches} batches",
+            local_checkpoint.batches_done
+        )));
+    }
+
+    let mut completed_shards = HashSet::new();
+    let mut new_entries = Vec::new();
+    let mut added_per_cell = local_checkpoint.added_per_cell.clone();
+    let pending_entry_by_id: HashMap<String, Arc<SuperfileEntry>> = remote_state
+        .entries
+        .iter()
+        .map(|entry| (entry.superfile_id.to_string(), Arc::clone(entry)))
+        .collect();
+    for remote_shard in &remote_state.checkpoint.completed_shards {
+        if !completed_shards.insert(remote_shard.shard_id) {
+            return Err(BuildError::Store(format!(
+                "drain checkpoint repeats shard {}",
+                remote_shard.shard_id
+            )));
+        }
+        let entry = pending_entry_by_id
+            .get(&remote_shard.superfile_id)
+            .cloned()
+            .ok_or_else(|| {
+                BuildError::Store(format!(
+                    "drain checkpoint shard {} entry {} is missing",
+                    remote_shard.shard_id, remote_shard.superfile_id
+                ))
+            })?;
+        if entry.partition_hint != Some(remote_shard.shard_id) {
+            return Err(BuildError::Store(format!(
+                "drain checkpoint shard {} entry has partition hint {:?}",
+                remote_shard.shard_id, entry.partition_hint
+            )));
+        }
+        storage
+            .head(&superfile_storage_path(&entry.uri))
+            .await
+            .map_err(|error| {
+                BuildError::Store(format!(
+                    "drain checkpoint shard {} object is unavailable: {error}",
+                    remote_shard.shard_id
+                ))
+            })?;
+        for &(cell, count) in &remote_shard.cell_counts {
+            match added_per_cell.insert(cell, count) {
+                Some(existing) if existing != count => {
+                    return Err(BuildError::Store(format!(
+                        "drain checkpoint cell {cell} count {count} != local count {existing}"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        new_entries.push(entry);
+    }
+
+    let mut cell_spills = HashMap::new();
+    for (&cell, spill) in &local_checkpoint.spills {
+        let cell_shard = packed_cell_shard(cell, shard_count) as u32;
+        if completed_shards.contains(&cell_shard) {
+            continue;
+        }
+        let rerank_codec = RerankCodec::from_codec_id(spill.rerank_codec_id).ok_or_else(|| {
+            BuildError::Store(format!(
+                "cell {cell}: checkpoint has unknown codec id {}",
+                spill.rerank_codec_id
+            ))
+        })?;
+        cell_spills.insert(
+            cell,
+            MaterializedRowSpillWriter::resume(
+                &drain_scratch,
+                cell,
+                MaterializedRowSpillState {
+                    n_rows: spill.n_rows,
+                    n_quants: spill.n_quants,
+                    dim: spill.dim,
+                    rabitq_len: spill.rabitq_len,
+                    rerank_codec,
+                },
+            )?,
+        );
+    }
+    let mut packed_cells = Vec::new();
+    for (&cell, state) in &local_checkpoint.built_cells {
+        let cell_shard = packed_cell_shard(cell, shard_count) as u32;
+        if completed_shards.contains(&cell_shard) {
+            continue;
+        }
+        packed_cells.push(restore_spilled_packed_cell(&drain_scratch, cell, state)?);
+    }
 
     for (batch_idx, (_, batch_sources)) in batches.iter().enumerate() {
+        if batch_idx < local_checkpoint.batches_done {
+            continue;
+        }
         let batch_t0 = std::time::Instant::now();
         // Zero the I/O timeline so the readout below reflects only this batch's
         // superfile reads (INFINO_IO_TIMELINE; a no-op otherwise).
@@ -2533,7 +3073,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
 
         let all_rows: Vec<MaterializedIvfRow> = row_sets.into_iter().flatten().collect();
         let n_batch_rows = all_rows.len();
-        let scratch = drain_scratch.path();
+        let scratch = drain_scratch.as_path();
         // Batch boundary: reset spill writers' Arc-pointer dedup.
         for writer in cell_spills.values_mut() {
             writer.begin_batch();
@@ -2542,9 +3082,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         let replica_extra_budget = drain_replica_extra_budget(all_rows.len(), replica_target);
         if replica_extra_budget == 0 && assign_skip {
             for row in &all_rows {
-                spill_row_to_cell(
+                spill_unfinished_shard_row(
                     &mut cell_spills,
                     &mut added_per_cell,
+                    &completed_shards,
+                    shard_count,
                     scratch,
                     row.cluster,
                     row,
@@ -2583,24 +3125,52 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             replica_candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
             // Boundary replicas: append the same row bytes to neighbor cells.
             for (row_idx, cell, _) in replica_candidates.into_iter().take(replica_extra_budget) {
-                spill_row_to_cell(
+                spill_unfinished_shard_row(
                     &mut cell_spills,
                     &mut added_per_cell,
+                    &completed_shards,
+                    shard_count,
                     scratch,
                     cell,
                     &all_rows[row_idx],
                 )?;
             }
             for (row, assignment) in all_rows.iter().zip(&assignments) {
-                spill_row_to_cell(
+                spill_unfinished_shard_row(
                     &mut cell_spills,
                     &mut added_per_cell,
+                    &completed_shards,
+                    shard_count,
                     scratch,
                     assignment.primary,
                     row,
                 )?;
             }
         }
+        let mut checkpointed_spills = HashMap::with_capacity(cell_spills.len());
+        for (&cell, writer) in &mut cell_spills {
+            let state = writer.checkpoint().map_err(BuildError::from)?;
+            checkpointed_spills.insert(
+                cell,
+                DrainLocalSpill {
+                    n_rows: state.n_rows,
+                    n_quants: state.n_quants,
+                    dim: state.dim,
+                    rabitq_len: state.rabitq_len,
+                    rerank_codec_id: state.rerank_codec.codec_id(),
+                },
+            );
+        }
+        local_checkpoint.batches_done = batch_idx + 1;
+        local_checkpoint.spills = checkpointed_spills;
+        local_checkpoint.added_per_cell = added_per_cell.clone();
+        save_drain_local_checkpoint(&drain_scratch, &local_checkpoint)?;
+        #[cfg(test)]
+        maybe_fail_drain_for_test(
+            &remote_state.checkpoint.epoch_id,
+            DrainTestFailurePhase::AfterBatch,
+            local_checkpoint.batches_done,
+        )?;
         let t_spill = batch_t0.elapsed().as_secs_f64() * 1e3;
         eprintln!(
             "[supertable drain] batch {}/{} ({} sf, kmeans): materialize {:.1}ms + {} {:.1}ms, {} batch row(s) -> {} cell spill(s)",
@@ -2627,70 +3197,96 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // The previous implementation grouped and published each wave
     // independently, multiplying the object count by the number of waves
     // (`waves × workers`) and violating the packed-drain contract at scale.
-    if !cell_spills.is_empty() {
+    {
         let build_t0 = time::Instant::now();
-        let scratch = drain_scratch.path();
-        let mut spilled: Vec<(u32, SpilledCellRows)> = cell_spills
-            .into_iter()
-            .map(|(cell, writer)| writer.finish().map(|s| (cell, s)).map_err(BuildError::from))
-            .collect::<Result<Vec<_>, BuildError>>()?;
-        spilled.sort_unstable_by_key(|(cell, _)| *cell);
-        let n_cells_total = spilled.len();
-        let total_rows: u64 = spilled.iter().map(|(_, s)| s.n_rows() as u64).sum();
+        let scratch = drain_scratch.as_path();
+        let n_cells_total = added_per_cell.len();
+        let total_rows: u64 = added_per_cell.values().map(|count| u64::from(*count)).sum();
         let vc = hidden_inner
             .options
             .vector_columns
             .first()
             .cloned()
             .ok_or_else(|| BuildError::Store("drain pack requires a vector column".into()))?;
-
-        crate::superfile::vector::builder::build_phase_timers::reset();
-        let mut packed_cells: Vec<SpilledPackedCell> = Vec::with_capacity(n_cells_total);
-        let mut wave: Vec<(u32, SpilledCellRows)> = Vec::new();
-        let mut wave_bytes: u64 = 0;
         let mut n_waves = 0usize;
-        let mut cells_built = 0usize;
-        let mut spilled_iter = spilled.into_iter().peekable();
-        while let Some((cell, spill)) = spilled_iter.next() {
-            wave_bytes += spill.row_bytes();
-            wave.push((cell, spill));
-            let flush = wave_bytes >= DRAIN_BUILD_GROUP_BYTES || spilled_iter.peek().is_none();
-            if !flush {
-                continue;
-            }
-            n_waves += 1;
-            let cells_rows: Vec<(u32, Vec<MaterializedIvfRow>)> = wave
-                .iter()
-                .map(|(cell, spill)| {
-                    read_spilled_cell_rows(spill)
-                        .map(|rows| (*cell, rows))
-                        .map_err(BuildError::from)
-                })
+        let mut cells_built = packed_cells.len();
+
+        if !cell_spills.is_empty() {
+            let mut spilled: Vec<(u32, SpilledCellRows)> = cell_spills
+                .into_iter()
+                .map(|(cell, writer)| writer.finish().map(|s| (cell, s)).map_err(BuildError::from))
                 .collect::<Result<Vec<_>, BuildError>>()?;
-            let built_wave: Vec<SpilledPackedCell> =
-                hidden_inner.options.writer_pool.install(|| {
-                    cells_rows
-                        .into_par_iter()
-                        .filter(|(_, rows)| !rows.is_empty())
-                        .map(|(cell_id, rows)| {
-                            let packed = drain_pack_materialized_cell(cell_id, rows, &vc)?;
-                            let (cell_id, subsection, stable_ids) = packed.into_hidden_triple();
-                            spill_packed_cell(scratch, cell_id, subsection, &stable_ids)
-                        })
-                        .collect::<Result<Vec<_>, BuildError>>()
-                })?;
-            cells_built += built_wave.len();
-            packed_cells.extend(built_wave);
-            for (_, spill) in wave.drain(..) {
-                spill.remove_files();
+            spilled.sort_unstable_by_key(|(cell, _)| *cell);
+
+            crate::superfile::vector::builder::build_phase_timers::reset();
+            let mut wave: Vec<(u32, SpilledCellRows)> = Vec::new();
+            let mut wave_bytes: u64 = 0;
+            let mut spilled_iter = spilled.into_iter().peekable();
+            while let Some((cell, spill)) = spilled_iter.next() {
+                wave_bytes += spill.row_bytes();
+                wave.push((cell, spill));
+                let flush = wave_bytes >= DRAIN_BUILD_GROUP_BYTES || spilled_iter.peek().is_none();
+                if !flush {
+                    continue;
+                }
+                n_waves += 1;
+                let cells_rows: Vec<(u32, Vec<MaterializedIvfRow>)> = wave
+                    .iter()
+                    .map(|(cell, spill)| {
+                        read_spilled_cell_rows(spill)
+                            .map(|rows| (*cell, rows))
+                            .map_err(BuildError::from)
+                    })
+                    .collect::<Result<Vec<_>, BuildError>>()?;
+                let built_wave: Vec<SpilledPackedCell> =
+                    hidden_inner.options.writer_pool.install(|| {
+                        cells_rows
+                            .into_par_iter()
+                            .filter(|(_, rows)| !rows.is_empty())
+                            .map(|(cell_id, rows)| {
+                                let packed = drain_pack_materialized_cell(cell_id, rows, &vc)?;
+                                let (cell_id, subsection, stable_ids) = packed.into_hidden_triple();
+                                spill_packed_cell(scratch, cell_id, subsection, &stable_ids)
+                            })
+                            .collect::<Result<Vec<_>, BuildError>>()
+                    })?;
+                cells_built += built_wave.len();
+                for cell in built_wave {
+                    local_checkpoint.spills.remove(&cell.cell_id);
+                    local_checkpoint.built_cells.insert(
+                        cell.cell_id,
+                        DrainLocalCell {
+                            n_docs: cell.n_docs,
+                            subsection_len: cell.subsection_len,
+                            rerank_codec_id: cell.rerank_codec.codec_id(),
+                        },
+                    );
+                    packed_cells.push(cell);
+                }
+                for (_, spill) in wave.drain(..) {
+                    spill.remove_files();
+                }
+                save_drain_local_checkpoint(&drain_scratch, &local_checkpoint)?;
+                eprintln!(
+                    "[supertable drain] pack wave {n_waves}: {cells_built}/{n_cells_total} cell-IVFs built to scratch"
+                );
+                wave_bytes = 0;
             }
-            eprintln!(
-                "[supertable drain] pack wave {n_waves}: {cells_built}/{n_cells_total} cell-IVFs built to scratch"
-            );
-            wave_bytes = 0;
         }
 
-        let n_shards = packed_cell_shard_count(&hidden_inner.options);
+        let n_shards = shard_count;
+        let mut cell_counts_by_shard: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+        for (&cell, &count) in &added_per_cell {
+            let shard = packed_cell_shard(cell, n_shards) as u32;
+            cell_counts_by_shard
+                .entry(shard)
+                .or_default()
+                .push((cell, count));
+        }
+        for counts in cell_counts_by_shard.values_mut() {
+            counts.sort_unstable_by_key(|(cell, _)| *cell);
+        }
+        let expected_shards = cell_counts_by_shard.len();
         let packed_cells: Vec<(u32, SpilledPackedCell)> = packed_cells
             .into_iter()
             .map(|cell| (cell.cell_id, cell))
@@ -2713,18 +3309,93 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             )));
         }
         let publish = collect_prepared_superfiles(&hidden_inner, prepared_shards)?;
-        let mut pending_writes = publish.pending_storage_writes;
-        let mut pending_replaces: Vec<(SuperfileUri, Bytes)> = Vec::new();
-        write_superfile_list_with_threshold(
-            &storage,
-            &hidden_inner.options,
-            DRAIN_PUT_MULTIPART_THRESHOLD_BYTES,
-            &mut pending_writes,
-            &mut pending_replaces,
-        )
-        .await
-        .map_err(|e| BuildError::Store(e.to_string()))?;
-        let new_entries = publish.new_entries;
+        if !publish.to_remove.is_empty() {
+            return Err(BuildError::Store(
+                "drain prepared removals while publishing new worker shards".into(),
+            ));
+        }
+        let entry_by_uri: HashMap<SuperfileUri, Arc<SuperfileEntry>> = publish
+            .new_entries
+            .iter()
+            .map(|entry| (entry.uri, Arc::clone(entry)))
+            .collect();
+        let pending_cache_inserts = publish.pending_cache_inserts;
+        let put_futures = publish
+            .pending_storage_writes
+            .into_iter()
+            .map(|(uri, bytes)| {
+                let storage = Arc::clone(&storage);
+                async move {
+                    put_new_superfile_bytes(
+                        &storage,
+                        DRAIN_PUT_MULTIPART_THRESHOLD_BYTES,
+                        uri,
+                        bytes,
+                    )
+                    .await
+                    .map(|()| uri)
+                    .map_err(|error| BuildError::Store(error.to_string()))
+                }
+            });
+        let mut uploads = stream::iter(put_futures).buffer_unordered(commit_write_concurrency());
+        while let Some(uploaded) = uploads.next().await {
+            let uri = uploaded?;
+            let entry = entry_by_uri.get(&uri).cloned().ok_or_else(|| {
+                BuildError::Store(format!("uploaded drain shard {} has no entry", uri.0))
+            })?;
+            let shard_id = entry.partition_hint.ok_or_else(|| {
+                BuildError::Store(format!(
+                    "uploaded drain shard {} has no partition hint",
+                    uri.0
+                ))
+            })?;
+            let cell_counts = cell_counts_by_shard
+                .get(&shard_id)
+                .cloned()
+                .ok_or_else(|| {
+                    BuildError::Store(format!(
+                        "uploaded drain shard {shard_id} has no cell counts"
+                    ))
+                })?;
+            remote_state.entries.push(Arc::clone(&entry));
+            remote_state
+                .checkpoint
+                .completed_shards
+                .push(DrainRemoteShard {
+                    shard_id,
+                    superfile_id: entry.superfile_id.to_string(),
+                    cell_counts: cell_counts.clone(),
+                });
+            remote_state
+                .checkpoint
+                .completed_shards
+                .sort_unstable_by_key(|shard| shard.shard_id);
+            save_drain_remote_checkpoint(&hidden_inner, &mut remote_state).await?;
+            #[cfg(test)]
+            maybe_fail_drain_for_test(
+                &remote_state.checkpoint.epoch_id,
+                DrainTestFailurePhase::AfterShard,
+                remote_state.checkpoint.completed_shards.len(),
+            )?;
+            completed_shards.insert(shard_id);
+            new_entries.push(entry);
+
+            for (cell, _) in cell_counts {
+                if let Some(state) = local_checkpoint.built_cells.remove(&cell)
+                    && let Ok(packed) = restore_spilled_packed_cell(&drain_scratch, cell, &state)
+                {
+                    remove_spilled_packed_cell(&packed);
+                }
+            }
+            save_drain_local_checkpoint(&drain_scratch, &local_checkpoint)?;
+        }
+        if new_entries.len() != expected_shards {
+            return Err(BuildError::Store(format!(
+                "drain has {} completed shards but expected {expected_shards}",
+                new_entries.len()
+            )));
+        }
+        let n_shard_files = new_entries.len();
 
         let mut cell_updates: HashMap<u32, u32> = HashMap::new();
         for (cell, added) in &added_per_cell {
@@ -2767,6 +3438,16 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         .await
         .map_err(|e| BuildError::Store(e.to_string()))?;
         hidden_inner.manifest.store(Arc::new(new_manifest));
+        if !pending_cache_inserts.is_empty()
+            && let Some(cache) = hidden_inner.options.disk_cache.as_ref()
+        {
+            warm_cache_after_commit(&hidden_inner, cache, pending_cache_inserts);
+        }
+        if let Err(error) = fs::remove_dir_all(&drain_scratch)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!("drain local checkpoint cleanup failed: {error}");
+        }
         eprintln!(
             "[supertable drain] cell build: {} row(s), {} cell(s) -> {} packed shard superfile(s) for {} worker(s) in {} build wave(s), {:.1}ms",
             total_rows,
@@ -2958,8 +3639,8 @@ struct SpilledPackedCell {
     n_docs: u32,
     rerank_codec: RerankCodec,
     subsection_len: u64,
-    subsection_path: TempPath,
-    stable_ids_path: TempPath,
+    subsection_path: PathBuf,
+    stable_ids_path: PathBuf,
 }
 
 impl MultiCellSubsectionSource for SpilledPackedCell {
@@ -3006,38 +3687,98 @@ fn spill_packed_cell(
         )));
     }
 
-    let mut subsection_file = NamedTempFile::new_in(scratch)
-        .map_err(|error| BuildError::Store(format!("cell subsection spill create: {error}")))?;
-    subsection_file
-        .write_all(&subsection.bytes)
-        .map_err(|error| BuildError::Store(format!("cell subsection spill write: {error}")))?;
-    subsection_file
-        .flush()
-        .map_err(|error| BuildError::Store(format!("cell subsection spill flush: {error}")))?;
+    let subsection_path = scratch.join(format!("cell-{cell_id}.ivf"));
+    let subsection_temp = scratch.join(format!("cell-{cell_id}.ivf.tmp"));
+    {
+        let mut subsection_file = File::create(&subsection_temp)
+            .map_err(|error| BuildError::Store(format!("cell subsection create: {error}")))?;
+        subsection_file
+            .write_all(&subsection.bytes)
+            .map_err(|error| BuildError::Store(format!("cell subsection write: {error}")))?;
+        subsection_file
+            .sync_all()
+            .map_err(|error| BuildError::Store(format!("cell subsection fsync: {error}")))?;
+    }
+    fs::rename(&subsection_temp, &subsection_path)
+        .map_err(|error| BuildError::Store(format!("cell subsection rename: {error}")))?;
     let subsection_len = subsection.bytes.len() as u64;
 
-    let mut ids_file = NamedTempFile::new_in(scratch)
-        .map_err(|error| BuildError::Store(format!("cell ids spill create: {error}")))?;
+    let stable_ids_path = scratch.join(format!("cell-{cell_id}.ids"));
+    let stable_ids_temp = scratch.join(format!("cell-{cell_id}.ids.tmp"));
     {
-        let mut writer = BufWriter::new(ids_file.as_file_mut());
+        let ids_file = File::create(&stable_ids_temp)
+            .map_err(|error| BuildError::Store(format!("cell ids create: {error}")))?;
+        let mut writer = BufWriter::new(ids_file);
         for stable_id in stable_ids {
             writer
                 .write_all(&stable_id.to_le_bytes())
-                .map_err(|error| BuildError::Store(format!("cell ids spill write: {error}")))?;
+                .map_err(|error| BuildError::Store(format!("cell ids write: {error}")))?;
         }
         writer
             .flush()
-            .map_err(|error| BuildError::Store(format!("cell ids spill flush: {error}")))?;
+            .map_err(|error| BuildError::Store(format!("cell ids flush: {error}")))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|error| BuildError::Store(format!("cell ids fsync: {error}")))?;
     }
+    fs::rename(&stable_ids_temp, &stable_ids_path)
+        .map_err(|error| BuildError::Store(format!("cell ids rename: {error}")))?;
 
     Ok(SpilledPackedCell {
         cell_id,
         n_docs: subsection.n_docs,
         rerank_codec: subsection.rerank_codec,
         subsection_len,
-        subsection_path: subsection_file.into_temp_path(),
-        stable_ids_path: ids_file.into_temp_path(),
+        subsection_path,
+        stable_ids_path,
     })
+}
+
+fn restore_spilled_packed_cell(
+    scratch: &Path,
+    cell_id: u32,
+    state: &DrainLocalCell,
+) -> Result<SpilledPackedCell, BuildError> {
+    let rerank_codec = RerankCodec::from_codec_id(state.rerank_codec_id).ok_or_else(|| {
+        BuildError::Store(format!(
+            "cell {cell_id}: checkpoint has unknown codec id {}",
+            state.rerank_codec_id
+        ))
+    })?;
+    let subsection_path = scratch.join(format!("cell-{cell_id}.ivf"));
+    let stable_ids_path = scratch.join(format!("cell-{cell_id}.ids"));
+    let subsection_size = fs::metadata(&subsection_path)
+        .map_err(|error| BuildError::Store(format!("cell subsection metadata: {error}")))?
+        .len();
+    if subsection_size != state.subsection_len {
+        return Err(BuildError::Store(format!(
+            "cell {cell_id}: checkpointed subsection length {} != file length {subsection_size}",
+            state.subsection_len
+        )));
+    }
+    let ids_size = fs::metadata(&stable_ids_path)
+        .map_err(|error| BuildError::Store(format!("cell ids metadata: {error}")))?
+        .len();
+    let expected_ids_size = u64::from(state.n_docs) * STABLE_ID_BYTES as u64;
+    if ids_size != expected_ids_size {
+        return Err(BuildError::Store(format!(
+            "cell {cell_id}: checkpointed ids length {expected_ids_size} != file length {ids_size}"
+        )));
+    }
+    Ok(SpilledPackedCell {
+        cell_id,
+        n_docs: state.n_docs,
+        rerank_codec,
+        subsection_len: state.subsection_len,
+        subsection_path,
+        stable_ids_path,
+    })
+}
+
+fn remove_spilled_packed_cell(cell: &SpilledPackedCell) {
+    let _ = fs::remove_file(&cell.subsection_path);
+    let _ = fs::remove_file(&cell.stable_ids_path);
 }
 
 fn read_spilled_stable_ids(cell: &SpilledPackedCell) -> Result<Vec<i128>, BuildError> {
@@ -4068,6 +4809,13 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 pub(in crate::supertable) async fn refresh_slow_vector_state(
     inner: &SupertableInner,
 ) -> Result<(), BuildError> {
+    stamp_slow_vector_state(inner, None).await
+}
+
+async fn stamp_slow_vector_state(
+    inner: &SupertableInner,
+    pending_drain: Option<slow_vector_state::PendingDrainState>,
+) -> Result<(), BuildError> {
     let Some(storage) = inner.options.storage.clone() else {
         return Ok(());
     };
@@ -4075,14 +4823,23 @@ pub(in crate::supertable) async fn refresh_slow_vector_state(
     for attempt in 0..max_retries {
         let old = inner.manifest.load_full();
         let entries = old.get_all_superfiles();
-        if entries.is_empty() {
+        if entries.is_empty() && pending_drain.is_none() {
             // Nothing to describe (pre-drain / empty table); the ref is
             // already absent because `update` never carries it forward.
             return Ok(());
         }
-        let (uri, hash) = slow_vector_state::write_state(storage.as_ref(), entries)
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
+        let (uri, hash) = match pending_drain.as_ref() {
+            Some(pending) => {
+                slow_vector_state::write_state_with_pending_drain(
+                    storage.as_ref(),
+                    entries,
+                    pending,
+                )
+                .await
+            }
+            None => slow_vector_state::write_state(storage.as_ref(), entries).await,
+        }
+        .map_err(|e| BuildError::Store(e.to_string()))?;
         if let Some((cur_uri, cur_hash)) = old.slow_vector_state_blob()
             && cur_uri == uri
             && cur_hash == hash
@@ -4330,6 +5087,24 @@ pub async fn write_superfile_list(
     .await
 }
 
+async fn put_new_superfile_bytes(
+    storage: &Arc<dyn StorageProvider>,
+    multipart_threshold: u64,
+    uri: SuperfileUri,
+    bytes: Bytes,
+) -> Result<(), SupertableCommitError> {
+    let path = superfile_storage_path(&uri);
+    let result = if (bytes.len() as u64) >= multipart_threshold {
+        put_superfile_multipart(storage.as_ref(), &path, bytes).await
+    } else {
+        storage.put_atomic(&path, bytes).await.map(|_| ())
+    };
+    match result {
+        Ok(()) | Err(StorageError::PreconditionFailed { .. }) => Ok(()),
+        Err(error) => Err(SupertableCommitError::from(error)),
+    }
+}
+
 async fn write_superfile_list_with_threshold(
     storage: &Arc<dyn StorageProvider>,
     _opts: &Arc<SupertableOptions>,
@@ -4391,17 +5166,9 @@ async fn write_superfile_list_with_threshold(
             let uri = *uri;
             let bytes = bytes.clone();
             async move {
-                let path = superfile_storage_path(&uri);
-                let result = if (bytes.len() as u64) >= multipart_threshold {
-                    put_superfile_multipart(storage.as_ref(), &path, bytes.clone()).await
-                } else {
-                    storage.put_atomic(&path, bytes.clone()).await.map(|_| ())
-                };
-                match result {
-                    Ok(()) => Ok(i),
-                    Err(StorageError::PreconditionFailed { .. }) => Ok(i),
-                    Err(e) => Err(SupertableCommitError::from(e)),
-                }
+                put_new_superfile_bytes(&storage, multipart_threshold, uri, bytes)
+                    .await
+                    .map(|()| i)
             }
         });
 
@@ -4718,7 +5485,10 @@ pub(crate) fn read_vector_layout_from_bytes(bytes: &Bytes) -> VectorLayout {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Instant};
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use arrow_array::{
         Array, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
@@ -4749,6 +5519,236 @@ mod tests {
     const COMMIT_AS_DRAIN_TEST_ROWS: usize = 8;
     /// Boundary test target that permits one extra posting per input row.
     const BOUNDARY_STUB_TARGET_FACTOR: f32 = 2.0;
+
+    #[test]
+    fn drain_local_checkpoint_round_trips_and_rejects_other_epoch() {
+        let directory = TempDir::new().expect("tempdir");
+        let mut checkpoint = DrainLocalCheckpoint::new("epoch-a".into());
+        checkpoint.batches_done = 2;
+        checkpoint.spills.insert(
+            7,
+            DrainLocalSpill {
+                n_rows: 11,
+                n_quants: 3,
+                dim: 16,
+                rabitq_len: 2,
+                rerank_codec_id: RerankCodec::Sq8FixedResidual.codec_id(),
+            },
+        );
+        checkpoint.built_cells.insert(
+            2,
+            DrainLocalCell {
+                n_docs: 9,
+                subsection_len: 1_024,
+                rerank_codec_id: RerankCodec::Sq8FixedResidual.codec_id(),
+            },
+        );
+        checkpoint.added_per_cell.insert(2, 9);
+        checkpoint.added_per_cell.insert(7, 11);
+        save_drain_local_checkpoint(directory.path(), &checkpoint).expect("save");
+
+        let loaded = load_drain_local_checkpoint(directory.path(), "epoch-a")
+            .expect("load")
+            .expect("checkpoint");
+        assert_eq!(loaded, checkpoint);
+        assert!(
+            load_drain_local_checkpoint(directory.path(), "epoch-b").is_err(),
+            "an incompatible local epoch must fail loud"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_remote_checkpoint_lives_in_slow_cas_state() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let table =
+            Supertable::create(options_id_title_serial().with_storage(Arc::clone(&storage)))
+                .expect("create table");
+        let mut writer = table.writer().expect("writer");
+        writer
+            .append(&build_simple_batch(0, 2))
+            .expect("append visible entry");
+        writer.commit().expect("commit visible entry");
+        drop(writer);
+        let pending_entry = Arc::clone(&table.reader().manifest().superfiles[0]);
+        let sources = vec![DrainCheckpointSource {
+            superfile_id: "source-id".into(),
+            uri: "source-uri".into(),
+            birth_version: 4,
+        }];
+        let batch_layout = vec![vec![4]];
+        let options_hash = "options".to_string();
+        let checkpoint = DrainRemoteCheckpoint {
+            schema: DRAIN_CHECKPOINT_SCHEMA,
+            epoch_id: drain_epoch_id(&options_hash, &sources, &batch_layout, 2),
+            options_hash,
+            sources,
+            batch_layout,
+            shard_count: 2,
+            completed_shards: Vec::new(),
+        };
+        let mut state = create_drain_remote_checkpoint(table.inner(), checkpoint.clone())
+            .await
+            .expect("create");
+        let loaded = load_drain_remote_checkpoint(table.inner())
+            .await
+            .expect("load")
+            .expect("checkpoint");
+        assert_eq!(loaded.checkpoint, checkpoint);
+
+        state.entries.push(Arc::clone(&pending_entry));
+        state.checkpoint.completed_shards.push(DrainRemoteShard {
+            shard_id: 1,
+            superfile_id: pending_entry.superfile_id.to_string(),
+            cell_counts: vec![(3, 10)],
+        });
+        save_drain_remote_checkpoint(table.inner(), &mut state)
+            .await
+            .expect("CAS update");
+        let updated = load_drain_remote_checkpoint(table.inner())
+            .await
+            .expect("reload")
+            .expect("checkpoint");
+        assert_eq!(updated.checkpoint.completed_shards.len(), 1);
+        assert_eq!(updated.entries.len(), 1);
+        assert_eq!(updated.entries[0].superfile_id, pending_entry.superfile_id);
+
+        refresh_slow_vector_state(table.inner())
+            .await
+            .expect("replace checkpoint with settled slow state");
+        assert!(
+            load_drain_remote_checkpoint(table.inner())
+                .await
+                .expect("load settled state")
+                .is_none(),
+            "settled slow-CAS state must not retain a drain checkpoint"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_resumes_from_last_local_batch_checkpoint() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let options = options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM, COMMIT_AS_DRAIN_TEST_ROWS)
+            .with_storage(storage)
+            .with_drain_batch_superfiles(1);
+        let table = Supertable::create(options).expect("create");
+        for _ in 0..2 {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch(
+                    COMMIT_AS_DRAIN_TEST_ROWS,
+                    COMMIT_AS_DRAIN_TEST_DIM,
+                ))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let (hidden, epoch_id) = current_drain_epoch(&table).await;
+        inject_drain_test_failure(epoch_id.clone(), DrainTestFailurePhase::AfterBatch, 1);
+        let first = drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await;
+        assert!(first.is_err(), "first drain must stop at the failpoint");
+        let local = load_drain_local_checkpoint(&drain_scratch_dir(&epoch_id), &epoch_id)
+            .expect("load local checkpoint")
+            .expect("local checkpoint");
+        assert_eq!(local.batches_done, 1);
+
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("resume drain");
+        assert!(
+            !drain_scratch_dir(&epoch_id).exists(),
+            "successful final CAS removes local checkpoint scratch"
+        );
+        assert!(
+            load_drain_remote_checkpoint(hidden.inner())
+                .await
+                .expect("load settled slow state")
+                .is_none(),
+            "settled slow-CAS state contains no pending drain"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_preserves_uploaded_shard_across_node_replacement() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let options = options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM, COMMIT_AS_DRAIN_TEST_ROWS)
+            .with_storage(storage)
+            .with_writer_pool(writer_pool_with(2))
+            .with_drain_batch_superfiles(1);
+        let table = Supertable::create(options).expect("create");
+        let mut writer = table.writer().expect("writer");
+        writer
+            .append(&build_axis_vector_batch(
+                4 * COMMIT_AS_DRAIN_TEST_ROWS,
+                COMMIT_AS_DRAIN_TEST_DIM,
+            ))
+            .expect("append");
+        writer.commit().expect("commit");
+        drop(writer);
+
+        let (hidden, epoch_id) = current_drain_epoch(&table).await;
+        inject_drain_test_failure(epoch_id.clone(), DrainTestFailurePhase::AfterShard, 1);
+        let first = drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await;
+        assert!(first.is_err(), "first drain must stop after one shard");
+        let checkpoint = load_drain_remote_checkpoint(hidden.inner())
+            .await
+            .expect("load pending slow state")
+            .expect("pending drain");
+        assert_eq!(checkpoint.checkpoint.completed_shards.len(), 1);
+        let preserved_id = checkpoint.entries[0].superfile_id;
+        let preserved_path = checkpoint.entries[0].uri.storage_path();
+        hidden
+            .gc_async(Duration::ZERO)
+            .await
+            .expect("GC with active checkpoint");
+        hidden
+            .options()
+            .storage
+            .as_ref()
+            .expect("hidden storage")
+            .head(&preserved_path)
+            .await
+            .expect("checkpointed shard remains live through GC");
+
+        // Simulate replacement on a node without the local spill/cell files.
+        fs::remove_dir_all(drain_scratch_dir(&epoch_id)).expect("drop local scratch");
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("replacement-node resume");
+        assert!(
+            hidden
+                .reader()
+                .manifest()
+                .superfiles
+                .iter()
+                .any(|entry| entry.superfile_id == preserved_id),
+            "final manifest must reuse the shard recorded in slow-CAS"
+        );
+        assert!(
+            load_drain_remote_checkpoint(hidden.inner())
+                .await
+                .expect("load settled state")
+                .is_none()
+        );
+    }
 
     fn schema_id_title() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
@@ -4855,6 +5855,49 @@ mod tests {
             vec![Arc::new(titles), Arc::new(list)],
         )
         .expect("vector batch")
+    }
+
+    async fn current_drain_epoch(table: &Supertable) -> (Arc<Supertable>, String) {
+        let hidden = table
+            .inner()
+            .vector_index_table
+            .as_ref()
+            .expect("hidden table")
+            .clone();
+        let user_manifest = table.inner().manifest.load_full();
+        let drained = hidden.inner().manifest.load_full().get_drained_ranges();
+        let mut sources: Vec<Arc<SuperfileEntry>> = user_manifest
+            .get_all_superfiles_loaded()
+            .await
+            .expect("load user sources")
+            .into_iter()
+            .filter(|entry| !drained.contains(entry.birth_version))
+            .collect();
+        sources.sort_unstable_by(|left, right| {
+            left.birth_version
+                .cmp(&right.birth_version)
+                .then_with(|| left.superfile_id.cmp(&right.superfile_id))
+        });
+        let batch_cfg = drain_batch_superfiles(&table.inner().options);
+        let budget = if batch_cfg < 0 {
+            usize::MAX
+        } else {
+            (batch_cfg as usize).max(1)
+        };
+        let source_refs: Vec<DrainCheckpointSource> = sources
+            .iter()
+            .map(|entry| drain_checkpoint_source(entry))
+            .collect();
+        let batches = make_drain_batches(sources, budget);
+        let batch_layout = drain_batch_layout(&batches);
+        let strategy = user_manifest.get_partition_strategy();
+        let options_hash =
+            options_hash::compute_options_hash(table.inner().options.as_ref(), &strategy).to_hex();
+        let shard_count = packed_cell_shard_count(&hidden.inner().options);
+        (
+            hidden,
+            drain_epoch_id(&options_hash, &source_refs, &batch_layout, shard_count),
+        )
     }
 
     fn committed_reader(st: &Supertable) -> (Arc<SuperfileEntry>, Arc<SuperfileReader>) {
