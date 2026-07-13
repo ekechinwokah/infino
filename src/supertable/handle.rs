@@ -434,6 +434,18 @@ impl Supertable {
     }
     }
 
+    test_visible! {
+    /// Hidden vector-index storage prefix recorded on the user manifest.
+    /// Exposed only to tests/benches that explicitly administer derived state.
+    fn vector_index_storage_prefix(&self) -> Option<String> {
+        self.inner
+            .manifest
+            .load()
+            .vector_index_storage_prefix()
+            .map(str::to_owned)
+    }
+    }
+
     /// Decide whether this handle's consistency policy requires a pointer read
     /// now. Bounded-staleness callers share the timestamp so concurrent query
     /// paths cannot stampede storage.

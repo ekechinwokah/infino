@@ -1145,6 +1145,19 @@ pub mod vector {
     const FILTER_MAX_MULT: usize = 64;
     /// Repeated warm probes per routing-state transition.
     const ROUTING_STATE_WARM_ITERS: usize = 20;
+    /// Explicitly discard only the derived hidden vector-index sibling before
+    /// a retained-prefix lifecycle run; the durable user table is untouched.
+    const RESET_HIDDEN_INDEX_ENV: &str = "INFINO_BENCH_RESET_HIDDEN_VECTOR_INDEX";
+    /// Skip the normal undrained-delta commit while retaining pre-drain,
+    /// drain, post-drain, and optimize/compact measurements.
+    const SKIP_VECTOR_DELTA_ENV: &str = "INFINO_BENCH_SKIP_VECTOR_DELTA";
+    /// Concrete hidden-table object prefixes. Empty-prefix listing is not
+    /// portable across object-store providers, so destructive benchmark reset
+    /// enumerates every owned namespace explicitly.
+    const HIDDEN_RESET_PREFIXES: &[&str] =
+        &["data", "manifest", "manifest-parts", "slow-vector-state"];
+    /// Hidden manifest pointer removed after all referenced objects.
+    const HIDDEN_POINTER_PATH: &str = "_supertable/current";
     /// Numerator/denominator for compact p90 drain diagnostics.
     const DRAIN_P90_NUMERATOR: usize = 9;
     const DRAIN_P90_DENOMINATOR: usize = 10;
@@ -1574,6 +1587,50 @@ pub mod vector {
         log_hidden_stats(hidden, "after drain");
     }
 
+    fn reset_hidden_vector_index_if_requested(built: &supertable::IngestResult) {
+        if std::env::var(RESET_HIDDEN_INDEX_ENV).ok().as_deref() != Some("1") {
+            return;
+        }
+        let (_cache_dir, cache) = tiers::fresh_disk_cache(Arc::clone(&built.storage));
+        let admin = tiers::open_consumer(tiers::consumer_options(
+            supertable::options_for(Modality::Vector, None),
+            Arc::clone(&built.storage),
+            cache,
+        ));
+        let hidden_prefix = admin
+            .vector_index_storage_prefix()
+            .expect("user manifest records hidden vector-index prefix");
+        drop(admin);
+        let root_storage = Arc::clone(&built.storage);
+        let deleted = tiers::block_on(async {
+            let mut keys = HashSet::new();
+            for prefix in HIDDEN_RESET_PREFIXES {
+                let full_prefix = format!("{hidden_prefix}/{prefix}");
+                keys.extend(
+                    root_storage
+                        .list_with_prefix(&full_prefix)
+                        .await
+                        .expect("list hidden vector-index namespace"),
+                );
+            }
+            let count = keys.len() + 1;
+            for key in keys {
+                root_storage
+                    .delete(&key)
+                    .await
+                    .expect("delete hidden vector-index object");
+            }
+            root_storage
+                .delete(&format!("{hidden_prefix}/{HIDDEN_POINTER_PATH}"))
+                .await
+                .expect("delete hidden manifest pointer");
+            count
+        });
+        eprintln!(
+            "[supertable_vector] reset hidden vector-index sibling: deleted {deleted} object(s); user table preserved"
+        );
+    }
+
     /// One metered cold public `vector_search` consumer, split at the phase
     /// boundaries the cost model prices: open window (consumer + manifest),
     /// first query on the cold cache (the per-query GET fan), then the same
@@ -1941,6 +1998,7 @@ pub mod vector {
                 phases,
             )
         };
+        reset_hidden_vector_index_if_requested(&built);
         if let Some(metrics) = &ingest_metrics {
             report.emit(&Section {
                 anchor: "bench/vector/supertable/ingest".into(),
@@ -2050,6 +2108,8 @@ pub mod vector {
                     .ok()
                     .as_deref()
                     == Some("1");
+            let skip_vector_delta =
+                std::env::var(SKIP_VECTOR_DELTA_ENV).ok().as_deref() == Some("1");
 
             let search_title = |phase: &str| {
                 format!(
@@ -2460,7 +2520,7 @@ pub mod vector {
                 // measurement. Recall remains comparable because its rows
                 // come from the same generated distribution and the oracle
                 // covers the augmented corpus.
-                if pre_post_drain {
+                if pre_post_drain && !skip_vector_delta {
                     let delta_rows = supertable::docs_per_commit();
                     eprintln!(
                         "[supertable_vector] committing {delta_rows} normal undrained vector rows..."
@@ -2529,11 +2589,15 @@ pub mod vector {
                         phases.warm,
                         phases.cold,
                     ));
+                } else if pre_post_drain {
+                    eprintln!(
+                        "[supertable_vector] skipping normal undrained delta ({SKIP_VECTOR_DELTA_ENV}=1)"
+                    );
                 }
 
-                // Optimize first drains the delta, then compacts user + hidden
-                // physical files. The following state must therefore return to
-                // hidden-only routing.
+                // Optimize compacts user + hidden physical files; when the
+                // delta phase ran it first drains that tail. The following
+                // state must therefore be hidden-only in either mode.
                 let compaction_stats = pre_post_drain.then(|| {
                     eprintln!("[supertable_vector] compacting (optimize: user + hidden)...");
                     let before = consumer_meter.snapshot();
@@ -2569,18 +2633,21 @@ pub mod vector {
                 }
                 let mut cold_split_post = None;
                 if pre_post_drain {
-                    let delta_map = delta_id_to_dense
-                        .as_ref()
-                        .expect("delta id map exists after delta commit");
+                    let compact_map = delta_id_to_dense.as_ref().unwrap_or(&id_to_dense);
+                    let compact_truth = if skip_vector_delta {
+                        &gt_correct
+                    } else {
+                        &augmented_gt
+                    };
                     let compact_reader = SupertableVectorRead {
                         table: &consumer,
-                        id_to_dense: Arc::clone(delta_map),
+                        id_to_dense: Arc::clone(compact_map),
                     };
                     let post_compact_recall = exec_vec::mean_recall(
                         &compact_reader,
                         supertable::VEC_COLUMN,
                         &q_correct,
-                        &augmented_gt,
+                        compact_truth,
                         TOP_K,
                         nprobe,
                         rerank,
@@ -2711,7 +2778,7 @@ pub mod vector {
                     .map(cost::cold_from_vector)
                     .unwrap_or_default();
                 let cost_n_docs = n_docs
-                    + if pre_post_drain {
+                    + if pre_post_drain && !skip_vector_delta {
                         supertable::docs_per_commit()
                     } else {
                         0
