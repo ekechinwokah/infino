@@ -162,9 +162,13 @@ const DEFAULT_READ_STALENESS_SECS: u64 = 1;
 const DEFAULT_TARGET_SUPERFILES_PER_PART: u64 = 10_000;
 /// Default soft cap on a manifest part's compressed size (10 MiB).
 const DEFAULT_PART_SIZE_THRESHOLD_BYTES: u64 = 10 * (1 << 20);
-/// Default: eager-load manifest parts at open when there are at most
-/// this many (open latency vs memory trade-off).
-const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = 4;
+/// Default: always eager-load every manifest part at open. Open pays the
+/// full (parallel) part fetch up front so search never issues a serial
+/// manifest GET wave before its data fetches; snapshot refreshes inherit
+/// loaded parts and fetch only the missing ones as part of the query that
+/// triggered them. Lazy load stays available as an explicit opt-in
+/// (`with_eager_load_threshold(0)`).
+const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = u32::MAX;
 /// Subdirectory under the disk-cache root that holds the
 /// content-addressed manifest-part byte cache. Kept separate from the
 /// superfile cache files so the two budgets and eviction sets don't
@@ -393,8 +397,10 @@ pub struct SupertableOptions {
     /// left in empty `OnceCell`s — the first
     /// `ManifestSnapshot::part(id).await` lazy-loads on demand.
     ///
-    /// Default `4`. Set to
-    /// `0` to force lazy-load even for tiny manifests
+    /// Default `u32::MAX` — open always eager-loads every part (in
+    /// parallel), so queries on a fresh handle pay zero serial manifest
+    /// GETs; cold open takes proportionally longer on huge tables instead.
+    /// Set to `0` to force lazy-load even for tiny manifests
     /// (useful for tests that want to verify the lazy path).
     ///
     /// **Eager mode** populates `ManifestSnapshot.superfile_list.superfiles`

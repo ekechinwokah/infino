@@ -214,9 +214,11 @@ impl Supertable {
     /// Reads the pointer file at
     /// `<root>/_supertable/current` via the storage provider
     /// attached on `options`, parses the manifest list, and
-    /// eager-fetches manifest parts when the part count is
-    /// below `options.eager_load_threshold_parts`. The returned
-    /// `Supertable` is ready to serve queries from the
+    /// eager-fetches every manifest part in parallel (the default;
+    /// `options.eager_load_threshold_parts` below the part count opts
+    /// into lazy loading). Open therefore scales with manifest size,
+    /// and queries on the returned handle pay no serial manifest GETs.
+    /// The returned `Supertable` is ready to serve queries from the
     /// snapshot at the pointer's `manifest_id`.
     ///
     /// A genuinely absent pointer is a [`ManifestLoadError::PointerNotFound`]
