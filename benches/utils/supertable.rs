@@ -1125,9 +1125,11 @@ pub mod vector {
     /// budget post-drain, and the resulting evictions re-fetch on every query
     /// (measured 62 GET/query on a supposedly warm consumer at 100K).
     const SHARED_CONSUMER_CACHE_INDEX_FACTOR: u64 = 2;
-    // Sourced from the engine's public defaults so the bench can't drift from
-    // what an unfiltered `VectorSearchOptions::default()` query resolves to.
-    const DEFAULT_NPROBE: usize = infino::superfile::reader::VectorSearchOptions::DEFAULT_NPROBE;
+    // Sourced from the engine's own defaults so the bench can't drift from
+    // what an unfiltered default query resolves to on the supertable user
+    // path (which owns its coarse default independently of the superfile
+    // tier's `VectorSearchOptions::DEFAULT_NPROBE`).
+    const DEFAULT_NPROBE: usize = infino::supertable::query::vector::USER_COARSE_CELLS;
     const DEFAULT_RERANK_MULT: usize = infino::superfile::reader::VectorSearchOptions::RERANK_MULT;
     const QUERY_CORRECTNESS_SEED: u64 = 17;
     const QUERY_CALIBRATION_SEED: u64 = 99;
@@ -2043,7 +2045,7 @@ pub mod vector {
             // Fresh ingest leaves hidden IVF in INCOMING; dataset / existing-prefix
             // tables may already be post-drain — run the two-phase comparison only
             // when we just built the table in this process.
-            let pre_post_drain = ingest_metrics.is_some()
+            let force_pre_post_drain = ingest_metrics.is_some()
                 || std::env::var("INFINO_BENCH_FORCE_PRE_POST_DRAIN")
                     .ok()
                     .as_deref()
@@ -2081,6 +2083,25 @@ pub mod vector {
             let warm_reader = SupertableVectorRead {
                 table: &consumer,
                 id_to_dense: Arc::clone(&id_to_dense),
+            };
+            // A retained prefix whose drain already ran is reusable as-is:
+            // measuring "pre-drain" on it would be a lie and re-draining is
+            // a no-op, so fall through to phase-derived single-phase
+            // reporting. This is what makes probe-config iteration cheap —
+            // point INFINO_BENCH_EXISTING_PREFIX at a drained table and each
+            // run skips the corpus upload AND the drain.
+            let pre_post_drain = if force_pre_post_drain
+                && ingest_metrics.is_none()
+                && current_routing_phase(&consumer) != "pre-drain"
+            {
+                eprintln!(
+                    "[supertable_vector] existing prefix is already drained ({}); \
+                     skipping forced pre/post-drain lifecycle (phase-derived reporting)",
+                    current_routing_phase(&consumer),
+                );
+                false
+            } else {
+                force_pre_post_drain
             };
             let mut drain_stats: Option<(f64, storage_meter::ObjectStoreMeter, u64, Option<f64>)> =
                 None;
@@ -2619,6 +2640,26 @@ pub mod vector {
                     rss::fmt_bytes(built.total_index_bytes),
                     rss::fmt_bytes(slow_state_stored),
                 );
+                // Retained tables keep everything the run wrote — including
+                // the drained hidden index — so a follow-up run can iterate
+                // on probe configs without re-uploading or re-draining.
+                if hidden_stored > 0 {
+                    if let Ok(prefix) = std::env::var("INFINO_BENCH_EXISTING_PREFIX") {
+                        eprintln!(
+                            "[supertable_vector] drained state retained ({}): rerun with \
+                             INFINO_BENCH_EXISTING_PREFIX={prefix} and without \
+                             INFINO_BENCH_FORCE_PRE_POST_DRAIN to reuse it (no ingest, no drain)",
+                            current_routing_phase(&consumer),
+                        );
+                    } else if std::env::var_os("INFINO_BENCH_KEEP_TABLE").is_some() {
+                        eprintln!(
+                            "[supertable_vector] drained state retained ({}): rerun with \
+                             INFINO_BENCH_EXISTING_PREFIX=<kept prefix logged by [tiers] above> \
+                             to reuse it (no ingest, no drain)",
+                            current_routing_phase(&consumer),
+                        );
+                    }
+                }
                 let warm_vec = cost::warm_from_vector(&recall_rows);
                 let cold_vec = cost::cold_from_vector(&recall_rows);
                 let cold_split = if pre_post_drain {

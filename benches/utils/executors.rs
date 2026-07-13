@@ -948,7 +948,9 @@ pub mod vector {
 
     use infino::{
         superfile::{SuperfileReader, reader::VectorSearchOptions},
-        supertable::manifest::list::PartitionStrategy,
+        supertable::{
+            manifest::list::PartitionStrategy, query::vector::USER_FINE_RUNS_PER_FRAGMENT,
+        },
     };
 
     use super::*;
@@ -1089,7 +1091,7 @@ pub mod vector {
                 }
             }
             format!(
-                "user: cells {nprobe}+, fine all, {}, r{rerank}",
+                "user: cells {nprobe}+, fine {USER_FINE_RUNS_PER_FRAGMENT}/fragment, {}, r{rerank}",
                 self.table.options().vector_columns[0].rerank_codec.name(),
             )
         }
