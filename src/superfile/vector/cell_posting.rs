@@ -495,11 +495,9 @@ fn encode_segmented_blob(
 
 fn compute_encoded_norms(p: &DecodedPosting) -> Vec<f32> {
     let dim = p.dim;
-    let residual_divisor = residual_divisor_for_codec(residual_family_codec_for_quantizer(
-        &p.scale,
-        &p.offset,
-    ))
-    .expect("decoded posting always carries a residual-family quantizer");
+    let residual_divisor =
+        residual_divisor_for_codec(residual_family_codec_for_quantizer(&p.scale, &p.offset))
+            .expect("decoded posting always carries a residual-family quantizer");
     let mut norms = Vec::with_capacity(p.ids.len());
     for row in 0..p.ids.len() {
         let base = row * dim * ROW_BYTES_PER_DIM;
@@ -921,8 +919,8 @@ mod tests {
                 vecs.push(if d == 0 { i as f32 * 0.01 } else { 0.0 });
             }
         }
-        let blob = encode_blob(Metric::L2Sq, dim, &ids, &vecs, RerankCodec::Sq8Residual)
-            .expect("encode");
+        let blob =
+            encode_blob(Metric::L2Sq, dim, &ids, &vecs, RerankCodec::Sq8Residual).expect("encode");
         let mut q = vec![0f32; dim];
         q[0] = 0.31;
         let hits = search_blob(&blob, &q, 5).expect("search");
@@ -946,8 +944,8 @@ mod tests {
                 vecs.push(if d == 0 { i as f32 * 0.01 } else { 0.0 });
             }
         }
-        let blob = encode_blob(Metric::L2Sq, dim, &ids, &vecs, RerankCodec::Sq8Residual)
-            .expect("encode");
+        let blob =
+            encode_blob(Metric::L2Sq, dim, &ids, &vecs, RerankCodec::Sq8Residual).expect("encode");
         let stable_ids: Vec<i128> = (0..n as i128).collect();
         let rows = load_encoded_rows_from_blob(&blob, &stable_ids, None).expect("load");
         assert_eq!(rows.len(), n as usize);
@@ -1093,22 +1091,10 @@ mod tests {
         let ids_b = vec![0u32, 1];
         let vecs_a = vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
         let vecs_b = vec![0.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0];
-        let blob_a = encode_blob(
-            Metric::L2Sq,
-            dim,
-            &ids_a,
-            &vecs_a,
-            RerankCodec::Sq8Residual,
-        )
-        .expect("encode a");
-        let blob_b = encode_blob(
-            Metric::L2Sq,
-            dim,
-            &ids_b,
-            &vecs_b,
-            RerankCodec::Sq8Residual,
-        )
-        .expect("encode b");
+        let blob_a = encode_blob(Metric::L2Sq, dim, &ids_a, &vecs_a, RerankCodec::Sq8Residual)
+            .expect("encode a");
+        let blob_b = encode_blob(Metric::L2Sq, dim, &ids_b, &vecs_b, RerankCodec::Sq8Residual)
+            .expect("encode b");
         let mut deleted = RoaringBitmap::new();
         deleted.insert(1);
 

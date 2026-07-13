@@ -3076,6 +3076,22 @@ mod tests {
             total_rows, N_COMMITS as u64,
             "every drained row lands exactly once"
         );
+        let fine_clusters: u32 = manifest
+            .superfiles
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .vector_summary
+                    .get("emb")
+                    .into_iter()
+                    .flat_map(|summary| summary.cells.iter())
+            })
+            .map(|cell| cell.clusters.n_cent)
+            .sum();
+        assert_eq!(
+            fine_clusters, 1,
+            "three one-row source batches must form one complete-cell fine IVF, not three batch fragments"
+        );
         assert!(
             !manifest.get_drained_ranges().is_empty(),
             "single publish must advance drained watermark"

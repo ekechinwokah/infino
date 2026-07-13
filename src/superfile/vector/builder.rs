@@ -13,13 +13,15 @@
 
 use std::{
     cmp::Ordering,
-    fs::{File, metadata},
-    io::{self, BufReader, BufWriter, Error as IoError, ErrorKind, Read, Write},
+    fs::{File, OpenOptions, metadata},
+    io::{self, BufReader, BufWriter, Error as IoError, ErrorKind, Read, Seek, SeekFrom, Write},
+    mem::size_of,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use rayon::prelude::*;
+use tempfile::tempdir_in;
 
 use crate::config;
 use crate::superfile::{
@@ -33,7 +35,10 @@ use crate::superfile::{
         },
     },
     vector::{
-        cell_posting::{MaterializedIvfRow, materialize_sq8_residual_row_into_cluster_quant},
+        cell_posting::{
+            MaterializedIvfRow, materialize_sq8_residual_row_into_cluster_quant,
+            sq8_residual_norm_sq,
+        },
         distance::{Metric, dequantize_sq8_residual_into, l2_sq, mean_f32_cluster_major},
         ivf_merge::MergedIvfSubsection,
         kmeans::{assign_to_centroids, kmeans},
@@ -41,7 +46,10 @@ use crate::superfile::{
         rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
         reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
         rotation::RandomRotation,
-        spill::{ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter},
+        spill::{
+            ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
+            SpilledCellRows,
+        },
         sq8_simd::{Sq8EncodeConsts, encode_sq8_residual_row, update_min_max},
     },
 };
@@ -85,6 +93,12 @@ const PASS2_CHUNK_ROWS_MIN: usize = 1024;
 
 /// Ceiling on pass-2 chunk rows, capping per-chunk RAM at small dims.
 const PASS2_CHUNK_ROWS_MAX: usize = 65_536;
+/// Target bytes read from one fine-cluster bucket at a time while assembling
+/// a streamed materialized subsection.
+const MATERIALIZED_BUCKET_CHUNK_BYTES: usize = 16 << 20;
+/// Approximate live bytes per dimension while assigning one materialized row:
+/// two encoded bytes plus one decoded f32.
+const MATERIALIZED_ASSIGN_BYTES_PER_DIM: usize = 2 + size_of::<f32>();
 
 /// Superfile-local document thresholds for capping the physical IVF centroid
 /// count. Caller-supplied `n_cent` remains a tuning knob, but the builder will
@@ -940,6 +954,14 @@ struct SubsectionBytes {
     codec_meta_size: usize,
 }
 
+/// Metadata for one materialized IVF subsection streamed directly to a file.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StreamedIvfSubsection {
+    pub(crate) n_docs: u32,
+    pub(crate) rerank_codec: RerankCodec,
+    pub(crate) subsection_len: u64,
+}
+
 /// Per-bucket BufWriter capacity. 64 KiB amortises one syscall
 /// per ~1300 dim=384 bucket rows (each row = 4 + code_bytes +
 /// dim*4 = ~1588 B). At very high n_cent (≥ 8192) the n_cent ×
@@ -1049,6 +1071,22 @@ pub(crate) mod build_phase_timers {
     }
 }
 
+fn materialized_centroids(cfg: &VectorConfig, n_docs: usize, sample: &[f32]) -> (usize, Vec<f32>) {
+    let dim = cfg.dim;
+    if let Some(global) = cfg.provided_centroids.as_ref() {
+        debug_assert!(dim > 0 && global.len() % dim == 0);
+        let n_cent = global.len() / dim.max(1);
+        return (n_cent, global.to_vec());
+    }
+    let n_cent = cfg
+        .n_cent
+        .max(1)
+        .min(n_cent_row_count_cap(n_docs))
+        .min(n_docs.max(1));
+    let centroids = kmeans(sample, dim, n_cent, KMEANS_ITERS, cfg.rot_seed);
+    (n_cent, centroids)
+}
+
 fn build_subsection_from_materialized(
     cfg: VectorConfig,
     mut rows: Vec<MaterializedIvfRow>,
@@ -1083,49 +1121,34 @@ fn build_subsection_from_materialized(
         .residual_divisor()
         .expect("residual-family source has divisor");
     let (n_cent, centroids) = build_phase_timers::timed(&build_phase_timers::TRAIN_US, || {
-        if let Some(global) = cfg.provided_centroids.as_ref() {
-            // Partition against the global cell centroids instead of training
-            // local ones. Every incoming shard then shares cell ordinals, so the
-            // drain splices cluster `c` → cell `c` with no re-clustering. Keep all
-            // `n_cent` cells even when this shard has fewer rows (empty clusters are
-            // count-0) so ordinal `c` always means cell `c`.
-            debug_assert!(dim > 0 && global.len() % dim == 0);
-            let nc = global.len() / dim.max(1);
-            (nc, global.to_vec())
+        let requested_n_cent = cfg
+            .n_cent
+            .max(1)
+            .min(n_cent_row_count_cap(n_docs))
+            .min(n_docs.max(1));
+        let sample_size = if cfg.provided_centroids.is_some() {
+            0
         } else {
-            let n_cent = cfg
-                .n_cent
-                .max(1)
-                .min(n_cent_row_count_cap(n_docs))
-                .min(n_docs.max(1));
-            // Train centroids the same way the user-superfile build does: on a bounded
-            // sample (NOT every row), via the shared `kmeans` (random init + parallel).
-            // The previous bespoke `encoded_ivf_kmeans` trained over every row with
-            // O(k²·n) farthest-point seeding on the single-thread maint pool, which hung
-            // on large cells. Only the sampled rows are decoded to fp32, so there is no
-            // full-corpus fp32 buffer.
-            // Per-cell sub-build: sample points-per-centroid, bounded by the cell.
-            let sample_size = partition_kmeans_sample_size(n_cent).min(n_docs);
-            let mut sample = vec![0f32; sample_size * dim];
-            for s in 0..sample_size {
-                let idx = if sample_size == n_docs {
-                    s
-                } else {
-                    s * n_docs / sample_size
-                };
-                let enc = &rows[idx].encoded;
-                dequantize_sq8_residual_into(
-                    &enc.scale,
-                    &enc.offset,
-                    &enc.codes,
-                    &enc.residuals,
-                    source_divisor,
-                    &mut sample[s * dim..(s + 1) * dim],
-                );
-            }
-            let centroids = kmeans(&sample, dim, n_cent, KMEANS_ITERS, cfg.rot_seed);
-            (n_cent, centroids)
+            partition_kmeans_sample_size(requested_n_cent).min(n_docs)
+        };
+        let mut sample = vec![0f32; sample_size * dim];
+        for s in 0..sample_size {
+            let idx = if sample_size == n_docs {
+                s
+            } else {
+                s * n_docs / sample_size
+            };
+            let enc = &rows[idx].encoded;
+            dequantize_sq8_residual_into(
+                &enc.scale,
+                &enc.offset,
+                &enc.codes,
+                &enc.residuals,
+                source_divisor,
+                &mut sample[s * dim..(s + 1) * dim],
+            );
         }
+        materialized_centroids(&cfg, n_docs, &sample)
     });
 
     let summary_centroid = mean_f32_cluster_major(&centroids, dim, n_cent);
@@ -1336,6 +1359,470 @@ pub(crate) fn build_merged_subsection_from_materialized(
         summary_offset_in_sub: sub.summary_offset_in_sub,
         codec_meta_offset_in_sub: sub.codec_meta_offset_in_sub,
         codec_meta_size: sub.codec_meta_size,
+    })
+}
+
+fn materialized_chunk_rows_for_dim(dim: usize) -> usize {
+    let row_bytes = dim.max(1).saturating_mul(MATERIALIZED_ASSIGN_BYTES_PER_DIM);
+    (PASS2_CHUNK_MEM_BUDGET_BYTES / row_bytes).clamp(PASS2_CHUNK_ROWS_MIN, PASS2_CHUNK_ROWS_MAX)
+}
+
+fn sample_spilled_materialized_rows(
+    spill: &SpilledCellRows,
+    sample_size: usize,
+    chunk_rows: usize,
+) -> Result<Vec<f32>, BuildError> {
+    if sample_size == 0 {
+        return Ok(Vec::new());
+    }
+    let n_docs = spill.n_rows();
+    let dim = spill.dim();
+    let targets: Vec<usize> = (0..sample_size)
+        .map(|sample| {
+            if sample_size == n_docs {
+                sample
+            } else {
+                sample * n_docs / sample_size
+            }
+        })
+        .collect();
+    let mut sample = vec![0.0f32; sample_size * dim];
+    let mut reader = spill.reader()?;
+    let mut row_base = 0usize;
+    let mut target_idx = 0usize;
+    while row_base < n_docs {
+        let rows = reader.next_chunk(chunk_rows)?;
+        if rows.is_empty() {
+            break;
+        }
+        let row_end = row_base + rows.len();
+        while target_idx < targets.len() && targets[target_idx] < row_end {
+            let row = &rows[targets[target_idx] - row_base];
+            if row.encoded.rerank_codec != spill.rerank_codec() {
+                return Err(BuildError::VectorSchemaMismatch(
+                    "materialized spill mixes rerank codecs".into(),
+                ));
+            }
+            dequantize_sq8_residual_into(
+                &row.encoded.scale,
+                &row.encoded.offset,
+                &row.encoded.codes,
+                &row.encoded.residuals,
+                row.encoded
+                    .rerank_codec
+                    .residual_divisor()
+                    .expect("materialized spill uses residual-family codec"),
+                &mut sample[target_idx * dim..(target_idx + 1) * dim],
+            );
+            target_idx += 1;
+        }
+        row_base = row_end;
+    }
+    if target_idx != sample_size {
+        return Err(BuildError::VectorSchemaMismatch(format!(
+            "materialized spill yielded {target_idx} of {sample_size} training rows"
+        )));
+    }
+    Ok(sample)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_materialized_rows_to_buckets(
+    spill: &SpilledCellRows,
+    cfg: &VectorConfig,
+    centroids: &[f32],
+    n_cent: usize,
+    bucket_writers: &mut [BufWriter<File>],
+    bucket_counts: &mut [u32],
+    stable_ids: &mut BufWriter<File>,
+    sq8_min_max: Option<(&mut [f32], &mut [f32])>,
+) -> Result<(), BuildError> {
+    let dim = cfg.dim;
+    let code_bytes = dim.div_ceil(u8::BITS as usize);
+    let chunk_rows = materialized_chunk_rows_for_dim(dim);
+    let fixed = cfg.rerank_codec.uses_fixed_quantizer();
+    let mut min_max = sq8_min_max;
+    let mut reader = spill.reader()?;
+    let mut next_local = 0u32;
+    while next_local < spill.n_rows() as u32 {
+        let rows = reader.next_chunk(chunk_rows)?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in &rows {
+            if row.encoded.rerank_codec != cfg.rerank_codec || row.rabitq_code.len() != code_bytes {
+                return Err(BuildError::VectorSchemaMismatch(
+                    "materialized spill row does not match destination vector config".into(),
+                ));
+            }
+        }
+        let mut decoded = vec![0.0f32; rows.len() * dim];
+        decoded
+            .par_chunks_mut(dim)
+            .zip(rows.par_iter())
+            .for_each(|(out, row)| {
+                dequantize_sq8_residual_into(
+                    &row.encoded.scale,
+                    &row.encoded.offset,
+                    &row.encoded.codes,
+                    &row.encoded.residuals,
+                    row.encoded
+                        .rerank_codec
+                        .residual_divisor()
+                        .expect("materialized row uses residual-family codec"),
+                    out,
+                );
+            });
+        let mut assignments = vec![0u32; rows.len()];
+        assign_to_centroids(&decoded, centroids, dim, n_cent, &mut assignments);
+        for (row_idx, (row, &cluster)) in rows.iter().zip(&assignments).enumerate() {
+            let cluster = cluster as usize;
+            let local_doc_id = next_local + row_idx as u32;
+            stable_ids.write_all(&row.stable_id.to_le_bytes())?;
+            let writer = &mut bucket_writers[cluster];
+            writer.write_all(&local_doc_id.to_le_bytes())?;
+            writer.write_all(&row.rabitq_code)?;
+            if fixed {
+                writer.write_all(&row.encoded.codes)?;
+                writer.write_all(&row.encoded.residuals)?;
+            } else {
+                let fp = &decoded[row_idx * dim..(row_idx + 1) * dim];
+                writer.write_all(bytemuck::cast_slice(fp))?;
+                if let Some((min, max)) = min_max.as_mut() {
+                    let offset = cluster * dim;
+                    update_min_max(
+                        fp,
+                        &mut min[offset..offset + dim],
+                        &mut max[offset..offset + dim],
+                    );
+                }
+            }
+            bucket_counts[cluster] = bucket_counts[cluster].saturating_add(1);
+        }
+        next_local += rows.len() as u32;
+    }
+    if next_local as usize != spill.n_rows() {
+        return Err(BuildError::VectorSchemaMismatch(format!(
+            "materialized spill streamed {next_local} of {} rows",
+            spill.n_rows()
+        )));
+    }
+    Ok(())
+}
+
+fn write_at(file: &mut File, offset: usize, bytes: &[u8]) -> Result<(), BuildError> {
+    file.seek(SeekFrom::Start(offset as u64))?;
+    file.write_all(bytes)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_bucket_into_subsection(
+    output: &mut File,
+    bucket_path: &Path,
+    block: &ClusterBlock,
+    code_bytes: usize,
+    dim: usize,
+    codec: RerankCodec,
+    scale: &[f32],
+    offset: &[f32],
+    norms_offset: Option<usize>,
+) -> Result<(), BuildError> {
+    let fixed = codec.uses_fixed_quantizer();
+    let payload_bytes = if fixed {
+        dim * 2
+    } else {
+        dim * size_of::<f32>()
+    };
+    let record_bytes = format::vec::DOC_ID_BYTES + code_bytes + payload_bytes;
+    let chunk_rows = (MATERIALIZED_BUCKET_CHUNK_BYTES / record_bytes.max(1)).max(1);
+    let mut reader = BufReader::new(File::open(bucket_path)?);
+    let mut rows_done = 0usize;
+    let encode_consts = (!fixed).then(|| Sq8EncodeConsts::from_scale_offset(scale, offset));
+    let mut recon = vec![0.0f32; dim];
+    let mut fp_row = vec![0.0f32; dim];
+    while rows_done < block.count {
+        let take = (block.count - rows_done).min(chunk_rows);
+        let mut records = vec![0u8; take * record_bytes];
+        reader.read_exact(&mut records)?;
+        let mut ids = vec![0u8; take * format::vec::DOC_ID_BYTES];
+        let mut codes = vec![0u8; take * code_bytes];
+        let mut rerank = vec![0u8; take * dim * 2];
+        let mut norms = norms_offset.map(|_| vec![0u8; take * size_of::<f32>()]);
+        for row_idx in 0..take {
+            let record = &records[row_idx * record_bytes..(row_idx + 1) * record_bytes];
+            let id_end = format::vec::DOC_ID_BYTES;
+            let code_end = id_end + code_bytes;
+            ids[row_idx * id_end..(row_idx + 1) * id_end].copy_from_slice(&record[..id_end]);
+            codes[row_idx * code_bytes..(row_idx + 1) * code_bytes]
+                .copy_from_slice(&record[id_end..code_end]);
+            let rerank_row = &mut rerank[row_idx * dim * 2..(row_idx + 1) * dim * 2];
+            let norm = if fixed {
+                rerank_row.copy_from_slice(&record[code_end..code_end + dim * 2]);
+                norms_offset.map(|_| {
+                    sq8_residual_norm_sq(
+                        scale,
+                        offset,
+                        &rerank_row[..dim],
+                        &rerank_row[dim..],
+                        codec
+                            .residual_divisor()
+                            .expect("fixed residual codec has divisor"),
+                    )
+                })
+            } else {
+                for (value, bytes) in fp_row
+                    .iter_mut()
+                    .zip(record[code_end..].chunks_exact(size_of::<f32>()))
+                {
+                    *value = f32::from_le_bytes(bytes.try_into().expect("4-byte f32 bucket value"));
+                }
+                let (code_out, residual_out) = rerank_row.split_at_mut(dim);
+                encode_sq8_residual_row(
+                    &fp_row,
+                    encode_consts
+                        .as_ref()
+                        .expect("non-fixed materialized bucket has encode constants"),
+                    scale,
+                    offset,
+                    code_out,
+                    residual_out,
+                    &mut recon,
+                    norms_offset.is_some(),
+                    codec
+                        .residual_divisor()
+                        .expect("residual-family codec has divisor"),
+                )
+            };
+            if let (Some(norm), Some(norm_bytes)) = (norm, norms.as_mut()) {
+                let start = row_idx * size_of::<f32>();
+                norm_bytes[start..start + size_of::<f32>()].copy_from_slice(&norm.to_le_bytes());
+            }
+        }
+        write_at(output, block.codes_base + rows_done * code_bytes, &codes)?;
+        write_at(
+            output,
+            block.ids_base + rows_done * format::vec::DOC_ID_BYTES,
+            &ids,
+        )?;
+        write_at(output, block.rerank_base + rows_done * dim * 2, &rerank)?;
+        if let (Some(norms_base), Some(norm_bytes)) = (norms_offset, norms) {
+            write_at(
+                output,
+                norms_base + (block.first_row + rows_done) * size_of::<f32>(),
+                &norm_bytes,
+            )?;
+        }
+        rows_done += take;
+    }
+    Ok(())
+}
+
+/// Build one complete cell IVF from a cross-batch materialized-row spill,
+/// writing the subsection and stable-id stream directly to disk.
+pub(crate) fn build_merged_subsection_from_spilled_materialized(
+    cfg: VectorConfig,
+    spill: &SpilledCellRows,
+    subsection_path: &Path,
+    stable_ids_path: &Path,
+    scratch: &Path,
+) -> Result<StreamedIvfSubsection, BuildError> {
+    let n_docs = spill.n_rows();
+    if n_docs == 0 || cfg.dim != spill.dim() {
+        return Err(BuildError::VectorSchemaMismatch(
+            "streamed materialized IVF requires a non-empty matching spill".into(),
+        ));
+    }
+    if cfg.rerank_codec != spill.rerank_codec()
+        || !cfg.rerank_codec.is_sq8_residual_family()
+        || !cfg.rerank_codec.supports_metric(cfg.metric)
+    {
+        return Err(BuildError::VectorSchemaMismatch(
+            "streamed materialized IVF codec or metric mismatch".into(),
+        ));
+    }
+    let dim = cfg.dim;
+    let requested_n_cent = cfg
+        .n_cent
+        .max(1)
+        .min(n_cent_row_count_cap(n_docs))
+        .min(n_docs);
+    let sample_size = if cfg.provided_centroids.is_some() {
+        0
+    } else {
+        partition_kmeans_sample_size(requested_n_cent).min(n_docs)
+    };
+    let chunk_rows = materialized_chunk_rows_for_dim(dim);
+    let sample = sample_spilled_materialized_rows(spill, sample_size, chunk_rows)?;
+    let (n_cent, centroids) = build_phase_timers::timed(&build_phase_timers::TRAIN_US, || {
+        materialized_centroids(&cfg, n_docs, &sample)
+    });
+    let summary_centroid = mean_f32_cluster_major(&centroids, dim, n_cent);
+    let code_bytes = dim.div_ceil(u8::BITS as usize);
+    let bucket_dir = tempdir_in(scratch)?;
+    let mut bucket_writers = Vec::with_capacity(n_cent);
+    for centroid in 0..n_cent {
+        let path = bucket_dir.path().join(format!("cluster-{centroid}.bin"));
+        bucket_writers.push(BufWriter::with_capacity(
+            BUCKET_BUF_SIZE,
+            File::create(path)?,
+        ));
+    }
+    let mut bucket_counts = vec![0u32; n_cent];
+    let fit_quantizer = matches!(cfg.rerank_codec, RerankCodec::Sq8Residual);
+    let (mut sq8_min, mut sq8_max) = if fit_quantizer {
+        (
+            vec![f32::INFINITY; n_cent * dim],
+            vec![f32::NEG_INFINITY; n_cent * dim],
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let mut stable_ids = BufWriter::new(File::create(stable_ids_path)?);
+    let min_max = fit_quantizer.then_some((sq8_min.as_mut_slice(), sq8_max.as_mut_slice()));
+    build_phase_timers::timed(&build_phase_timers::ASSIGN_US, || {
+        stream_materialized_rows_to_buckets(
+            spill,
+            &cfg,
+            &centroids,
+            n_cent,
+            &mut bucket_writers,
+            &mut bucket_counts,
+            &mut stable_ids,
+            min_max,
+        )
+    })?;
+    stable_ids.flush()?;
+    stable_ids.get_ref().sync_all()?;
+    for writer in bucket_writers {
+        writer
+            .into_inner()
+            .map_err(|error| BuildError::Io(error.into_error()))?
+            .sync_all()?;
+    }
+    let quantizers: Vec<(Vec<f32>, Vec<f32>)> = if fit_quantizer {
+        (0..n_cent)
+            .map(|centroid| {
+                let start = centroid * dim;
+                derive_sq8_quantizer_from_min_max(
+                    &sq8_min[start..start + dim],
+                    &sq8_max[start..start + dim],
+                )
+            })
+            .collect()
+    } else {
+        (0..n_cent).map(|_| fixed_sq8_quantizer(dim)).collect()
+    };
+    let codec = cfg.rerank_codec;
+    let codec_meta_size = codec.codec_meta_bytes(dim, n_docs, n_cent, cfg.metric);
+    let per_vec_bytes = codec.per_vector_bytes(dim);
+    let cluster_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
+    let stable_ids_region_bytes = n_docs * format::vec::STABLE_ID_BYTES;
+    let layout = IvfSubsectionLayout::compute(
+        dim,
+        n_cent,
+        n_docs,
+        cluster_stride,
+        codec_meta_size,
+        stable_ids_region_bytes,
+    );
+    let cluster_order = centroid_storage_order(&centroids, n_cent, dim);
+    let planned = plan_ivf_cluster_blocks(
+        &layout,
+        &cluster_order,
+        &bucket_counts,
+        code_bytes,
+        per_vec_bytes,
+    );
+    let open_region_len = layout
+        .stable_ids_off
+        .unwrap_or(layout.per_cluster_blocks_off);
+    let mut open_region = vec![0u8; open_region_len];
+    write_ivf_subsection_header(
+        &mut open_region,
+        &layout,
+        codec_meta_size,
+        &summary_centroid,
+        &centroids,
+    );
+    for planned_block in &planned {
+        let idx = planned_block.cluster_idx_offset;
+        open_region[idx..idx + CLUSTER_IDX_COUNT_OFFSET]
+            .copy_from_slice(&(planned_block.doc_offset as u32).to_le_bytes());
+        open_region[idx + CLUSTER_IDX_COUNT_OFFSET..idx + CLUSTER_IDX_ENTRY_BYTES]
+            .copy_from_slice(&(planned_block.count as u32).to_le_bytes());
+    }
+    let scale_offset = layout.codec_meta_off;
+    let offset_offset = scale_offset + n_cent * dim * size_of::<f32>();
+    for (centroid, (scale, offset)) in quantizers.iter().enumerate() {
+        let start = centroid * dim * size_of::<f32>();
+        open_region[scale_offset + start..scale_offset + start + dim * size_of::<f32>()]
+            .copy_from_slice(bytemuck::cast_slice(scale));
+        open_region[offset_offset + start..offset_offset + start + dim * size_of::<f32>()]
+            .copy_from_slice(bytemuck::cast_slice(offset));
+    }
+    let norms_offset = matches!(cfg.metric, Metric::L2Sq | Metric::Cosine)
+        .then_some(offset_offset + n_cent * dim * size_of::<f32>());
+    let mut output = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(subsection_path)?;
+    output.set_len((layout.total_size_before_crc + format::CRC_BYTES) as u64)?;
+    write_at(&mut output, 0, &open_region)?;
+    let stable_ids_offset = layout
+        .stable_ids_off
+        .expect("streamed materialized IVF always has stable ids");
+    output.seek(SeekFrom::Start(stable_ids_offset as u64))?;
+    let copied = io::copy(
+        &mut BufReader::new(File::open(stable_ids_path)?),
+        &mut output,
+    )?;
+    if copied != stable_ids_region_bytes as u64 {
+        return Err(BuildError::VectorSchemaMismatch(format!(
+            "streamed stable-id bytes {copied} != expected {stable_ids_region_bytes}"
+        )));
+    }
+    for planned_block in &planned {
+        let Some(block) = planned_block.block.as_ref() else {
+            continue;
+        };
+        let path = bucket_dir
+            .path()
+            .join(format!("cluster-{}.bin", planned_block.centroid_id));
+        let (scale, offset) = &quantizers[planned_block.centroid_id];
+        stream_bucket_into_subsection(
+            &mut output,
+            &path,
+            block,
+            code_bytes,
+            dim,
+            codec,
+            scale,
+            offset,
+            norms_offset,
+        )?;
+    }
+    output.flush()?;
+    output.seek(SeekFrom::Start(0))?;
+    let mut remaining = layout.total_size_before_crc;
+    let mut crc = 0u32;
+    let mut crc_buffer = vec![0u8; MATERIALIZED_BUCKET_CHUNK_BYTES];
+    while remaining > 0 {
+        let take = remaining.min(crc_buffer.len());
+        output.read_exact(&mut crc_buffer[..take])?;
+        crc = crc32c_append(crc, &crc_buffer[..take]);
+        remaining -= take;
+    }
+    output.seek(SeekFrom::Start(layout.total_size_before_crc as u64))?;
+    output.write_all(&crc.to_le_bytes())?;
+    output.flush()?;
+    output.sync_all()?;
+    Ok(StreamedIvfSubsection {
+        n_docs: n_docs as u32,
+        rerank_codec: codec,
+        subsection_len: (layout.total_size_before_crc + format::CRC_BYTES) as u64,
     })
 }
 
@@ -1986,6 +2473,26 @@ pub(crate) fn alloc_ivf_subsection_with_header(
     centroids: &[f32],
 ) -> Vec<u8> {
     let mut bytes = vec![0u8; layout.total_size_before_crc];
+    write_ivf_subsection_header(
+        &mut bytes,
+        layout,
+        codec_meta_size,
+        summary_centroid,
+        centroids,
+    );
+    bytes
+}
+
+/// Write the fixed subsection header and centroid regions into an already
+/// allocated destination. Shared by the in-memory and direct-to-file builders.
+fn write_ivf_subsection_header(
+    bytes: &mut [u8],
+    layout: &IvfSubsectionLayout,
+    codec_meta_size: usize,
+    summary_centroid: &[f32],
+    centroids: &[f32],
+) {
+    debug_assert!(bytes.len() >= layout.codec_meta_off);
     bytes[0..MAGIC_BYTES].copy_from_slice(format::vec::SUB_MAGIC);
     bytes[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]
         .copy_from_slice(&format::vec::SUBSECTION_VERSION.to_le_bytes());
@@ -2003,11 +2510,11 @@ pub(crate) fn alloc_ivf_subsection_with_header(
         .copy_from_slice(bytemuck::cast_slice(summary_centroid));
     bytes[layout.centroids_off..layout.centroids_off + centroids.len() * 4]
         .copy_from_slice(bytemuck::cast_slice(centroids));
-    bytes
 }
 
 /// One cluster's `code‖doc_id‖rerank` sub-region offsets, handed to the
 /// per-cluster row writer by [`write_ivf_cluster_blocks`].
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct ClusterBlock {
     /// Byte offset of this cluster's 1-bit code sub-region.
     pub codes_base: usize,
@@ -2021,6 +2528,54 @@ pub(crate) struct ClusterBlock {
     pub first_row: usize,
     /// Row count in this cluster.
     pub count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlannedClusterBlock {
+    centroid_id: usize,
+    cluster_idx_offset: usize,
+    doc_offset: usize,
+    count: usize,
+    block: Option<ClusterBlock>,
+}
+
+fn plan_ivf_cluster_blocks(
+    layout: &IvfSubsectionLayout,
+    cluster_order: &[usize],
+    cluster_counts: &[u32],
+    code_bytes: usize,
+    per_vec_bytes: usize,
+) -> Vec<PlannedClusterBlock> {
+    let cluster_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
+    let mut block_cursor = 0usize;
+    let mut doc_offset = 0usize;
+    let mut planned = Vec::with_capacity(cluster_order.len());
+    for &centroid_id in cluster_order {
+        let count = cluster_counts[centroid_id] as usize;
+        let cluster_idx_offset = layout.cluster_idx_off + centroid_id * CLUSTER_IDX_ENTRY_BYTES;
+        let block = (count > 0).then(|| {
+            let block_base = layout.per_cluster_blocks_off + block_cursor;
+            let codes_len = count * code_bytes;
+            let ids_len = count * format::vec::DOC_ID_BYTES;
+            ClusterBlock {
+                codes_base: block_base,
+                ids_base: block_base + codes_len,
+                rerank_base: block_base + codes_len + ids_len,
+                first_row: doc_offset,
+                count,
+            }
+        });
+        planned.push(PlannedClusterBlock {
+            centroid_id,
+            cluster_idx_offset,
+            doc_offset,
+            count,
+            block,
+        });
+        block_cursor += count * cluster_stride;
+        doc_offset += count;
+    }
+    planned
 }
 
 /// Write the cluster index and drive per-cluster block production for an IVF
@@ -2043,31 +2598,21 @@ pub(crate) fn write_ivf_cluster_blocks<F>(
 where
     F: FnMut(&mut [u8], usize, &ClusterBlock) -> Result<(), BuildError>,
 {
-    let cluster_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
-    let mut block_cursor = 0usize;
-    let mut acc_off = 0usize;
-    for &centroid_id in cluster_order {
-        let cnt = cluster_counts[centroid_id] as usize;
-        let idx_base = layout.cluster_idx_off + centroid_id * CLUSTER_IDX_ENTRY_BYTES;
+    for planned in plan_ivf_cluster_blocks(
+        layout,
+        cluster_order,
+        cluster_counts,
+        code_bytes,
+        per_vec_bytes,
+    ) {
+        let idx_base = planned.cluster_idx_offset;
         bytes[idx_base..idx_base + CLUSTER_IDX_COUNT_OFFSET]
-            .copy_from_slice(&(acc_off as u32).to_le_bytes());
+            .copy_from_slice(&(planned.doc_offset as u32).to_le_bytes());
         bytes[idx_base + CLUSTER_IDX_COUNT_OFFSET..idx_base + CLUSTER_IDX_ENTRY_BYTES]
-            .copy_from_slice(&(cnt as u32).to_le_bytes());
-        if cnt > 0 {
-            let block_base = layout.per_cluster_blocks_off + block_cursor;
-            let codes_len = cnt * code_bytes;
-            let ids_len = cnt * format::vec::DOC_ID_BYTES;
-            let block = ClusterBlock {
-                codes_base: block_base,
-                ids_base: block_base + codes_len,
-                rerank_base: block_base + codes_len + ids_len,
-                first_row: acc_off,
-                count: cnt,
-            };
-            write_cluster(bytes, centroid_id, &block)?;
-            block_cursor += cnt * cluster_stride;
+            .copy_from_slice(&(planned.count as u32).to_le_bytes());
+        if let Some(block) = planned.block {
+            write_cluster(bytes, planned.centroid_id, &block)?;
         }
-        acc_off += cnt;
     }
     Ok(())
 }
@@ -2177,9 +2722,12 @@ mod tests {
     use std::fs::{read, write};
 
     use bytes::Bytes;
+    use tempfile::tempdir;
 
     use super::*;
-    use crate::superfile::vector::{cell_posting::EncodedCellRow, reader::VectorReader};
+    use crate::superfile::vector::{
+        cell_posting::EncodedCellRow, reader::VectorReader, spill::MaterializedRowSpillWriter,
+    };
 
     /// Drive an async reader call to completion. The materialized read-back is
     /// async (the drain fetches-on-miss); these tests use in-memory readers, so
@@ -3059,6 +3607,76 @@ mod tests {
             assert_eq!(before.encoded.residuals, after.encoded.residuals);
             assert_eq!(after.encoded.rerank_codec, RerankCodec::Sq8FixedResidual);
         }
+    }
+
+    #[test]
+    fn streamed_materialized_cell_matches_in_memory_fixed_residual() {
+        let dim = 16;
+        let scale: Arc<[f32]> = Arc::from(vec![SQ8_FIXED_SCALE; dim]);
+        let offset: Arc<[f32]> = Arc::from(vec![SQ8_FIXED_OFFSET; dim]);
+        let rows: Vec<MaterializedIvfRow> = (0..32)
+            .map(|row| {
+                let stable_id = i128::from(row) * 17 + 3;
+                MaterializedIvfRow {
+                    local_doc_id: row,
+                    stable_id,
+                    cluster: 0,
+                    rabitq_code: vec![row as u8; dim.div_ceil(8)],
+                    encoded: EncodedCellRow {
+                        stable_id,
+                        rerank_codec: RerankCodec::Sq8FixedResidual,
+                        scale: Arc::clone(&scale),
+                        offset: Arc::clone(&offset),
+                        codes: vec![32 + row as u8; dim],
+                        residuals: vec![(row as i8 - 16) as u8; dim],
+                        norm_sq: None,
+                    },
+                }
+            })
+            .collect();
+        let config = VectorConfig {
+            column: "emb".into(),
+            dim,
+            n_cent: 4,
+            rot_seed: 7,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8FixedResidual,
+            provided_centroids: None,
+        };
+        let expected = build_merged_subsection_from_materialized(config.clone(), rows.clone())
+            .expect("in-memory materialized build");
+        let directory = tempdir().expect("tempdir");
+        let mut spill_writer =
+            MaterializedRowSpillWriter::create(directory.path(), 11, dim, dim.div_ceil(8))
+                .expect("spill writer");
+        for row in &rows {
+            spill_writer.append(row).expect("spill row");
+        }
+        let spill = spill_writer.finish().expect("finish spill");
+        let subsection_path = directory.path().join("streamed.ivf");
+        let stable_ids_path = directory.path().join("streamed.ids");
+        let built = build_merged_subsection_from_spilled_materialized(
+            config,
+            &spill,
+            &subsection_path,
+            &stable_ids_path,
+            directory.path(),
+        )
+        .expect("streamed materialized build");
+        assert_eq!(built.n_docs, rows.len() as u32);
+        assert_eq!(
+            read(&subsection_path).expect("read streamed subsection"),
+            expected.bytes,
+            "streamed and in-memory materialized builders must be byte-identical"
+        );
+        let expected_ids: Vec<u8> = rows
+            .iter()
+            .flat_map(|row| row.stable_id.to_le_bytes())
+            .collect();
+        assert_eq!(
+            read(&stable_ids_path).expect("read stable ids"),
+            expected_ids
+        );
     }
 
     /// Multi-cell cluster search must return nearest-first. A descending

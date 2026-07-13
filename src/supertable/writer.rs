@@ -58,7 +58,7 @@ use std::{
     marker::PhantomData,
     mem,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, Mutex, atomic::Ordering},
     time,
 };
 
@@ -134,6 +134,7 @@ use crate::{
             builder::{
                 MultiCellSubsectionSource, build_merged_subsection_from_fp32,
                 build_merged_subsection_from_materialized,
+                build_merged_subsection_from_spilled_materialized,
             },
             cell_posting::{EncodedCellRow, MaterializedIvfRow},
             distance::{Metric, transpose_centroids_cluster_major},
@@ -144,10 +145,7 @@ use crate::{
             layout::VectorLayout,
             reader::VectorReader,
             rerank_codec::RerankCodec,
-            spill::{
-                MaterializedRowSpillState, MaterializedRowSpillWriter, SpilledCellRows,
-                read_spilled_cell_rows,
-            },
+            spill::{MaterializedRowSpillState, MaterializedRowSpillWriter, SpilledCellRows},
         },
     },
     supertable::{
@@ -173,7 +171,8 @@ use crate::{
 const DRAIN_FINE_RUN_TARGET_BYTES: usize = 2 * 1024 * 1024;
 /// Multipart chunk size for large superfile uploads.
 const SUPERFILE_MULTIPART_PART_BYTES: usize = 8 * (1 << 20);
-/// Checkpoint schema for the resumable drain state machine.
+/// Stable IDs fed to the streamed shard Parquet builder per Arrow batch.
+const DRAIN_ID_BATCH_ROWS: usize = 64 * 1024;
 const DRAIN_CHECKPOINT_SCHEMA: u32 = 1;
 /// Local checkpoint filename inside one epoch scratch directory.
 const DRAIN_LOCAL_CHECKPOINT_FILE: &str = "checkpoint.json";
@@ -261,21 +260,19 @@ enum DrainTestFailurePhase {
 
 #[cfg(test)]
 struct DrainTestFailure {
-    epoch_id: String,
     phase: DrainTestFailurePhase,
     completed: usize,
 }
 
 #[cfg(test)]
-static DRAIN_TEST_FAILURE: StdMutex<Option<DrainTestFailure>> = StdMutex::new(None);
+static DRAIN_TEST_FAILURES: StdMutex<Option<HashMap<String, DrainTestFailure>>> =
+    StdMutex::new(None);
 
 #[cfg(test)]
 fn inject_drain_test_failure(epoch_id: String, phase: DrainTestFailurePhase, completed: usize) {
-    *DRAIN_TEST_FAILURE.lock().expect("drain test failure lock") = Some(DrainTestFailure {
-        epoch_id,
-        phase,
-        completed,
-    });
+    let mut guard = DRAIN_TEST_FAILURES.lock().expect("drain test failure lock");
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.insert(epoch_id, DrainTestFailure { phase, completed });
 }
 
 #[cfg(test)]
@@ -284,12 +281,15 @@ fn maybe_fail_drain_for_test(
     phase: DrainTestFailurePhase,
     completed: usize,
 ) -> Result<(), BuildError> {
-    let mut guard = DRAIN_TEST_FAILURE.lock().expect("drain test failure lock");
-    let should_fail = guard.as_ref().is_some_and(|failure| {
-        failure.epoch_id == epoch_id && failure.phase == phase && completed >= failure.completed
-    });
+    let mut guard = DRAIN_TEST_FAILURES.lock().expect("drain test failure lock");
+    let Some(map) = guard.as_mut() else {
+        return Ok(());
+    };
+    let should_fail = map
+        .get(epoch_id)
+        .is_some_and(|failure| failure.phase == phase && completed >= failure.completed);
     if should_fail {
-        guard.take();
+        map.remove(epoch_id);
         return Err(BuildError::Store(format!(
             "injected drain failure after {phase:?} {completed}"
         )));
@@ -2269,14 +2269,13 @@ fn maint_pool() -> &'static rayon::ThreadPool {
 /// writes to `hidden_inner`; user superfiles remain the durable source.
 ///
 /// Processes user superfiles in BOUNDED BATCHES (`drain_batch_superfiles`) so
-/// working-set RAM stays O(batch). Batches append to per-cell disk spills;
-/// after the final batch, cells are built in bounded waves and streamed into
-/// ≤N shard objects for the whole drain. **Incremental**: skips user commits whose
-/// `birth_version` is already in the hidden manifest's `drained_ranges`, and
-/// advances `drained_ranges` atomically with each batch's commit — so re-running
-/// (or running periodically) drains only newly-ingested commits, never
-/// duplicating cells. Pre-drain queries see an empty hidden index (0 results)
-/// until this runs.
+/// working-set RAM stays O(batch). Kmeans mode accumulates encoded rows in one
+/// disk spill per global cell and trains that cell's fine IVF once over the
+/// complete cross-batch population. Splice mode accumulates source clusters
+/// verbatim. Both modes finally stream complete cell IVFs into at most one
+/// MultiCellIvf per writer worker. **Incremental**: skips user commits whose
+/// `birth_version` is already in the hidden manifest's `drained_ranges`.
+/// Pre-drain queries see an empty hidden index (0 results) until this runs.
 ///
 /// Batch size comes from `vector.drain_batch_superfiles`, which
 /// [`SupertableOptions::apply_config`] copies into the option below; per-table
@@ -2285,11 +2284,6 @@ fn drain_batch_superfiles(opts: &SupertableOptions) -> i64 {
     opts.drain_batch_superfiles
 }
 
-/// Working-set cap for one wave of the drain's end-of-run per-cell builds.
-const DRAIN_BUILD_GROUP_BYTES: u64 = 4 * (1 << 30);
-
-/// Append one materialized row to `cell`'s spill, creating the cell writer on
-/// first touch.
 fn spill_row_to_cell(
     spills: &mut HashMap<u32, MaterializedRowSpillWriter>,
     added: &mut HashMap<u32, u32>,
@@ -2298,8 +2292,8 @@ fn spill_row_to_cell(
     row: &MaterializedIvfRow,
 ) -> Result<(), BuildError> {
     let writer = match spills.entry(cell) {
-        Entry::Occupied(o) => o.into_mut(),
-        Entry::Vacant(v) => v.insert(MaterializedRowSpillWriter::create(
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => entry.insert(MaterializedRowSpillWriter::create(
             scratch,
             cell,
             row.encoded.codes.len(),
@@ -2307,8 +2301,8 @@ fn spill_row_to_cell(
         )?),
     };
     writer.append(row)?;
-    let n = added.entry(cell).or_insert(0);
-    *n = n.saturating_add(1);
+    let count = added.entry(cell).or_insert(0);
+    *count = count.saturating_add(1);
     Ok(())
 }
 
@@ -2321,8 +2315,7 @@ fn spill_unfinished_shard_row(
     cell: u32,
     row: &MaterializedIvfRow,
 ) -> Result<(), BuildError> {
-    let shard = packed_cell_shard(cell, shard_count) as u32;
-    if completed_shards.contains(&shard) {
+    if completed_shards.contains(&(packed_cell_shard(cell, shard_count) as u32)) {
         return Ok(());
     }
     spill_row_to_cell(spills, added, scratch, cell, row)
@@ -2850,10 +2843,9 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // are immutable (owned by the user manifest), so each batch's
     // `apply_cell_updates` builds on the prior batches' running totals.
     let mut running_clusters = clusters;
-    // Drain decouples the batch budget (a memory bound on how many user
-    // superfiles are materialized at once) from the published layout: every
-    // batch spills rows per cell to scratch, then packs cell IVFs into ≤N
-    // shard objects after the last batch.
+    // The batch budget bounds source materialization. Kmeans rows accumulate
+    // in per-cell disk spills; complete cell IVFs and final worker shards are
+    // built only after every source batch is durable.
     let drain_scratch = drain_scratch_dir(&remote_state.checkpoint.epoch_id);
     fs::create_dir_all(&drain_scratch)
         .map_err(|error| BuildError::Store(format!("drain scratch create: {error}")))?;
@@ -2921,8 +2913,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
 
     let mut cell_spills = HashMap::new();
     for (&cell, spill) in &local_checkpoint.spills {
-        let cell_shard = packed_cell_shard(cell, shard_count) as u32;
-        if completed_shards.contains(&cell_shard) {
+        if completed_shards.contains(&(packed_cell_shard(cell, shard_count) as u32)) {
             continue;
         }
         let rerank_codec = RerankCodec::from_codec_id(spill.rerank_codec_id).ok_or_else(|| {
@@ -3138,7 +3129,6 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
 
                 let all_rows: Vec<MaterializedIvfRow> = row_sets.into_iter().flatten().collect();
                 let n_batch_rows = all_rows.len();
-                let scratch = drain_scratch.as_path();
                 for writer in cell_spills.values_mut() {
                     writer.begin_batch();
                 }
@@ -3152,7 +3142,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             &mut added_per_cell,
                             &completed_shards,
                             shard_count,
-                            scratch,
+                            drain_scratch.as_path(),
                             row.cluster,
                             row,
                         )?;
@@ -3196,7 +3186,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             &mut added_per_cell,
                             &completed_shards,
                             shard_count,
-                            scratch,
+                            drain_scratch.as_path(),
                             cell,
                             &all_rows[row_idx],
                         )?;
@@ -3207,7 +3197,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             &mut added_per_cell,
                             &completed_shards,
                             shard_count,
-                            scratch,
+                            drain_scratch.as_path(),
                             assignment.primary,
                             row,
                         )?;
@@ -3261,113 +3251,16 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         );
     }
 
-    // Produce packed cell-IVFs (mode-specific), then one shared pack/upload:
-    // group by `cell % writer_pool_width` and stream exactly one packed
-    // superfile per non-empty worker shard.
+    // One task per final worker shard. Splice cells are already packed; each
+    // kmeans worker streams its row-spilled cells one at a time, checkpoints
+    // their completed IVF files, then assembles one MultiCellIvf.
     {
         let build_t0 = time::Instant::now();
         let scratch = drain_scratch.as_path();
         let n_cells_total = added_per_cell.len();
         let total_rows: u64 = added_per_cell.values().map(|count| u64::from(*count)).sum();
-        let mut n_waves = 0usize;
-        let mut cells_built = packed_cells.len();
-
-        match consolidate {
-            DrainConsolidate::Splice => {
-                if !cell_spills.is_empty() {
-                    return Err(BuildError::Store(
-                        "splice drain must not leave kmeans row spills".into(),
-                    ));
-                }
-                if packed_cells.is_empty() && !added_per_cell.is_empty() {
-                    return Err(BuildError::Store(
-                        "splice drain has cell counts but no packed cell-IVFs".into(),
-                    ));
-                }
-            }
-            DrainConsolidate::Kmeans => {
-                let vc = hidden_inner
-                    .options
-                    .vector_columns
-                    .first()
-                    .cloned()
-                    .ok_or_else(|| BuildError::Store("drain pack requires a vector column".into()))?;
-                if !cell_spills.is_empty() {
-                    let mut spilled: Vec<(u32, SpilledCellRows)> = cell_spills
-                        .into_iter()
-                        .map(|(cell, writer)| {
-                            writer.finish().map(|s| (cell, s)).map_err(BuildError::from)
-                        })
-                        .collect::<Result<Vec<_>, BuildError>>()?;
-                    spilled.sort_unstable_by_key(|(cell, _)| *cell);
-
-                    crate::superfile::vector::builder::build_phase_timers::reset();
-                    let mut wave: Vec<(u32, SpilledCellRows)> = Vec::new();
-                    let mut wave_bytes: u64 = 0;
-                    let mut spilled_iter = spilled.into_iter().peekable();
-                    while let Some((cell, spill)) = spilled_iter.next() {
-                        wave_bytes += spill.row_bytes();
-                        wave.push((cell, spill));
-                        let flush =
-                            wave_bytes >= DRAIN_BUILD_GROUP_BYTES || spilled_iter.peek().is_none();
-                        if !flush {
-                            continue;
-                        }
-                        n_waves += 1;
-                        let cells_rows: Vec<(u32, Vec<MaterializedIvfRow>)> = wave
-                            .iter()
-                            .map(|(cell, spill)| {
-                                read_spilled_cell_rows(spill)
-                                    .map(|rows| (*cell, rows))
-                                    .map_err(BuildError::from)
-                            })
-                            .collect::<Result<Vec<_>, BuildError>>()?;
-                        let built_wave: Vec<SpilledPackedCell> =
-                            hidden_inner.options.writer_pool.install(|| {
-                                cells_rows
-                                    .into_par_iter()
-                                    .filter(|(_, rows)| !rows.is_empty())
-                                    .map(|(cell_id, rows)| {
-                                        let packed =
-                                            drain_pack_materialized_cell(cell_id, rows, &vc)?;
-                                        let (cell_id, subsection, stable_ids) =
-                                            packed.into_hidden_triple();
-                                        spill_packed_cell(
-                                            scratch,
-                                            cell_id,
-                                            subsection,
-                                            &stable_ids,
-                                        )
-                                    })
-                                    .collect::<Result<Vec<_>, BuildError>>()
-                            })?;
-                        cells_built += built_wave.len();
-                        for cell in built_wave {
-                            local_checkpoint.spills.remove(&cell.cell_id);
-                            local_checkpoint.built_cells.insert(
-                                cell.cell_id,
-                                DrainLocalCell {
-                                    n_docs: cell.n_docs,
-                                    subsection_len: cell.subsection_len,
-                                    rerank_codec_id: cell.rerank_codec.codec_id(),
-                                },
-                            );
-                            packed_cells.push(cell);
-                        }
-                        for (_, spill) in wave.drain(..) {
-                            spill.remove_files();
-                        }
-                        save_drain_local_checkpoint(&drain_scratch, &local_checkpoint)?;
-                        eprintln!(
-                            "[supertable drain] pack wave {n_waves}: {cells_built}/{n_cells_total} cell-IVFs built to scratch"
-                        );
-                        wave_bytes = 0;
-                    }
-                }
-            }
-        }
-
         let n_shards = shard_count;
+
         let mut cell_counts_by_shard: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
         for (&cell, &count) in &added_per_cell {
             let shard = packed_cell_shard(cell, n_shards) as u32;
@@ -3380,25 +3273,96 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             counts.sort_unstable_by_key(|(cell, _)| *cell);
         }
         let expected_shards = cell_counts_by_shard.len();
-        let packed_cells: Vec<(u32, SpilledPackedCell)> = packed_cells
+
+        crate::superfile::vector::builder::build_phase_timers::reset();
+        let mut sources: Vec<(u32, DrainCellSource)> = packed_cells
             .into_iter()
-            .map(|cell| (cell.cell_id, cell))
+            .map(|cell| (cell.cell_id, DrainCellSource::Packed(cell)))
             .collect();
-        let packed_shards = group_cells_by_packed_shard(packed_cells, n_shards);
-        let n_shard_files = packed_shards.len();
-        let prepared_shards: Vec<PreparedSuperfile> =
-            hidden_inner.options.writer_pool.install(|| {
-                packed_shards
-                    .into_par_iter()
-                    .map(|(shard_id, cells)| {
-                        let cells = cells.into_iter().map(|(_, cell)| cell).collect();
-                        build_prepared_from_spilled_cells(&hidden_inner, scratch, shard_id, cells)
-                    })
-                    .collect::<Result<Vec<_>, BuildError>>()
-            })?;
-        if n_shard_files > n_shards {
+        match consolidate {
+            DrainConsolidate::Splice => {
+                if !cell_spills.is_empty() {
+                    return Err(BuildError::Store(
+                        "splice drain must not leave materialized row spills".into(),
+                    ));
+                }
+            }
+            DrainConsolidate::Kmeans => {
+                sources.extend(
+                    cell_spills
+                        .into_iter()
+                        .map(|(cell, writer)| {
+                            writer
+                                .finish()
+                                .map(|spill| (cell, DrainCellSource::Rows(spill)))
+                                .map_err(BuildError::from)
+                        })
+                        .collect::<Result<Vec<_>, BuildError>>()?,
+                );
+            }
+        }
+        if sources.is_empty() && !added_per_cell.is_empty() {
+            return Err(BuildError::Store(
+                "drain has cell counts but no cell build sources".into(),
+            ));
+        }
+        let mut shard_sources = group_cells_by_packed_shard(sources, n_shards);
+        shard_sources.retain(|(shard_id, _)| !completed_shards.contains(shard_id));
+        let checkpoint = Arc::new(Mutex::new(local_checkpoint));
+        let vector_config = hidden_inner
+            .options
+            .vector_columns
+            .first()
+            .cloned()
+            .ok_or_else(|| BuildError::Store("drain pack requires a vector column".into()))?;
+        let prepared_shards: Vec<PreparedSuperfile> = fanout_shards(
+            &hidden_inner.options.writer_pool,
+            &shard_sources,
+            |(shard_id, cells)| {
+                let mut packed = Vec::with_capacity(cells.len());
+                for (cell_id, source) in cells {
+                    let cell = match source {
+                        DrainCellSource::Packed(cell) => cell.clone(),
+                        DrainCellSource::Rows(spill) => {
+                            let cell = build_spilled_packed_cell_from_rows(
+                                scratch,
+                                *cell_id,
+                                spill,
+                                &vector_config,
+                            )?;
+                            {
+                                let mut state = checkpoint.lock().map_err(|_| {
+                                    BuildError::Store("drain checkpoint lock poisoned".into())
+                                })?;
+                                state.spills.remove(cell_id);
+                                state.built_cells.insert(
+                                    *cell_id,
+                                    DrainLocalCell {
+                                        n_docs: cell.n_docs,
+                                        subsection_len: cell.subsection_len,
+                                        rerank_codec_id: cell.rerank_codec.codec_id(),
+                                    },
+                                );
+                                save_drain_local_checkpoint(&drain_scratch, &state)?;
+                            }
+                            spill.remove_files();
+                            cell
+                        }
+                    };
+                    packed.push((*cell_id, cell));
+                }
+                build_prepared_from_spilled_cells(&hidden_inner, scratch, *shard_id, &packed)
+            },
+        )?;
+        local_checkpoint = checkpoint
+            .lock()
+            .map_err(|_| BuildError::Store("drain checkpoint lock poisoned".into()))?
+            .clone();
+
+        if prepared_shards.len() + completed_shards.len() > n_shards {
             return Err(BuildError::Store(format!(
-                "drain produced {n_shard_files} packed shards for {n_shards} workers"
+                "drain produced {} packed shards for {n_shards} workers",
+                prepared_shards.len() + completed_shards.len()
             )));
         }
         let publish = collect_prepared_superfiles(&hidden_inner, prepared_shards)?;
@@ -3474,6 +3438,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             new_entries.push(entry);
 
             for (cell, _) in cell_counts {
+                local_checkpoint.spills.remove(&cell);
                 if let Some(state) = local_checkpoint.built_cells.remove(&cell)
                     && let Ok(packed) = restore_spilled_packed_cell(&drain_scratch, cell, &state)
                 {
@@ -3542,12 +3507,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             tracing::warn!("drain local checkpoint cleanup failed: {error}");
         }
         eprintln!(
-            "[supertable drain] cell build: {} row(s), {} cell(s) -> {} packed shard superfile(s) for {} worker(s) in {} build wave(s), {:.1}ms",
+            "[supertable drain] cell build: {} row(s), {} cell(s) -> {} packed shard superfile(s) for {} worker(s), {:.1}ms",
             total_rows,
             n_cells_total,
             n_shard_files,
             n_shards,
-            n_waves,
             build_t0.elapsed().as_secs_f64() * 1e3,
         );
         if crate::superfile::vector::builder::build_phase_timers::enabled() {
@@ -3731,6 +3695,7 @@ fn proc_rss_mib() -> Option<f64> {
 /// One completed cell-IVF and its stable-id column, both spilled to local
 /// scratch. The vector blob writer streams the subsection file directly into
 /// its final packed shard; no shard ever rehydrates all of its cell bytes.
+#[derive(Clone)]
 struct SpilledPackedCell {
     cell_id: u32,
     n_docs: u32,
@@ -3738,6 +3703,11 @@ struct SpilledPackedCell {
     subsection_len: u64,
     subsection_path: PathBuf,
     stable_ids_path: PathBuf,
+}
+
+enum DrainCellSource {
+    Packed(SpilledPackedCell),
+    Rows(SpilledCellRows),
 }
 
 impl MultiCellSubsectionSource for SpilledPackedCell {
@@ -3767,6 +3737,28 @@ impl MultiCellSubsectionSource for SpilledPackedCell {
             )));
         }
         Ok(())
+    }
+}
+
+impl MultiCellSubsectionSource for &SpilledPackedCell {
+    fn cell_id(&self) -> u32 {
+        (*self).cell_id()
+    }
+
+    fn n_docs(&self) -> u32 {
+        (*self).n_docs()
+    }
+
+    fn len(&self) -> u64 {
+        (*self).len()
+    }
+
+    fn rerank_codec(&self) -> RerankCodec {
+        (*self).rerank_codec()
+    }
+
+    fn write_to(&self, output: &mut dyn Write) -> Result<(), SuperfileBuildError> {
+        (*self).write_to(output)
     }
 }
 
@@ -3827,6 +3819,38 @@ fn spill_packed_cell(
         n_docs: subsection.n_docs,
         rerank_codec: subsection.rerank_codec,
         subsection_len,
+        subsection_path,
+        stable_ids_path,
+    })
+}
+
+fn build_spilled_packed_cell_from_rows(
+    scratch: &Path,
+    cell_id: u32,
+    spill: &SpilledCellRows,
+    vector_config: &VectorConfig,
+) -> Result<SpilledPackedCell, BuildError> {
+    let subsection_path = scratch.join(format!("cell-{cell_id}.ivf"));
+    let subsection_temp = scratch.join(format!("cell-{cell_id}.ivf.tmp"));
+    let stable_ids_path = scratch.join(format!("cell-{cell_id}.ids"));
+    let stable_ids_temp = scratch.join(format!("cell-{cell_id}.ids.tmp"));
+    let cell_config = drain_cell_vector_config(vector_config, spill.n_rows());
+    let built = build_merged_subsection_from_spilled_materialized(
+        cell_config,
+        spill,
+        &subsection_temp,
+        &stable_ids_temp,
+        scratch,
+    )?;
+    fs::rename(&subsection_temp, &subsection_path)
+        .map_err(|error| BuildError::Store(format!("cell subsection rename: {error}")))?;
+    fs::rename(&stable_ids_temp, &stable_ids_path)
+        .map_err(|error| BuildError::Store(format!("cell ids rename: {error}")))?;
+    Ok(SpilledPackedCell {
+        cell_id,
+        n_docs: built.n_docs,
+        rerank_codec: built.rerank_codec,
+        subsection_len: built.subsection_len,
         subsection_path,
         stable_ids_path,
     })
@@ -3918,7 +3942,8 @@ fn load_merged_from_spilled(
             .try_into()
             .expect("4-byte codec meta size"),
     ) as usize;
-    if cluster_idx_off < centroids_off || (cluster_idx_off - centroids_off) % (dim * 4) != 0 {
+    if cluster_idx_off < centroids_off || !(cluster_idx_off - centroids_off).is_multiple_of(dim * 4)
+    {
         return Err(BuildError::Store(format!(
             "cell {}: invalid centroid region for dim {dim}",
             cell.cell_id
@@ -3969,17 +3994,17 @@ fn accumulate_splice_cell(
         return Ok(());
     }
 
-    let (subsection, stable_ids) = match packed_cells.iter().position(|cell| cell.cell_id == cell_id)
-    {
-        Some(idx) => {
-            let existing = packed_cells.swap_remove(idx);
-            let (left, left_ids) = load_merged_from_spilled(&existing, dim)?;
-            remove_spilled_packed_cell(&existing);
-            local_checkpoint.built_cells.remove(&cell_id);
-            merge_fragment_subsections(&left, &left_ids, &subsection, &stable_ids, dim, metric)?
-        }
-        None => (subsection, stable_ids),
-    };
+    let (subsection, stable_ids) =
+        match packed_cells.iter().position(|cell| cell.cell_id == cell_id) {
+            Some(idx) => {
+                let existing = packed_cells.swap_remove(idx);
+                let (left, left_ids) = load_merged_from_spilled(&existing, dim)?;
+                remove_spilled_packed_cell(&existing);
+                local_checkpoint.built_cells.remove(&cell_id);
+                merge_fragment_subsections(&left, &left_ids, &subsection, &stable_ids, dim, metric)?
+            }
+            None => (subsection, stable_ids),
+        };
 
     let n_docs = subsection.n_docs;
     let packed = spill_packed_cell(scratch, cell_id, subsection, &stable_ids)?;
@@ -4045,9 +4070,7 @@ fn group_cells_by_packed_shard<T>(
         .collect()
 }
 
-/// One commit-buffer row for the shared assign+pack core. The drain does not
-/// come through here: its rows are spilled per cell and packed from
-/// [`SpilledCellRows`] via [`drain_pack_materialized_cell`].
+/// One commit-buffer row for the shared assign+pack core.
 #[derive(Clone, Copy)]
 enum PackRow<'a> {
     Fp32 { stable_id: i128, vector: &'a [f32] },
@@ -4068,13 +4091,8 @@ struct AssignedCellGroup<'a> {
 struct PackedCellGroup {
     cell_id: u32,
     subsection: MergedIvfSubsection,
+    #[cfg(test)]
     stable_ids: Vec<i128>,
-}
-
-impl PackedCellGroup {
-    fn into_hidden_triple(self) -> (u32, MergedIvfSubsection, Vec<i128>) {
-        (self.cell_id, self.subsection, self.stable_ids)
-    }
 }
 
 fn pack_row_stable_id(row: PackRow<'_>) -> i128 {
@@ -4148,36 +4166,6 @@ fn assign_cells<'a>(
     Ok(out)
 }
 
-/// Call drain's cell IVF pack on one assigned bucket.
-///
-/// This is the **only** pack entry: it forwards to drain's APIs —
-/// [`build_merged_subsection_from_fp32`] (commit fp32 / in-memory stream) or
-/// [`build_merged_subsection_from_materialized`] (hidden drain Sq8 rows).
-/// No commit-local IVF logic. Returns buffers only (no S3 / no superfile write).
-fn drain_pack_materialized_cell(
-    cell_id: u32,
-    mut rows: Vec<MaterializedIvfRow>,
-    cfg: &VectorConfig,
-) -> Result<PackedCellGroup, BuildError> {
-    if rows.is_empty() {
-        return Err(BuildError::Store(format!(
-            "cell {cell_id}: drain pack received no rows"
-        )));
-    }
-    rows.sort_by_key(|row| row.stable_id);
-    for (local, row) in rows.iter_mut().enumerate() {
-        row.local_doc_id = local as u32;
-    }
-    let stable_ids: Vec<i128> = rows.iter().map(|row| row.stable_id).collect();
-    let cell_cfg = drain_cell_vector_config(cfg, rows.len());
-    let subsection = build_merged_subsection_from_materialized(cell_cfg, rows)?;
-    Ok(PackedCellGroup {
-        cell_id,
-        subsection,
-        stable_ids,
-    })
-}
-
 /// Size one cell's fine IVF so one run is approximately
 /// [`DRAIN_FINE_RUN_TARGET_BYTES`]. The stride counts every per-row byte in
 /// the packed IVF: RaBitQ estimate code, local id, Sq8+epsilon rerank bytes,
@@ -4228,6 +4216,7 @@ fn drain_pack_assigned_cell(
     Ok(PackedCellGroup {
         cell_id,
         subsection,
+        #[cfg(test)]
         stable_ids,
     })
 }
@@ -4316,46 +4305,72 @@ fn build_prepared_from_spilled_cells(
     inner: &SupertableInner,
     scratch: &Path,
     shard_id: u32,
-    mut cells: Vec<SpilledPackedCell>,
+    cells: &[(u32, SpilledPackedCell)],
 ) -> Result<PreparedSuperfile, BuildError> {
     if cells.is_empty() {
         return Err(BuildError::NoDocsToBuild);
     }
-    cells.sort_unstable_by_key(|cell| cell.cell_id);
+    let mut ordered: Vec<&SpilledPackedCell> = cells.iter().map(|(_, cell)| cell).collect();
+    ordered.sort_unstable_by_key(|cell| cell.cell_id);
 
-    let n_docs = cells.iter().map(|cell| cell.n_docs as usize).sum::<usize>();
-    let mut stable_ids = Vec::with_capacity(n_docs);
-    for cell in &cells {
-        stable_ids.extend(read_spilled_stable_ids(cell)?);
-    }
-    if stable_ids.len() != n_docs {
-        return Err(BuildError::Store(format!(
-            "shard {shard_id}: stable id count {} != expected {n_docs}",
-            stable_ids.len()
-        )));
-    }
-
-    let id_array = Decimal128Array::from_iter_values(stable_ids.iter().copied())
-        .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
-        .expect("invariant: precision 38 + scale 0 always valid for any i128 payload");
-    let scalar = RecordBatch::try_new(
-        inner.options.scalar_schema(),
-        vec![Arc::new(id_array) as ArrayRef],
-    )
-    .map_err(|_| BuildError::BatchSchemaMismatch)?;
-    let scalar_stats = ScalarStatsAgg::from_batches(&inner.options.scalar_schema(), &[&scalar]);
-
+    let n_docs = ordered
+        .iter()
+        .map(|cell| cell.n_docs as usize)
+        .sum::<usize>();
+    let scalar_schema = inner.options.scalar_schema();
+    let mut scalar_stats = HashMap::new();
     let mut builder = SuperfileBuilder::new(
         inner
             .options
             .builder_options()
             .with_vector_layout(VectorLayout::MultiCellIvf),
     )?;
-    builder.add_batch_ids_only(&scalar)?;
+    let mut id_min = i128::MAX;
+    let mut id_max = i128::MIN;
+    let mut ids_seen = 0usize;
+    for cell in &ordered {
+        let mut reader = BufReader::new(
+            File::open(&cell.stable_ids_path)
+                .map_err(|error| BuildError::Store(format!("cell ids spill open: {error}")))?,
+        );
+        let mut remaining = cell.n_docs as usize;
+        while remaining > 0 {
+            let take = remaining.min(DRAIN_ID_BATCH_ROWS);
+            let mut ids = Vec::with_capacity(take);
+            let mut encoded = [0u8; STABLE_ID_BYTES];
+            for _ in 0..take {
+                reader
+                    .read_exact(&mut encoded)
+                    .map_err(|error| BuildError::Store(format!("cell ids spill read: {error}")))?;
+                let id = i128::from_le_bytes(encoded);
+                id_min = id_min.min(id);
+                id_max = id_max.max(id);
+                ids.push(id);
+            }
+            let id_array = Decimal128Array::from_iter_values(ids)
+                .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
+                .expect("invariant: precision 38 + scale 0 always valid for any i128 payload");
+            let scalar =
+                RecordBatch::try_new(scalar_schema.clone(), vec![Arc::new(id_array) as ArrayRef])
+                    .map_err(|_| BuildError::BatchSchemaMismatch)?;
+            ScalarStatsAgg::merge(
+                &mut scalar_stats,
+                &ScalarStatsAgg::from_batch(&scalar_schema, &scalar),
+            );
+            builder.add_batch_ids_only(&scalar)?;
+            ids_seen += take;
+            remaining -= take;
+        }
+    }
+    if ids_seen != n_docs {
+        return Err(BuildError::Store(format!(
+            "shard {shard_id}: stable id count {ids_seen} != expected {n_docs}"
+        )));
+    }
 
     let mut output = NamedTempFile::new_in(scratch)
         .map_err(|error| BuildError::Store(format!("packed shard temp create: {error}")))?;
-    builder.finish_multi_cell_sources_to(&cells, BufWriter::new(output.as_file_mut()))?;
+    builder.finish_multi_cell_sources_to(&ordered, BufWriter::new(output.as_file_mut()))?;
     output
         .as_file_mut()
         .flush()
@@ -4363,8 +4378,11 @@ fn build_prepared_from_spilled_cells(
     let bytes = mmap_readonly_bytes(output.path())
         .map_err(|error| BuildError::Store(format!("packed shard mmap: {error}")))?;
 
-    let id_min = stable_ids.iter().copied().min().unwrap_or(0);
-    let id_max = stable_ids.iter().copied().max().unwrap_or(0);
+    let (id_min, id_max) = if n_docs == 0 {
+        (0, 0)
+    } else {
+        (id_min, id_max)
+    };
     let shard = ShardOutput {
         bytes,
         n_docs: n_docs as u64,
@@ -4887,9 +4905,7 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
                 .unwrap_or(1)
                 .max(1);
             cfg.n_cent = n_cent;
-            let sub = crate::superfile::vector::builder::build_merged_subsection_from_materialized(
-                cfg, rows,
-            )?;
+            let sub = build_merged_subsection_from_materialized(cfg, rows)?;
             packed.push((cell_id, sub, stable_ids));
         }
         if packed.is_empty() {

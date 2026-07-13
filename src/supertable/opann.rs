@@ -439,8 +439,8 @@ mod tests {
                 vecs.push(offset + i as f32 * 0.01 + d as f32 * 0.001);
             }
         }
-        let blob = encode_blob(Metric::L2Sq, dim, &ids, &vecs, RerankCodec::Sq8Residual)
-            .expect("encode");
+        let blob =
+            encode_blob(Metric::L2Sq, dim, &ids, &vecs, RerankCodec::Sq8Residual).expect("encode");
         let stable_ids: Vec<i128> = (0..n).map(|i| i as i128).collect();
         load_encoded_rows_from_blob(&blob, &stable_ids, None).expect("load")
     }

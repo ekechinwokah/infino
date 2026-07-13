@@ -15,7 +15,8 @@ use rayon::prelude::*;
 use crate::superfile::{
     BuildError,
     format::{
-        CRC_BYTES, checksum::crc32c,
+        CRC_BYTES,
+        checksum::crc32c,
         vec::{
             CLUSTER_IDX_ENTRY_BYTES, DOC_ID_BYTES, STABLE_ID_BYTES, SUB_HEADER_SIZE, U32_BYTES,
             U64_BYTES, sub_hdr,
@@ -723,8 +724,7 @@ pub(crate) fn sq8_ivf_merge_input_from_subsection(
         ));
     }
     let scale = decode_f32_le_vec(&sub[codec_meta_off..codec_meta_off + so_bytes]);
-    let offset =
-        decode_f32_le_vec(&sub[codec_meta_off + so_bytes..codec_meta_off + 2 * so_bytes]);
+    let offset = decode_f32_le_vec(&sub[codec_meta_off + so_bytes..codec_meta_off + 2 * so_bytes]);
     let quant = BitQuantizer::new(dim);
     let code_bytes = quant.code_bytes();
     let per_vec_bytes = rerank_codec.per_vector_bytes(dim);

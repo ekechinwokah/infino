@@ -17,9 +17,8 @@
 //!   `Arc<Vec<f32>>`, no spill needed) and [`MmapVectorSource`]
 //!   (wraps a memory-mapped spill file).
 //! - [`MaterializedRowSpillWriter`] / [`SpilledCellRows`] — per-cell
-//!   drain scratch: every assigned [`MaterializedIvfRow`] is appended
-//!   to its cell's spill file so drain RAM stays O(batch); the pack
-//!   rehydrates bounded waves via [`read_spilled_cell_rows`].
+//!   Sq8 row scratch accumulated across drain batches, plus bounded
+//!   readers used by the streamed materialized-IVF builder.
 //!
 //! Both `ChunkedVectorSource` implementations own their backing
 //! storage so the trait isn't tied to an external lifetime; the
@@ -369,6 +368,7 @@ const NORM_PRESENT: u8 = 1;
 
 /// One finished per-cell spill: the row-record file, its quantizer-table
 /// sidecar, and the counts needed to read them back.
+#[derive(Debug)]
 pub(crate) struct SpilledCellRows {
     rows_path: PathBuf,
     quants_path: PathBuf,
@@ -380,10 +380,20 @@ pub(crate) struct SpilledCellRows {
 }
 
 impl SpilledCellRows {
-    /// On-disk size of the row-record file — the working-set estimate the
-    /// drain uses to group cells into memory-bounded build waves.
-    pub(crate) fn row_bytes(&self) -> u64 {
-        (self.n_rows as u64) * record_bytes(self.dim, self.rabitq_len) as u64
+    pub(crate) fn n_rows(&self) -> usize {
+        self.n_rows as usize
+    }
+
+    pub(crate) fn dim(&self) -> usize {
+        self.dim
+    }
+
+    pub(crate) fn rerank_codec(&self) -> RerankCodec {
+        self.rerank_codec
+    }
+
+    pub(crate) fn reader(&self) -> Result<MaterializedRowSpillReader, BuildError> {
+        MaterializedRowSpillReader::open(self)
     }
 
     /// Delete both backing files. Called after the cell superfile is built
@@ -607,10 +617,53 @@ impl MaterializedRowSpillWriter {
     }
 }
 
-/// Read one cell's spilled rows back into [`MaterializedIvfRow`]s.
-pub(crate) fn read_spilled_cell_rows(
+/// Bounded reader over one finished per-cell encoded-row spill.
+pub(crate) struct MaterializedRowSpillReader {
+    rows: BufReader<File>,
+    quants: Vec<(Arc<[f32]>, Arc<[f32]>)>,
+    remaining: u32,
+    dim: usize,
+    rabitq_len: usize,
+    rerank_codec: RerankCodec,
+}
+
+impl MaterializedRowSpillReader {
+    fn open(spill: &SpilledCellRows) -> Result<Self, BuildError> {
+        let dim = spill.dim;
+        let quants = read_spilled_quantizers(spill)?;
+        Ok(Self {
+            rows: BufReader::new(File::open(&spill.rows_path)?),
+            quants,
+            remaining: spill.n_rows,
+            dim,
+            rabitq_len: spill.rabitq_len,
+            rerank_codec: spill.rerank_codec,
+        })
+    }
+
+    pub(crate) fn next_chunk(
+        &mut self,
+        max_rows: usize,
+    ) -> Result<Vec<MaterializedIvfRow>, BuildError> {
+        let take = (self.remaining as usize).min(max_rows.max(1));
+        let mut rows = Vec::with_capacity(take);
+        for _ in 0..take {
+            rows.push(read_spilled_row(
+                &mut self.rows,
+                &self.quants,
+                self.dim,
+                self.rabitq_len,
+                self.rerank_codec,
+            )?);
+        }
+        self.remaining -= take as u32;
+        Ok(rows)
+    }
+}
+
+fn read_spilled_quantizers(
     spill: &SpilledCellRows,
-) -> Result<Vec<MaterializedIvfRow>, BuildError> {
+) -> Result<Vec<(Arc<[f32]>, Arc<[f32]>)>, BuildError> {
     let dim = spill.dim;
     let mut quants: Vec<(Arc<[f32]>, Arc<[f32]>)> = Vec::with_capacity(spill.n_quants as usize);
     {
@@ -624,49 +677,69 @@ pub(crate) fn read_spilled_cell_rows(
             quants.push((scale, offset));
         }
     }
+    Ok(quants)
+}
 
-    let mut rows = Vec::with_capacity(spill.n_rows as usize);
-    let mut reader = BufReader::new(File::open(&spill.rows_path)?);
+fn read_spilled_row(
+    reader: &mut BufReader<File>,
+    quants: &[(Arc<[f32]>, Arc<[f32]>)],
+    dim: usize,
+    rabitq_len: usize,
+    rerank_codec: RerankCodec,
+) -> Result<MaterializedIvfRow, BuildError> {
     let mut prefix = [0u8; ROW_SPILL_PREFIX_BYTES];
-    for _ in 0..spill.n_rows {
-        reader.read_exact(&mut prefix)?;
-        let stable_id = i128::from_le_bytes(prefix[0..16].try_into().expect("16-byte i128 slice"));
-        let cluster = u32::from_le_bytes(prefix[16..20].try_into().expect("4-byte u32 slice"));
-        let quant_idx =
-            u32::from_le_bytes(prefix[20..24].try_into().expect("4-byte u32 slice")) as usize;
-        let norm_flag = prefix[24];
-        let norm = f32::from_le_bytes(prefix[25..29].try_into().expect("4-byte f32 slice"));
-        let (scale, offset) = quants.get(quant_idx).cloned().ok_or_else(|| {
-            BuildError::Io(Error::new(
-                ErrorKind::InvalidData,
-                format!(
-                    "drain spill: quantizer index {quant_idx} out of range ({} entries)",
-                    quants.len()
-                ),
-            ))
-        })?;
-        let mut rabitq_code = vec![0u8; spill.rabitq_len];
-        reader.read_exact(&mut rabitq_code)?;
-        let mut codes = vec![0u8; dim];
-        reader.read_exact(&mut codes)?;
-        let mut residuals = vec![0u8; dim];
-        reader.read_exact(&mut residuals)?;
-        let norm_sq = (norm_flag == NORM_PRESENT).then_some(norm);
-        rows.push(MaterializedIvfRow {
-            local_doc_id: 0,
+    reader.read_exact(&mut prefix)?;
+    let stable_id = i128::from_le_bytes(prefix[0..16].try_into().expect("16-byte i128 slice"));
+    let cluster = u32::from_le_bytes(prefix[16..20].try_into().expect("4-byte u32 slice"));
+    let quant_idx =
+        u32::from_le_bytes(prefix[20..24].try_into().expect("4-byte u32 slice")) as usize;
+    let norm_flag = prefix[24];
+    let norm = f32::from_le_bytes(prefix[25..29].try_into().expect("4-byte f32 slice"));
+    let (scale, offset) = quants.get(quant_idx).cloned().ok_or_else(|| {
+        BuildError::Io(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "drain spill: quantizer index {quant_idx} out of range ({} entries)",
+                quants.len()
+            ),
+        ))
+    })?;
+    let mut rabitq_code = vec![0u8; rabitq_len];
+    reader.read_exact(&mut rabitq_code)?;
+    let mut codes = vec![0u8; dim];
+    reader.read_exact(&mut codes)?;
+    let mut residuals = vec![0u8; dim];
+    reader.read_exact(&mut residuals)?;
+    let norm_sq = (norm_flag == NORM_PRESENT).then_some(norm);
+    Ok(MaterializedIvfRow {
+        local_doc_id: 0,
+        stable_id,
+        cluster,
+        rabitq_code,
+        encoded: EncodedCellRow {
             stable_id,
-            cluster,
-            rabitq_code,
-            encoded: EncodedCellRow {
-                stable_id,
-                rerank_codec: spill.rerank_codec,
-                scale,
-                offset,
-                codes,
-                residuals,
-                norm_sq,
-            },
-        });
+            rerank_codec,
+            scale,
+            offset,
+            codes,
+            residuals,
+            norm_sq,
+        },
+    })
+}
+
+/// Read one cell's spilled rows back into [`MaterializedIvfRow`]s.
+///
+/// Retained for small in-memory callers and equivalence tests. Large drain
+/// packs use [`MaterializedRowSpillReader`] directly.
+#[cfg(test)]
+pub(crate) fn read_spilled_cell_rows(
+    spill: &SpilledCellRows,
+) -> Result<Vec<MaterializedIvfRow>, BuildError> {
+    let mut reader = spill.reader()?;
+    let mut rows = Vec::with_capacity(spill.n_rows());
+    while rows.len() < spill.n_rows() {
+        rows.extend(reader.next_chunk(spill.n_rows() - rows.len())?);
     }
     Ok(rows)
 }
@@ -813,10 +886,6 @@ mod tests {
         let spill = w.finish().expect("finish");
 
         assert_eq!(spill.n_rows, 4);
-        assert_eq!(
-            spill.row_bytes(),
-            4 * (ROW_SPILL_PREFIX_BYTES + RABITQ_LEN + 2 * DIM) as u64
-        );
 
         let rows = read_spilled_cell_rows(&spill).expect("read back");
         assert_eq!(rows.len(), 4);
