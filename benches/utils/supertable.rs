@@ -1151,13 +1151,6 @@ pub mod vector {
     /// Skip the normal undrained-delta commit while retaining pre-drain,
     /// drain, post-drain, and optimize/compact measurements.
     const SKIP_VECTOR_DELTA_ENV: &str = "INFINO_BENCH_SKIP_VECTOR_DELTA";
-    /// Concrete hidden-table object prefixes. Empty-prefix listing is not
-    /// portable across object-store providers, so destructive benchmark reset
-    /// enumerates every owned namespace explicitly.
-    const HIDDEN_RESET_PREFIXES: &[&str] =
-        &["data", "manifest", "manifest-parts", "slow-vector-state"];
-    /// Hidden manifest pointer removed after all referenced objects.
-    const HIDDEN_POINTER_PATH: &str = "_supertable/current";
     /// Numerator/denominator for compact p90 drain diagnostics.
     const DRAIN_P90_NUMERATOR: usize = 9;
     const DRAIN_P90_DENOMINATOR: usize = 10;
@@ -1603,31 +1596,38 @@ pub mod vector {
         drop(admin);
         let root_storage = Arc::clone(&built.storage);
         let deleted = tiers::block_on(async {
-            let mut keys = HashSet::new();
-            for prefix in HIDDEN_RESET_PREFIXES {
-                let full_prefix = format!("{hidden_prefix}/{prefix}");
-                keys.extend(
-                    root_storage
-                        .list_with_prefix(&full_prefix)
-                        .await
-                        .expect("list hidden vector-index namespace"),
-                );
-            }
-            let count = keys.len() + 1;
+            // The manifest prefix is a generated UUID namespace, so one broad
+            // non-empty prefix list is both portable and scoped exclusively to
+            // this table's derived hidden index.
+            let keys = root_storage
+                .list_with_prefix(&hidden_prefix)
+                .await
+                .expect("list hidden vector-index namespace");
+            let count = keys.len();
             for key in keys {
                 root_storage
                     .delete(&key)
                     .await
                     .expect("delete hidden vector-index object");
             }
-            root_storage
-                .delete(&format!("{hidden_prefix}/{HIDDEN_POINTER_PATH}"))
-                .await
-                .expect("delete hidden manifest pointer");
             count
         });
         eprintln!(
             "[supertable_vector] reset hidden vector-index sibling: deleted {deleted} object(s); user table preserved"
+        );
+        let (_verify_cache_dir, verify_cache) = tiers::fresh_disk_cache(Arc::clone(&built.storage));
+        let verify = tiers::open_consumer(tiers::consumer_options(
+            supertable::options_for(Modality::Vector, None),
+            Arc::clone(&built.storage),
+            verify_cache,
+        ));
+        let hidden = verify
+            .vector_index_table()
+            .expect("reset must recreate the hidden vector index");
+        assert_eq!(
+            hidden.reader().n_superfiles(),
+            0,
+            "reset hidden index must reopen empty"
         );
     }
 

@@ -567,6 +567,20 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
     }
 }
 
+/// Convert an object-store LIST result back into the provider-relative key
+/// accepted by the rest of [`StorageProvider`]. Remote providers prepend their
+/// configured root before listing; callers must not see or re-prefix it.
+pub(crate) fn logical_list_key(provider_prefix: &str, location: &str) -> String {
+    if provider_prefix.is_empty() {
+        return location.to_owned();
+    }
+    let prefix = format!("{provider_prefix}/");
+    location
+        .strip_prefix(&prefix)
+        .expect("listed object remains under provider prefix")
+        .to_owned()
+}
+
 /// A wrapper that prepends a sub-prefix to every URI before delegating to an
 /// inner `StorageProvider`. Used to give the hidden `VectorIndexSuperTable` its
 /// own namespace under the user table's storage prefix.
@@ -700,6 +714,18 @@ mod tests {
 
     /// Fixed etag the mock reports for any stored object.
     const MOCK_ETAG: &str = "mock-etag";
+
+    #[test]
+    fn logical_list_key_strips_exact_provider_root() {
+        assert_eq!(
+            logical_list_key("table/root", "table/root/data/segment.parquet"),
+            "data/segment.parquet"
+        );
+        assert_eq!(
+            logical_list_key("", "table/root/data/segment.parquet"),
+            "table/root/data/segment.parquet"
+        );
+    }
 
     /// Minimal in-memory [`StorageProvider`] implementing only the
     /// required methods, leaving `tail`, `list_with_prefix`, and

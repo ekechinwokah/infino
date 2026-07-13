@@ -34,7 +34,10 @@ use object_store::{
     path::Path as ObjPath,
 };
 
-use super::{ObjectMeta, StorageError, StorageOptions, StorageProvider, options::apply, retry};
+use super::{
+    ObjectMeta, StorageError, StorageOptions, StorageProvider, logical_list_key, options::apply,
+    retry,
+};
 
 /// Config key written by [`S3StorageProvider::new_with_endpoint`] to point
 /// at a custom endpoint. Detection accepts any object_store alias (see
@@ -454,12 +457,13 @@ impl StorageProvider for S3StorageProvider {
         prefix: &str,
     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
         crate::storage::io_counters::record_list();
-        let path = ObjPath::from(prefix);
+        let path = self.path(prefix)?;
         let mut stream = self.store.list(Some(&path));
         let mut out = Vec::new();
         while let Some(meta) = stream.try_next().await.map_err(|e| translate(prefix, e))? {
+            let location = meta.location.to_string();
             out.push((
-                meta.location.to_string(),
+                logical_list_key(&self.prefix, &location),
                 ObjectMeta {
                     size: meta.size,
                     etag: meta.e_tag,
