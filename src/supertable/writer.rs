@@ -3377,21 +3377,17 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .map(|entry| (entry.uri, Arc::clone(entry)))
             .collect();
         let pending_cache_inserts = publish.pending_cache_inserts;
+        let multipart_threshold = hidden_inner.options.put_multipart_threshold_bytes;
         let put_futures = publish
             .pending_storage_writes
             .into_iter()
             .map(|(uri, bytes)| {
                 let storage = Arc::clone(&storage);
                 async move {
-                    put_new_superfile_bytes(
-                        &storage,
-                        DRAIN_PUT_MULTIPART_THRESHOLD_BYTES,
-                        uri,
-                        bytes,
-                    )
-                    .await
-                    .map(|()| uri)
-                    .map_err(|error| BuildError::Store(error.to_string()))
+                    put_new_superfile_bytes(&storage, multipart_threshold, uri, bytes)
+                        .await
+                        .map(|()| uri)
+                        .map_err(|error| BuildError::Store(error.to_string()))
                 }
             });
         let mut uploads = stream::iter(put_futures).buffer_unordered(commit_write_concurrency());
@@ -5274,10 +5270,6 @@ fn commit_write_concurrency() -> usize {
 /// Upper bound on the drain's auto-sized read fan-out — keeps a very large box
 /// from stampeding a single S3 prefix. An explicit env override is not clamped.
 const DRAIN_READ_CONCURRENCY_CAP: usize = 64;
-
-/// Drain upload threshold: disable multipart so every drain superfile is
-/// written through a single create-only `put_atomic`.
-const DRAIN_PUT_MULTIPART_THRESHOLD_BYTES: u64 = u64::MAX;
 
 /// Read fan-out for the drain's superfile opens — bulk S3 reads off the
 /// query-critical path. Ideal sizing tracks network bandwidth; vCPU count is the
