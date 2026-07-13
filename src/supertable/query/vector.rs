@@ -100,6 +100,24 @@ use crate::{
 /// Candidate growth when a deleted row occupies a current top-k slot.
 const DELETE_REFILL_GROWTH_FACTOR: usize = 2;
 
+test_visible! {
+/// Coarse cells selected on the unfiltered user-table path when the caller
+/// does not override `nprobe`. The user path owns this default outright —
+/// it is not shared with the hidden index (persisted `CellRoutingParams`)
+/// or the single-superfile tier (`VectorSearchOptions::DEFAULT_NPROBE`).
+/// Exact-neighbor cell attribution at 100M ranks every true neighbor's
+/// cell within the top 16 (coverage is 0.85 at 6 cells).
+const USER_COARSE_CELLS: usize = 16;
+}
+
+test_visible! {
+/// Fine IVF runs probed per (superfile, cell) fragment on the user path.
+/// A fragment's fine runs are ranked by centroid distance and only the
+/// closest runs are probed, so the 16-cell coarse sweep does not multiply
+/// per-fragment read volume the way probing every run would.
+const USER_FINE_RUNS_PER_FRAGMENT: usize = 8;
+}
+
 type FineCandidate = (usize, u32, f32, u64);
 
 /// Rank fine centroids globally across selected coarse cells, keep a bounded
@@ -565,12 +583,22 @@ impl SupertableReader {
         allow: Option<HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let filtered = allow.is_some();
-        let (nprobe, _) = options.resolve(filtered);
+        let (resolved_nprobe, _) = options.resolve(filtered);
         let manifest = self.manifest();
         let hidden_vector_index = is_hidden_vector_manifest(manifest);
         let hidden_routing = match manifest.get_partition_strategy() {
             PartitionStrategy::VectorCell { routing, .. } => Some(routing),
             _ => None,
+        };
+        // The user-table path owns its coarse default (16 cells). Explicit
+        // caller overrides and the filtered path keep the resolved value;
+        // hidden routing ignores `nprobe` entirely (persisted
+        // CellRoutingParams). The single-superfile tier is untouched — this
+        // widening lives only in the supertable fan-out.
+        let nprobe = if !hidden_vector_index && !filtered && options.nprobe.is_none() {
+            USER_COARSE_CELLS
+        } else {
+            resolved_nprobe
         };
 
         // ---- Global cross-superfile cluster selection.
@@ -764,13 +792,67 @@ impl SupertableReader {
                         cutoff += 1;
                     }
                     let selected_cells = &ranked[..cutoff];
-                    for (si, cluster, score, cell, _) in candidates {
+                    let selected: HashSet<u32> = selected_cells.iter().copied().collect();
+                    let mut fine_by_fragment: HashMap<(u32, usize), Vec<(u32, f32, u64)>> =
+                        HashMap::new();
+                    for (si, cluster, score, cell, count) in candidates {
                         match cell {
-                            Some(cell) if selected_cells.contains(&cell) => {
-                                gated.push((si, cluster, score));
-                            }
+                            Some(cell) if selected.contains(&cell) => fine_by_fragment
+                                .entry((cell, si))
+                                .or_default()
+                                .push((cluster, score, count)),
                             Some(_) => {}
                             None => scored.push((si, cluster, score)),
+                        }
+                    }
+                    let mut remaining = Vec::new();
+                    for &cell in selected_cells {
+                        let mut fragment_ids: Vec<usize> = fine_by_fragment
+                            .keys()
+                            .filter_map(|(candidate_cell, si)| {
+                                (*candidate_cell == cell).then_some(*si)
+                            })
+                            .collect();
+                        fragment_ids.sort_unstable();
+                        for si in fragment_ids {
+                            let Some(mut fine) = fine_by_fragment.remove(&(cell, si)) else {
+                                continue;
+                            };
+                            fine.sort_unstable_by(|a, b| {
+                                a.1.partial_cmp(&b.1)
+                                    .unwrap_or(Ordering::Equal)
+                                    .then_with(|| a.0.cmp(&b.0))
+                            });
+                            let keep = USER_FINE_RUNS_PER_FRAGMENT.min(fine.len());
+                            let tail = fine.split_off(keep);
+                            gated.extend(
+                                fine.into_iter()
+                                    .map(|(cluster, score, _)| (si, cluster, score)),
+                            );
+                            remaining.extend(
+                                tail.into_iter()
+                                    .map(|(cluster, score, count)| (si, cluster, score, count)),
+                            );
+                        }
+                    }
+                    let mut postings: u64 = gated
+                        .iter()
+                        .map(|(si, cluster, _)| {
+                            candidate_counts.get(&(*si, *cluster)).copied().unwrap_or(0)
+                        })
+                        .sum();
+                    if postings < gated_target {
+                        remaining.sort_unstable_by(|a, b| {
+                            a.2.partial_cmp(&b.2)
+                                .unwrap_or(Ordering::Equal)
+                                .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
+                        });
+                        for (si, cluster, score, count) in remaining {
+                            gated.push((si, cluster, score));
+                            postings += count;
+                            if postings >= gated_target {
+                                break;
+                            }
                         }
                     }
                 }
@@ -785,8 +867,10 @@ impl SupertableReader {
 
         // Every hidden-index search globally ranks fine centroids within the
         // selected cells. Filtering changes only which rows survive each
-        // probe; user and undrained paths retain their own complete-cell
-        // routing.
+        // probe. User and undrained paths keep the closest
+        // `USER_FINE_RUNS_PER_FRAGMENT` fine runs per immutable fragment
+        // inside each selected coarse cell (posting-refilled toward the
+        // gated target when the kept runs are too small to fill top-k).
         // Untagged legacy candidates still use the global fallback budget.
         let n_eligible = {
             let mut segs: Vec<usize> = scored

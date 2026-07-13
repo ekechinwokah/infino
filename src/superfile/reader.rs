@@ -1295,7 +1295,9 @@ impl SuperfileReader {
 /// Each field is an optional override. `None` means “use the engine default”,
 /// which depends on whether the query is filtered:
 ///
-/// - unfiltered: `nprobe=6`, `rerank_mult=256`
+/// - unfiltered: `nprobe=6`, `rerank_mult=256` (the supertable user-table
+///   path widens its own coarse default independently — see
+///   `USER_COARSE_CELLS` in the supertable query layer)
 /// - filtered (`filter: Some(...)` or an internal allow-set): `nprobe=8`, `rerank_mult=256`
 ///
 /// Set a field with [`Self::with_nprobe`] / [`Self::with_rerank_mult`].
