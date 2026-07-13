@@ -62,9 +62,8 @@ pub fn docs_per_commit() -> usize {
 }
 
 /// Writer-pool thread count for ingest — the machine's logical core
-/// count by default, overridable with `INFINO_BENCH_WRITERS` (same
-/// knob the superfile build honors). Each commit's per-shard build
-/// fans out across this pool.
+/// count (same policy the superfile build uses). Each commit's
+/// per-shard build fans out across this pool.
 pub fn n_writers() -> usize {
     corpus::parallel_writers()
 }

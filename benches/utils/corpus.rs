@@ -91,18 +91,15 @@ pub fn block_on_inmem<F: std::future::Future>(fut: F) -> F::Output {
 
 // ─── Scale constants ──────────────────────────────────────────────────
 
-/// Codec selected for vector A/B benchmarks.
+/// Codec benches build vector columns with. Mirrors the engine default
+/// (`VectorConfig::new`): the fixed cosine grid for cosine, locally fitted
+/// residuals for unbounded metrics. Codec choice is engine configuration
+/// (`vector.rerank_codec` in YAML), not a bench env knob.
 pub fn bench_rerank_codec(metric: Metric) -> RerankCodec {
-    let codec = match env::var("INFINO_BENCH_VECTOR_CODEC").as_deref() {
-        Ok("fp32") => RerankCodec::Fp32,
-        Ok("sq8_residual") => RerankCodec::Sq8Residual,
-        Ok("sq8_fixed_residual") => RerankCodec::Sq8FixedResidual,
-        Ok("rabitq_only") => RerankCodec::RabitqOnly,
-        Ok(other) => panic!(
-            "unknown INFINO_BENCH_VECTOR_CODEC={other:?}; expected fp32, \
-             sq8_residual, sq8_fixed_residual, or rabitq_only"
-        ),
-        Err(_) => RerankCodec::default(),
+    let codec = if metric == Metric::Cosine {
+        RerankCodec::default()
+    } else {
+        RerankCodec::Sq8Residual
     };
     assert!(
         codec.supports_metric(metric),
@@ -212,7 +209,7 @@ pub fn supertable_docs() -> usize {
 /// Parse a positive doc-count override from `var`, falling back to
 /// `default` when unset, empty, unparseable, or zero.
 fn docs_from_env(var: &str, default: usize) -> usize {
-    std::env::var(var)
+    env::var(var)
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
@@ -222,10 +219,10 @@ fn docs_from_env(var: &str, default: usize) -> usize {
 /// Parallel-writer count for the "N writers" build row — how many
 /// writers build the corpus concurrently. Applied identically to every
 /// engine (infino shards across this many builders; Tantivy uses this
-/// many indexing threads). Defaults to the machine's logical core count;
-/// override with `INFINO_BENCH_WRITERS`.
+/// many indexing threads). Always the machine's logical core count so
+/// runs on the same box are comparable.
 pub fn parallel_writers() -> usize {
-    docs_from_env("INFINO_BENCH_WRITERS", num_cpus::get())
+    num_cpus::get()
 }
 
 /// IVF cluster count. Conventionally `~sqrt(n_docs)`, snapped to a

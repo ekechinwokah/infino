@@ -1082,30 +1082,19 @@ pub mod vector {
     const SWEEP_START_RERANK: usize = 256;
 
     fn sweep_start_probe() -> usize {
-        std::env::var("INFINO_BENCH_VECTOR_SWEEP_PROBE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(SWEEP_START_PROBE)
+        SWEEP_START_PROBE
     }
 
     fn sweep_start_rerank() -> usize {
-        std::env::var("INFINO_BENCH_VECTOR_SWEEP_RERANK")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(SWEEP_START_RERANK)
+        SWEEP_START_RERANK
     }
 
     fn sweep_probe_min() -> usize {
-        std::env::var("INFINO_BENCH_VECTOR_SWEEP_PROBE_MIN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(sweep_start_probe)
+        sweep_start_probe()
     }
 
     fn sweep_probe_max() -> Option<usize> {
-        std::env::var("INFINO_BENCH_VECTOR_SWEEP_PROBE_MAX")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        None
     }
 
     fn sweep_rerank_ladder(start: usize) -> Vec<usize> {

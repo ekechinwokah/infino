@@ -1167,21 +1167,16 @@ pub mod vector {
             || n_docs > exec_vec::FULL_CALIBRATION_MAX_DOCS
     }
 
-    /// Fixed probe count for the `default` row, overridable with
-    /// `INFINO_BENCH_VECTOR_NPROBE` (defaults to [`DEFAULT_NPROBE`]).
+    /// Fixed probe count for the `default` row. Not env-tunable: the
+    /// default row must measure the engine's default behavior, so a
+    /// leaked per-shell override can never skew recorded numbers.
     fn fixed_nprobe() -> usize {
-        std::env::var("INFINO_BENCH_VECTOR_NPROBE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_NPROBE)
+        DEFAULT_NPROBE
     }
-    /// Fixed rerank multiplier for the `default` row, overridable with
-    /// `INFINO_BENCH_VECTOR_RERANK` (defaults to [`DEFAULT_RERANK_MULT`]).
+    /// Fixed rerank multiplier for the `default` row. Same policy as
+    /// [`fixed_nprobe`].
     fn fixed_rerank_mult() -> usize {
-        std::env::var("INFINO_BENCH_VECTOR_RERANK")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_RERANK_MULT)
+        DEFAULT_RERANK_MULT
     }
 
     #[derive(Clone, Copy)]

@@ -8,13 +8,13 @@
 #   2. $XDG_CONFIG_HOME/infino/config.yaml (user; falls back to
 #                                            $HOME/.config/infino/...)
 #   3. ./infino.yaml                       (per-project / per-cwd)
-#   4. INFINO_<UPPERCASE_FIELD>            (per-process env var)
 #
 # Each layer is a partial override — keys not set in a higher layer
 # fall through to lower layers.
 #
-# Nested keys are addressed with `__` (double underscore) in env vars.
-# Examples below.
+# Environment variables never override this configuration: engine
+# behavior is set in YAML only, so a run's effective config is
+# readable from files instead of reconstructed from process env.
 
 # Supertable runtime knobs. Reader fan-out (skip + per-superfile
 # search + top-k merge) and writer commit-time rayon-shard run on
@@ -28,13 +28,6 @@
 #     and a 96-core production node.
 #   - a positive integer — explicit override. Use when you've
 #     measured a workload-specific tuning.
-#
-# Env overrides (note the double underscore for nesting):
-#   INFINO_SUPERTABLE__READER_THREADS=8
-#   INFINO_SUPERTABLE__WRITER_THREADS=4
-#   INFINO_SUPERTABLE__ID_COLUMN=row_id
-#   INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB=2048
-#   INFINO_SUPERTABLE__VERIFY_CRC_ON_OPEN=false
 supertable:
   reader_threads: auto
   writer_threads: auto
@@ -70,12 +63,6 @@ supertable:
 # naming the Azure container. `backend: gcs` attaches a
 # GcsStorageProvider, with `bucket` naming the GCS bucket and
 # `storage_options` carrying `google_*` config keys.
-#
-# Env overrides:
-#   INFINO_STORAGE__BACKEND=s3
-#   INFINO_STORAGE__BUCKET=my-bucket
-#   INFINO_STORAGE__PREFIX=tables/my-table
-#   INFINO_STORAGE__DISK_CACHE_ROOT=/mnt/nvme/infino-cache
 storage:
   backend: none
   local_root:
@@ -120,11 +107,6 @@ storage:
 # Compaction merges the small superfiles produced by individual
 # commits into one target-sized superfile, cutting query fan-out.
 # Sizes are in mb (1 MiB = 1024 × 1024 bytes).
-#
-# Env overrides (note the double underscore for nesting):
-#   INFINO_COMPACTION__TARGET_SUPERFILE_SIZE_MB=2048
-#   INFINO_COMPACTION__MIN_FILL_PERCENT=80
-#   INFINO_COMPACTION__MAX_MEMORY_MB=3072
 compaction:
   # Size a compacted output aims for.
   target_superfile_size_mb: 1024
@@ -140,13 +122,7 @@ compaction:
 # Vector-index build / search / drain tuning. Every value below
 # defaults to the engine's built-in behavior — a fresh install never
 # needs to touch this section. These are the levers that used to be
-# one-off INFINO_* env vars.
-#
-# Env overrides (note the double underscore for nesting):
-#   INFINO_VECTOR__CELL_SPLIT_DOC_CAP=100000
-#   INFINO_VECTOR__DRAIN_BATCH_SUPERFILES=32
-#   INFINO_VECTOR__USER_CENTROIDS=global
-#   INFINO_VECTOR__RERANK_CODEC=sq8_residual
+# one-off INFINO_* env vars; they are YAML-only now.
 vector:
   # Default rerank codec for cosine vector columns. Non-cosine metrics
   # still use locally fitted sq8_residual (values are not bounded to
@@ -198,14 +174,15 @@ vector:
   # integer.
   drain_read_concurrency: auto
 
+  # Global vector-index cell count used when bootstrapping a table's
+  # cell grid. Stamped into the manifest at create; changing it later
+  # affects new tables only.
+  global_cell_count: 64
+
 # Diagnostic and hardware-capability toggles. Each gates
 # instrumentation or forces a slower code path for A/B measurement;
 # none of them change query results. Leave everything off unless you
 # are profiling or benchmarking.
-#
-# Env overrides:
-#   INFINO_DIAGNOSTICS__IO_TIMELINE=true
-#   INFINO_DIAGNOSTICS__DISABLE_AVX512=true
 diagnostics:
   # Accumulate per-phase timers during the vector drain build.
   drain_build_timers: false
@@ -222,6 +199,10 @@ diagnostics:
   # Force the scalar vector-distance path even where AVX2 is available.
   disable_avx2: false
 
+  # Skip the disk cache's lazy background fill so foreground-only read
+  # behavior can be measured.
+  disable_background_fill: false
+
 # Per-connection memory budget: a ceiling on the anonymous heap the query
 # and ingest paths allocate (result batches, the vector shortlist, ingest
 # buffers), so one connection can't grow memory until the process is OOM-
@@ -231,9 +212,6 @@ diagnostics:
 # Applies to connections built from this config file. Code that opens a
 # connection programmatically sets the budget on ConnectOptions
 # (with_connection_memory_budget_bytes) instead.
-#
-# Env override:
-#   INFINO_MEMORY__CONNECTION_BUDGET_BYTES=8589934592
 memory:
   # Bytes. 0 (default) is measure-only: usage is tracked but never refused.
   # A positive value enforces the ceiling (the engine reserves at 90% of it,

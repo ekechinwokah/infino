@@ -34,10 +34,11 @@ selected cell runs inline (its process is the isolation).
 - **Supertable** — multi-artifact table committed to object storage and read
   through warm/cold table paths. Default scale: `10M` docs, controlled by
   `INFINO_BENCH_SUPERTABLE_DOCS`.
-- Doc counts are plain integers — `100K`/`1M` suffixes do not parse.
-- **Writer count** — build rows report `1 writer` and `N writers`. `N` defaults
-  to the machine's logical core count and is controlled by
-  `INFINO_BENCH_WRITERS`.
+- Doc counts are plain integers — `100K`/`1M` suffixes do not parse. They are
+  the **only** env-tunable bench knobs; everything else that changes engine
+  behavior lives in the config YAML.
+- **Writer count** — build rows report `1 writer` and `N writers`. `N` is the
+  machine's logical core count.
 
 ## Invocation
 
@@ -63,9 +64,6 @@ cargo bench -- supertable vector build warm
 
 # Smaller local loop (plain integer; K/M suffixes do not parse).
 INFINO_BENCH_SUPERFILE_DOCS=100000 cargo bench -- superfile fts warm
-
-# Override the N-writers build row.
-INFINO_BENCH_WRITERS=4 cargo bench -- superfile fts build
 
 # Refresh the markdown sections in this file.
 INFINO_BENCH_UPDATE_README=1 cargo bench -- superfile fts
@@ -111,15 +109,12 @@ emulator self-cleans and reproduces request/byte volume, not network latency.
 ## Vector search tuning
 
 The vector benches calibrate each recall target by sweeping a probe/refine
-grid, then report a user-facing `default` row. Three knobs control that row
-and let you skip the sweep:
+grid, then report a user-facing `default` row. The `default` row always
+measures the engine defaults — probe count, rerank multiplier, and codec are
+deliberately **not** env-tunable, so a leaked shell variable can never skew
+recorded numbers. Engine behavior changes belong in the config YAML
+(`vector:` section), never in the environment.
 
-- `INFINO_BENCH_VECTOR_NPROBE` — probe count for the `default` row (default 8).
-- `INFINO_BENCH_VECTOR_RERANK` — rerank multiplier for the `default` row
-  (default 256 at the 1M×1024 bench scale; clears the 0.80 default-config gate).
-- `INFINO_BENCH_VECTOR_CODEC` — rerank payload codec: `sq8_fixed_residual`
-  (default, cosine-only), `sq8_residual`, `fp32`, or
-  `rabitq_only`.
 - `INFINO_BENCH_SKIP_CALIBRATION=1` — measure the fixed `(nprobe, rerank)`
   `default` row without the recall-target calibration sweep or the
   high-nprobe correctness gate. Brute-force ground truth for the
@@ -127,13 +122,11 @@ and let you skip the sweep:
   filtered recall can be reported. This is the fast path for a fixed-config
   latency number on a many-segment table, where sweeping the full grid is
   prohibitively slow.
-- `INFINO_BENCH_PREFETCH_CONCURRENCY` — disk-cache prefetch fan-out for the
-  cold-fill / promotion path on many-segment tables (default 8).
 
 ```sh
 # Fast fixed-config cold vector latency (no calibration sweep):
 INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SKIP_CALIBRATION=1 \
-  INFINO_BENCH_VECTOR_NPROBE=8 INFINO_BENCH_VECTOR_RERANK=4 cargo bench -- supertable vector cold
+  cargo bench -- supertable vector cold
 ```
 
 ## Prepared datasets

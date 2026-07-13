@@ -36,6 +36,7 @@ use super::{
     options::SupertableOptions,
 };
 use crate::{
+    config,
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     storage::{PrefixedStorageProvider, StorageError},
     superfile::{
@@ -905,19 +906,10 @@ impl Supertable {
 /// genuinely-in-flight pin set (URIs a query is actively
 /// holding) can be wired here if a workload ever needs it —
 /// but that is a *bounded* set, never the whole manifest.
-/// Default number of global vector-index cells for routed search.
-const DEFAULT_GLOBAL_VECTOR_CELL_COUNT: usize = 64;
-
-/// Runtime override for the global vector-index cell count.
-///
-/// Useful for benchmark/ops tuning without rebuilding. Invalid or unset values
-/// fall back to [`DEFAULT_GLOBAL_VECTOR_CELL_COUNT`].
+/// Global vector-index cell count used when bootstrapping a table's cell
+/// grid, from `vector.global_cell_count` (YAML-only; no env override).
 pub(crate) fn global_vector_cell_count() -> usize {
-    std::env::var("INFINO_GLOBAL_VECTOR_CELL_COUNT")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_GLOBAL_VECTOR_CELL_COUNT)
+    config::global().vector.global_cell_count.max(1)
 }
 
 /// Reserved VectorCell partition id for the hidden index's "incoming" append

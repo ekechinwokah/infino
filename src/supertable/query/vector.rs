@@ -900,11 +900,6 @@ impl SupertableReader {
             config::global()
                 .vector
                 .inner_budget
-                .or_else(|| {
-                    std::env::var("INFINO_INNER_BUDGET")
-                        .ok()
-                        .and_then(|value| value.parse::<usize>().ok())
-                })
                 .map(|value| value.max(1))
                 .unwrap_or(default_budget)
         };

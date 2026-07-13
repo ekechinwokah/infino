@@ -15,23 +15,23 @@
 //!      (or `$HOME/.config/infino/config.yaml` if `XDG_CONFIG_HOME`
 //!      is unset).
 //!   4. **`./infino.yaml`** — per-project / per-cwd override.
-//!   5. **Environment variables** prefixed `INFINO_`. Field names
-//!      are uppercased and nested keys join with `__`;
-//!      e.g. `supertable.commit_threshold_size_mb` is set by
-//!      `INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB`.
 //!
 //! Each layer is a partial override — keys absent from a higher
-//! layer fall through to lower layers. Unknown keys at any layer
-//! are accepted (figment's default leniency); typos in env vars
-//! therefore silently no-op. We document the published variables
-//! here and rely on tests + code review to keep them in sync.
+//! layer fall through to lower layers.
+//!
+//! **Environment variables never override config.** Engine behavior
+//! is set exclusively in YAML so a run's effective configuration is
+//! readable from files, not reconstructed from process env. (Env
+//! overrides existed once and produced silent drift between runs;
+//! `env_vars_do_not_override_config` pins the removal.)
 //!
 //! ## Adding a new field
 //!
 //! 1. Add the field to [`Config`] with a `serde` rename / default
 //!    if appropriate.
 //! 2. Add the same key to `config.yaml` with its default value.
-//! 3. Add a docstring and a unit test exercising the override path.
+//! 3. Add a docstring and a unit test exercising the YAML override
+//!    path.
 
 use std::{
     collections::HashMap,
@@ -43,7 +43,7 @@ use std::{
 
 use figment::{
     Figment,
-    providers::{Env, Format, Yaml},
+    providers::{Format, Yaml},
 };
 use serde::{
     Deserialize, Serialize,
@@ -144,9 +144,7 @@ impl Default for MemorySettings {
 /// where threading a per-table [`crate::supertable::SupertableOptions`]
 /// down to the read site isn't practical. Such knobs were previously
 /// bespoke `std::env::var("INFINO_…")` reads; they now live in
-/// [`Config`] and are read from here, so a single YAML (or the
-/// `INFINO_<SECTION>__<FIELD>` env form figment already supports)
-/// controls them.
+/// [`Config`] and are read from here, so YAML alone controls them.
 ///
 /// Load failure falls back to the embedded defaults so a read site
 /// never panics on a malformed host config.
@@ -247,6 +245,8 @@ const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
 const DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES: i64 = 64;
 /// Default drain replica factor: `1.0` means no boundary replicas.
 const DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR: f32 = 1.0;
+/// Default global vector-index cell count for routed search.
+const DEFAULT_VECTOR_GLOBAL_CELL_COUNT: usize = 64;
 
 /// How the writer aligns user-superfile vector clusters to the global
 /// cell grid. Selected by `vector.user_centroids`.
@@ -320,6 +320,10 @@ pub struct VectorSettings {
     /// to one in-flight read per hardware thread, floored at the
     /// background-fill default and capped at 64.
     pub drain_read_concurrency: ThreadCount,
+    /// Global vector-index cell count used when bootstrapping a table's
+    /// cell grid. Stamped into the manifest at create; changing it later
+    /// affects new tables only.
+    pub global_cell_count: usize,
 }
 
 impl Default for VectorSettings {
@@ -334,6 +338,7 @@ impl Default for VectorSettings {
             drain_replica_target_factor: DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR,
             drain_consolidate: DrainConsolidate::Kmeans,
             drain_read_concurrency: ThreadCount::Auto,
+            global_cell_count: DEFAULT_VECTOR_GLOBAL_CELL_COUNT,
         }
     }
 }
@@ -356,6 +361,9 @@ pub struct DiagnosticsSettings {
     /// Force the scalar vector-distance path even where AVX2 is
     /// available (A/B measurement).
     pub disable_avx2: bool,
+    /// Skip the disk cache's lazy background fill so foreground-only
+    /// read behavior can be measured (A/B measurement).
+    pub disable_background_fill: bool,
 }
 
 /// Options for [`crate::Supertable::optimize`].
@@ -614,6 +622,7 @@ impl Config {
 }
 
 /// Build the standard layered figment used by [`Config::load`].
+/// YAML files only — process env never participates.
 fn default_figment() -> Figment {
     let mut fig = Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT));
 
@@ -633,11 +642,7 @@ fn default_figment() -> Figment {
         fig = fig.merge(Yaml::file(cwd));
     }
 
-    // `split("__")` lets nested fields be addressed in env, e.g.
-    // `INFINO_SUPERTABLE__READER_THREADS=8` maps to
-    // `supertable.reader_threads`. Single-underscore field names
-    // are unaffected.
-    fig.merge(Env::prefixed("INFINO_").split("__"))
+    fig
 }
 
 /// Resolve the user-level config path. Honors `XDG_CONFIG_HOME`
@@ -672,23 +677,26 @@ mod tests {
     }
 
     #[test]
-    fn env_overrides_default() {
+    fn env_vars_do_not_override_config() {
         let _g = ENV_LOCK.lock().expect("acquire lock");
         // SAFETY: serialized via ENV_LOCK; cleanup at end.
-        unsafe { env::set_var("INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB", "2048") };
-        let cfg = Config::load().expect("load with env override");
-        assert_eq!(cfg.supertable.commit_threshold_size_mb, 2048);
-        unsafe { env::remove_var("INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB") };
-    }
-
-    #[test]
-    fn missing_env_falls_through_to_default() {
-        let _g = ENV_LOCK.lock().expect("acquire lock");
-        // SAFETY: serialized via ENV_LOCK; we ensure the var is unset
-        // before reading.
-        unsafe { env::remove_var("INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB") };
-        let cfg = Config::load().expect("load with no env override");
-        assert_eq!(cfg.supertable.commit_threshold_size_mb, 1024);
+        unsafe {
+            env::set_var("INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB", "2048");
+            env::set_var("INFINO_VECTOR__DRAIN_REPLICA_TARGET_FACTOR", "9.9");
+            env::set_var("INFINO_DIAGNOSTICS__IO_TIMELINE", "true");
+        }
+        let cfg = Config::load().expect("load ignoring env");
+        assert_eq!(
+            cfg.supertable.commit_threshold_size_mb, 1024,
+            "engine config must come from YAML only"
+        );
+        assert_eq!(cfg.vector.drain_replica_target_factor, 1.0);
+        assert!(!cfg.diagnostics.io_timeline);
+        unsafe {
+            env::remove_var("INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB");
+            env::remove_var("INFINO_VECTOR__DRAIN_REPLICA_TARGET_FACTOR");
+            env::remove_var("INFINO_DIAGNOSTICS__IO_TIMELINE");
+        }
     }
 
     #[test]
@@ -913,20 +921,18 @@ supertable:
     }
 
     #[test]
-    fn nested_env_var_overrides_supertable_field() {
-        let _g = ENV_LOCK.lock().expect("acquire lock");
-        // SAFETY: serialized via ENV_LOCK; cleanup at end.
-        unsafe {
-            env::set_var("INFINO_SUPERTABLE__WRITER_THREADS", "4");
-            env::set_var("INFINO_SUPERTABLE__READER_THREADS", "auto");
-        }
-        let cfg = Config::load().expect("load with nested env override");
+    fn thread_count_yaml_layer_overrides_default() {
+        let yaml = r#"
+supertable:
+  writer_threads: 4
+  reader_threads: auto
+"#;
+        let fig = Figment::new()
+            .merge(Yaml::string(EMBEDDED_DEFAULT))
+            .merge(Yaml::string(yaml));
+        let cfg = Config::from_figment(fig).expect("layered yaml");
         assert_eq!(cfg.supertable.writer_threads, ThreadCount::Fixed(4));
         assert_eq!(cfg.supertable.reader_threads, ThreadCount::Auto);
-        unsafe {
-            env::remove_var("INFINO_SUPERTABLE__WRITER_THREADS");
-            env::remove_var("INFINO_SUPERTABLE__READER_THREADS");
-        }
     }
 
     #[test]
@@ -981,22 +987,6 @@ supertable:
         assert_eq!(cfg.compaction.target_superfile_size_mb, 2048);
         assert_eq!(cfg.compaction.min_fill_percent, 50);
         assert_eq!(cfg.compaction.max_memory_mb, 3072);
-    }
-
-    #[test]
-    fn compaction_nested_env_var_overrides_field() {
-        let _g = ENV_LOCK.lock().expect("acquire lock");
-        unsafe {
-            env::set_var("INFINO_COMPACTION__TARGET_SUPERFILE_SIZE_MB", "4096");
-            env::set_var("INFINO_COMPACTION__MIN_FILL_PERCENT", "60");
-        }
-        let cfg = Config::load().expect("load with compaction env override");
-        assert_eq!(cfg.compaction.target_superfile_size_mb, 4096);
-        assert_eq!(cfg.compaction.min_fill_percent, 60);
-        unsafe {
-            env::remove_var("INFINO_COMPACTION__TARGET_SUPERFILE_SIZE_MB");
-            env::remove_var("INFINO_COMPACTION__MIN_FILL_PERCENT");
-        }
     }
 
     #[test]
@@ -1111,36 +1101,5 @@ vector:
         assert_eq!(cfg.vector.drain_read_concurrency, ThreadCount::Fixed(12));
         // Untouched keys fall through to the embedded default.
         assert_eq!(cfg.vector.drain_batch_superfiles, 64);
-    }
-
-    #[test]
-    fn vector_nested_env_var_overrides_field() {
-        let _g = ENV_LOCK.lock().expect("acquire lock");
-        // SAFETY: serialized via ENV_LOCK; cleanup at end.
-        unsafe {
-            env::set_var("INFINO_VECTOR__USER_CENTROIDS", "global");
-            env::set_var("INFINO_VECTOR__DRAIN_BATCH_SUPERFILES", "32");
-        }
-        let cfg = Config::load().expect("load with vector env override");
-        assert_eq!(cfg.vector.user_centroids, CentroidAlignment::Global);
-        assert_eq!(cfg.vector.drain_batch_superfiles, 32);
-        unsafe {
-            env::remove_var("INFINO_VECTOR__USER_CENTROIDS");
-            env::remove_var("INFINO_VECTOR__DRAIN_BATCH_SUPERFILES");
-        }
-    }
-
-    #[test]
-    fn diagnostics_nested_env_var_overrides_field() {
-        let _g = ENV_LOCK.lock().expect("acquire lock");
-        // SAFETY: serialized via ENV_LOCK; cleanup at end.
-        unsafe {
-            env::set_var("INFINO_DIAGNOSTICS__IO_TIMELINE", "true");
-        }
-        let cfg = Config::load().expect("load with diagnostics env override");
-        assert!(cfg.diagnostics.io_timeline);
-        unsafe {
-            env::remove_var("INFINO_DIAGNOSTICS__IO_TIMELINE");
-        }
     }
 }

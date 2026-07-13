@@ -7,7 +7,7 @@
 
 use std::{
     collections::HashSet,
-    env, fmt, fs, io,
+    fmt, fs, io,
     io::SeekFrom,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
@@ -38,6 +38,7 @@ use super::{
     config::{ColdFetchMode, DiskCacheConfig, EvictionCandidate},
 };
 use crate::{
+    config::global as global_config,
     storage::{StorageError, StorageProvider},
     superfile::{
         LazyByteSource, PrefetchedSource,
@@ -2048,14 +2049,10 @@ fn rollback_lazy_background_fill(store: &Arc<DiskCacheStore>, uri: &SuperfileUri
     let _ = fs::remove_file(tmp);
 }
 
-/// Diagnostic gate for measuring lazy foreground reads without promotion.
+/// Diagnostic gate for measuring lazy foreground reads without promotion,
+/// from `diagnostics.disable_background_fill` (YAML-only; no env override).
 pub(crate) fn skip_background_fill() -> bool {
-    static SKIP: OnceLock<bool> = OnceLock::new();
-    *SKIP.get_or_init(|| {
-        env::var("INFINO_DISABLE_BG_FILL")
-            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    global_config().diagnostics.disable_background_fill
 }
 
 /// Promote one released lazy reader to an mmap-backed cache entry.
