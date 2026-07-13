@@ -82,7 +82,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    io::Error,
+    io::{BufReader, BufWriter, Cursor, Error, Seek, SeekFrom, Write},
     sync::Arc,
 };
 
@@ -90,13 +90,14 @@ use arrow_array::{Array, Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Schema};
 use parquet::basic::{Compression, ZstdLevel};
 use roaring::RoaringBitmap;
+use tempfile::tempfile;
 
 pub use crate::superfile::vector::builder::VectorConfig;
 use crate::superfile::{
     BuildError, SuperfileReader,
     format::{
         self,
-        footer::{encode_parquet_body, splice_index_blobs},
+        footer::{encode_parquet_body, splice_index_blobs, splice_index_streams_to},
         kv,
     },
     fts::{
@@ -105,7 +106,10 @@ use crate::superfile::{
     },
     stats::SuperfileStats,
     vector::{
-        builder::{VectorBuilder, build_merged_subsection_from_materialized},
+        builder::{
+            MultiCellSubsectionSource, VectorBuilder, build_merged_subsection_from_materialized,
+            finish_multi_cell_blob_to,
+        },
         cell_posting::{CellPostingBuilder, MaterializedIvfRow},
         distance::Metric,
         ivf_merge::{
@@ -1129,38 +1133,10 @@ impl SuperfileBuilder {
 
         // Assemble inf.* KV metadata (cheap; do it before the parallel
         // section so the splice has it ready).
-        let mut kvs: Vec<(String, String)> = vec![
-            (kv::FORMAT.into(), kv::FORMAT_VALUE.into()),
-            (kv::FORMAT_VERSION.into(), format::FORMAT_VERSION.into()),
-            (kv::ID_COLUMN.into(), self.opts.id_column.clone()),
-            (kv::N_DOCS.into(), n_docs.to_string()),
-            (kv::BUILDER.into(), crate::BUILDER_ID.to_string()),
-        ];
-        if !self.opts.fts_columns.is_empty() {
-            kvs.push((
-                kv::FTS_COLUMNS.into(),
-                fts_columns_json(&self.opts.fts_columns),
-            ));
-        }
-        if !self.opts.vector_columns.is_empty() {
-            kvs.push((
-                kv::VEC_COLUMNS.into(),
-                vec_columns_json(&self.opts.vector_columns),
-            ));
-            if self.opts.vector_layout != VectorLayout::Ivf {
-                kvs.push((
-                    kv::VEC_LAYOUT.into(),
-                    self.opts.vector_layout.as_kv_value().into(),
-                ));
-            }
-            if let Some(ref cells) = prebuilt_multi_cell {
-                let cell_ids: Vec<u32> = cells.iter().map(|(id, _)| *id).collect();
-                let cells_json = serde_json::to_string(&cell_ids).map_err(|e| {
-                    BuildError::VectorSchemaMismatch(format!("inf.vec.cells JSON: {e}"))
-                })?;
-                kvs.push((kv::VEC_CELLS.into(), cells_json));
-            }
-        }
+        let cell_ids: Option<Vec<u32>> = prebuilt_multi_cell
+            .as_ref()
+            .map(|cells| cells.iter().map(|(id, _)| *id).collect());
+        let kvs = superfile_kvs(&self.opts, n_docs, cell_ids.as_deref())?;
 
         // A superfile has three independent build outputs: the scalar /
         // relational Parquet body (the SQL-queryable columns), the FTS
@@ -1217,6 +1193,119 @@ impl SuperfileBuilder {
         let parts = splice_index_blobs(body, &fts_blob, &vec_blob, &kvs)?;
         Ok(parts.bytes)
     }
+
+    /// Consume an ids-only builder and stream one packed MultiCellIvf
+    /// superfile to `output`.
+    ///
+    /// Drain uses disk-backed [`MultiCellSubsectionSource`] implementations,
+    /// while commit's ordinary [`finish`](Self::finish) uses in-memory
+    /// subsections. Directory/CRC assembly and Parquet footer surgery remain
+    /// single implementations shared by both paths.
+    pub(crate) fn finish_multi_cell_sources_to<W, S>(
+        mut self,
+        cells: &[S],
+        mut output: W,
+    ) -> Result<(), BuildError>
+    where
+        W: Write,
+        S: MultiCellSubsectionSource,
+    {
+        if self.next_local_doc_id == 0 {
+            return Err(BuildError::VectorSchemaMismatch(
+                "streamed multi-cell finish requires at least one row".into(),
+            ));
+        }
+        if self.fts_builder.is_some()
+            || self.cell_posting_builder.is_some()
+            || self.prebuilt_multi_cell.is_some()
+        {
+            return Err(BuildError::VectorSchemaMismatch(
+                "streamed multi-cell finish requires ids-only batches and disk-backed cell IVFs"
+                    .into(),
+            ));
+        }
+        if self.opts.vector_layout != VectorLayout::MultiCellIvf {
+            return Err(BuildError::VectorSchemaMismatch(
+                "streamed multi-cell finish requires MultiCellIvf layout".into(),
+            ));
+        }
+        // `SuperfileBuilder::new` registers the configured vector column, but
+        // `add_batch_ids_only` deliberately feeds it no rows. The streamed
+        // cell-IVFs are the sole vector source for this finish.
+        drop(self.vec_builder.take());
+
+        let n_docs = self.next_local_doc_id as u64;
+        let cell_ids: Vec<u32> = cells
+            .iter()
+            .map(MultiCellSubsectionSource::cell_id)
+            .collect();
+        let kvs = superfile_kvs(&self.opts, n_docs, Some(&cell_ids))?;
+        let id_page_limit = [(self.opts.id_column.as_str(), self.opts.id_page_size_limit)];
+        let body = encode_parquet_body(
+            &self.opts.schema,
+            &self.batches,
+            self.opts.compression,
+            self.opts.row_group_size,
+            &id_page_limit,
+        )?;
+
+        let mut vector_file = tempfile().map_err(BuildError::Io)?;
+        finish_multi_cell_blob_to(cells, BufWriter::new(&mut vector_file))?;
+        let vector_length = vector_file.seek(SeekFrom::End(0)).map_err(BuildError::Io)?;
+        vector_file
+            .seek(SeekFrom::Start(0))
+            .map_err(BuildError::Io)?;
+        splice_index_streams_to(
+            body,
+            BufReader::new(Cursor::new(Vec::<u8>::new())),
+            0,
+            BufReader::new(vector_file),
+            vector_length,
+            &kvs,
+            &mut output,
+        )?;
+        output.flush().map_err(BuildError::Io)?;
+        Ok(())
+    }
+}
+
+fn superfile_kvs(
+    options: &BuilderOptions,
+    n_docs: u64,
+    multi_cell_ids: Option<&[u32]>,
+) -> Result<Vec<(String, String)>, BuildError> {
+    let mut kvs: Vec<(String, String)> = vec![
+        (kv::FORMAT.into(), kv::FORMAT_VALUE.into()),
+        (kv::FORMAT_VERSION.into(), format::FORMAT_VERSION.into()),
+        (kv::ID_COLUMN.into(), options.id_column.clone()),
+        (kv::N_DOCS.into(), n_docs.to_string()),
+        (kv::BUILDER.into(), crate::BUILDER_ID.to_string()),
+    ];
+    if !options.fts_columns.is_empty() {
+        kvs.push((
+            kv::FTS_COLUMNS.into(),
+            fts_columns_json(&options.fts_columns),
+        ));
+    }
+    if !options.vector_columns.is_empty() {
+        kvs.push((
+            kv::VEC_COLUMNS.into(),
+            vec_columns_json(&options.vector_columns),
+        ));
+        if options.vector_layout != VectorLayout::Ivf {
+            kvs.push((
+                kv::VEC_LAYOUT.into(),
+                options.vector_layout.as_kv_value().into(),
+            ));
+        }
+        if let Some(cell_ids) = multi_cell_ids {
+            let cells_json = serde_json::to_string(cell_ids).map_err(|error| {
+                BuildError::VectorSchemaMismatch(format!("inf.vec.cells JSON: {error}"))
+            })?;
+            kvs.push((kv::VEC_CELLS.into(), cells_json));
+        }
+    }
+    Ok(kvs)
 }
 
 /// Finish the independent embedded index blobs. Once `add_batch` has

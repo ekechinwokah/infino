@@ -177,11 +177,6 @@ vector:
   # a Voronoi boundary; <= 1.0 disables replication.
   drain_replica_target_factor: 1.0
 
-  # Per-cell consolidation op the drain applies:
-  #   kmeans — re-cluster each cell's rows (default).
-  #   splice — keep each superfile's local clusters verbatim.
-  drain_consolidate: kmeans
-
   # Read fan-out for the drain's superfile opens. `auto` resolves to
   # one in-flight read per hardware thread, floored at the
   # background-fill default and capped at 64; or set a positive

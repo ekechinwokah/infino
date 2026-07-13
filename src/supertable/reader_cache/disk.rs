@@ -2177,6 +2177,17 @@ fn open_readonly_mmap(path: &Path) -> io::Result<Mmap> {
     unsafe { Mmap::map(&file) }
 }
 
+/// Open a completed local superfile as zero-copy mmap-backed [`Bytes`].
+///
+/// Drain assembles very large packed shards in temporary files and maps the
+/// finished file through this helper before handing it to the ordinary
+/// `prepare_superfile`/publish path. Keeping the unsafe mmap construction in
+/// this module preserves the repository's documented mmap safety boundary.
+pub(crate) fn mmap_readonly_bytes(path: &Path) -> io::Result<Bytes> {
+    let mmap = Arc::new(open_readonly_mmap(path)?);
+    Ok(Bytes::from_owner(ArcMmapOwner(mmap)))
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Error as IoError;

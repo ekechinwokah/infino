@@ -1090,6 +1090,8 @@ fn build_vector_index_options(
     hidden_opts = hidden_opts
         .with_storage(Arc::clone(&sub_storage))
         .with_vector_layout(crate::superfile::vector::layout::VectorLayout::Ivf)
+        .with_reader_pool(Arc::clone(&user_opts.reader_pool))
+        .with_writer_pool(Arc::clone(&user_opts.writer_pool))
         .with_read_consistency(user_opts.read_consistency);
     hidden_opts.connection_memory_budget = Arc::clone(&user_opts.connection_memory_budget);
     if let Some(cache) = user_opts.disk_cache.as_ref() {
@@ -2675,34 +2677,43 @@ mod tests {
         .with_writer_pool(pool);
         let st = Supertable::create(options).expect("create");
 
-        // Distinct directions so drain touches multiple cells.
+        // Train the initial grid from distinct directions in ONE commit. Using
+        // one row per commit would train the immutable grid from the first
+        // single row, leaving every centroid identical and failing to exercise
+        // multi-cell shard packing.
+        let titles =
+            LargeStringArray::from((0..8usize).map(|i| format!("doc{i}")).collect::<Vec<_>>());
+        let mut vectors = vec![0.0f32; 8 * dim];
         for i in 0..8usize {
-            let titles = LargeStringArray::from(vec![format!("doc{i}")]);
-            let mut v = vec![0.0f32; dim];
-            v[i % dim] = 1.0;
-            let flat = Float32Array::from(v);
-            let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
-            let batch = arrow_array::RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(titles) as Arc<dyn Array>,
-                    Arc::new(fsl) as Arc<dyn Array>,
-                ],
-            )
-            .expect("batch");
-            let mut w = st.writer().expect("writer");
-            w.append(&batch).expect("append");
-            w.commit().expect("commit");
+            vectors[i * dim + (i % dim)] = 1.0;
         }
+        let flat = Float32Array::from(vectors);
+        let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
         st.drain_vectors_to_cells_sync().expect("drain");
 
         let hidden = st.reader().vector_index_table().expect("hidden").clone();
+        assert_eq!(
+            hidden.options().writer_pool.current_num_threads(),
+            POOL,
+            "hidden drain must inherit the user table's configured writer pool"
+        );
         let hidden_reader = hidden.reader();
         let manifest = hidden_reader.manifest();
         let n_objects = manifest.superfiles.len();
-        assert!(
-            n_objects > 0 && n_objects <= POOL,
-            "expected 1..={POOL} packed shards, got {n_objects}"
+        assert_eq!(
+            n_objects, POOL,
+            "five populated cells span both cell % {POOL} worker shards"
         );
         let mut hints = HashSet::new();
         for entry in manifest.superfiles.iter() {

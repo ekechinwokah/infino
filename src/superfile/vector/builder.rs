@@ -14,7 +14,7 @@
 use std::{
     cmp::Ordering,
     fs::{File, metadata},
-    io::{BufReader, BufWriter, Error as IoError, ErrorKind, Read, Write},
+    io::{self, BufReader, BufWriter, Error as IoError, ErrorKind, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -744,31 +744,89 @@ impl VectorBuilder {
     }
 }
 
-/// Assemble a v2 multi-cell vector blob: one logical column packing many
-/// complete cell-IVF subsections behind a cell directory of
+/// Byte source for one complete cell-IVF subsection in a v2 multi-cell blob.
+///
+/// Commit uses the in-memory implementation below. Drain implements this for
+/// its disk-spilled subsections, so both paths share the exact same directory,
+/// CRC, and byte-assembly implementation.
+pub(crate) trait MultiCellSubsectionSource {
+    fn cell_id(&self) -> u32;
+    fn n_docs(&self) -> u32;
+    fn len(&self) -> u64;
+    fn rerank_codec(&self) -> RerankCodec;
+    fn write_to(&self, output: &mut dyn Write) -> Result<(), BuildError>;
+}
+
+struct BorrowedMultiCellSubsection<'a> {
+    cell_id: u32,
+    subsection: &'a MergedIvfSubsection,
+}
+
+impl MultiCellSubsectionSource for BorrowedMultiCellSubsection<'_> {
+    fn cell_id(&self) -> u32 {
+        self.cell_id
+    }
+
+    fn n_docs(&self) -> u32 {
+        self.subsection.n_docs
+    }
+
+    fn len(&self) -> u64 {
+        self.subsection.bytes.len() as u64
+    }
+
+    fn rerank_codec(&self) -> RerankCodec {
+        self.subsection.rerank_codec
+    }
+
+    fn write_to(&self, output: &mut dyn Write) -> Result<(), BuildError> {
+        output
+            .write_all(&self.subsection.bytes)
+            .map_err(BuildError::Io)
+    }
+}
+
+struct CrcWriter<'a, W> {
+    output: &'a mut W,
+    crc: u32,
+}
+
+impl<W: Write> Write for CrcWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.output.write(buf)?;
+        self.crc = crc32c_append(self.crc, &buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
+/// Stream a v2 multi-cell vector blob to `output`: one logical column packing
+/// many complete cell-IVF subsections behind a cell directory of
 /// `(global_cell_id, subsection_off, subsection_len)`.
 ///
 /// `cells` must be non-empty and sorted by ascending `global_cell_id` with
 /// unique ids. Each subsection is a standard `INFVECC1` IVF (unchanged).
-pub(crate) fn finish_multi_cell_blob(
-    cells: &[(u32, MergedIvfSubsection)],
-) -> Result<Vec<u8>, BuildError> {
+pub(crate) fn finish_multi_cell_blob_to<W, S>(cells: &[S], mut output: W) -> Result<(), BuildError>
+where
+    W: Write,
+    S: MultiCellSubsectionSource,
+{
     if cells.is_empty() {
         return Err(BuildError::VectorSchemaMismatch(
             "multi-cell vector blob requires at least one cell IVF".into(),
         ));
     }
-    let packed_codec = cells[0].1.rerank_codec;
-    if cells
-        .iter()
-        .any(|(_, subsection)| subsection.rerank_codec != packed_codec)
-    {
+    let packed_codec = cells[0].rerank_codec();
+    if cells.iter().any(|cell| cell.rerank_codec() != packed_codec) {
         return Err(BuildError::VectorSchemaMismatch(
             "multi-cell blob cannot mix rerank codecs".into(),
         ));
     }
-    for w in cells.windows(2) {
-        if w[0].0 >= w[1].0 {
+    for pair in cells.windows(2) {
+        if pair[0].cell_id() >= pair[1].cell_id() {
             return Err(BuildError::VectorSchemaMismatch(
                 "multi-cell cells must be sorted by unique ascending cell_id".into(),
             ));
@@ -776,20 +834,20 @@ pub(crate) fn finish_multi_cell_blob(
     }
 
     let n_cells = cells.len() as u32;
-    let n_docs: u64 = cells.iter().map(|(_, s)| u64::from(s.n_docs)).sum();
+    let n_docs: u64 = cells.iter().map(|cell| u64::from(cell.n_docs())).sum();
     let directory_offset = OUTER_HEADER_SIZE as u64;
     let directory_size = cells.len() * CELL_DIR_ENTRY_SIZE;
     let mut subsection_start = directory_offset + directory_size as u64 + format::CRC_BYTES as u64;
 
     let mut directory = Vec::with_capacity(directory_size);
-    for (cell_id, sub) in cells {
-        directory.extend_from_slice(&cell_id.to_le_bytes());
+    for cell in cells {
+        directory.extend_from_slice(&cell.cell_id().to_le_bytes());
         directory.extend_from_slice(&subsection_start.to_le_bytes());
-        directory.extend_from_slice(&(sub.bytes.len() as u64).to_le_bytes());
-        directory.extend_from_slice(&u32::from(sub.rerank_codec.codec_id()).to_le_bytes());
+        directory.extend_from_slice(&cell.len().to_le_bytes());
+        directory.extend_from_slice(&u32::from(cell.rerank_codec().codec_id()).to_le_bytes());
         debug_assert_eq!(directory.len() % CELL_DIR_ENTRY_SIZE, 0);
         let _ = cell_dir_entry::CELL_ID_OFF;
-        subsection_start += sub.bytes.len() as u64;
+        subsection_start += cell.len();
     }
     let dir_crc = crc32c(&directory);
 
@@ -814,27 +872,52 @@ pub(crate) fn finish_multi_cell_blob(
         debug_assert!(cursor.is_empty());
     }
 
-    let mut out = Vec::with_capacity(
-        OUTER_HEADER_SIZE
-            + directory_size
-            + format::CRC_BYTES
-            + cells.iter().map(|(_, s)| s.bytes.len()).sum::<usize>()
-            + format::CRC_BYTES,
-    );
-    let mut outer_crc_acc: u32 = 0;
-    out.extend_from_slice(&outer_header);
-    outer_crc_acc = crc32c_append(outer_crc_acc, &outer_header);
-    out.extend_from_slice(&directory);
-    outer_crc_acc = crc32c_append(outer_crc_acc, &directory);
-    let dir_crc_le = dir_crc.to_le_bytes();
-    out.extend_from_slice(&dir_crc_le);
-    outer_crc_acc = crc32c_append(outer_crc_acc, &dir_crc_le);
-    for (_, sub) in cells {
-        out.extend_from_slice(&sub.bytes);
-        outer_crc_acc = crc32c_append(outer_crc_acc, &sub.bytes);
-    }
-    out.extend_from_slice(&outer_crc_acc.to_le_bytes());
-    Ok(out)
+    let outer_crc = {
+        let mut crc_output = CrcWriter {
+            output: &mut output,
+            crc: 0,
+        };
+        crc_output
+            .write_all(&outer_header)
+            .map_err(BuildError::Io)?;
+        crc_output.write_all(&directory).map_err(BuildError::Io)?;
+        crc_output
+            .write_all(&dir_crc.to_le_bytes())
+            .map_err(BuildError::Io)?;
+        for cell in cells {
+            cell.write_to(&mut crc_output)?;
+        }
+        crc_output.flush().map_err(BuildError::Io)?;
+        crc_output.crc
+    };
+    output
+        .write_all(&outer_crc.to_le_bytes())
+        .map_err(BuildError::Io)?;
+    output.flush().map_err(BuildError::Io)?;
+    Ok(())
+}
+
+/// In-memory convenience wrapper used by normal commit builds.
+pub(crate) fn finish_multi_cell_blob(
+    cells: &[(u32, MergedIvfSubsection)],
+) -> Result<Vec<u8>, BuildError> {
+    let sources: Vec<BorrowedMultiCellSubsection<'_>> = cells
+        .iter()
+        .map(|(cell_id, subsection)| BorrowedMultiCellSubsection {
+            cell_id: *cell_id,
+            subsection,
+        })
+        .collect();
+    let capacity = OUTER_HEADER_SIZE
+        + cells.len() * CELL_DIR_ENTRY_SIZE
+        + 2 * format::CRC_BYTES
+        + cells
+            .iter()
+            .map(|(_, subsection)| subsection.bytes.len())
+            .sum::<usize>();
+    let mut output = Vec::with_capacity(capacity);
+    finish_multi_cell_blob_to(&sources, &mut output)?;
+    Ok(output)
 }
 
 /// Builder output for one column's subsection.
@@ -1050,30 +1133,38 @@ fn build_subsection_from_materialized(
 
     let buckets: Vec<Vec<&MaterializedIvfRow>> =
         build_phase_timers::timed(&build_phase_timers::ASSIGN_US, || {
+            // This O(rows × n_cent × dim) scan is the dominant pack CPU wave.
+            // Assign rows independently on the ambient writer pool with one
+            // decode buffer per worker, then fill buckets serially in input
+            // order so the resulting bytes remain deterministic.
+            let assigned: Vec<usize> = rows
+                .par_iter()
+                .map_init(
+                    || vec![0f32; dim],
+                    |row_fp, row| {
+                        dequantize_sq8_residual_into(
+                            &row.encoded.scale,
+                            &row.encoded.offset,
+                            &row.encoded.codes,
+                            &row.encoded.residuals,
+                            source_divisor,
+                            row_fp,
+                        );
+                        let mut best_c = 0usize;
+                        let mut best = f32::INFINITY;
+                        for c in 0..n_cent {
+                            let dist = l2_sq(row_fp, &centroids[c * dim..(c + 1) * dim]);
+                            if dist < best {
+                                best = dist;
+                                best_c = c;
+                            }
+                        }
+                        best_c
+                    },
+                )
+                .collect();
             let mut buckets: Vec<Vec<&MaterializedIvfRow>> = vec![Vec::new(); n_cent];
-            // Decode each row to fp32 once into a reusable buffer, then argmin
-            // over the centroids with SIMD `l2_sq`. L2 matches the k-means
-            // training above and equals the cosine argmin for unit-normalized
-            // inputs.
-            let mut row_fp = vec![0f32; dim];
-            for row in &rows {
-                dequantize_sq8_residual_into(
-                    &row.encoded.scale,
-                    &row.encoded.offset,
-                    &row.encoded.codes,
-                    &row.encoded.residuals,
-                    source_divisor,
-                    &mut row_fp,
-                );
-                let mut best_c = 0usize;
-                let mut best = f32::INFINITY;
-                for c in 0..n_cent {
-                    let dist = l2_sq(&row_fp, &centroids[c * dim..(c + 1) * dim]);
-                    if dist < best {
-                        best = dist;
-                        best_c = c;
-                    }
-                }
+            for (row, &best_c) in rows.iter().zip(&assigned) {
                 buckets[best_c].push(row);
             }
             buckets
@@ -2853,7 +2944,21 @@ mod tests {
             .expect("cell 0 subsection");
         let sub1 = build_merged_subsection_from_materialized(cfg(2), make_rows(1, 3))
             .expect("cell 1 subsection");
-        let blob = finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack");
+        let cells = vec![(0, sub0), (1, sub1)];
+        let blob = finish_multi_cell_blob(&cells).expect("pack");
+        let streamed_sources: Vec<BorrowedMultiCellSubsection<'_>> = cells
+            .iter()
+            .map(|(cell_id, subsection)| BorrowedMultiCellSubsection {
+                cell_id: *cell_id,
+                subsection,
+            })
+            .collect();
+        let mut streamed = Vec::new();
+        finish_multi_cell_blob_to(&streamed_sources, &mut streamed).expect("stream pack");
+        assert_eq!(
+            streamed, blob,
+            "streamed and in-memory multi-cell assembly must be byte-identical"
+        );
         let json =
             format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
         let reader = VectorReader::open(Bytes::from(blob.clone()), &json).expect("open multi-cell");
