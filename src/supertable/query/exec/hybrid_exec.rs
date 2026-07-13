@@ -1141,8 +1141,21 @@ mod tests {
         .with_writer_pool(pool)
     }
 
-    /// Doc `i` (0-based within the batch) gets `cats[i]`, `titles[i]`,
-    /// and a one-hot embedding at *global* dim `base_dim + i`.
+    /// Shared base component of every dim in [`build_batch_cat`] embeddings.
+    /// Kept well inside the fixed Sq8 grid's `[-1, 1]` span so nothing
+    /// clamps during encode.
+    const CAT_EMB_BASE: f32 = 0.2;
+    /// Per-doc perturbation on the doc's active dim. Large enough that
+    /// adjacent docs' cosine scores separate well above Sq8 rerank noise,
+    /// small enough that every doc stays in one grid cell.
+    const CAT_EMB_EPSILON: f32 = 0.05;
+
+    /// Doc `i` (0-based within the batch) gets `cats[i]`, `titles[i]`, and an
+    /// embedding `base·1 + ε·e_{base_dim+i}`. Every doc shares the same
+    /// dominant direction, so the global cell grid assigns the whole corpus
+    /// to one cell — the routed default (one grid-nearest cell) then covers
+    /// every doc and `vector_search` stays exact for the oracle below — while
+    /// the ε one-hot component keeps the graded-query ranking strict in `i`.
     fn build_batch_cat(
         cats: &[&str],
         titles: &[&str],
@@ -1157,7 +1170,11 @@ mod tests {
         for i in 0..n {
             let active = base_dim + i;
             for d in 0..dim {
-                flat.push(if d == active { 1.0 } else { 0.0 });
+                flat.push(if d == active {
+                    CAT_EMB_BASE + CAT_EMB_EPSILON
+                } else {
+                    CAT_EMB_BASE
+                });
             }
         }
         let fsl = FixedSizeListArray::try_new(

@@ -92,7 +92,10 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
-        manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri, list::PartitionStrategy},
+        manifest::{
+            ManifestSnapshot, SuperfileEntry, SuperfileUri,
+            list::{CellRoutingParams, PartitionStrategy},
+        },
         tombstones::SidecarCache,
     },
 };
@@ -101,12 +104,12 @@ use crate::{
 const DELETE_REFILL_GROWTH_FACTOR: usize = 2;
 
 test_visible! {
-/// Coarse cells selected on the unfiltered user-table path when the caller
-/// does not override `nprobe`. The user path owns this default outright —
-/// it is not shared with the hidden index (persisted `CellRoutingParams`)
-/// or the single-superfile tier (`VectorSearchOptions::DEFAULT_NPROBE`).
-/// Exact-neighbor cell attribution at 100M ranks every true neighbor's
-/// cell within the top 16 (coverage is 0.85 at 6 cells).
+/// Fallback fine-probe scale for untagged (pre-grid) user manifests, and
+/// the widest explicit coarse sweep benches exercise. The routed user path
+/// no longer defaults to this: unfiltered queries with no caller `nprobe`
+/// use the same bounded cell routing as the hidden index (one grid-nearest
+/// cell, slack-widened on near-ties) and span every commit fragment holding
+/// the selected cell.
 const USER_COARSE_CELLS: usize = 16;
 }
 
@@ -636,7 +639,7 @@ impl SupertableReader {
                 }
                 _ => None,
             });
-        let ranked_cells: Option<Vec<u32>> = grid.as_ref().map(|grid| {
+        let ranked_cells_scored: Option<Vec<(u32, f32)>> = grid.as_ref().map(|grid| {
             let mut cells: Vec<(u32, f32)> = (0..grid.n_cent)
                 .map(|cell| (cell, grid.score_one(metric, cell as usize, query)))
                 .collect();
@@ -645,8 +648,11 @@ impl SupertableReader {
                     .unwrap_or(Ordering::Equal)
                     .then_with(|| a.0.cmp(&b.0))
             });
-            cells.into_iter().map(|(cell, _)| cell).collect()
+            cells
         });
+        let ranked_cells: Option<Vec<u32>> = ranked_cells_scored
+            .as_ref()
+            .map(|cells| cells.iter().map(|(cell, _)| *cell).collect());
 
         let mut candidates: Vec<(usize, u32, f32, Option<u32>, u64)> = Vec::new();
         for (si, entry) in superfiles.iter().enumerate() {
@@ -733,6 +739,23 @@ impl SupertableReader {
             None
         };
 
+        // Cell cutoff shared by the hidden and user branches: probe the
+        // `nprobe_min` nearest cells under GRID ranking, widening toward
+        // `nprobe_max` while a cell's score stays within the slack threshold
+        // of the nearest cell.
+        let grid_cell_cutoff = |ranked: &[(u32, f32)], routing: &CellRoutingParams| -> usize {
+            if ranked.is_empty() {
+                return 0;
+            }
+            let mut cutoff = routing.nprobe_min.max(1).min(ranked.len());
+            let max_cells = routing.nprobe_max.max(routing.nprobe_min).min(ranked.len());
+            let nearest = ranked[0].1;
+            let threshold = nearest + nearest.abs().max(f32::EPSILON) * routing.slack.max(0.0);
+            while cutoff < max_cells && ranked[cutoff].1 <= threshold {
+                cutoff += 1;
+            }
+            cutoff
+        };
         let candidate_counts: HashMap<(usize, u32), u64> = candidates
             .iter()
             .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
@@ -752,20 +775,33 @@ impl SupertableReader {
                 }
                 if hidden_vector_index {
                     let routing = hidden_routing.expect("hidden manifest carries routing");
-                    let ranked_hidden = hidden_ranked_cells
+                    // Rank the cell cutoff by the SAME grid centroids the drain
+                    // assigns rows against, not by each cell's best fine
+                    // centroid: rows live in their grid-Voronoi cell, and near
+                    // a boundary a neighboring cell's edge cluster commonly
+                    // out-scores the owning cell's fine centroids. At
+                    // nprobe_max=1 that mis-pick forfeits the query's true
+                    // neighbors entirely (measured at 100K: 0.950 neighbor
+                    // coverage grid-ranked vs 0.700 fine-ranked — recall
+                    // followed the fine-ranked curve exactly). Fine centroids
+                    // still rank the within-cell probe below; cells absent
+                    // from the candidate set (no committed superfiles) are
+                    // skipped. Legacy hidden manifests without a grid keep the
+                    // fine-min ranking.
+                    let grid_ranked_hidden: Option<Vec<(u32, f32)>> =
+                        ranked_cells_scored.as_ref().map(|cells| {
+                            cells
+                                .iter()
+                                .filter(|(cell, _)| postings_by_cell.contains_key(cell))
+                                .copied()
+                                .collect()
+                        });
+                    let ranked_hidden = grid_ranked_hidden
                         .as_ref()
+                        .filter(|cells| !cells.is_empty())
+                        .or(hidden_ranked_cells.as_ref())
                         .expect("hidden candidates carry ranked cells");
-                    let mut cutoff = routing.nprobe_min.max(1).min(ranked_hidden.len());
-                    let max_cells = routing
-                        .nprobe_max
-                        .max(routing.nprobe_min)
-                        .min(ranked_hidden.len());
-                    let nearest = ranked_hidden[0].1;
-                    let threshold =
-                        nearest + nearest.abs().max(f32::EPSILON) * routing.slack.max(0.0);
-                    while cutoff < max_cells && ranked_hidden[cutoff].1 <= threshold {
-                        cutoff += 1;
-                    }
+                    let cutoff = grid_cell_cutoff(ranked_hidden, &routing);
                     let selected_cells: HashSet<u32> = ranked_hidden[..cutoff]
                         .iter()
                         .map(|(cell, _)| *cell)
@@ -782,7 +818,31 @@ impl SupertableReader {
                     }
                     gated = select_bounded_fine_candidates(fine, routing.fine_nprobe, gated_target);
                 } else {
-                    let mut cutoff = nprobe.max(1).min(ranked.len());
+                    // Same cell routing as the hidden index: probe the single
+                    // grid-nearest cell by default (bounded default, slack
+                    // widening on near-ties); an explicit caller `nprobe` (and
+                    // the filtered path's boosted probe) pins min == max. The
+                    // difference from the hidden path is physical, not policy:
+                    // an undrained cell's rows are scattered across every
+                    // commit fragment, so within each selected cell EVERY
+                    // fragment holding that cell is probed — accepted read
+                    // amplification — keeping the closest
+                    // `USER_FINE_RUNS_PER_FRAGMENT` fine runs per fragment.
+                    let user_routing = if filtered || options.nprobe.is_some() {
+                        CellRoutingParams {
+                            nprobe_min: nprobe.max(1),
+                            nprobe_max: nprobe.max(1),
+                            ..CellRoutingParams::bounded_hidden_default()
+                        }
+                    } else {
+                        CellRoutingParams::bounded_hidden_default()
+                    };
+                    let ranked_scored = ranked_cells_scored
+                        .as_ref()
+                        .expect("scored cell ranking exists whenever ranked_cells does");
+                    let mut cutoff = grid_cell_cutoff(ranked_scored, &user_routing);
+                    // Widen past the routed cells only if they cannot fill
+                    // top-k (tiny tables, heavily deleted cells).
                     let mut covered: u64 = ranked[..cutoff]
                         .iter()
                         .map(|cell| postings_by_cell.get(cell).copied().unwrap_or(0))
