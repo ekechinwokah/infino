@@ -1483,8 +1483,17 @@ pub mod vector {
                 }
             }
         }
+        // Same row stored twice in the SAME cell = wasted top-k slots at
+        // query time and inflated amplification; replicas are only ever
+        // legitimate in a *different* cell than the primary.
+        let mut duplicate_pairs = 0usize;
+        for stored in stored_by_dense.values() {
+            let mut sorted = stored.clone();
+            sorted.sort_unstable();
+            duplicate_pairs += sorted.windows(2).filter(|w| w[0] == w[1]).count();
+        }
         eprintln!(
-            "[drain-diag] stored rows: {stored_total} across {} cells (distinct rows {}, corpus rows {n_rows}, unmapped ids {unmapped})",
+            "[drain-diag] stored rows: {stored_total} across {} cells (distinct rows {}, corpus rows {n_rows}, unmapped ids {unmapped}, same-cell duplicate pairs {duplicate_pairs})",
             cells.len(),
             stored_by_dense.len(),
         );
@@ -1615,27 +1624,93 @@ pub mod vector {
                 }
             }
         }
-        let fmt_curve = |cov: &[usize]| {
+        let fmt_curve = |cov: &[usize], denom: usize| {
             DRAIN_DIAG_PROBE_DEPTHS
                 .iter()
                 .zip(cov)
                 .map(|(probe, count)| {
-                    format!("p{probe}={:.3}", *count as f64 / total.max(1) as f64)
+                    format!("p{probe}={:.3}", *count as f64 / denom.max(1) as f64)
                 })
                 .collect::<Vec<_>>()
                 .join(" · ")
         };
         eprintln!(
             "[drain-diag] GT neighbor coverage by STORED cell ({total} occurrences, {missing} not stored): {}",
-            fmt_curve(&cov_stored),
+            fmt_curve(&cov_stored, total),
         );
         eprintln!(
             "[drain-diag] GT neighbor coverage by NEAREST cell (perfect assignment): {}",
-            fmt_curve(&cov_geom),
+            fmt_curve(&cov_geom, total),
         );
         eprintln!(
             "[drain-diag] GT neighbor coverage under FINE-centroid routing (query path): {}",
-            fmt_curve(&cov_routed),
+            fmt_curve(&cov_routed, total),
+        );
+
+        // Within-cell fine-run spread: for neighbors stored in the query's
+        // probed (grid-top-1) cell, rank that cell's fine centroids by query
+        // distance and record the rank of the neighbor's own run. Directly
+        // measures how many ~2 MiB fine runs `fine_nprobe` must cover — the
+        // GET/byte floor of the within-cell probe, and the guard that says
+        // how fat a cell can grow before fine 8 stops covering it.
+        let mut fine_cov = [0usize; DRAIN_DIAG_PROBE_DEPTHS.len()];
+        let mut fine_total = 0usize;
+        for (query, truth) in queries.iter().zip(ground_truth) {
+            let probed = nearest_cell(query);
+            let Some(cluster_sets) = fine_by_cell.get(&probed) else {
+                continue;
+            };
+            let mut query_scores: Vec<(usize, f32)> = Vec::new();
+            let mut flat_base = 0usize;
+            for clusters in cluster_sets {
+                clusters.score_clusters_into(metric, query, |local, score| {
+                    query_scores.push((flat_base + local as usize, score));
+                });
+                flat_base += clusters.n_cent as usize;
+            }
+            query_scores.sort_unstable_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            let mut rank_of = vec![usize::MAX; flat_base];
+            for (rank, (idx, _)) in query_scores.iter().enumerate() {
+                rank_of[*idx] = rank + 1;
+            }
+            for id in truth {
+                let start = *id as usize * DIM;
+                if start + DIM > vectors.len() {
+                    continue;
+                }
+                if !stored_by_dense
+                    .get(id)
+                    .is_some_and(|cells| cells.contains(&probed))
+                {
+                    continue;
+                }
+                fine_total += 1;
+                let neighbor = &vectors[start..start + DIM];
+                let mut best_run = usize::MAX;
+                let mut best_score = f32::INFINITY;
+                let mut flat = 0usize;
+                for clusters in cluster_sets {
+                    clusters.score_clusters_into(metric, neighbor, |local, score| {
+                        if score < best_score {
+                            best_score = score;
+                            best_run = flat + local as usize;
+                        }
+                    });
+                    flat += clusters.n_cent as usize;
+                }
+                let run_rank = rank_of.get(best_run).copied().unwrap_or(usize::MAX);
+                for (i, probe) in DRAIN_DIAG_PROBE_DEPTHS.iter().enumerate() {
+                    fine_cov[i] += usize::from(run_rank <= *probe);
+                }
+            }
+        }
+        eprintln!(
+            "[drain-diag] fine-run coverage inside the probed cell ({fine_total} neighbor occurrences): {}",
+            fmt_curve(&fine_cov, fine_total),
         );
 
         // Self-query probe: search the post-drain index with stored rows' own

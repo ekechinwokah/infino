@@ -289,7 +289,6 @@ impl Default for CellRoutingParams {
     }
 }
 
-
 /// How superfiles are routed into manifest parts. Stamped into
 /// the list on first commit; immutable thereafter (changes
 /// require external compaction).

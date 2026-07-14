@@ -2383,35 +2383,6 @@ impl ClusterCentroids {
         best_cell
     }
 
-    /// Return the closest two cells to `query`, keeping empty cells eligible.
-    /// Drain routing uses this because an empty cell can be the right
-    /// destination for incoming rows.
-    pub(crate) fn nearest_two_cells(
-        &self,
-        metric: Metric,
-        query: &[f32],
-    ) -> Option<((u32, f32), Option<(u32, f32)>)> {
-        debug_assert_eq!(query.len(), self.dim as usize);
-        let mut best: Option<(u32, f32)> = None;
-        let mut second: Option<(u32, f32)> = None;
-        for cell in 0..self.n_cent {
-            let score = self.score_one(metric, cell as usize, query);
-            match best {
-                None => best = Some((cell, score)),
-                Some((_, best_score)) if score < best_score => {
-                    second = best;
-                    best = Some((cell, score));
-                }
-                _ => {
-                    if second.is_none_or(|(_, second_score)| score < second_score) {
-                        second = Some((cell, score));
-                    }
-                }
-            }
-        }
-        best.map(|best| (best, second))
-    }
-
     /// Assign each row in `vectors` to its nearest cell. Parallel over rows;
     /// each assignment uses [`Self::nearest_cell`].
     pub fn assign_rows(&self, metric: Metric, vectors: &[f32], assignments: &mut [u32]) {

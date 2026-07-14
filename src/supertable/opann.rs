@@ -30,7 +30,7 @@ use crate::{
             EncodedCellRow, dequantize_sq8_residual_into, manifest_centroid_components_from_row,
             medoid_index_by,
         },
-        distance::{Metric, distance, nearest_two_centroids_transposed},
+        distance::{Metric, distance, nearest_k_centroids_transposed},
     },
     supertable::manifest::ClusterCentroids,
 };
@@ -71,14 +71,30 @@ pub(crate) fn apply_cell_updates(
     apply_cell_count_updates(base, count_updates)
 }
 
-/// Primary cell assignment plus the nearest neighboring Voronoi cell.
+/// Replica candidates considered per row beyond its primary cell — the
+/// SPANN-style closure depth. Together with the closure distance ratio this
+/// bounds the candidate pool; the configured replica budget
+/// (`drain_replica_target_factor`) still decides how many candidates are
+/// actually materialized, thinnest margins first.
+pub(crate) const REPLICA_CLOSURE_MAX_REPLICAS: usize = 3;
+
+/// A cell qualifies as a replica candidate when the row's distance to it is
+/// within this multiple of the row's primary-cell distance. Rows deep inside
+/// their cell (small primary distance) get a proportionally tight window and
+/// therefore no replicas; genuine boundary rows qualify toward every nearby
+/// cell, not only the single second-nearest.
+pub(crate) const REPLICA_CLOSURE_DISTANCE_RATIO: f32 = 1.2;
+
+/// Primary cell assignment plus the row's replica-candidate cells.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct BoundaryAssignment {
     pub primary: u32,
-    /// Second-nearest cell and the row's distance to the primary/neighbor
-    /// boundary. Smaller margin means closer to the boundary and therefore a
-    /// better replication candidate.
-    pub neighbor: Option<(u32, f32)>,
+    /// Up to [`REPLICA_CLOSURE_MAX_REPLICAS`] cells within the closure
+    /// distance ratio of the primary, each with the row's margin to the
+    /// primary/candidate Voronoi boundary. Smaller margin means closer to
+    /// the boundary and therefore a better replication candidate. Fixed-size
+    /// (`None`-padded) so the per-row hot assign path stays allocation-free.
+    pub replicas: [Option<(u32, f32)>; REPLICA_CLOSURE_MAX_REPLICAS],
 }
 
 fn score_row_against_cell(
@@ -180,38 +196,55 @@ fn boundary_assignment_decoded(
     metric: Metric,
     row_fp: &[f32],
 ) -> BoundaryAssignment {
-    let nearest = transposed_centroids
-        .and_then(|transposed| {
-            nearest_two_centroids_transposed(
-                metric,
-                row_fp,
-                transposed,
-                clusters.n_cent as usize,
-                clusters.dim as usize,
-                None,
-            )
-        })
-        .or_else(|| clusters.nearest_two_cells(metric, row_fp));
-    let Some(((primary, primary_score), second)) = nearest else {
+    let n_cent = clusters.n_cent as usize;
+    let top_k = REPLICA_CLOSURE_MAX_REPLICAS + 1;
+    let ranked: Vec<(u32, f32)> = match transposed_centroids {
+        Some(transposed) => nearest_k_centroids_transposed(
+            metric,
+            row_fp,
+            transposed,
+            n_cent,
+            clusters.dim as usize,
+            None,
+            top_k,
+        ),
+        None => {
+            // No transposed cache (small callers / tests): scalar-score every
+            // cell into the same ascending top-k shape.
+            let mut all: Vec<(u32, f32)> = (0..n_cent)
+                .map(|cell| (cell as u32, clusters.score_one(metric, cell, row_fp)))
+                .collect();
+            all.sort_unstable_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            all.truncate(top_k);
+            all
+        }
+    };
+    let mut replicas = [None; REPLICA_CLOSURE_MAX_REPLICAS];
+    let Some(&(primary, primary_score)) = ranked.first() else {
         return BoundaryAssignment {
             primary: 0,
-            neighbor: None,
+            replicas,
         };
     };
-    let neighbor = second.map(|(neighbor, neighbor_score)| {
-        (
-            neighbor,
-            boundary_margin(
-                clusters,
-                metric,
-                primary,
-                neighbor,
-                primary_score,
-                neighbor_score,
-            ),
-        )
-    });
-    BoundaryAssignment { primary, neighbor }
+    // Closure pool: every ranked cell whose distance sits within the ratio
+    // window of the primary. The margin (distance to the shared Voronoi
+    // boundary) orders candidates globally at the budget cut.
+    let closure_threshold = primary_score
+        + primary_score.abs().max(f32::EPSILON) * (REPLICA_CLOSURE_DISTANCE_RATIO - 1.0);
+    for (slot, &(cell, score)) in ranked.iter().skip(1).enumerate() {
+        if score > closure_threshold {
+            break;
+        }
+        replicas[slot] = Some((
+            cell,
+            boundary_margin(clusters, metric, primary, cell, primary_score, score),
+        ));
+    }
+    BoundaryAssignment { primary, replicas }
 }
 
 /// One-cluster [`ClusterCentroids`] prototype from a Sq8+ε row (split k-means seeds).
@@ -459,6 +492,44 @@ mod tests {
                 norm_sq: None,
             })
             .collect()
+    }
+
+    /// Closure replication: a row equidistant-ish to several cells collects a
+    /// replica candidate for every cell inside the distance-ratio window
+    /// (ordered nearest-first), and a row deep inside its cell collects none.
+    #[test]
+    fn boundary_assignment_closure_matches_distance_ratio() {
+        let dim = 4usize;
+        // Four centroids at 0, 1, 2, 30 on every axis.
+        let mut fp32 = Vec::new();
+        for base in [0.0f32, 1.0, 2.0, 30.0] {
+            fp32.extend(std::iter::repeat_n(base, dim));
+        }
+        let clusters = ClusterCentroids::from_fp32(4, dim as u32, &fp32, vec![1; 4]);
+
+        // Row at 0.9: distances (L2Sq per dim) to cells 0/1/2 are 0.81, 0.01,
+        // 1.21 (per-dim) — cell 1 is primary; cell 0 and 2 are far outside a
+        // 1.2 ratio window of 0.01. No replicas.
+        let deep = vec![0.9f32; dim];
+        let assignment = boundary_assignment_fp32(&clusters, None, Metric::L2Sq, &deep);
+        assert_eq!(assignment.primary, 1);
+        assert_eq!(assignment.replicas, [None; REPLICA_CLOSURE_MAX_REPLICAS]);
+
+        // Row at 1.01 — just past the exact midpoint region between cells 0.98
+        // and 1.02... use 1.5: exactly between cells 1 and 2 (distances equal),
+        // both inside each other's ratio window; cell 0 at 1.5 distance 2.25
+        // per dim is outside 1.2 × 0.25. Expect primary = 1 (tie broken by
+        // lower id) and exactly one replica: cell 2.
+        let boundary = vec![1.5f32; dim];
+        let assignment = boundary_assignment_fp32(&clusters, None, Metric::L2Sq, &boundary);
+        assert_eq!(assignment.primary, 1);
+        assert_eq!(assignment.replicas[0].map(|(cell, _)| cell), Some(2));
+        assert_eq!(assignment.replicas[1], None);
+        let margin = assignment.replicas[0].expect("replica").1;
+        assert!(
+            margin.is_finite() && margin >= 0.0,
+            "boundary margin must be a finite non-negative distance, got {margin}"
+        );
     }
 
     #[test]

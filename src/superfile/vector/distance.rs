@@ -143,10 +143,9 @@ pub(crate) fn transpose_centroids_cluster_major(
 }
 
 /// Return the closest two centroids in a block-transposed fp32 centroid cache.
-/// Full blocks score multiple centroids per SIMD register: AVX-512 scores 16
-/// centroids from contiguous loads, and the portable fallback scores each block
-/// as two contiguous `wide::f32x8` halves. `counts = Some(..)` skips zero-count
-/// centroids; `None` keeps every centroid eligible.
+/// Thin wrapper over [`nearest_k_centroids_transposed`] with `k = 2` — kept
+/// for the scalar-reference equivalence tests that pin the top-k reduction.
+#[cfg(test)]
 pub(crate) fn nearest_two_centroids_transposed(
     metric: Metric,
     query: &[f32],
@@ -155,14 +154,37 @@ pub(crate) fn nearest_two_centroids_transposed(
     dim: usize,
     counts: Option<&[u32]>,
 ) -> Option<((u32, f32), Option<(u32, f32)>)> {
+    let top = nearest_k_centroids_transposed(metric, query, transposed, n_cent, dim, counts, 2);
+    let mut it = top.into_iter();
+    it.next().map(|best| (best, it.next()))
+}
+
+/// Return the closest `k` centroids (ascending by score) in a block-transposed
+/// fp32 centroid cache. Full blocks score multiple centroids per SIMD
+/// register: AVX-512 scores 16 centroids from contiguous loads, and the
+/// portable fallback scores each block as two contiguous `wide::f32x8`
+/// halves. `counts = Some(..)` skips zero-count centroids; `None` keeps every
+/// centroid eligible. `k` is expected to be small (replica closure / boundary
+/// assignment); the reduction is an insertion top-k.
+pub(crate) fn nearest_k_centroids_transposed(
+    metric: Metric,
+    query: &[f32],
+    transposed: &[f32],
+    n_cent: usize,
+    dim: usize,
+    counts: Option<&[u32]>,
+    k: usize,
+) -> Vec<(u32, f32)> {
     debug_assert_eq!(query.len(), dim);
     debug_assert_eq!(
         transposed.len(),
         n_cent.div_ceil(CENTROID_BATCH_LANES) * dim * CENTROID_BATCH_LANES
     );
     debug_assert!(counts.is_none_or(|counts| counts.len() >= n_cent));
-    let mut best: Option<(u32, f32)> = None;
-    let mut second: Option<(u32, f32)> = None;
+    let mut top: Vec<(u32, f32)> = Vec::with_capacity(k.saturating_add(1));
+    if k == 0 {
+        return top;
+    }
 
     let n_blocks = n_cent.div_ceil(CENTROID_BATCH_LANES);
     #[cfg(target_arch = "x86_64")]
@@ -172,16 +194,16 @@ pub(crate) fn nearest_two_centroids_transposed(
             let scores = unsafe {
                 score_centroid_block16_transposed_avx512(metric, query, transposed, dim, block)
             };
-            update_centroid_block_top_two(
+            update_centroid_block_top_k(
                 counts,
                 block * CENTROID_BATCH_LANES,
                 n_cent,
                 &scores,
-                &mut best,
-                &mut second,
+                &mut top,
+                k,
             );
         }
-        return best.map(|best| (best, second));
+        return top;
     }
 
     for block in 0..n_blocks {
@@ -196,18 +218,18 @@ pub(crate) fn nearest_two_centroids_transposed(
                 block,
                 lane_offset,
             );
-            update_centroid_block_top_two(
+            update_centroid_block_top_k(
                 counts,
                 base_centroid + lane_offset,
                 n_cent,
                 &scores,
-                &mut best,
-                &mut second,
+                &mut top,
+                k,
             );
         }
     }
 
-    best.map(|best| (best, second))
+    top
 }
 
 #[inline]
@@ -216,39 +238,26 @@ fn centroid_included(counts: Option<&[u32]>, centroid: usize) -> bool {
 }
 
 #[inline]
-fn update_centroid_block_top_two(
+fn update_centroid_block_top_k(
     counts: Option<&[u32]>,
     base_centroid: usize,
     n_cent: usize,
     scores: &[f32],
-    best: &mut Option<(u32, f32)>,
-    second: &mut Option<(u32, f32)>,
+    top: &mut Vec<(u32, f32)>,
+    k: usize,
 ) {
     for (lane, &score) in scores.iter().enumerate() {
         let centroid = base_centroid + lane;
         if centroid < n_cent && centroid_included(counts, centroid) {
-            update_top_two(centroid as u32, score, best, second);
-        }
-    }
-}
-
-#[inline]
-fn update_top_two(
-    centroid: u32,
-    score: f32,
-    best: &mut Option<(u32, f32)>,
-    second: &mut Option<(u32, f32)>,
-) {
-    match *best {
-        None => *best = Some((centroid, score)),
-        Some((_, best_score)) if score < best_score => {
-            *second = *best;
-            *best = Some((centroid, score));
-        }
-        _ => {
-            if second.is_none_or(|(_, second_score)| score < second_score) {
-                *second = Some((centroid, score));
+            if top.len() == k && score >= top[k - 1].1 {
+                continue;
             }
+            let pos = top
+                .iter()
+                .position(|&(_, s)| score < s)
+                .unwrap_or(top.len());
+            top.insert(pos, (centroid as u32, score));
+            top.truncate(k);
         }
     }
 }

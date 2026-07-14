@@ -2563,7 +2563,12 @@ fn drain_replica_extra_budget(n_rows: usize, target_factor: f32) -> usize {
         return 0;
     }
     let target_rows = (n_rows as f64 * target_factor as f64).ceil() as usize;
-    target_rows.saturating_sub(n_rows).min(n_rows)
+    // The closure emits up to REPLICA_CLOSURE_MAX_REPLICAS candidates per
+    // row, so factors up to 1 + that many are meaningful (a row can be
+    // materialized in every cell of its closure).
+    target_rows
+        .saturating_sub(n_rows)
+        .min(n_rows.saturating_mul(opann::REPLICA_CLOSURE_MAX_REPLICAS))
 }
 
 async fn materialized_user_rows_for_drain(
@@ -3171,10 +3176,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     let mut replica_candidates: Vec<(usize, u32, f32)> = assignments
                         .iter()
                         .enumerate()
-                        .filter_map(|(row_idx, assignment)| {
+                        .flat_map(|(row_idx, assignment)| {
                             assignment
-                                .neighbor
-                                .map(|(neighbor, margin)| (row_idx, neighbor, margin))
+                                .replicas
+                                .iter()
+                                .flatten()
+                                .map(move |&(cell, margin)| (row_idx, cell, margin))
                         })
                         .collect();
                     replica_candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
@@ -4130,10 +4137,12 @@ fn assign_cells<'a>(
     let mut replica_candidates: Vec<(usize, u32, f32)> = assignments
         .iter()
         .enumerate()
-        .filter_map(|(row_idx, assignment)| {
+        .flat_map(|(row_idx, assignment)| {
             assignment
-                .neighbor
-                .map(|(neighbor, margin)| (row_idx, neighbor, margin))
+                .replicas
+                .iter()
+                .flatten()
+                .map(move |&(cell, margin)| (row_idx, cell, margin))
         })
         .collect();
     replica_candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
