@@ -3138,9 +3138,9 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     writer.begin_batch();
                 }
                 let replica_target = drain_replica_target_factor();
-                let replica_extra_budget =
-                    drain_replica_extra_budget(all_rows.len(), replica_target);
-                if replica_extra_budget == 0 && assign_skip {
+                if assign_skip && drain_replica_extra_budget(n_batch_rows, replica_target) == 0 {
+                    // Globally-aligned superfiles with no drain-side budget:
+                    // trust ingest placement verbatim, replicas included.
                     for row in &all_rows {
                         spill_unfinished_shard_row(
                             &mut cell_spills,
@@ -3153,6 +3153,22 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         )?;
                     }
                 } else {
+                    // The drain re-derives placement and replication from the
+                    // DISTINCT corpus. User superfiles already carry
+                    // commit-time boundary replicas (user-space recall rides
+                    // on them); without this dedup every ingest copy assigns
+                    // beside its primary and lands as a same-cell duplicate
+                    // that wastes top-k slots — measured at 100K/factor 1.5:
+                    // 211,009 stored rows for 100,000 distinct, 88,961
+                    // same-cell duplicate pairs, post-drain recall 0.950 →
+                    // 0.870.
+                    let mut seen_stable_ids: HashSet<i128> = HashSet::with_capacity(n_batch_rows);
+                    let distinct_rows: Vec<&MaterializedIvfRow> = all_rows
+                        .iter()
+                        .filter(|row| seen_stable_ids.insert(row.stable_id))
+                        .collect();
+                    let replica_extra_budget =
+                        drain_replica_extra_budget(distinct_rows.len(), replica_target);
                     let clusters_ref = &running_clusters;
                     let transposed_centroids = transpose_centroids_cluster_major(
                         &clusters_ref.centroids,
@@ -3161,7 +3177,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     );
                     let assignments: Vec<opann::BoundaryAssignment> =
                         hidden_inner.options.writer_pool.install(|| {
-                            all_rows
+                            distinct_rows
                                 .par_iter()
                                 .map(|row| {
                                     opann::boundary_assignment_encoded_with_transposed(
@@ -3195,10 +3211,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             shard_count,
                             drain_scratch.as_path(),
                             cell,
-                            &all_rows[row_idx],
+                            distinct_rows[row_idx],
                         )?;
                     }
-                    for (row, assignment) in all_rows.iter().zip(&assignments) {
+                    for (row, assignment) in distinct_rows.iter().zip(&assignments) {
                         spill_unfinished_shard_row(
                             &mut cell_spills,
                             &mut added_per_cell,
