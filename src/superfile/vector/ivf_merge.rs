@@ -25,7 +25,7 @@ use crate::superfile::{
     vector::{
         builder::{
             IvfSubsectionLayout, alloc_ivf_subsection_with_header, centroid_storage_order,
-            write_ivf_cluster_blocks,
+            fixed_sq8_quantizer, write_ivf_cluster_blocks,
         },
         cell_posting::{
             EncodedCellRow, materialize_sq8_residual_row_into_cluster_quant,
@@ -161,8 +161,18 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
 
     let summary_centroid = mean_f32_cluster_major(&out_centroids, dim, n_cent);
 
-    let mut dst_scale = vec![1.0f32; n_cent * dim];
-    let mut dst_offset = vec![0.0f32; n_cent * dim];
+    // Seed the merged quantizer table with the pinned constants when the
+    // codec's quantizer is fixed: a cluster that is empty in every input
+    // keeps its seed slot, and the reader's open-time validation requires
+    // every slot — populated or empty — to carry the pinned scale/offset
+    // bitwise, exactly as the direct build paths write them. Fitted codecs
+    // keep the neutral 1.0/0.0 seed; their empty slots are never read.
+    let (mut dst_scale, mut dst_offset) = if codec.uses_fixed_quantizer() {
+        let (scale, offset) = fixed_sq8_quantizer(dim);
+        (scale.repeat(n_cent), offset.repeat(n_cent))
+    } else {
+        (vec![1.0f32; n_cent * dim], vec![0.0f32; n_cent * dim])
+    };
     for c in 0..n_cent {
         for inp in parsed {
             let (_, count) = cluster_entry(&inp.sub, inp.cluster_idx_off, c);
@@ -797,4 +807,111 @@ pub(crate) fn merge_fragment_subsections(
     splice_fragments_into_cell(&fragments)?.ok_or_else(|| {
         BuildError::VectorSchemaMismatch("fragment merge produced an empty cell".into())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::superfile::vector::{
+        builder::{VectorConfig, build_merged_subsection_from_fp32},
+        rerank_codec::{SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
+    };
+
+    /// Dim of the tiny fixture corpus.
+    const DIM: usize = 8;
+    /// Provided grid width: one populated cluster plus three empty ones.
+    const N_CENT: usize = 4;
+    /// Rows per merge input.
+    const ROWS: usize = 6;
+
+    /// Build one fixed-codec cell subsection whose rows all land in cluster 0
+    /// of a provided 4-centroid grid, leaving clusters 1..3 empty (count 0)
+    /// by construction — the shape a fine k-means with more centroids than
+    /// natural clusters produces at scale.
+    fn fixed_subsection_with_empty_clusters(id_base: i128) -> MergedIvfSubsection {
+        let mut centroids = vec![0.0f32; N_CENT * DIM];
+        for c in 0..N_CENT {
+            centroids[c * DIM + c] = 1.0;
+        }
+        let mut vectors = Vec::with_capacity(ROWS * DIM);
+        for r in 0..ROWS {
+            let mut row = [0.0f32; DIM];
+            row[0] = 1.0;
+            row[4 + r % 4] = 0.05 + r as f32 * 0.01;
+            let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+            vectors.extend(row.iter().map(|v| v / norm));
+        }
+        let ids: Vec<i128> = (0..ROWS as i128).map(|i| id_base + i).collect();
+        let cfg = VectorConfig {
+            column: "emb".into(),
+            dim: DIM,
+            n_cent: N_CENT,
+            rot_seed: 7,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8FixedResidual,
+            provided_centroids: Some(Arc::from(centroids)),
+        };
+        build_merged_subsection_from_fp32(cfg, Arc::new(vectors), &ids).expect("cell build")
+    }
+
+    /// Splice-merging inputs that share an all-empty cluster must leave the
+    /// pinned scale/offset constants in that cluster's codec-meta slots: the
+    /// open-time validator requires every slot — populated or empty — to be
+    /// bitwise-equal to the pinned quantizer, exactly as the direct build
+    /// paths write it. The placeholder-seeded merge previously left 1.0/0.0
+    /// in all-empty slots, and compaction's own summary open rejected the
+    /// merged superfile (first seen at 10M docs / 64 cells, where per-cell
+    /// fine k-means is the first shape to produce empty fine clusters).
+    #[test]
+    fn splice_merge_keeps_pinned_meta_in_empty_clusters() {
+        let a = fixed_subsection_with_empty_clusters(1_000);
+        let b = fixed_subsection_with_empty_clusters(2_000);
+        let parse = |sub: &MergedIvfSubsection| {
+            sq8_ivf_merge_input_from_subsection(
+                &sub.bytes,
+                DIM,
+                sub.n_cent,
+                sub.n_docs,
+                Metric::Cosine,
+                RerankCodec::Sq8FixedResidual,
+                None,
+            )
+            .expect("parse merge input")
+        };
+        let inputs = [parse(&a), parse(&b)];
+        let empty_everywhere = (0..N_CENT).any(|c| {
+            inputs
+                .iter()
+                .all(|inp| cluster_entry(&inp.sub, inp.cluster_idx_off, c).1 == 0)
+        });
+        assert!(
+            empty_everywhere,
+            "fixture must produce an all-empty cluster"
+        );
+
+        let merged = merge_sq8_ivf_subsections_from_parsed(&inputs).expect("splice merge");
+        let so_bytes = merged.n_cent * DIM * 4;
+        let meta = &merged.bytes
+            [merged.codec_meta_offset_in_sub..merged.codec_meta_offset_in_sub + 2 * so_bytes];
+        let scale = decode_f32_le_vec(&meta[..so_bytes]);
+        let offset = decode_f32_le_vec(&meta[so_bytes..]);
+        for (i, value) in scale.iter().enumerate() {
+            assert_eq!(
+                value.to_bits(),
+                SQ8_FIXED_SCALE.to_bits(),
+                "scale slot {i} (cluster {}) must stay pinned",
+                i / DIM
+            );
+        }
+        for (i, value) in offset.iter().enumerate() {
+            assert_eq!(
+                value.to_bits(),
+                SQ8_FIXED_OFFSET.to_bits(),
+                "offset slot {i} (cluster {}) must stay pinned",
+                i / DIM
+            );
+        }
+    }
 }
