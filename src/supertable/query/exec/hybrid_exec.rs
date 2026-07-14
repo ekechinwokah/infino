@@ -64,12 +64,6 @@ use datafusion::{
 use futures::{future, stream};
 use tracing::debug;
 
-use super::{
-    common::{
-        arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits, resolve_hits_named,
-    },
-    vector_exec::arg_to_query_vector,
-};
 use crate::{
     InfinoError,
     superfile::{fts::reader::BoolMode, reader::VectorSearchOptions},
@@ -77,7 +71,16 @@ use crate::{
         QueryError,
         handle::{Supertable, SupertableReader, WeakReader},
         manifest::SuperfileUri,
-        query::SuperfileHit,
+        query::{
+            SuperfileHit,
+            exec::{
+                common::{
+                    arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits,
+                    resolve_hits_named, search_query_df_error,
+                },
+                vector_exec::arg_to_query_vector,
+            },
+        },
     },
 };
 
@@ -118,6 +121,10 @@ impl SupertableReader {
     /// `pub(crate)` kernel; the public surface is the sync
     /// [`SupertableReader::hybrid_search`].
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(text_col = text_col, vec_col = vec_col, k = k, mode = ?mode))
+    )]
     pub(crate) async fn hybrid_search_async(
         &self,
         text_col: &str,
@@ -168,6 +175,10 @@ impl Supertable {
     /// bounds each retriever and the fused result. `projection` follows
     /// the same rules as [`Supertable::bm25_search`].
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(text_col = text_col, vec_col = vec_col, k = k, mode = ?mode))
+    )]
     pub fn hybrid_search(
         &self,
         text_col: &str,
@@ -183,7 +194,7 @@ impl Supertable {
         let reader = self.reader();
         let hits = reader
             .hybrid_search(text_col, q_text, mode, vec_col, q_vec, options, k)
-            .map_err(InfinoError::from)?;
+            .map_err(|e| InfinoError::from(e).with_context("hybrid_search", None))?;
         let batch = self
             .block_on_query(resolve_hits_named(
                 &reader,
@@ -191,7 +202,7 @@ impl Supertable {
                 projection,
                 "hybrid_search",
             ))
-            .map_err(|e| InfinoError::Query(e.to_string()))?;
+            .map_err(|e| InfinoError::Query(e.to_string()).with_context("hybrid_search", None))?;
         Ok(vec![batch])
     }
 }
@@ -463,7 +474,7 @@ impl ExecutionPlan for HybridSearchExec {
             let fused = reader
                 .hybrid_search_async(&text_col, &q_text, mode, &vec_col, &q_vec, options, k)
                 .await
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                .map_err(search_query_df_error)?;
             resolve_hits(
                 &reader,
                 &fused,

@@ -100,6 +100,12 @@ pub enum BuildError {
     #[error("error from underlying superfile layer: {0}")]
     Superfile(#[from] SuperfileBuildError),
 
+    /// Ingest build refused: would cross the connection memory budget. The
+    /// string is already labelled ("during ingest, ..."); routes to
+    /// `InfinoError::OverBudget` via [`BuildError::over_budget`].
+    #[error("{0}")]
+    OverBudget(String),
+
     #[error(
         "another SupertableWriter is already outstanding for this Supertable; \
          drop it before acquiring a new one"
@@ -108,6 +114,9 @@ pub enum BuildError {
 
     #[error("superfile store: {0}")]
     Store(String),
+
+    #[error("merge needs more memory than the connection budget allows: {0}")]
+    MemoryBudgetExceeded(String),
 
     #[error("rayon thread pool creation failed: {0}")]
     ThreadPoolCreation(String),
@@ -135,6 +144,16 @@ pub enum BuildError {
     /// back. Caller fixes config or schema.
     #[error("partition column missing in schema: {0}")]
     PartitionColumnMissing(String),
+}
+
+impl BuildError {
+    /// The over-budget message if this is a budget refusal, else `None`.
+    pub(crate) fn over_budget(&self) -> Option<&str> {
+        match self {
+            BuildError::OverBudget(m) => Some(m),
+            _ => None,
+        }
+    }
 }
 
 /// Errors raised by the supertable's commit path — building +
@@ -191,13 +210,14 @@ pub enum ManifestError {
     /// possible value hashes to bucket 0.
     #[error("superfile spans partition boundary: {detail}")]
     SuperfileSpansPartition { detail: String },
-    /// A superfile entry reached `update()` already carrying a `partition_key`.
-    /// Entries must arrive unstamped: the key is derived from the strategy at
-    /// commit time. A non-empty key means an earlier stage already stamped it,
-    /// and committing would silently overwrite that assignment.
+    /// A superfile entry reached `update()` already carrying a
+    /// `partition_key`. Entries must arrive unstamped: the key is
+    /// derived from the strategy at commit time. A non-empty key means
+    /// an earlier stage already stamped it, and committing would
+    /// silently overwrite that assignment.
     #[error("superfile entry already partitioned: {detail}")]
     EntryAlreadyPartitioned { detail: String },
-    /// ManifestSnapshot load error
+    /// Manifest load error
     #[error("manifest load error: {0}")]
     ManifestLoadError(#[from] ManifestLoadError),
     /// Unknown part id
@@ -267,29 +287,44 @@ pub enum OpenError {
 /// Errors raised by [`crate::supertable::Supertable::optimize`].
 #[derive(Debug, thiserror::Error)]
 pub enum OptimizeError {
+    /// No durable storage backend is configured (e.g. `memory://`); optimize
+    /// needs one.
     #[error("optimize requires a storage backend")]
     NoStorage,
+    /// A superfile selected for compaction was absent from the manifest
+    /// snapshot.
     #[error("superfile {0} not found in manifest snapshot")]
     SuperfileNotFound(uuid::Uuid),
+    /// Compaction produced an empty merged superfile.
     #[error("empty merged superfile")]
     EmptyMergedSuperfile,
+    /// The tombstone sidecar for a superfile was already sealed by another
+    /// compaction.
     #[error(
         "tombstone sidecar for {superfile_id} already sealed by compaction {existing_compaction_id}"
     )]
     SidecarConflict {
+        /// The superfile whose sidecar conflicted.
         superfile_id: uuid::Uuid,
+        /// The compaction that had already sealed the sidecar.
         existing_compaction_id: uuid::Uuid,
     },
+    /// Sealing the compaction output failed.
     #[error("seal failed: {0}")]
     Seal(String),
+    /// Building a merged superfile failed.
     #[error("failed to build superfile: {0}")]
     Build(String),
+    /// Committing the compaction to the manifest failed.
     #[error("failed to commit: {0}")]
     Commit(String),
+    /// Refreshing the in-memory manifest after the commit failed.
     #[error("post-commit manifest refresh failed: {0}")]
     Refresh(String),
+    /// Another optimize is already running on this handle.
     #[error("optimize already in progress on this handle")]
     AlreadyRunning,
+    /// The post-compaction garbage-collection step failed.
     #[error("gc failed during optimize: {0}")]
     Gc(#[from] GcError),
 }
@@ -369,9 +404,12 @@ pub(crate) enum CompactionError {
 /// Errors raised by [`crate::supertable::Supertable::gc`].
 #[derive(Debug, thiserror::Error)]
 pub enum GcError {
+    /// No durable storage backend is configured (e.g. `memory://`); gc needs
+    /// one.
     #[error("gc requires a storage backend")]
     NoStorage,
 
+    /// A storage operation failed while listing or deleting objects.
     #[error("storage error during gc: {0}")]
     Storage(#[from] crate::storage::StorageError),
 
@@ -406,9 +444,22 @@ pub enum QueryError {
     #[error("DataFusion failed to execute the query: {0}")]
     Execute(String),
 
-    #[error("query exceeded the connection memory budget: {0}")]
+    /// A query crossed the connection memory budget. The string is already
+    /// labelled with the operation; routes to `InfinoError::OverBudget` via
+    /// [`QueryError::over_budget`].
+    #[error("{0}")]
     OverBudget(String),
 
     #[error("manifest load error: {0}")]
     ManifestLoad(ManifestLoadError),
+}
+
+impl QueryError {
+    /// The over-budget message if this is a budget refusal, else `None`.
+    pub(crate) fn over_budget(&self) -> Option<&str> {
+        match self {
+            QueryError::OverBudget(m) => Some(m),
+            _ => None,
+        }
+    }
 }

@@ -185,10 +185,6 @@ const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Default object size (100 MiB) above which uploads route through
 /// multipart.
 const DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES: u64 = 100 * (1 << 20);
-/// Default hash-partition bucket count — a single bucket, which is
-/// observationally equivalent to no partitioning.
-const DEFAULT_PARTITION_N_BUCKETS: u32 = 1;
-
 /// Read-path freshness policy — how an open handle picks up superfiles
 /// committed (by this or another process) after it opened.
 ///
@@ -642,17 +638,16 @@ impl SupertableOptions {
     /// Resolve the effective partition strategy for this
     /// supertable. Called at [`Supertable::create`] time
     /// when nothing's been persisted yet. The default —
-    /// `Hash { column: id_column, n_buckets: 1 }` — is
-    /// observationally equivalent to "no partitioning";
-    /// callers wanting real partitioning set
+    /// `IngestionTime { granularity_secs: 86_400 }`, one-day buckets
+    /// keyed off the injected `_id`'s timestamp — groups each day's
+    /// commits; callers wanting different partitioning set
     /// [`Self::partition_strategy`] via
     /// [`Self::with_partition_strategy`].
     pub fn effective_partition_strategy(&self) -> PartitionStrategy {
         self.partition_strategy
             .clone()
-            .unwrap_or_else(|| PartitionStrategy::Hash {
-                column: self.id_column.clone(),
-                n_buckets: DEFAULT_PARTITION_N_BUCKETS,
+            .unwrap_or(PartitionStrategy::IngestionTime {
+                granularity_secs: 86_400,
             })
     }
 
@@ -864,6 +859,15 @@ impl SupertableOptions {
     pub(crate) fn superfile_open_options(&self) -> OpenOptions {
         OpenOptions {
             verify_crc: self.verify_crc_on_open,
+        }
+    }
+
+    test_visible! {
+        /// The connection memory budget these options carry. Exposed for
+        /// integration tests that assert budget accounting (peak / denials)
+        /// after a query, confirming the budget was wired to the query path.
+        fn connection_budget(&self) -> &Arc<ConnectionMemoryBudget> {
+            &self.connection_memory_budget
         }
     }
 
@@ -1570,14 +1574,13 @@ supertable:
     }
 
     #[test]
-    fn effective_partition_strategy_defaults_to_single_bucket_hash() {
+    fn effective_partition_strategy_defaults_to_ingestion_time() {
         let opts = plain_opts();
         match opts.effective_partition_strategy() {
-            PartitionStrategy::Hash { column, n_buckets } => {
-                assert_eq!(column, "_id");
-                assert_eq!(n_buckets, DEFAULT_PARTITION_N_BUCKETS);
+            PartitionStrategy::IngestionTime { granularity_secs } => {
+                assert_eq!(granularity_secs, 86_400);
             }
-            other => panic!("expected single-bucket Hash, got {other:?}"),
+            other => panic!("expected IngestionTime with 1-day granularity, got {other:?}"),
         }
     }
 
@@ -1817,6 +1820,33 @@ supertable:
         assert!(
             opts.disk_cache.is_some(),
             "disk_cache_root ⇒ cache attached"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_config_disk_cache_root_with_range_only_is_rejected() {
+        use figment::{
+            Figment,
+            providers::{Format, Yaml},
+        };
+
+        let dir = env::temp_dir().join(format!("infino-opts-ro-cfg-{}", Uuid::new_v4()));
+        let cache_root = dir.join("cache");
+        fs::create_dir_all(&dir).expect("mkdir");
+        let yaml = format!(
+            "storage:\n  backend: local_fs\n  local_root: {}\n  disk_cache_root: {}\n  cold_fetch_mode: range_only\n",
+            dir.display(),
+            cache_root.display()
+        );
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(&yaml))).expect("parse config");
+        let err = plain_opts()
+            .apply_config(&cfg)
+            .expect_err("range_only + disk_cache_root must be rejected");
+        assert!(
+            matches!(err, BuildError::Store(_)),
+            "expected BuildError::Store, got: {err:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }

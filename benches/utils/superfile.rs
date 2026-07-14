@@ -1141,6 +1141,7 @@ pub mod vector {
                 Some(Arc::clone(allow)),
                 None,
                 None,
+                None,
             ))
             .expect("filtered sweep query");
             sum += corpus::recall_at_k(&hits, gt);
@@ -1282,6 +1283,7 @@ pub mod vector {
                     TOP_K,
                     opts,
                     Some(Arc::clone(allow)),
+                    None,
                     None,
                     None,
                 ))
@@ -1457,6 +1459,7 @@ pub mod vector {
                             Some(Arc::clone(&allow)),
                             None,
                             None,
+                            None,
                         ))
                         .expect("filtered recall query");
                         recalls.push(corpus::recall_at_k(&hits, gt));
@@ -1530,6 +1533,7 @@ pub mod vector {
                                 TOP_K,
                                 exec_vec::search_opts(nominal_nprobe, nominal_rerank),
                                 set.clone(),
+                                None,
                                 None,
                                 None,
                             ))

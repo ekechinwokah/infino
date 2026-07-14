@@ -59,10 +59,14 @@ impl MemoryPool for ConnectionBudgetPool {
     }
 
     fn try_grow(&self, _reservation: &MemoryReservation, additional: usize) -> DfResult<()> {
-        self.budget.try_grow(additional).map_err(|_| {
-            DataFusionError::ResourcesExhausted(format!(
-                "connection memory budget exhausted: {additional} more bytes would cross the limit"
-            ))
+        // DataFusion's spilling operators (sort, aggregate) call try_grow and, on `Err`, spill to disk
+        // and retry rather than fail. They branch on the error variant (`ResourcesExhausted`), never on
+        // its message, so the text here only surfaces if the query still can't fit after spilling.
+        //
+        // We label it "during SQL query" so that final error matches the ingest and vector over-budget
+        // messages once it reaches InfinoError::OverBudget.
+        self.budget.try_grow(additional).map_err(|over| {
+            DataFusionError::ResourcesExhausted(format!("during SQL query, {over}"))
         })
     }
 
@@ -287,6 +291,70 @@ mod tests {
             assert_eq!(rows, ROWS);
             assert!(sorted);
             assert_eq!(spills, 0, "a generous budget sorts in memory, no spill");
+        });
+    }
+
+    #[test]
+    fn budget_counter_climbs_per_query_and_returns_to_baseline() {
+        // A measured budget tracks usage without ever refusing. Run the same
+        // GROUP BY three times on one shared budget:
+        //  - each query reserves (peak climbs above 0), then frees it all (used -> 0);
+        //  - the peak stays flat across runs, so nothing leaks between queries.
+        // Single partition keeps the reservations reproducible run-to-run.
+        const GROUPS: usize = 50 * 1024;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let vals: Vec<String> = (0..GROUPS).map(|i| format!("key-{i}")).collect();
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(StringArray::from(vals))])
+                .expect("batch");
+
+        // One shared budget across all the queries below (as on a connection).
+        let budget = ConnectionMemoryBudget::measured();
+
+        let runtime_env = Runtime::new().expect("tokio runtime");
+        runtime_env.block_on(async {
+            let mut prev_peak = 0;
+            for i in 0..3 {
+                // Fresh ctx per query, all sharing the one budget.
+                let rt = budgeted_runtime(&budget).expect("runtime env");
+
+                let mut cfg = SessionConfig::new();
+                cfg.options_mut().execution.target_partitions = 1;
+
+                let ctx = SessionContext::new_with_config_rt(cfg, rt);
+                let table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]])
+                    .expect("memtable");
+
+                ctx.register_table("t", Arc::new(table)).expect("register");
+
+                let rows: usize = ctx
+                    .sql("SELECT s, COUNT(*) FROM t GROUP BY s")
+                    .await
+                    .expect("plan")
+                    .collect()
+                    .await
+                    .expect("collect")
+                    .iter()
+                    .map(|b| b.num_rows())
+                    .sum();
+
+                assert_eq!(rows, GROUPS);
+
+                let peak = budget.peak();
+
+                assert!(peak > 0, "query {i} reserved against the budget");
+                assert_eq!(budget.used(), 0, "query {i} freed all its reservations");
+
+                if i > 0 {
+                    assert_eq!(
+                        peak, prev_peak,
+                        "identical queries hold a flat peak (no leak)"
+                    );
+                }
+
+                prev_peak = peak;
+            }
         });
     }
 }

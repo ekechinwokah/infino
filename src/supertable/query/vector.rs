@@ -90,6 +90,7 @@ use crate::{
     config,
     superfile::{
         SuperfileReader,
+        error::ReadError,
         fts::reader::BoolMode,
         vector::{distance::relative_score_window, layout::VectorLayout},
     },
@@ -201,6 +202,16 @@ fn gate_fine_candidates_by_fragment(
         }
     }
     gated
+}
+
+/// Map a per-superfile vector-search error to a query error. A budget refusal
+/// keeps its own variant (found via `ReadError::over_budget`) so it surfaces as
+/// the public `InfinoError::OverBudget`; anything else is a generic query error.
+fn vector_read_query_error(e: ReadError) -> QueryError {
+    if let Some(msg) = e.over_budget() {
+        return QueryError::OverBudget(msg.to_string());
+    }
+    QueryError::Parquet(e.to_string())
 }
 
 /// An optional text-predicate filter for vector kNN search. When
@@ -1021,26 +1032,78 @@ impl SupertableReader {
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
         let reader_pool = Arc::clone(&manifest.options.reader_pool);
-        let kernel =
-            move |reader: Arc<SuperfileReader>,
-                  (ids, bitmap): (Vec<u32>, Option<Arc<RoaringBitmap>>)| {
-                let column = Arc::clone(&column_arc);
-                let query = Arc::clone(&query_arc);
+        // Per-connection memory budget: gates each superfile's cold cluster-block fetch.
+        let budget = Some(Arc::clone(&manifest.options.connection_memory_budget));
+        let storage = manifest.options.storage.as_ref().map(Arc::clone);
+
+        // `fanout_with`, not a plain post-rank filter: the body resolves each
+        // superfile's tombstone bitmap *before* its kernel and pushes it down
+        // as a deny set wherever IVF locals address Parquet rows (post-rank
+        // filtering underflows the top-k). MultiCell user files are the
+        // exception — their locals include boundary stubs, so deletes are
+        // dropped after ranking by identity instead. The hidden path skips
+        // sidecars entirely: its deletes ride inline in the hidden manifest
+        // and are applied after remapping to user `_id`s.
+        let body = move |reader: Arc<SuperfileReader>,
+                         entry: Arc<SuperfileEntry>,
+                         tombstone_cache: Option<Arc<SidecarCache>>,
+                         now: Instant,
+                         (ids, bitmap): (Vec<u32>, Option<Arc<RoaringBitmap>>)| {
+            let column = Arc::clone(&column_arc);
+            let query = Arc::clone(&query_arc);
+            let reader_pool = Arc::clone(&reader_pool);
+            let budget = budget.clone();
+            let storage = storage.clone();
+            async move {
+                // Unfiltered user path on row-addressable locals: resolve the
+                // bitmap once (warm after the orchestrator's prefetch) and
+                // push it down. Filtered search leaves it `None` — its
+                // allow-set already excludes tombstones.
+                let deny_pushdown = !hidden_vector_index
+                    && bitmap.is_none()
+                    && entry.vector_layout != VectorLayout::MultiCellIvf;
+                let deny = match tombstone_cache.as_ref() {
+                    Some(cache) if deny_pushdown => {
+                        dispatch::tombstone_deny_set(cache, entry.superfile_id, now)?
+                    }
+                    _ => None,
+                };
                 let pool = Some(Arc::clone(&reader_pool));
-                async move {
-                    let replica_overhead = reader
-                        .vec()
-                        .map(|v| (v.n_docs() as usize).saturating_sub(reader.n_docs() as usize))
-                        .unwrap_or(0);
-                    let k_fetch = k.saturating_add(replica_overhead);
-                    reader
-                        .vector_search_clusters_filtered(
-                            &column, &query, k_fetch, &ids, options, bitmap, None, pool,
-                        )
-                        .await
-                        .map_err(|e| QueryError::Parquet(e.to_string()))
+                // Replicated hidden cells store boundary duplicates; fetch
+                // enough extra slots that the post-merge stable-id dedup
+                // still leaves k distinct rows.
+                let replica_overhead = reader
+                    .vec()
+                    .map(|v| (v.n_docs() as usize).saturating_sub(reader.n_docs() as usize))
+                    .unwrap_or(0);
+                let k_fetch = k.saturating_add(replica_overhead);
+                let reader_for_ids = Arc::clone(&reader);
+                let hits = reader
+                    .vector_search_clusters_filtered(
+                        &column, &query, k_fetch, &ids, options, bitmap, deny, pool, budget,
+                    )
+                    .await
+                    .map_err(vector_read_query_error)?;
+                let mut tagged = dispatch::tag_hits(&entry, hits);
+                // Prefer manifest span arithmetic; only touch `_id` pages /
+                // inline IVF regions when the layout is cell-packed or gapped.
+                dispatch::attach_stable_ids(&reader_for_ids, &entry, &mut tagged, false).await?;
+                if !hidden_vector_index && !deny_pushdown {
+                    // MultiCell user files (and any path that skipped the
+                    // push-down): drop deleted rows by identity post-rank.
+                    dispatch::apply_resolved_tombstone_filter(
+                        &reader_for_ids,
+                        storage.as_ref(),
+                        tombstone_cache.as_ref(),
+                        &entry,
+                        &mut tagged,
+                        now,
+                    )
+                    .await?;
                 }
-            };
+                Ok::<Vec<SuperfileHit>, QueryError>(tagged)
+            }
+        };
         // Filtered search holds a per-superfile RoaringBitmap while the
         // kernel builds its shortlist; wave-cap the fan-out by reader-pool
         // width so transient memory stays bounded. The unfiltered path
@@ -1052,17 +1115,13 @@ impl SupertableReader {
             while !units.is_empty() {
                 let n = fanout_width.min(units.len());
                 let wave: Vec<_> = units.drain(..n).collect();
-                collected.extend(if hidden_vector_index {
-                    dispatch::fanout_without_tombstones(self, wave, kernel.clone()).await?
-                } else {
-                    dispatch::fanout(self, wave, kernel.clone()).await?
-                });
+                collected.extend(
+                    dispatch::fanout_with(self, wave, !hidden_vector_index, body.clone()).await?,
+                );
             }
             collected
-        } else if hidden_vector_index {
-            dispatch::fanout_without_tombstones(self, units, kernel).await?
         } else {
-            dispatch::fanout(self, units, kernel).await?
+            dispatch::fanout_with(self, units, !hidden_vector_index, body).await?
         };
 
         Ok(top_k_ascending(per_superfile, k))
@@ -1082,6 +1141,10 @@ impl SupertableReader {
     ///
     /// `pub(crate)` async kernel — the public surface is the sync
     /// `vector_search` with a filter; this drives the cross-superfile fan-out.
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(column = column, k = k, dim = query.len()))
+    )]
     pub(crate) async fn vector_hits_filtered_async(
         &self,
         column: &str,
@@ -2053,9 +2116,9 @@ impl Supertable {
     ///
     /// ```
     /// # use std::sync::Arc;
-    /// # use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
-    /// # use arrow_array::types::Float32Type;
-    /// # use arrow_schema::{DataType, Field, Schema};
+    /// # use infino::arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
+    /// # use infino::arrow_array::types::Float32Type;
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
     /// # use infino::{connect, IndexSpec, Metric, VectorSearchOptions};
     /// # let db = connect("memory://")?;
     /// # let schema = Arc::new(Schema::new(vec![Field::new(
@@ -2084,6 +2147,10 @@ impl Supertable {
     /// assert!(rows.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    #[cfg_attr(
+        feature = "detailed-tracing",
+        tracing::instrument(skip_all, fields(column = column, k = k, dim = query.len()))
+    )]
     pub fn vector_search(
         &self,
         column: &str,
@@ -2096,6 +2163,7 @@ impl Supertable {
         self.reader()
             .vector_search(column, query, k, options, filter, projection)
             .map_err(crate::InfinoError::from)
+            .map_err(|e| e.with_context("vector_search", None))
     }
 }
 
@@ -2112,12 +2180,15 @@ mod tests {
 
     use super::{
         VectorFilter, VectorSearchOptions, gate_fine_candidates_by_fragment,
-        is_hidden_vector_manifest,
+        is_hidden_vector_manifest, vector_read_query_error,
     };
     use crate::{
+        InfinoError,
         superfile::{
-            builder::{FtsConfig, SuperfileBuilder, VectorConfig},
-            vector::distance::Metric,
+            SuperfileReader,
+            builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
+            error::{ReadError, VectorError},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
             Supertable, SupertableOptions,
@@ -2198,6 +2269,28 @@ mod tests {
         assert_eq!(gated.iter().filter(|(si, _, _)| *si == 0).count(), 2);
     }
 
+    #[test]
+    fn over_budget_vector_error_surfaces_as_infino_over_budget() {
+        // A cold vector search that crosses the budget returns
+        // `VectorError::OverBudget` (see the vector reader tests). Confirm it
+        // routes all the way to the public `InfinoError::OverBudget` and isn't
+        // flattened to a generic query error.
+        let read_err = ReadError::Vector(Box::new(VectorError::OverBudget("gate".into())));
+        let q = vector_read_query_error(read_err);
+
+        assert!(matches!(q, QueryError::OverBudget(_)), "got {q:?}");
+        assert!(matches!(
+            InfinoError::from(QueryError::OverBudget("x".into())),
+            InfinoError::OverBudget(_)
+        ));
+
+        // A non-budget read error stays a generic query error.
+        assert!(matches!(
+            vector_read_query_error(ReadError::MissingKv("k")),
+            QueryError::Parquet(_)
+        ));
+    }
+
     fn fixed_list_f32(dim: usize) -> DataType {
         DataType::FixedSizeList(
             Arc::new(Field::new("item", DataType::Float32, true)),
@@ -2233,7 +2326,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
+                rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
             }],
             Some(tok()),
@@ -2273,10 +2366,7 @@ mod tests {
     /// argument shape that `SuperfileBuilder::add_batch` takes —
     /// the supertable's writer wraps this for callers via
     /// `vector_split`, but for the oracle we plumb it manually.
-    fn build_oracle_superfile(
-        n_total: usize,
-        dim: usize,
-    ) -> Arc<crate::superfile::SuperfileReader> {
+    fn build_oracle_superfile(n_total: usize, dim: usize) -> Arc<SuperfileReader> {
         // Oracle path goes through SuperfileBuilder directly,
         // so we mimic the supertable's effective schema by hand:
         // `_id` is `Decimal128(38, 0)`, ids are 0..n.
@@ -2291,7 +2381,7 @@ mod tests {
             ),
             Field::new("title", DataType::LargeUtf8, false),
         ]));
-        let opts = crate::superfile::builder::BuilderOptions::new(
+        let opts = BuilderOptions::new(
             scalar_schema.clone(),
             "_id",
             vec![FtsConfig {
@@ -2303,7 +2393,7 @@ mod tests {
                 n_cent: 4,
                 rot_seed: 7,
                 metric: Metric::Cosine,
-                rerank_codec: crate::superfile::vector::rerank_codec::RerankCodec::Fp32,
+                rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
             }],
             Some(tok()),
@@ -2331,7 +2421,7 @@ mod tests {
         b.add_batch(&scalar_batch, &[flat.as_slice()])
             .expect("add_batch");
         let bytes = bytes::Bytes::from(b.finish().expect("finish"));
-        Arc::new(crate::superfile::SuperfileReader::open(bytes).expect("open"))
+        Arc::new(SuperfileReader::open(bytes).expect("open"))
     }
 
     #[test]
@@ -2563,7 +2653,7 @@ mod tests {
         supertable::{
             manifest::{SuperfileEntry, SuperfileUri},
             query::SuperfileHit,
-            tombstones::{SidecarCache, cache::DEFAULT_REFRESH_TTL},
+            tombstones::{SidecarCache, TombstoneSeqView, cache::DEFAULT_SEAL_TTL},
             wal::{WalStore, tombstones_codec::TombstonesSidecar},
         },
     };
@@ -2595,9 +2685,15 @@ mod tests {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let ws = WalStore::new(Arc::clone(&storage));
-        let cache = Arc::new(SidecarCache::new(ws.clone(), DEFAULT_REFRESH_TTL));
-
         let sf_id = Uuid::from_u128(0xFEEDFACE);
+        let cache = Arc::new(SidecarCache::new(
+            ws.clone(),
+            DEFAULT_SEAL_TTL,
+            Arc::new(TombstoneSeqView {
+                manifest_id: 1,
+                seqs: [(sf_id, 1u64)].into_iter().collect(),
+            }),
+        ));
         // Pre-populate a sidecar with doc-ids 1, 3, 5 set.
         let mut bitmap = roaring::RoaringBitmap::new();
         bitmap.insert(1);
@@ -2653,14 +2749,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_tombstone_filter_short_circuits_on_empty_bitmap() {
-        // No sidecar at all → cache populates the "known 404"
-        // sentinel and `bitmap.is_empty()` short-circuits the
-        // filter loop. Hit list is unchanged.
+        // Superfile absent from the seq map → the cache answers
+        // "no tombstones" authoritatively (zero GETs) and
+        // `bitmap.is_empty()` short-circuits the filter loop.
+        // Hit list is unchanged.
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let ws = WalStore::new(Arc::clone(&storage));
-        let cache = Arc::new(SidecarCache::new(ws, DEFAULT_REFRESH_TTL));
+        let cache = Arc::new(SidecarCache::new(
+            ws,
+            DEFAULT_SEAL_TTL,
+            Arc::new(TombstoneSeqView::default()),
+        ));
 
         let entry = synthetic_entry(Uuid::from_u128(0x1111));
         let mut hits: Vec<SuperfileHit> = (0..4u32)

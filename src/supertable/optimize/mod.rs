@@ -8,6 +8,10 @@ use crate::{
 };
 
 impl Supertable {
+    /// Merge small or underfilled superfiles into larger ones, then run a
+    /// best-effort gc sweep. Pass [`OptimizeOptions::default`] for engine
+    /// defaults. Requires durable storage.
+    #[doc(alias = "compact")]
     pub fn optimize(&self, opts: &OptimizeOptions) -> Result<(), OptimizeError> {
         self.drain_hidden_vector_cells_sync()
             .map_err(|e| OptimizeError::Build(e.to_string()))?;

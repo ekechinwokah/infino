@@ -71,6 +71,10 @@ use crate::{
 /// Warm opens are in-memory cache hits (microseconds); cold opens
 /// fetch the superfile header/footer from object storage. Always
 /// `await`ed so the open I/O overlaps across the fan-out.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(skip_all, fields(uri = ?entry.uri))
+)]
 pub(crate) async fn open_reader(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<DiskCacheStore>>,
@@ -226,71 +230,6 @@ pub(crate) fn apply_tombstone_filter(
     Ok(())
 }
 
-/// MultiCell IVF locals include boundary stubs and do not address Parquet
-/// rows. Resolve the tombstone bitmap's Parquet locals to stable `_id`s, then
-/// filter tagged IVF hits by identity. Non-MultiCell files keep the trusted
-/// local-id fast path above.
-async fn apply_resolved_tombstone_filter(
-    reader: &SuperfileReader,
-    storage: Option<&Arc<dyn StorageProvider>>,
-    cache: Option<&Arc<SidecarCache>>,
-    entry: &SuperfileEntry,
-    hits: &mut Vec<SuperfileHit>,
-    now: Instant,
-) -> Result<(), QueryError> {
-    if entry.vector_layout != VectorLayout::MultiCellIvf {
-        return apply_tombstone_filter(cache, entry, hits, now);
-    }
-    let Some(cache) = cache else {
-        return Ok(());
-    };
-    let bitmap = cache
-        .bitmap_for(entry.superfile_id, now)
-        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
-    if bitmap.is_empty() {
-        return Ok(());
-    }
-    let locals: Vec<u32> = bitmap.iter().collect();
-    let id_column = reader.id_column();
-    let batch = if reader.parquet_bytes().is_some() {
-        reader
-            .take_by_local_doc_ids(&locals, &[id_column])
-            .map_err(|e| QueryError::Execute(e.to_string()))?
-    } else {
-        let storage = storage.ok_or_else(|| {
-            QueryError::Execute(
-                "MultiCell tombstone resolve needs resident bytes or storage".into(),
-            )
-        })?;
-        let (object_store, path) = storage
-            .object_store_handle(&entry.uri.storage_path())
-            .ok_or_else(|| QueryError::Execute("no object_store handle for superfile".into()))?;
-        let file_size = entry
-            .subsection_offsets
-            .as_ref()
-            .map(|offsets| offsets.total_size);
-        take_rows_object_store(
-            object_store,
-            path,
-            file_size,
-            reader.schema(),
-            reader.n_docs(),
-            &locals,
-            &[id_column],
-        )
-        .await
-        .map_err(|e| QueryError::Execute(e.to_string()))?
-    };
-    let ids = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| QueryError::Execute("_id column missing".into()))?;
-    let deleted: HashSet<i128> = ids.values().iter().copied().collect();
-    hits.retain(|hit| hit.stable_id.is_none_or(|id| !deleted.contains(&id)));
-    Ok(())
-}
-
 /// Attach stable `_id`s to tagged hits without paying a Parquet `_id` decode
 /// when span arithmetic already answers.
 ///
@@ -302,7 +241,7 @@ async fn apply_resolved_tombstone_filter(
 /// superfile. Skipping the Parquet take on the arithmetic path is what keeps
 /// warm FTS at microseconds instead of tens of milliseconds — the same class
 /// of bug as the SQL vector id-only fast path.
-async fn attach_stable_ids(
+pub(crate) async fn attach_stable_ids(
     reader: &SuperfileReader,
     entry: &SuperfileEntry,
     hits: &mut [SuperfileHit],
@@ -404,6 +343,71 @@ pub(crate) async fn attach_stable_ids_to_hits(
     Ok(())
 }
 
+/// MultiCell IVF locals include boundary stubs and do not address Parquet
+/// rows. Resolve the tombstone bitmap's Parquet locals to stable `_id`s, then
+/// filter tagged IVF hits by identity. Non-MultiCell files keep the trusted
+/// local-id fast path above.
+pub(crate) async fn apply_resolved_tombstone_filter(
+    reader: &SuperfileReader,
+    storage: Option<&Arc<dyn StorageProvider>>,
+    cache: Option<&Arc<SidecarCache>>,
+    entry: &SuperfileEntry,
+    hits: &mut Vec<SuperfileHit>,
+    now: Instant,
+) -> Result<(), QueryError> {
+    if entry.vector_layout != VectorLayout::MultiCellIvf {
+        return apply_tombstone_filter(cache, entry, hits, now);
+    }
+    let Some(cache) = cache else {
+        return Ok(());
+    };
+    let bitmap = cache
+        .bitmap_for(entry.superfile_id, now)
+        .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+    if bitmap.is_empty() {
+        return Ok(());
+    }
+    let locals: Vec<u32> = bitmap.iter().collect();
+    let id_column = reader.id_column();
+    let batch = if reader.parquet_bytes().is_some() {
+        reader
+            .take_by_local_doc_ids(&locals, &[id_column])
+            .map_err(|e| QueryError::Execute(e.to_string()))?
+    } else {
+        let storage = storage.ok_or_else(|| {
+            QueryError::Execute(
+                "MultiCell tombstone resolve needs resident bytes or storage".into(),
+            )
+        })?;
+        let (object_store, path) = storage
+            .object_store_handle(&entry.uri.storage_path())
+            .ok_or_else(|| QueryError::Execute("no object_store handle for superfile".into()))?;
+        let file_size = entry
+            .subsection_offsets
+            .as_ref()
+            .map(|offsets| offsets.total_size);
+        take_rows_object_store(
+            object_store,
+            path,
+            file_size,
+            reader.schema(),
+            reader.n_docs(),
+            &locals,
+            &[id_column],
+        )
+        .await
+        .map_err(|e| QueryError::Execute(e.to_string()))?
+    };
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| QueryError::Execute("_id column missing".into()))?;
+    let deleted: HashSet<i128> = ids.values().iter().copied().collect();
+    hits.retain(|hit| hit.stable_id.is_none_or(|id| !deleted.contains(&id)));
+    Ok(())
+}
+
 /// Resolve stable user `_id`s for tagged hits from bytes already resident
 /// on this superfile reader — inline IVF region first (materialized hidden
 /// cells), then the scalar `_id` column (INCOMING staging / MultiCell).
@@ -450,67 +454,6 @@ async fn stable_ids_for_tagged_hits(
     Ok(Some(array.values().to_vec()))
 }
 
-/// Fan a per-superfile async kernel out across `units`, returning each
-/// unit's tagged + tombstone-filtered hits in input order.
-///
-/// Each unit is `(superfile_entry, params)`; `params` carries any
-/// per-unit kernel input (e.g. an FTS doc-id sub-range — `()` for
-/// vector). The orchestrator:
-///
-///   1. Warms the tombstone sidecar cache for every distinct superfile
-///      in one concurrent batch (so the post-search filter is all
-///      cache hits).
-///   2. `tokio::spawn`s one task per unit on the shared query runtime;
-///      each opens its reader (`await`) and runs `kernel` (`await`) —
-///      so opens and the kernel's cold GETs are concurrent across the
-///      whole fan-out.
-///   3. Tags + tombstone-filters each unit's hits.
-///
-/// The kernel returns `(local_doc_id, score)` pairs. CPU policy is the
-/// kernel's own: the vector kernel parallelizes with `par_iter`, while
-/// the FTS kernel scores serially within this task (FTS parallelism is
-/// expressed as extra work units, not rayon).
-pub(crate) async fn fanout<P, K, Fut>(
-    reader: &SupertableReader,
-    units: Vec<(Arc<SuperfileEntry>, P)>,
-    kernel: K,
-) -> Result<Vec<Vec<SuperfileHit>>, QueryError>
-where
-    P: Send + 'static,
-    K: Fn(Arc<SuperfileReader>, P) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Result<Vec<(u32, f32)>, QueryError>> + Send + 'static,
-{
-    let storage = reader.manifest().options.storage.as_ref().map(Arc::clone);
-    fanout_with(
-        reader,
-        units,
-        true,
-        move |r, entry, tombstone_cache, now, params| {
-            let kernel = kernel.clone();
-            let storage = storage.clone();
-            async move {
-                let reader_for_ids = Arc::clone(&r);
-                let hits = kernel(r, params).await?;
-                let mut tagged = tag_hits(&entry, hits);
-                // Prefer manifest span arithmetic; only touch `_id` pages /
-                // inline IVF regions when the layout is cell-packed or gapped.
-                attach_stable_ids(&reader_for_ids, &entry, &mut tagged, false).await?;
-                apply_resolved_tombstone_filter(
-                    &reader_for_ids,
-                    storage.as_ref(),
-                    tombstone_cache.as_ref(),
-                    &entry,
-                    &mut tagged,
-                    now,
-                )
-                .await?;
-                Ok::<Vec<SuperfileHit>, QueryError>(tagged)
-            }
-        },
-    )
-    .await
-}
-
 /// Fan out a kernel whose local ids are Parquet-local (FTS and exact-match).
 ///
 /// These hits can apply ordinary tombstones directly and defer stable-id
@@ -537,37 +480,6 @@ where
                 let hits = kernel(r, params).await?;
                 let mut tagged = tag_hits(&entry, hits);
                 apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
-                Ok::<Vec<SuperfileHit>, QueryError>(tagged)
-            }
-        },
-    )
-    .await
-}
-
-/// Same fan-out as [`fanout`], but without ordinary per-superfile tombstone
-/// sidecars. Hidden vector cells use the deleted `_id` set carried inline in
-/// the hidden manifest and apply it after remapping hits to user `_id`s.
-pub(crate) async fn fanout_without_tombstones<P, K, Fut>(
-    reader: &SupertableReader,
-    units: Vec<(Arc<SuperfileEntry>, P)>,
-    kernel: K,
-) -> Result<Vec<Vec<SuperfileHit>>, QueryError>
-where
-    P: Send + 'static,
-    K: Fn(Arc<SuperfileReader>, P) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Result<Vec<(u32, f32)>, QueryError>> + Send + 'static,
-{
-    fanout_with(
-        reader,
-        units,
-        false,
-        move |r, entry, _tombstone_cache, _now, params| {
-            let kernel = kernel.clone();
-            async move {
-                let reader_for_ids = Arc::clone(&r);
-                let hits = kernel(r, params).await?;
-                let mut tagged = tag_hits(&entry, hits);
-                attach_stable_ids(&reader_for_ids, &entry, &mut tagged, false).await?;
                 Ok::<Vec<SuperfileHit>, QueryError>(tagged)
             }
         },

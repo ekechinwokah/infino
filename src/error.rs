@@ -13,6 +13,13 @@
 //! change. Named `InfinoError` (not `Error`) to avoid colliding with
 //! the `std::error::Error` trait at call sites and to read consistently
 //! alongside `DataFusionError` / `ArrowError`.
+//!
+//! ## Boundary context
+//!
+//! Public API methods prefix the message with the operation (and catalog
+//! table name when known), e.g. `not found: open_table(posts): posts`,
+//! via [`InfinoError::with_context`]. Structured payload / `source()`
+//! chaining can follow in later PRs.
 
 use crate::{
     storage::StorageError,
@@ -71,6 +78,38 @@ pub enum InfinoError {
     /// variant.
     #[error("backend: {0}")]
     Backend(String),
+
+    /// An invalid or conflicting configuration was supplied.
+    #[error("config: {0}")]
+    Config(String),
+}
+
+impl InfinoError {
+    /// Prefix this error's message with `operation` or `operation(table)`.
+    ///
+    /// Used at public API boundaries so Display carries enough context
+    /// without changing the variant shape. Example:
+    /// `not found: open_table(posts): posts`.
+    ///  not found: Kind of failure (the InfinoError variant)
+    ///  open_table(posts): Public operation that failed (Operation open_table, catalog table posts)
+    ///  posts: Detail / original message.
+    pub(crate) fn with_context(self, operation: &'static str, table: Option<&str>) -> Self {
+        let prefix = match table {
+            Some(t) => format!("{operation}({t})"),
+            None => operation.to_string(),
+        };
+        match self {
+            Self::NotFound(m) => Self::NotFound(format!("{prefix}: {m}")),
+            Self::AlreadyExists(m) => Self::AlreadyExists(format!("{prefix}: {m}")),
+            Self::Schema(m) => Self::Schema(format!("{prefix}: {m}")),
+            Self::Cardinality(m) => Self::Cardinality(format!("{prefix}: {m}")),
+            Self::Io(m) => Self::Io(format!("{prefix}: {m}")),
+            Self::Query(m) => Self::Query(format!("{prefix}: {m}")),
+            Self::OverBudget(m) => Self::OverBudget(format!("{prefix}: {m}")),
+            Self::Backend(m) => Self::Backend(format!("{prefix}: {m}")),
+            Self::Config(m) => Self::Config(format!("{prefix}: {m}")),
+        }
+    }
 }
 
 impl From<StorageError> for InfinoError {
@@ -88,15 +127,18 @@ impl From<StorageError> for InfinoError {
 
 impl From<QueryError> for InfinoError {
     fn from(e: QueryError) -> Self {
-        match e {
-            QueryError::OverBudget(msg) => InfinoError::OverBudget(msg),
-            other => InfinoError::Query(other.to_string()),
+        if let Some(msg) = e.over_budget() {
+            return InfinoError::OverBudget(msg.to_string());
         }
+        InfinoError::Query(e.to_string())
     }
 }
 
 impl From<SuperfileReadError> for InfinoError {
     fn from(e: SuperfileReadError) -> Self {
+        if let Some(msg) = e.over_budget() {
+            return InfinoError::OverBudget(msg.to_string());
+        }
         InfinoError::Query(e.to_string())
     }
 }
@@ -109,6 +151,9 @@ impl From<SuperfileBuildError> for InfinoError {
 
 impl From<SupertableBuildError> for InfinoError {
     fn from(e: SupertableBuildError) -> Self {
+        if let Some(msg) = e.over_budget() {
+            return InfinoError::OverBudget(msg.to_string());
+        }
         InfinoError::Schema(e.to_string())
     }
 }
@@ -129,6 +174,8 @@ impl From<MutationError> for InfinoError {
     fn from(e: MutationError) -> Self {
         let msg = e.to_string();
         match e {
+            // Routes over-budget through From<QueryError> when the predicate
+            // eval was the budget refusal.
             MutationError::PredicateEval(q) => InfinoError::from(q),
             MutationError::Storage(s) => InfinoError::from(s),
             MutationError::CardinalityMismatch { .. }
@@ -141,6 +188,9 @@ impl From<MutationError> for InfinoError {
 
 impl From<MutationCommitError> for InfinoError {
     fn from(e: MutationCommitError) -> Self {
+        if let Some(msg) = e.over_budget() {
+            return InfinoError::OverBudget(msg.to_string());
+        }
         InfinoError::Backend(e.to_string())
     }
 }
@@ -168,6 +218,16 @@ mod tests {
         assert_eq!(InfinoError::Io("t".into()).to_string(), "io: t");
         assert_eq!(InfinoError::Query("t".into()).to_string(), "query: t");
         assert_eq!(InfinoError::Backend("t".into()).to_string(), "backend: t");
+        assert_eq!(InfinoError::Config("t".into()).to_string(), "config: t");
+    }
+
+    #[test]
+    fn with_context_prefixes_operation_and_table() {
+        let err = InfinoError::NotFound("posts".into()).with_context("open_table", Some("posts"));
+        assert_eq!(err.to_string(), "not found: open_table(posts): posts");
+
+        let err = InfinoError::Cardinality("mismatch".into()).with_context("update", None);
+        assert_eq!(err.to_string(), "cardinality: update: mismatch");
     }
 
     #[test]
@@ -229,6 +289,26 @@ mod tests {
         ));
         assert!(matches!(
             InfinoError::from(OpenError::ManifestListParse("m".into())),
+            InfinoError::Backend(_)
+        ));
+    }
+
+    #[test]
+    fn over_budget_routes_through_wrappers() {
+        // A budget refusal nested under a wrapper (here the commit's
+        // append-flush phase) still routes to OverBudget: each wrapper's
+        // over_budget() delegates to the inner error's.
+        let nested =
+            MutationCommitError::AppendFlush(SupertableBuildError::OverBudget("deep".into()));
+        assert!(matches!(
+            InfinoError::from(nested),
+            InfinoError::OverBudget(_)
+        ));
+        // A non-budget error in the same wrapper stays a generic backend error.
+        assert!(matches!(
+            InfinoError::from(MutationCommitError::AppendFlush(
+                SupertableBuildError::NoDocsToBuild
+            )),
             InfinoError::Backend(_)
         ));
     }

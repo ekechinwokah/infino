@@ -127,6 +127,9 @@ pub enum DiskCacheError {
     /// surfaces it as a typed error.
     #[error("disk cache budget exceeded with no eligible victims")]
     BudgetExceeded,
+    /// An invalid or conflicting configuration was supplied.
+    #[error("config: {0}")]
+    Config(String),
 }
 
 /// Live cache entry. Holds the cached `Arc<SuperfileReader>`
@@ -279,6 +282,13 @@ impl DiskCacheStore {
         config: DiskCacheConfig,
         pinned_fn: Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync>,
     ) -> Result<Arc<Self>, DiskCacheError> {
+        if config.cold_fetch_mode == ColdFetchMode::RangeOnly {
+            return Err(DiskCacheError::Config(
+                "range_only does not currently use a disk cache; \
+                 omit cache_dir or choose a different cold_fetch_mode"
+                    .into(),
+            ));
+        }
         fs::create_dir_all(&config.cache_root)?;
         let threshold_secs = config.mmap_cold_threshold_secs;
         let interval_secs = config.mmap_sweep_interval_secs.max(1);
@@ -952,6 +962,18 @@ impl DiskCacheStore {
             }
         }
         Ok(())
+    }
+
+    /// `insert_warm`, but best-effort: logs and swallows the error
+    /// instead of returning it. Shared by every committer (writer,
+    /// compaction) that pre-populates the cache after a superfile is
+    /// already durable in storage. A failure here just means the
+    /// next query cold-fetches instead of hitting a warm cache, it
+    /// never fails the commit itself.
+    pub async fn insert_warm_or_warn(self: &Arc<Self>, uri: &SuperfileUri, bytes: Bytes) {
+        if let Err(e) = self.insert_warm(uri, bytes).await {
+            tracing::warn!(uri = %uri.0, error = %e, "failed to warm disk cache");
+        }
     }
 
     // ----- internals -----
@@ -2574,7 +2596,6 @@ mod tests {
         let err = store.reader(&uri).await.expect_err("empty not a superfile");
         let _ = format!("{err}");
     }
-
     #[tokio::test]
     async fn cold_fetch_uses_caller_storage_not_cache_embedded_storage() {
         use crate::storage::{LocalFsStorageProvider, PrefixedStorageProvider};
@@ -2718,15 +2739,19 @@ mod tests {
 
     // ----- RangeOnly mode rejects + open_range_only bypass -----
 
-    #[tokio::test]
-    async fn reader_range_only_mode_is_rejected() {
-        let (_dir, store) = test_store_with(|cfg| {
-            cfg.cold_fetch_mode = ColdFetchMode::RangeOnly;
-        });
-        let uri = SuperfileUri::new_v4();
-        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
-        let err = store.reader(&uri).await.expect_err("RangeOnly rejected");
-        assert!(matches!(err, DiskCacheError::SuperfileOpen(_)));
+    #[test]
+    fn reader_range_only_mode_is_rejected() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        let cfg = DiskCacheConfig {
+            cache_root: dir.path().join("cache"),
+            cold_fetch_mode: ColdFetchMode::RangeOnly,
+            ..Default::default()
+        };
+        let err = DiskCacheStore::new_unpinned(storage, cfg)
+            .expect_err("range_only + disk cache must be rejected");
+        assert!(matches!(err, DiskCacheError::Config(_)));
     }
 
     #[tokio::test]

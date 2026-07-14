@@ -29,12 +29,19 @@ use crate::{
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) const DEFAULT_SUPERFILE_RECLAIM_GRACE: Duration = Duration::from_secs(5 * 60);
 
+/// Outcome of a [`Supertable::gc`] sweep: what was reclaimed and what was
+/// intentionally kept.
 #[derive(Debug, Default, Clone)]
 pub struct GcReport {
+    /// Orphaned objects deleted.
     pub objects_deleted: u64,
+    /// Total bytes reclaimed by the deleted objects.
     pub bytes_freed: u64,
+    /// Objects kept because they are still referenced by the live set.
     pub objects_skipped_live: u64,
+    /// Objects kept because they are younger than the safety gap.
     pub objects_skipped_too_new: u64,
+    /// Objects that could not be deleted (left for a later sweep).
     pub delete_errors: u64,
 }
 
@@ -63,6 +70,10 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
 }
 
 impl Supertable {
+    /// Delete orphaned storage objects left by compaction or interrupted
+    /// writes. Only objects older than `safety_gap` are removed, so a
+    /// concurrent reader or writer is never raced. Requires durable storage.
+    #[doc(alias = "vacuum")]
     pub fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
         bridge_on_runtime(self.gc_async(safety_gap), &self.inner().query_runtime())
     }
@@ -218,6 +229,7 @@ mod tests {
             Vec::new(),
             Some(storage),
             Some(Manifest {
+                tombstone_seqs: Default::default(),
                 format_version: FORMAT_VERSION.into(),
                 manifest_id: TEST_MANIFEST_ID,
                 options_hash: ContentHash::of(b"options"),
@@ -282,6 +294,7 @@ mod tests {
             Vec::new(),
             Some(storage),
             Some(Manifest {
+                tombstone_seqs: Default::default(),
                 format_version: FORMAT_VERSION.into(),
                 manifest_id: TEST_MANIFEST_ID,
                 options_hash: ContentHash::of(b"options"),
