@@ -142,6 +142,107 @@ pub(crate) fn transpose_centroids_cluster_major(
     transposed
 }
 
+/// Widen a score by a relative slack: the shared "score window" used by the
+/// hidden/user cell-routing cutoff (probe cells while their score stays
+/// within `slack` of the nearest) and by replica closure (a cell is a
+/// replica candidate while the row's distance stays within the closure
+/// ratio of its primary). One definition keeps routing and replication
+/// interpreting boundary geometry identically.
+#[inline]
+pub(crate) fn relative_score_window(base: f32, slack: f32) -> f32 {
+    base + base.abs().max(f32::EPSILON) * slack.max(0.0)
+}
+
+/// Insert `(centroid, score)` into an ascending top-`k` vec, keeping the
+/// lowest-index winner on equal scores (matching the naive scalar scan).
+/// The one ranked-insertion shared by the blocked top-k reducers.
+#[inline]
+pub(crate) fn insert_ranked(top: &mut Vec<(u32, f32)>, k: usize, centroid: u32, score: f32) {
+    if top.len() == k && score >= top[k - 1].1 {
+        return;
+    }
+    let pos = top
+        .iter()
+        .position(|&(_, s)| score < s)
+        .unwrap_or(top.len());
+    top.insert(pos, (centroid, score));
+    top.truncate(k);
+}
+
+/// Drive the blocked centroid scorers over every block of a transposed
+/// centroid cache, feeding each block's lane scores to `reduce(base, scores)`.
+/// The single owner of the AVX-512 / `wide` dispatch skeleton — every
+/// nearest-centroid shape (argmin, top-k) is a reducer over this driver.
+#[inline]
+fn for_each_centroid_block_scores(
+    metric: Metric,
+    query: &[f32],
+    transposed: &[f32],
+    n_cent: usize,
+    dim: usize,
+    mut reduce: impl FnMut(usize, &[f32]),
+) {
+    debug_assert_eq!(query.len(), dim);
+    debug_assert_eq!(
+        transposed.len(),
+        n_cent.div_ceil(CENTROID_BATCH_LANES) * dim * CENTROID_BATCH_LANES
+    );
+    let n_blocks = n_cent.div_ceil(CENTROID_BATCH_LANES);
+
+    #[cfg(target_arch = "x86_64")]
+    if avx512_enabled() {
+        for block in 0..n_blocks {
+            // SAFETY: gated by runtime CPUID detection in `avx512_enabled()`.
+            let scores = unsafe {
+                score_centroid_block16_transposed_avx512(metric, query, transposed, dim, block)
+            };
+            reduce(block * CENTROID_BATCH_LANES, &scores);
+        }
+        return;
+    }
+
+    for block in 0..n_blocks {
+        let base_centroid = block * CENTROID_BATCH_LANES;
+        for half in 0..CENTROID_BATCH_LANES / F32X8_LANES {
+            let lane_offset = half * F32X8_LANES;
+            let scores = score_centroid_block8_transposed_wide(
+                metric,
+                query,
+                transposed,
+                dim,
+                block,
+                lane_offset,
+            );
+            reduce(base_centroid + lane_offset, &scores);
+        }
+    }
+}
+
+/// Return the single closest centroid in a block-transposed fp32 centroid
+/// cache: the k-means assign step's hot call. Same blocked scoring kernels
+/// as [`nearest_k_centroids_transposed`], reduced with a scalar best tracker
+/// (no per-call allocation) and the same tie-breaking as the naive scalar
+/// loop — lowest centroid index wins on equal scores.
+pub(crate) fn nearest_centroid_transposed(
+    metric: Metric,
+    query: &[f32],
+    transposed: &[f32],
+    n_cent: usize,
+    dim: usize,
+) -> (u32, f32) {
+    debug_assert!(n_cent > 0);
+    let mut best = (0u32, f32::INFINITY);
+    for_each_centroid_block_scores(metric, query, transposed, n_cent, dim, |base, scores| {
+        for (lane, &score) in scores.iter().enumerate() {
+            let centroid = base + lane;
+            if centroid < n_cent && score < best.1 {
+                best = (centroid as u32, score);
+            }
+        }
+    });
+    best
+}
+
 /// Return the closest two centroids in a block-transposed fp32 centroid cache.
 /// Thin wrapper over [`nearest_k_centroids_transposed`] with `k = 2` — kept
 /// for the scalar-reference equivalence tests that pin the top-k reduction.
@@ -175,91 +276,25 @@ pub(crate) fn nearest_k_centroids_transposed(
     counts: Option<&[u32]>,
     k: usize,
 ) -> Vec<(u32, f32)> {
-    debug_assert_eq!(query.len(), dim);
-    debug_assert_eq!(
-        transposed.len(),
-        n_cent.div_ceil(CENTROID_BATCH_LANES) * dim * CENTROID_BATCH_LANES
-    );
     debug_assert!(counts.is_none_or(|counts| counts.len() >= n_cent));
     let mut top: Vec<(u32, f32)> = Vec::with_capacity(k.saturating_add(1));
     if k == 0 {
         return top;
     }
-
-    let n_blocks = n_cent.div_ceil(CENTROID_BATCH_LANES);
-    #[cfg(target_arch = "x86_64")]
-    if avx512_enabled() {
-        for block in 0..n_blocks {
-            // SAFETY: gated by runtime CPUID detection in `avx512_enabled()`.
-            let scores = unsafe {
-                score_centroid_block16_transposed_avx512(metric, query, transposed, dim, block)
-            };
-            update_centroid_block_top_k(
-                counts,
-                block * CENTROID_BATCH_LANES,
-                n_cent,
-                &scores,
-                &mut top,
-                k,
-            );
+    for_each_centroid_block_scores(metric, query, transposed, n_cent, dim, |base, scores| {
+        for (lane, &score) in scores.iter().enumerate() {
+            let centroid = base + lane;
+            if centroid < n_cent && centroid_included(counts, centroid) {
+                insert_ranked(&mut top, k, centroid as u32, score);
+            }
         }
-        return top;
-    }
-
-    for block in 0..n_blocks {
-        let base_centroid = block * CENTROID_BATCH_LANES;
-        for half in 0..CENTROID_BATCH_LANES / F32X8_LANES {
-            let lane_offset = half * F32X8_LANES;
-            let scores = score_centroid_block8_transposed_wide(
-                metric,
-                query,
-                transposed,
-                dim,
-                block,
-                lane_offset,
-            );
-            update_centroid_block_top_k(
-                counts,
-                base_centroid + lane_offset,
-                n_cent,
-                &scores,
-                &mut top,
-                k,
-            );
-        }
-    }
-
+    });
     top
 }
 
 #[inline]
 fn centroid_included(counts: Option<&[u32]>, centroid: usize) -> bool {
     counts.is_none_or(|counts| counts[centroid] != 0)
-}
-
-#[inline]
-fn update_centroid_block_top_k(
-    counts: Option<&[u32]>,
-    base_centroid: usize,
-    n_cent: usize,
-    scores: &[f32],
-    top: &mut Vec<(u32, f32)>,
-    k: usize,
-) {
-    for (lane, &score) in scores.iter().enumerate() {
-        let centroid = base_centroid + lane;
-        if centroid < n_cent && centroid_included(counts, centroid) {
-            if top.len() == k && score >= top[k - 1].1 {
-                continue;
-            }
-            let pos = top
-                .iter()
-                .position(|&(_, s)| score < s)
-                .unwrap_or(top.len());
-            top.insert(pos, (centroid as u32, score));
-            top.truncate(k);
-        }
-    }
 }
 
 #[inline]
@@ -1865,6 +1900,52 @@ mod tests {
             got_second.1,
             expected_second.1
         );
+    }
+
+    /// The k-means assign kernel must agree with the naive per-centroid
+    /// scan: same argmin on random data, and lowest-index winner on exact
+    /// ties (duplicated centroids). Covers lane-tail shapes (`n_cent` not a
+    /// multiple of the SIMD block width).
+    #[test]
+    fn nearest_centroid_transposed_matches_naive_scan() {
+        for n_cent in [128usize, 130, 144, 160] {
+            let dim = 33;
+            let mut centroids = Vec::with_capacity(n_cent * dim);
+            for c in 0..n_cent {
+                for d in 0..dim {
+                    centroids.push(((c * 31 + d * 17) % 29) as f32 * 0.04 - 0.5);
+                }
+            }
+            // Exact tie: centroid n-1 duplicates centroid 3; the naive
+            // scan keeps the lower index and the blocked kernel must too.
+            let dup = centroids[3 * dim..4 * dim].to_vec();
+            let last = (n_cent - 1) * dim;
+            centroids[last..last + dim].copy_from_slice(&dup);
+            let transposed = transpose_centroids_cluster_major(&centroids, n_cent, dim);
+            for probe in 0..64 {
+                let query: Vec<f32> = (0..dim)
+                    .map(|d| ((probe * 13 + d * 7) % 23) as f32 * 0.05 - 0.4)
+                    .collect();
+                let mut naive = (0u32, f32::INFINITY);
+                for c in 0..n_cent {
+                    let dist = l2_sq(&query, &centroids[c * dim..(c + 1) * dim]);
+                    if dist < naive.1 {
+                        naive = (c as u32, dist);
+                    }
+                }
+                let blocked =
+                    nearest_centroid_transposed(Metric::L2Sq, &query, &transposed, n_cent, dim);
+                assert_eq!(
+                    blocked.0, naive.0,
+                    "n_cent {n_cent} probe {probe}: blocked argmin diverged from naive"
+                );
+            }
+            // Tie probe: query exactly at the duplicated centroid.
+            let tie_query = dup.clone();
+            let blocked =
+                nearest_centroid_transposed(Metric::L2Sq, &tie_query, &transposed, n_cent, dim);
+            assert_eq!(blocked.0, 3, "tie must resolve to the lowest index");
+        }
     }
 
     #[test]

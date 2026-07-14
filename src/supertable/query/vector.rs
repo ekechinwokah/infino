@@ -88,7 +88,11 @@ use super::{
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::{
     config,
-    superfile::{SuperfileReader, fts::reader::BoolMode, vector::layout::VectorLayout},
+    superfile::{
+        SuperfileReader,
+        fts::reader::BoolMode,
+        vector::{distance::relative_score_window, layout::VectorLayout},
+    },
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
@@ -728,8 +732,10 @@ impl SupertableReader {
             }
             let mut cutoff = routing.nprobe_min.max(1).min(ranked.len());
             let max_cells = routing.nprobe_max.max(routing.nprobe_min).min(ranked.len());
-            let nearest = ranked[0].1;
-            let threshold = nearest + nearest.abs().max(f32::EPSILON) * routing.slack.max(0.0);
+            // Same window definition replica closure uses at drain time
+            // (`relative_score_window`), so probing and replication agree
+            // on what counts as a near-tie.
+            let threshold = relative_score_window(ranked[0].1, routing.slack);
             while cutoff < max_cells && ranked[cutoff].1 <= threshold {
                 cutoff += 1;
             }

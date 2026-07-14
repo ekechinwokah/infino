@@ -30,7 +30,7 @@ use crate::{
             EncodedCellRow, dequantize_sq8_residual_into, manifest_centroid_components_from_row,
             medoid_index_by,
         },
-        distance::{Metric, distance, nearest_k_centroids_transposed},
+        distance::{Metric, distance, nearest_k_centroids_transposed, relative_score_window},
     },
     supertable::manifest::ClusterCentroids,
 };
@@ -232,9 +232,11 @@ fn boundary_assignment_decoded(
     };
     // Closure pool: every ranked cell whose distance sits within the ratio
     // window of the primary. The margin (distance to the shared Voronoi
-    // boundary) orders candidates globally at the budget cut.
-    let closure_threshold = primary_score
-        + primary_score.abs().max(f32::EPSILON) * (REPLICA_CLOSURE_DISTANCE_RATIO - 1.0);
+    // boundary) orders candidates globally at the budget cut. Same window
+    // definition as the routing cutoff (`relative_score_window`), so
+    // replication and probing agree on what "near the boundary" means.
+    let closure_threshold =
+        relative_score_window(primary_score, REPLICA_CLOSURE_DISTANCE_RATIO - 1.0);
     for (slot, &(cell, score)) in ranked.iter().skip(1).enumerate() {
         if score > closure_threshold {
             break;
