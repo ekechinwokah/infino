@@ -149,18 +149,12 @@ fn boundary_margin(
     }
 }
 
-/// Drain-only boundary assignment: decode each row once, then rank centroids
-/// with a prebuilt transposed centroid cache.
-///
-/// Same assignment semantics as `nearest-two by score then Voronoi margin`,
-/// but without changing ingest/manifest structs.
-///
-/// Centroid ranking uses a prebuilt
-/// transposed centroid cache. The cache is derived from manifest centroids by
-/// the drain caller and is not stored on ingest/manifest structs.
-pub(crate) fn boundary_assignment_encoded_with_transposed(
+/// Drain-side boundary assignment: decode the Sq8+ε row once, then rank
+/// centroids through the shared blocked-SIMD kernel over the
+/// [`ClusterCentroids`] transposed cache. Same assignment semantics as
+/// `nearest-two by score then Voronoi margin`.
+pub(crate) fn boundary_assignment_encoded(
     clusters: &ClusterCentroids,
-    transposed_centroids: &[f32],
     metric: Metric,
     row: &EncodedCellRow,
 ) -> BoundaryAssignment {
@@ -176,53 +170,37 @@ pub(crate) fn boundary_assignment_encoded_with_transposed(
             .expect("encoded row uses residual-family codec"),
         &mut row_fp,
     );
-    boundary_assignment_decoded(clusters, Some(transposed_centroids), metric, &row_fp)
+    boundary_assignment_decoded(clusters, metric, &row_fp)
 }
 
 /// Boundary assignment for an already-decoded fp32 row (commit buffer path).
-/// Uses the same nearest-two + margin logic as the encoded drain wrapper.
+/// Same nearest-two + margin logic as the encoded drain wrapper.
 pub(crate) fn boundary_assignment_fp32(
     clusters: &ClusterCentroids,
-    transposed_centroids: Option<&[f32]>,
     metric: Metric,
     row_fp: &[f32],
 ) -> BoundaryAssignment {
-    boundary_assignment_decoded(clusters, transposed_centroids, metric, row_fp)
+    boundary_assignment_decoded(clusters, metric, row_fp)
 }
 
 fn boundary_assignment_decoded(
     clusters: &ClusterCentroids,
-    transposed_centroids: Option<&[f32]>,
     metric: Metric,
     row_fp: &[f32],
 ) -> BoundaryAssignment {
     let n_cent = clusters.n_cent as usize;
     let top_k = REPLICA_CLOSURE_MAX_REPLICAS + 1;
-    let ranked: Vec<(u32, f32)> = match transposed_centroids {
-        Some(transposed) => nearest_k_centroids_transposed(
-            metric,
-            row_fp,
-            transposed,
-            n_cent,
-            clusters.dim as usize,
-            None,
-            top_k,
-        ),
-        None => {
-            // No transposed cache (small callers / tests): scalar-score every
-            // cell into the same ascending top-k shape.
-            let mut all: Vec<(u32, f32)> = (0..n_cent)
-                .map(|cell| (cell as u32, clusters.score_one(metric, cell, row_fp)))
-                .collect();
-            all.sort_unstable_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            all.truncate(top_k);
-            all
-        }
-    };
+    // One centroid-scan owner: the blocked SIMD kernel over the struct's
+    // cached transposed layout. No scalar fallback path.
+    let ranked: Vec<(u32, f32)> = nearest_k_centroids_transposed(
+        metric,
+        row_fp,
+        clusters.transposed(),
+        n_cent,
+        clusters.dim as usize,
+        None,
+        top_k,
+    );
     let mut replicas = [None; REPLICA_CLOSURE_MAX_REPLICAS];
     let Some(&(primary, primary_score)) = ranked.first() else {
         return BoundaryAssignment {
@@ -513,7 +491,7 @@ mod tests {
         // 1.21 (per-dim) — cell 1 is primary; cell 0 and 2 are far outside a
         // 1.2 ratio window of 0.01. No replicas.
         let deep = vec![0.9f32; dim];
-        let assignment = boundary_assignment_fp32(&clusters, None, Metric::L2Sq, &deep);
+        let assignment = boundary_assignment_fp32(&clusters, Metric::L2Sq, &deep);
         assert_eq!(assignment.primary, 1);
         assert_eq!(assignment.replicas, [None; REPLICA_CLOSURE_MAX_REPLICAS]);
 
@@ -523,7 +501,7 @@ mod tests {
         // per dim is outside 1.2 × 0.25. Expect primary = 1 (tie broken by
         // lower id) and exactly one replica: cell 2.
         let boundary = vec![1.5f32; dim];
-        let assignment = boundary_assignment_fp32(&clusters, None, Metric::L2Sq, &boundary);
+        let assignment = boundary_assignment_fp32(&clusters, Metric::L2Sq, &boundary);
         assert_eq!(assignment.primary, 1);
         assert_eq!(assignment.replicas[0].map(|(cell, _)| cell), Some(2));
         assert_eq!(assignment.replicas[1], None);

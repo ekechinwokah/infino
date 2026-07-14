@@ -139,7 +139,7 @@ use crate::{
                 build_merged_subsection_from_spilled_materialized,
             },
             cell_posting::{EncodedCellRow, MaterializedIvfRow},
-            distance::{Metric, transpose_centroids_cluster_major},
+            distance::Metric,
             ivf_merge::{
                 MergedIvfSubsection, merge_fragment_subsections, route_clusters_into_cells,
             },
@@ -3311,19 +3311,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     let replica_extra_budget =
                         drain_replica_extra_budget(distinct_rows.len(), replica_target);
                     let clusters_ref = &running_clusters;
-                    let transposed_centroids = transpose_centroids_cluster_major(
-                        &clusters_ref.centroids,
-                        clusters_ref.n_cent as usize,
-                        clusters_ref.dim as usize,
-                    );
                     let assignments: Vec<opann::BoundaryAssignment> =
                         hidden_inner.options.writer_pool.install(|| {
                             distinct_rows
                                 .par_iter()
                                 .map(|row| {
-                                    opann::boundary_assignment_encoded_with_transposed(
+                                    opann::boundary_assignment_encoded(
                                         clusters_ref,
-                                        &transposed_centroids,
                                         metric,
                                         &row.encoded,
                                     )
@@ -4275,18 +4269,15 @@ fn assign_cells<'a>(
         return Ok(Vec::new());
     }
     let replica_extra_budget = drain_replica_extra_budget(rows.len(), replica_target_factor);
-    let transposed = transpose_centroids_cluster_major(
-        &clusters.centroids,
-        clusters.n_cent as usize,
-        clusters.dim as usize,
-    );
     // Per-row nearest-cell scoring is the commit CPU wave: run it on the
     // ambient rayon pool (callers wrap this in `writer_pool.install`).
+    // Centroid ranking rides the `ClusterCentroids` cached transposed
+    // layout — built once on the first row, shared across the pool.
     let assignments: Vec<opann::BoundaryAssignment> = rows
         .par_iter()
         .map(|row| match *row {
             PackRow::Fp32 { vector, .. } => {
-                opann::boundary_assignment_fp32(clusters, Some(&transposed), metric, vector)
+                opann::boundary_assignment_fp32(clusters, metric, vector)
             }
         })
         .collect();

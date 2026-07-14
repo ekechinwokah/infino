@@ -297,6 +297,62 @@ fn centroid_included(counts: Option<&[u32]>, centroid: usize) -> bool {
     counts.is_none_or(|counts| counts[centroid] != 0)
 }
 
+/// Score `query` against every centroid in a block-transposed fp32 centroid
+/// cache and return the dense per-centroid score vector (`scores[c]` is
+/// centroid `c`'s distance). The full-scan reducer over
+/// [`for_each_centroid_block_scores`] — callers that need every score in
+/// centroid order (cell ranking, per-cluster candidate emission) use this
+/// instead of hand-rolling a `(0..n_cent).map(distance)` loop.
+pub(crate) fn all_centroid_scores_transposed(
+    metric: Metric,
+    query: &[f32],
+    transposed: &[f32],
+    n_cent: usize,
+    dim: usize,
+) -> Vec<f32> {
+    let mut out = vec![0f32; n_cent];
+    for_each_centroid_block_scores(metric, query, transposed, n_cent, dim, |base, scores| {
+        for (lane, &score) in scores.iter().enumerate() {
+            let centroid = base + lane;
+            if centroid < n_cent {
+                out[centroid] = score;
+            }
+        }
+    });
+    out
+}
+
+/// Top-`k` nearest centroids over the *row-major fp32-bytes* layout — the
+/// on-disk shape of a superfile subsection's centroid region, scored in
+/// place with no decode or transpose copy. The row-major sibling of
+/// [`nearest_k_centroids_transposed`]: same ascending order, same
+/// deterministic lowest-index tie-break via [`insert_ranked`]. These are the
+/// only two centroid-scan owners; every caller routes through one of them
+/// according to its memory layout.
+pub(crate) fn nearest_k_centroids_bytes(
+    metric: Metric,
+    query: &[f32],
+    centroids_bytes: &[u8],
+    n_cent: usize,
+    dim: usize,
+    k: usize,
+) -> Vec<(u32, f32)> {
+    // Centroids are stored fp32 regardless of the column's rerank codec —
+    // only the per-doc `full[]` region compresses. `distance_bytes` assumes
+    // fp32, which is correct here.
+    let stride = dim * 4;
+    debug_assert!(centroids_bytes.len() >= n_cent * stride);
+    let mut top: Vec<(u32, f32)> = Vec::with_capacity(k.saturating_add(1));
+    if k == 0 {
+        return top;
+    }
+    for c in 0..n_cent {
+        let bytes = &centroids_bytes[c * stride..(c + 1) * stride];
+        insert_ranked(&mut top, k, c as u32, distance_bytes(metric, query, bytes));
+    }
+    top
+}
+
 #[inline]
 fn score_centroid_block8_transposed_wide(
     metric: Metric,

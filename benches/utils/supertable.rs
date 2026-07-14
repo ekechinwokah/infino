@@ -1539,17 +1539,13 @@ pub mod vector {
             stored_by_dense.len(),
         );
 
+        // Geometric nearest cell over ALL cells (count-0 included) — the
+        // kernel-backed full ranking, same tie-break (lowest id).
         let nearest_cell = |vector: &[f32]| -> u32 {
-            let mut best = 0u32;
-            let mut best_score = f32::INFINITY;
-            for cell in 0..n_cells {
-                let score = grid.score_one(metric, cell, vector);
-                if score < best_score {
-                    best_score = score;
-                    best = cell as u32;
-                }
-            }
-            best
+            grid.rank_cells(metric, vector)
+                .first()
+                .map(|&(cell, _)| cell)
+                .unwrap_or(0)
         };
 
         let audited: Vec<(u32, &Vec<u32>)> = stored_by_dense
@@ -1599,8 +1595,9 @@ pub mod vector {
         let mut missing = 0usize;
         for (query, truth) in queries.iter().zip(ground_truth) {
             let rank_by_cell = rank_map(
-                (0..n_cells)
-                    .map(|cell| (cell, grid.score_one(metric, cell, query)))
+                grid.rank_cells(metric, query)
+                    .into_iter()
+                    .map(|(cell, score)| (cell as usize, score))
                     .collect(),
                 n_cells,
             );
@@ -1698,13 +1695,11 @@ pub mod vector {
                 let own_score = grid.score_one(metric, own as usize, neighbor);
                 let rescue_score = grid.score_one(metric, probed as usize, neighbor);
                 let needed_ratio = rescue_score / own_score.abs().max(f32::EPSILON);
-                let mut depth = 0usize;
-                for cell in 0..n_cells {
-                    let score = grid.score_one(metric, cell, neighbor);
-                    if cell as u32 != own && score < rescue_score {
-                        depth += 1;
-                    }
-                }
+                let depth = grid
+                    .rank_cells(metric, neighbor)
+                    .iter()
+                    .filter(|&&(cell, score)| cell != own && score < rescue_score)
+                    .count();
                 eprintln!(
                     "[drain-diag] miss: neighbor {id} stored in cell {own}, probe hits cell {probed}; rescue needs ratio {needed_ratio:.3} at closure depth {}",
                     depth + 1,
@@ -1722,10 +1717,12 @@ pub mod vector {
             .par_iter()
             .map(|&row_idx| {
                 let row = &vectors[row_idx * DIM..(row_idx + 1) * DIM];
-                let mut scores: Vec<f32> = (0..n_cells)
-                    .map(|cell| grid.score_one(metric, cell, row))
+                // Already ascending — `rank_cells` sorts.
+                let scores: Vec<f32> = grid
+                    .rank_cells(metric, row)
+                    .into_iter()
+                    .map(|(_, score)| score)
                     .collect();
-                scores.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
                 let primary = scores[0];
                 let mut out = [0usize; CLOSURE_RATIO_CANDIDATES.len()];
                 for (i, ratio) in CLOSURE_RATIO_CANDIDATES.iter().enumerate() {
@@ -1760,10 +1757,12 @@ pub mod vector {
         const TIE_SLACK_CANDIDATES: [f32; 3] = [0.02, 0.04, 0.08];
         let mut tie_counts = [[0usize; 3]; TIE_SLACK_CANDIDATES.len()];
         for query in queries {
-            let mut scores: Vec<f32> = (0..n_cells)
-                .map(|cell| grid.score_one(metric, cell, query))
+            // Already ascending — `rank_cells` sorts.
+            let scores: Vec<f32> = grid
+                .rank_cells(metric, query)
+                .into_iter()
+                .map(|(_, score)| score)
                 .collect();
-            scores.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
             let top = scores[0];
             for (si, slack) in TIE_SLACK_CANDIDATES.iter().enumerate() {
                 let threshold = top + top.abs().max(f32::EPSILON) * slack;

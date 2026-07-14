@@ -615,12 +615,12 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, Decode
     let centroids_b = view_n(&mut c, body * 4, "cluster_centroids")?;
     let centroids = decode_f32_le_vec(centroids_b);
 
-    Ok(ClusterCentroids {
-        n_cent: n_cent as u32,
-        dim: cdim as u32,
+    Ok(ClusterCentroids::from_decoded(
+        n_cent as u32,
+        cdim as u32,
         centroids,
         counts,
-    })
+    ))
 }
 
 pub fn encode_vector_summary(s: &VectorSummary) -> Vec<u8> {

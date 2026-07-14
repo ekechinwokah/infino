@@ -44,8 +44,8 @@ use crate::{
         vector::{
             cell_posting::{EncodedCellRow, MaterializedIvfRow, sq8_residual_norm_sq},
             distance::{
-                Metric, Sq8ResidualKernel, decode_f32_le_into, distance_bytes,
-                distance_bytes_codec, sum_f32,
+                Metric, Sq8ResidualKernel, decode_f32_le_into, distance_bytes_codec,
+                nearest_k_centroids_bytes, sum_f32,
             },
             ivf_merge::Sq8IvfMergeInput,
             quant::BitQuantizer,
@@ -3568,7 +3568,10 @@ fn effective_filtered_rerank_mult(rerank_mult: usize, filter_mult: usize) -> usi
 /// Takes a `&[u8]` view so the caller can hand in either an
 /// in-memory subsection slice or the just-fetched centroids
 /// region bytes from [`Source::get_range`] — both reach this
-/// helper through the same shape.
+/// helper through the same shape. Thin adapter over
+/// [`nearest_k_centroids_bytes`], the row-major-layout centroid-scan
+/// owner in `distance` (its transposed sibling serves the manifest
+/// routing paths).
 #[inline]
 fn score_centroids(
     centroids_bytes: &[u8],
@@ -3576,24 +3579,17 @@ fn score_centroids(
     query: &[f32],
     nprobe: usize,
 ) -> Vec<(usize, f32)> {
-    // Centroids are stored as fp32 regardless of the column's rerank
-    // codec — only the per-doc `full[]` region compresses. `distance_bytes`
-    // assumes fp32, which is correct here.
-    let centroid_stride = col.dim * 4;
-    let mut scores: Vec<(usize, f32)> = (0..col.n_cent as usize)
-        .map(|c| {
-            let bytes = &centroids_bytes[c * centroid_stride..(c + 1) * centroid_stride];
-            (c, distance_bytes(col.metric, query, bytes))
-        })
-        .collect();
-    if nprobe < scores.len() {
-        scores.select_nth_unstable_by(nprobe, |a, b| {
-            a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal)
-        });
-        scores.truncate(nprobe);
-    }
-    scores.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-    scores
+    nearest_k_centroids_bytes(
+        col.metric,
+        query,
+        centroids_bytes,
+        col.n_cent as usize,
+        col.dim,
+        nprobe,
+    )
+    .into_iter()
+    .map(|(c, score)| (c as usize, score))
+    .collect()
 }
 
 /// Minimum candidate-pool size before per-query scans (coarse 1-bit

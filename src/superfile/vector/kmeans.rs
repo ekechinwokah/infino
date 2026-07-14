@@ -30,7 +30,7 @@ use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 
 use crate::superfile::vector::distance::{
-    Metric, add_f32_to_f64_acc, f64_acc_mean_into_f32, l2_sq, nearest_centroid_transposed,
+    Metric, add_f32_to_f64_acc, f64_acc_mean_into_f32, nearest_centroid_transposed,
     transpose_centroids_cluster_major,
 };
 
@@ -38,17 +38,6 @@ use crate::superfile::vector::distance::{
 /// clustering PRNG stream distinct from the rotation stream, which is
 /// seeded from `rot_seed` directly.
 const KMEANS_SEED_OFFSET: u64 = 7;
-
-/// Centroid count at which the assign step switches from the naive
-/// per-centroid scalar scan to the block-transposed SIMD kernel. The naive
-/// loop streams every centroid through cache per doc (memory-bound at large
-/// `k` — the 4096-centroid grid bootstrap spent ~5 minutes in it at 10M
-/// docs); the blocked kernel scores 16 centroids per register load. Small
-/// `k` (fine clusters, 2-means splits) keeps the simple loop, where the
-/// transpose overhead would dominate. Both paths use the same argmin and
-/// lowest-index tie-breaking; scores can differ by reduction-order ULPs,
-/// which sits far below every recall-oracle threshold.
-const KMEANS_BLOCKED_ASSIGN_MIN_K: usize = 128;
 
 /// Run 5-iteration Lloyd k-means and return `k * dim` centroids,
 /// row-major. `vectors` is `n_docs * dim`, also row-major. Drops
@@ -102,34 +91,17 @@ pub fn kmeans_with_assignments(
     let mut assignments = vec![0u32; n];
 
     for _ in 0..iters {
-        // Assign — parallel over docs. Large k goes through the
-        // block-transposed SIMD kernel (one transpose per iteration);
-        // small k keeps the naive scan.
-        assignments = if k >= KMEANS_BLOCKED_ASSIGN_MIN_K {
+        // Assign — parallel over docs through the block-transposed SIMD
+        // kernel (one transpose per iteration; at small k the transpose is
+        // proportionally tiny). Single scan owner, no scalar branch; argmin
+        // tie-breaking matches the naive loop (lowest index wins).
+        assignments = {
             let transposed = transpose_centroids_cluster_major(&centroids, k, dim);
             (0..n)
                 .into_par_iter()
                 .map(|d| {
                     let v = &vectors[d * dim..(d + 1) * dim];
                     nearest_centroid_transposed(Metric::L2Sq, v, &transposed, k, dim).0
-                })
-                .collect()
-        } else {
-            (0..n)
-                .into_par_iter()
-                .map(|d| {
-                    let v = &vectors[d * dim..(d + 1) * dim];
-                    let mut best = 0u32;
-                    let mut best_d = f32::INFINITY;
-                    for c in 0..k {
-                        let cv = &centroids[c * dim..(c + 1) * dim];
-                        let dist = l2_sq(v, cv);
-                        if dist < best_d {
-                            best_d = dist;
-                            best = c as u32;
-                        }
-                    }
-                    best
                 })
                 .collect()
         };
@@ -185,9 +157,10 @@ pub fn kmeans_with_assignments(
 }
 
 /// Assign each row of `vectors` to its argmin centroid under L2²,
-/// writing the result into `assignments`. Rayon-parallel over docs;
-/// per-pair distance via [`l2_sq`]. Wraps the same per-doc loop as
-/// one iteration of [`kmeans_with_assignments`]'s inner loop, but
+/// writing the result into `assignments`. Rayon-parallel over docs
+/// through the block-transposed SIMD kernel (one transpose per call,
+/// amortized across the chunk's rows). Same assignment as one
+/// iteration of [`kmeans_with_assignments`]'s inner loop, but
 /// exposed as a standalone entry point so the reservoir-trained
 /// k-means in [`crate::superfile::vector::reservoir`] can fan the
 /// trained centroids back out across the full corpus after
@@ -231,24 +204,14 @@ pub(crate) fn assign_to_centroids(
     if n == 0 {
         return;
     }
-    let new_assignments: Vec<u32> = (0..n)
-        .into_par_iter()
-        .map(|d| {
+    let transposed = transpose_centroids_cluster_major(centroids, k, dim);
+    assignments
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(d, slot)| {
             let v = &vectors[d * dim..(d + 1) * dim];
-            let mut best = 0u32;
-            let mut best_d = f32::INFINITY;
-            for c in 0..k {
-                let cv = &centroids[c * dim..(c + 1) * dim];
-                let dist = l2_sq(v, cv);
-                if dist < best_d {
-                    best_d = dist;
-                    best = c as u32;
-                }
-            }
-            best
-        })
-        .collect();
-    assignments.copy_from_slice(&new_assignments);
+            *slot = nearest_centroid_transposed(Metric::L2Sq, v, &transposed, k, dim).0;
+        });
 }
 
 #[cfg(test)]

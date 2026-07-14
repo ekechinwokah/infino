@@ -701,17 +701,11 @@ impl SupertableReader {
                 }
                 _ => None,
             });
-        let ranked_cells_scored: Option<Vec<(u32, f32)>> = grid.as_ref().map(|grid| {
-            let mut cells: Vec<(u32, f32)> = (0..grid.n_cent)
-                .map(|cell| (cell, grid.score_one(metric, cell as usize, query)))
-                .collect();
-            cells.sort_unstable_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            cells
-        });
+        // Full grid ranking through the blocked SIMD kernel over the manifest
+        // grid's cached transposed centroids ([`ClusterCentroids::rank_cells`])
+        // — the single centroid-scan owner; no per-cell `score_one` loop here.
+        let ranked_cells_scored: Option<Vec<(u32, f32)>> =
+            grid.as_ref().map(|grid| grid.rank_cells(metric, query));
         let ranked_cells: Option<Vec<u32>> = ranked_cells_scored
             .as_ref()
             .map(|cells| cells.iter().map(|(cell, _)| *cell).collect());

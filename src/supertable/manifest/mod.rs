@@ -36,10 +36,11 @@ pub mod partition;
 pub mod term_range;
 
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
     ops::Deref,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use arrow::compute::kernels::aggregate as agg;
@@ -61,7 +62,10 @@ use super::options::SupertableOptions;
 use crate::{
     storage::{StorageError, StorageProvider},
     superfile::vector::{
-        distance::{Metric, distance},
+        distance::{
+            Metric, all_centroid_scores_transposed, distance, nearest_k_centroids_transposed,
+            transpose_centroids_cluster_major,
+        },
         layout::VectorLayout,
     },
     supertable::{
@@ -2424,10 +2428,14 @@ pub struct CellVectorSummary {
 /// superfile's on-disk compressed vectors; these drive cluster *selection* only.
 ///
 /// Centroids are `n_cent * dim` (~1% of index bytes), so they are kept
-/// fp32 — routing reads a centroid as a zero-copy `&[f32]` slice and
-/// calls [`distance`] directly, no per-query dequant. (Rerank rows, the
-/// bulk of the index, stay Sq8+ε; representation follows cardinality.)
-#[derive(Debug, Clone, Default)]
+/// fp32, no per-query dequant. (Rerank rows, the bulk of the index, stay
+/// Sq8+ε; representation follows cardinality.) Every scan-shaped read —
+/// [`Self::score_clusters_into`], [`Self::rank_cells`],
+/// [`Self::nearest_cell`], boundary assignment — goes through the blocked
+/// SIMD kernels in `superfile::vector::distance` over [`Self::transposed`],
+/// the lazily-built block-transposed cache. [`Self::score_one`] stays a
+/// zero-copy single-centroid [`distance`] probe.
+#[derive(Debug, Default)]
 pub struct ClusterCentroids {
     pub n_cent: u32,
     pub dim: u32,
@@ -2436,6 +2444,27 @@ pub struct ClusterCentroids {
     /// Per-cluster indexed doc count; length `n_cent`. Count-0 clusters
     /// are skipped by the selector.
     pub counts: Vec<u32>,
+    /// Lazily-built block-transposed centroid cache feeding the blocked
+    /// SIMD scan kernels in `superfile::vector::distance`. Built once per
+    /// instance on first scan; reset by `Clone` (a clone may mutate
+    /// `centroids`, so it re-derives its own cache on first use).
+    transposed: OnceLock<Vec<f32>>,
+}
+
+impl Clone for ClusterCentroids {
+    fn clone(&self) -> Self {
+        Self {
+            n_cent: self.n_cent,
+            dim: self.dim,
+            centroids: self.centroids.clone(),
+            counts: self.counts.clone(),
+            // Not carried over: `centroids` is a public field a clone may
+            // mutate (e.g. split-centroid insertion), which would silently
+            // stale a copied cache. Rebuilding on first scan is cheap and
+            // always correct.
+            transposed: OnceLock::new(),
+        }
+    }
 }
 
 impl PartialEq for ClusterCentroids {
@@ -2481,24 +2510,52 @@ impl ClusterCentroids {
             .iter()
             .map(|v| if v.is_finite() { *v } else { 0.0 })
             .collect();
+        Self::from_decoded(n_cent, dim, stored, counts)
+    }
+
+    /// Wrap already-validated fp32 centroids (wire decode path — bytes were
+    /// written by [`Self::from_fp32`], so the clamp already happened).
+    pub(crate) fn from_decoded(
+        n_cent: u32,
+        dim: u32,
+        centroids: Vec<f32>,
+        counts: Vec<u32>,
+    ) -> Self {
         Self {
             n_cent,
             dim,
-            centroids: stored,
+            centroids,
             counts,
+            transposed: OnceLock::new(),
         }
     }
 
+    /// The block-transposed centroid cache feeding the blocked SIMD scan
+    /// kernels — built once per instance on first scan, shared by every
+    /// scan-shaped method below and by boundary assignment. This is the ONLY
+    /// sanctioned way to scan these centroids; do not hand-roll
+    /// `(0..n_cent).map(distance)` loops against [`Self::centroid`].
+    pub(crate) fn transposed(&self) -> &[f32] {
+        self.transposed.get_or_init(|| {
+            transpose_centroids_cluster_major(
+                &self.centroids,
+                self.n_cent as usize,
+                self.dim as usize,
+            )
+        })
+    }
+
     /// Score cluster `c` against `query`: [`distance`] on the fp32 centroid
-    /// slice (zero-copy, no dequant).
+    /// slice (zero-copy, no dequant). Single-centroid probe — for scans use
+    /// [`Self::score_clusters_into`] / [`Self::rank_cells`].
     pub fn score_one(&self, metric: Metric, c: usize, query: &[f32]) -> f32 {
         debug_assert_eq!(query.len(), self.dim as usize);
         distance(metric, query, self.centroid(c))
     }
 
-    /// Score every populated cluster: [`distance`] on each fp32 centroid
-    /// slice against `query` (zero-copy, no dequant). Calls
-    /// `emit(cluster_id, score)` for each cluster with a nonzero indexed count.
+    /// Score every populated cluster via the blocked SIMD kernel over the
+    /// cached transposed layout. Calls `emit(cluster_id, score)` in ascending
+    /// cluster order for each cluster with a nonzero indexed count.
     pub fn score_clusters_into(
         &self,
         metric: Metric,
@@ -2506,25 +2563,65 @@ impl ClusterCentroids {
         mut emit: impl FnMut(u32, f32),
     ) {
         debug_assert_eq!(query.len(), self.dim as usize);
-        for c in 0..self.n_cent as usize {
+        let n_cent = self.n_cent as usize;
+        let scores = all_centroid_scores_transposed(
+            metric,
+            query,
+            self.transposed(),
+            n_cent,
+            self.dim as usize,
+        );
+        for (c, &score) in scores.iter().enumerate() {
             if self.counts[c] == 0 {
                 continue;
             }
-            emit(c as u32, distance(metric, query, self.centroid(c)));
+            emit(c as u32, score);
         }
     }
 
-    /// Return the cell whose centroid is closest to `query` under `metric`.
-    pub fn nearest_cell(&self, metric: Metric, query: &[f32]) -> u32 {
-        let mut best_cell = 0u32;
-        let mut best_score = f32::INFINITY;
-        self.score_clusters_into(metric, query, |c, score| {
-            if score < best_score {
-                best_score = score;
-                best_cell = c;
-            }
+    /// Rank every cell (including count-0 cells) against `query`: ascending
+    /// score, ties broken by lower cell id. The full-ranking shape the cell
+    /// routing cutoff consumes; scored by the blocked SIMD kernel.
+    pub fn rank_cells(&self, metric: Metric, query: &[f32]) -> Vec<(u32, f32)> {
+        debug_assert_eq!(query.len(), self.dim as usize);
+        let n_cent = self.n_cent as usize;
+        let scores = all_centroid_scores_transposed(
+            metric,
+            query,
+            self.transposed(),
+            n_cent,
+            self.dim as usize,
+        );
+        let mut ranked: Vec<(u32, f32)> = scores
+            .into_iter()
+            .enumerate()
+            .map(|(c, score)| (c as u32, score))
+            .collect();
+        ranked.sort_unstable_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
         });
-        best_cell
+        ranked
+    }
+
+    /// Return the cell whose centroid is closest to `query` under `metric`
+    /// (count-0 cells excluded; 0 when every cell is empty). Blocked SIMD
+    /// top-1 over the cached transposed layout.
+    pub fn nearest_cell(&self, metric: Metric, query: &[f32]) -> u32 {
+        debug_assert_eq!(query.len(), self.dim as usize);
+        nearest_k_centroids_transposed(
+            metric,
+            query,
+            self.transposed(),
+            self.n_cent as usize,
+            self.dim as usize,
+            Some(&self.counts),
+            1,
+        )
+        .first()
+        .map(|&(cell, _)| cell)
+        .unwrap_or(0)
     }
 
     /// Assign each row in `vectors` to its nearest cell. Parallel over rows;
