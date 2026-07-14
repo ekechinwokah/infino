@@ -259,6 +259,17 @@ const DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES: i64 = 64;
 const DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR: f32 = 1.5;
 /// Default global vector-index cell count for routed search.
 const DEFAULT_VECTOR_GLOBAL_CELL_COUNT: usize = 64;
+/// Default hidden vector-index compaction target superfile size (MiB). Sized
+/// to hold a full packed cell shard plus incremental deltas so the drain's
+/// base shard stays a merge candidate and absorbs later deltas rather than
+/// being sealed as over-target on the first pass.
+const DEFAULT_VECTOR_COMPACTION_TARGET_MB: u64 = 2048;
+/// Default hidden vector-index compaction min-fill: merge only once the
+/// combined inputs reach this percentage of the target size.
+const DEFAULT_VECTOR_COMPACTION_MIN_FILL_PERCENT: u8 = 40;
+/// Default hidden vector-index compaction per-pass memory ceiling (MiB). Must
+/// stay >= the target or it caps the packed inputs below a full output.
+const DEFAULT_VECTOR_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_VECTOR_COMPACTION_TARGET_MB + 2048;
 
 /// How the writer aligns user-superfile vector clusters to the global
 /// cell grid. Selected by `vector.user_centroids`.
@@ -336,6 +347,17 @@ pub struct VectorSettings {
     /// cell grid. Stamped into the manifest at create; changing it later
     /// affects new tables only.
     pub global_cell_count: usize,
+    /// Hidden vector-index compaction target superfile size (MiB). Distinct
+    /// from the user table's `compaction.target_superfile_size_mb`; a
+    /// packed cell shard stays a merge candidate until it reaches this.
+    pub compaction_target_mb: u64,
+    /// Hidden vector-index compaction min-fill: a merge fires only once its
+    /// combined inputs reach this percentage of `compaction_target_mb`.
+    pub compaction_min_fill_percent: u8,
+    /// Hidden vector-index compaction per-pass memory ceiling (MiB). Caps
+    /// the input bytes packed into one merge, so it must stay >=
+    /// `compaction_target_mb` or the target is never reached.
+    pub compaction_max_memory_mb: u64,
 }
 
 impl Default for VectorSettings {
@@ -351,6 +373,9 @@ impl Default for VectorSettings {
             drain_consolidate: DrainConsolidate::Kmeans,
             drain_read_concurrency: ThreadCount::Auto,
             global_cell_count: DEFAULT_VECTOR_GLOBAL_CELL_COUNT,
+            compaction_target_mb: DEFAULT_VECTOR_COMPACTION_TARGET_MB,
+            compaction_min_fill_percent: DEFAULT_VECTOR_COMPACTION_MIN_FILL_PERCENT,
+            compaction_max_memory_mb: DEFAULT_VECTOR_COMPACTION_MAX_MEMORY_MB,
         }
     }
 }

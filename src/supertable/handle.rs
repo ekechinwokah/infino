@@ -1047,17 +1047,6 @@ pub(crate) const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
 /// the full working set stays resident.
 const CACHE_BUDGET_HEADROOM_DIVISOR: u64 = 10;
 
-/// Hidden vector-index compaction: target packed per-cell superfile size. Smaller
-/// than the user table's default — cell superfiles are many and individually small.
-const HIDDEN_VECTOR_INDEX_TARGET_SUPERFILE_SIZE_MB: u64 = 8;
-
-/// Hidden vector-index compaction: merge a superfile once it drops below this
-/// fraction (percent) of the target size.
-const HIDDEN_VECTOR_INDEX_MIN_FILL_PERCENT: u8 = 40;
-
-/// Hidden vector-index compaction: per-pass memory ceiling.
-const HIDDEN_VECTOR_INDEX_MAX_MEMORY_MB: u64 = 512;
-
 /// Train global VectorCell centroids from the user manifest and queue them
 /// on the hidden index table for its next commit.
 /// Aggressive compaction profile for the hidden vector-index table: keep
@@ -1074,10 +1063,11 @@ pub(crate) fn is_hidden_vector_index_table(opts: &SupertableOptions) -> bool {
 }
 
 pub(crate) fn hidden_vector_index_compaction_settings() -> crate::config::CompactionSettings {
+    let vector = &crate::config::global().vector;
     crate::config::CompactionSettings {
-        target_superfile_size_mb: HIDDEN_VECTOR_INDEX_TARGET_SUPERFILE_SIZE_MB,
-        min_fill_percent: HIDDEN_VECTOR_INDEX_MIN_FILL_PERCENT,
-        max_memory_mb: HIDDEN_VECTOR_INDEX_MAX_MEMORY_MB,
+        target_superfile_size_mb: vector.compaction_target_mb,
+        min_fill_percent: vector.compaction_min_fill_percent,
+        max_memory_mb: vector.compaction_max_memory_mb,
         ..Default::default()
     }
 }

@@ -1122,7 +1122,14 @@ mod tests {
             s.partition_key = 3u32.to_le_bytes().to_vec();
             segs.push(s);
         }
-        let cfg = hidden_vector_index_compaction_settings();
+        // Exercises same-cell selection grouping independent of the
+        // production target; a small target keeps the 1 MiB fixtures under
+        // the ceiling while their combined size clears the fill floor.
+        let cfg = CompactionSettings {
+            target_superfile_size_mb: 8,
+            min_fill_percent: 40,
+            ..CompactionSettings::default()
+        };
         let jobs = select(&segs, &cfg);
         assert!(
             !jobs.is_empty(),
