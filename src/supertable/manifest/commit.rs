@@ -234,9 +234,8 @@ pub struct ManifestWriteResult {
 pub async fn write_manifest_part(
     storage: &dyn StorageProvider,
     part: &ManifestPart,
-    zstd_level: i32,
 ) -> Result<PartWriteResult, CommitError> {
-    let compressed = part_mod::encode(part, zstd_level);
+    let compressed = part_mod::encode(part);
     let content_hash = ContentHash::of(&compressed);
     let uri = part_uri(&content_hash);
     let size_compressed = compressed.len() as u64;

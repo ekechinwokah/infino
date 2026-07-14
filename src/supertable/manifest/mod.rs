@@ -45,6 +45,7 @@ use std::{
 use arrow::compute::kernels::aggregate as agg;
 use arrow_array::*;
 use arrow_schema::DataType;
+use bytes::Bytes;
 use dashmap::DashMap;
 use futures::future;
 /// Re-export the per-column skip aggregates so callers can refer to them as
@@ -52,7 +53,7 @@ use futures::future;
 /// `SuperfileEntry.scalar_stats` / `SuperfileEntry.fts_summary`).
 pub use list::{FtsSummaryAgg, GlobalVectorIndex, ScalarStatsAgg};
 use rayon::prelude::*;
-use tokio::sync::OnceCell;
+use tokio::{sync::OnceCell, task::spawn_blocking};
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -83,12 +84,6 @@ use crate::{
         slow_vector_state,
     },
 };
-
-/// Zstd compression level for manifest parts and the manifest list.
-/// Level 3 is zstd's own default — a balanced ratio/speed point that
-/// keeps commit latency low while compressing the Avro-encoded
-/// manifest well. (Valid range is 1..=22.)
-pub const MANIFEST_ZSTD_LEVEL: i32 = 3;
 
 /// Object-store / LocalFS directory prefix under which committed superfile
 /// bytes live (`<data>/seg-<id>.sf.parquet`). Shared by [`SuperfileUri::storage_path`]
@@ -1601,7 +1596,7 @@ fn rebuild_part_and_entry(
         part_id: PartId::new_v4(),
         superfiles,
     };
-    let compressed = part::encode(&part, MANIFEST_ZSTD_LEVEL);
+    let compressed = part::encode(&part);
     let size_compressed = compressed.len() as u64;
     let content_hash = ContentHash::of(&compressed);
     let size_uncompressed = frame_content_size(&compressed, size_compressed);
@@ -1679,7 +1674,7 @@ impl ManifestPartLoader {
         if let Some(cache) = &self.manifest_disk_cache
             && let Some(bytes) = cache.get(expected_hash).await
         {
-            let parsed = part::decode(&bytes)?;
+            let parsed = decode_part_off_thread(Bytes::from(bytes)).await?;
             return Ok(Arc::new(parsed));
         }
 
@@ -1700,8 +1695,23 @@ impl ManifestPartLoader {
         if let Some(cache) = &self.manifest_disk_cache {
             cache.put(actual_hash, &bytes).await;
         }
-        let parsed = part::decode(&bytes)?;
+        let parsed = decode_part_off_thread(bytes).await?;
         Ok(Arc::new(parsed))
+    }
+}
+
+/// Decode part bytes off the async runtime. Part decode is a CPU wave
+/// (multi-MiB Avro payloads carrying centroid summaries and open blobs);
+/// running it inline used to serialize every part behind one polling
+/// task, so 18 nominally-concurrent part loads decoded one at a time.
+/// `spawn_blocking` keeps the runtime free to drive the remaining
+/// fetches while decodes run in parallel on the blocking pool.
+async fn decode_part_off_thread(bytes: Bytes) -> Result<ManifestPart, ManifestLoadError> {
+    match spawn_blocking(move || part::decode(&bytes)).await {
+        Ok(result) => Ok(result?),
+        Err(join_error) => Err(ManifestLoadError::Parse(part::PartParseError::Avro(
+            format!("part decode task failed: {join_error}"),
+        ))),
     }
 }
 
@@ -2840,7 +2850,7 @@ mod tests {
             let mut objects = HashMap::new();
             let mut entries = Vec::new();
             for p in parts {
-                let bytes = part_mod::encode(p, 3);
+                let bytes = part_mod::encode(p);
                 let hash = ContentHash::of(&bytes);
                 let uri = format!("manifests/part-{}.avro.zst", hash.to_hex());
                 let size_compressed = bytes.len() as u64;
@@ -3461,7 +3471,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: entries.clone(),
         };
-        let pw = write_manifest_part(storage.as_ref(), &part, MANIFEST_ZSTD_LEVEL)
+        let pw = write_manifest_part(storage.as_ref(), &part)
             .await
             .expect("write part");
         let (slow_uri, slow_hash) = match slow_ref {
@@ -3638,7 +3648,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![old_superfile.clone()],
         };
-        let pw = write_manifest_part(storage.as_ref(), &existing_part, MANIFEST_ZSTD_LEVEL)
+        let pw = write_manifest_part(storage.as_ref(), &existing_part)
             .await
             .expect("write part");
 
@@ -3758,7 +3768,7 @@ mod tests {
                     make_superfile_entry_hinted(docs[1], hint),
                 ],
             };
-            let pw = write_manifest_part(storage, &part, MANIFEST_ZSTD_LEVEL)
+            let pw = write_manifest_part(storage, &part)
                 .await
                 .expect("write part");
             (part, pw)
@@ -3996,7 +4006,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf1.clone(), sf2.clone()],
         };
-        let pw = write_manifest_part(storage.as_ref(), &existing_part, MANIFEST_ZSTD_LEVEL)
+        let pw = write_manifest_part(storage.as_ref(), &existing_part)
             .await
             .expect("write part");
 
@@ -4094,7 +4104,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf1.clone(), sf2.clone()],
         };
-        let pw = write_manifest_part(storage.as_ref(), &existing_part, MANIFEST_ZSTD_LEVEL)
+        let pw = write_manifest_part(storage.as_ref(), &existing_part)
             .await
             .expect("write part");
 
@@ -4205,7 +4215,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf1.clone(), sf2.clone()],
         };
-        let pw = write_manifest_part(storage.as_ref(), &existing_part, MANIFEST_ZSTD_LEVEL)
+        let pw = write_manifest_part(storage.as_ref(), &existing_part)
             .await
             .expect("write part");
 
@@ -4328,7 +4338,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf_old.clone()],
         };
-        let pw_old = write_manifest_part(storage.as_ref(), &part_old, MANIFEST_ZSTD_LEVEL)
+        let pw_old = write_manifest_part(storage.as_ref(), &part_old)
             .await
             .expect("write part_old");
 
@@ -4337,7 +4347,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf_latest.clone()],
         };
-        let pw_latest = write_manifest_part(storage.as_ref(), &part_latest, MANIFEST_ZSTD_LEVEL)
+        let pw_latest = write_manifest_part(storage.as_ref(), &part_latest)
             .await
             .expect("write part_latest");
 
@@ -4457,7 +4467,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf_a.clone()],
         };
-        let pw_a = write_manifest_part(storage.as_ref(), &part_a, MANIFEST_ZSTD_LEVEL)
+        let pw_a = write_manifest_part(storage.as_ref(), &part_a)
             .await
             .expect("write part_a");
 
@@ -4467,7 +4477,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf_b.clone()],
         };
-        let pw_b = write_manifest_part(storage.as_ref(), &part_b, MANIFEST_ZSTD_LEVEL)
+        let pw_b = write_manifest_part(storage.as_ref(), &part_b)
             .await
             .expect("write part_b");
 
@@ -4596,7 +4606,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf_a.clone()],
         };
-        let pw_a = write_manifest_part(storage.as_ref(), &part_a, MANIFEST_ZSTD_LEVEL)
+        let pw_a = write_manifest_part(storage.as_ref(), &part_a)
             .await
             .expect("write part_a");
 
@@ -4606,7 +4616,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf_b.clone()],
         };
-        let pw_b = write_manifest_part(storage.as_ref(), &part_b, MANIFEST_ZSTD_LEVEL)
+        let pw_b = write_manifest_part(storage.as_ref(), &part_b)
             .await
             .expect("write part_b");
 
@@ -4728,7 +4738,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf_a_old.clone()],
         };
-        let pw_a_old = write_manifest_part(storage.as_ref(), &part_a_old, MANIFEST_ZSTD_LEVEL)
+        let pw_a_old = write_manifest_part(storage.as_ref(), &part_a_old)
             .await
             .expect("write part_a_old");
 
@@ -4738,10 +4748,9 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf_a_latest.clone()],
         };
-        let pw_a_latest =
-            write_manifest_part(storage.as_ref(), &part_a_latest, MANIFEST_ZSTD_LEVEL)
-                .await
-                .expect("write part_a_latest");
+        let pw_a_latest = write_manifest_part(storage.as_ref(), &part_a_latest)
+            .await
+            .expect("write part_a_latest");
 
         // Partition B: two parts
         let sf_b_old = make_superfile_entry_hinted(200, 1);
@@ -4750,7 +4759,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf_b_old.clone()],
         };
-        let pw_b_old = write_manifest_part(storage.as_ref(), &part_b_old, MANIFEST_ZSTD_LEVEL)
+        let pw_b_old = write_manifest_part(storage.as_ref(), &part_b_old)
             .await
             .expect("write part_b_old");
 
@@ -4760,10 +4769,9 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf_b_latest.clone()],
         };
-        let pw_b_latest =
-            write_manifest_part(storage.as_ref(), &part_b_latest, MANIFEST_ZSTD_LEVEL)
-                .await
-                .expect("write part_b_latest");
+        let pw_b_latest = write_manifest_part(storage.as_ref(), &part_b_latest)
+            .await
+            .expect("write part_b_latest");
 
         // List order: [a_old, a_latest, b_old, b_latest]
         let list = Manifest {
@@ -4917,7 +4925,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf_keep.clone(), sf_remove.clone()],
         };
-        let pw = write_manifest_part(storage.as_ref(), &existing_part, MANIFEST_ZSTD_LEVEL)
+        let pw = write_manifest_part(storage.as_ref(), &existing_part)
             .await
             .expect("write part");
 
@@ -5011,7 +5019,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf_keep.clone(), sf_remove.clone()],
         };
-        let pw = write_manifest_part(storage.as_ref(), &existing_part, MANIFEST_ZSTD_LEVEL)
+        let pw = write_manifest_part(storage.as_ref(), &existing_part)
             .await
             .expect("write part");
 
@@ -5110,7 +5118,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf_a_keep.clone(), sf_a_remove.clone()],
         };
-        let pw_a = write_manifest_part(storage.as_ref(), &part_a, MANIFEST_ZSTD_LEVEL)
+        let pw_a = write_manifest_part(storage.as_ref(), &part_a)
             .await
             .expect("write part_a");
 
@@ -5120,7 +5128,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf_b.clone()],
         };
-        let pw_b = write_manifest_part(storage.as_ref(), &part_b, MANIFEST_ZSTD_LEVEL)
+        let pw_b = write_manifest_part(storage.as_ref(), &part_b)
             .await
             .expect("write part_b");
 
@@ -5245,7 +5253,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf_a_old.clone()],
         };
-        let pw_a_old = write_manifest_part(storage.as_ref(), &part_a_old, MANIFEST_ZSTD_LEVEL)
+        let pw_a_old = write_manifest_part(storage.as_ref(), &part_a_old)
             .await
             .expect("write part_a_old");
 
@@ -5257,10 +5265,9 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf_a_latest_keep.clone(), sf_a_latest_remove.clone()],
         };
-        let pw_a_latest =
-            write_manifest_part(storage.as_ref(), &part_a_latest, MANIFEST_ZSTD_LEVEL)
-                .await
-                .expect("write part_a_latest");
+        let pw_a_latest = write_manifest_part(storage.as_ref(), &part_a_latest)
+            .await
+            .expect("write part_a_latest");
 
         let list = Manifest {
             drained_ranges: Default::default(),
@@ -5386,7 +5393,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf1.clone(), sf2.clone()],
         };
-        let pw = write_manifest_part(storage.as_ref(), &existing_part, MANIFEST_ZSTD_LEVEL)
+        let pw = write_manifest_part(storage.as_ref(), &existing_part)
             .await
             .expect("write part");
 
@@ -5471,7 +5478,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf1.clone(), sf2.clone()],
         };
-        let pw = write_manifest_part(storage.as_ref(), &existing_part, MANIFEST_ZSTD_LEVEL)
+        let pw = write_manifest_part(storage.as_ref(), &existing_part)
             .await
             .expect("write part");
 
@@ -5565,7 +5572,7 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf_a_old_keep.clone(), sf_a_old_remove.clone()],
         };
-        let pw_a_old = write_manifest_part(storage.as_ref(), &part_a_old, MANIFEST_ZSTD_LEVEL)
+        let pw_a_old = write_manifest_part(storage.as_ref(), &part_a_old)
             .await
             .expect("write part_a_old");
 
@@ -5576,10 +5583,9 @@ mod tests {
             part_id: PartId::new_v4(),
             superfiles: vec![sf_a_latest.clone()],
         };
-        let pw_a_latest =
-            write_manifest_part(storage.as_ref(), &part_a_latest, MANIFEST_ZSTD_LEVEL)
-                .await
-                .expect("write part_a_latest");
+        let pw_a_latest = write_manifest_part(storage.as_ref(), &part_a_latest)
+            .await
+            .expect("write part_a_latest");
 
         let list = Manifest {
             drained_ranges: Default::default(),

@@ -84,7 +84,7 @@ async fn commit_manifest(
     new_list: &Manifest,
     parts: &[&ManifestPart],
 ) -> Result<PointerFile, CommitError> {
-    let encoded: Vec<Vec<u8>> = parts.iter().map(|p| part_mod::encode(p, 3)).collect();
+    let encoded: Vec<Vec<u8>> = parts.iter().map(|p| part_mod::encode(p)).collect();
     let encoded_refs: Vec<&[u8]> = encoded.iter().map(|b| b.as_slice()).collect();
 
     // Start from an empty manifest (no superfiles) carrying the
@@ -188,21 +188,19 @@ fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> Manifest {
 }
 
 /// Build a manifest list entry referencing an already-encoded
-/// part. Skip-summary aggregates left empty here.
+/// part. Skip-summary aggregates left empty here. Parts are stored as
+/// raw Avro now, so both size fields carry the stored byte count.
 fn entry_for(part: &ManifestPart) -> ManifestPartEntry {
-    let encoded = part_mod::encode(part, 3);
+    let encoded = part_mod::encode(part);
     let hash = ContentHash::of(&encoded);
     let uri = part_uri(&hash);
-    let size_compressed = encoded.len() as u64;
-    let size_uncompressed = zstd::stream::decode_all(encoded.as_slice())
-        .expect("self-decode")
-        .len() as u64;
+    let size_bytes = encoded.len() as u64;
     ManifestPartEntry {
         part_id: part.part_id,
         uri,
         n_superfiles: part.superfiles.len() as u64,
-        size_bytes_compressed: size_compressed,
-        size_bytes_uncompressed: size_uncompressed,
+        size_bytes_compressed: size_bytes,
+        size_bytes_uncompressed: size_bytes,
         content_hash: hash,
         id_range: (0, 0),
         scalar_stats_agg: Default::default(),
@@ -377,10 +375,10 @@ async fn idempotent_content_addressed_part_put() {
     let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
     let part = fresh_part(9);
 
-    let r1 = commit::write_manifest_part(&storage, &part, 3)
+    let r1 = commit::write_manifest_part(&storage, &part)
         .await
         .expect("first write");
-    let r2 = commit::write_manifest_part(&storage, &part, 3)
+    let r2 = commit::write_manifest_part(&storage, &part)
         .await
         .expect("second write (idempotent)");
     assert_eq!(r1.uri, r2.uri);

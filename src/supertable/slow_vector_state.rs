@@ -31,7 +31,7 @@ use uuid::Uuid;
 use crate::{
     storage::{StorageError, StorageProvider},
     supertable::manifest::{
-        MANIFEST_ZSTD_LEVEL, SuperfileEntry,
+        SuperfileEntry,
         part::{self, ContentHash, ManifestPart, PartId},
     },
 };
@@ -90,7 +90,7 @@ pub(crate) fn encode_entries(entries: &[Arc<SuperfileEntry>]) -> Vec<u8> {
         part_id: PartId(Uuid::nil()),
         superfiles: entries.to_vec(),
     };
-    part::encode(&synthetic, MANIFEST_ZSTD_LEVEL)
+    part::encode(&synthetic)
 }
 
 /// Decode a blob written by [`encode_entries`].

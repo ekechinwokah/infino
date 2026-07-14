@@ -254,18 +254,19 @@ fn schema() -> &'static AvroSchema {
     })
 }
 
-/// Encode a [`ManifestPart`] to Avro bytes wrapped in a zstd
-/// frame, returning the bytes + their `ContentHash`.
+/// Encode a [`ManifestPart`] to raw Avro datum bytes.
 ///
-/// The hash is the blake3 of the **compressed** bytes — the
-/// URI uses the same form, so a re-write of bit-identical
-/// content produces the same URI (the load-bearing property
-/// for cross-version part sharing).
+/// Deliberately uncompressed: part payloads are dominated by fp32
+/// centroid summaries and open-blob bytes that compress poorly, byte
+/// volume is not the priced dimension (requests are), and the zstd
+/// decode used to serialize the cold-open path (measured: 18 parts /
+/// 507 MiB decoded one-at-a-time ≈ 27 s of open latency at 10M docs).
+/// [`decode`] still reads legacy zstd-framed parts by magic-byte sniff.
 ///
-/// `zstd_level` is the compression level (1..=22); v1 default
-/// is 3 (matches Iceberg's manifest-file default; good
-/// time/space trade for sub-MB Avro payloads).
-pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
+/// Content addressing hashes the stored bytes — a re-encode of
+/// bit-identical logical content produces the same URI (the
+/// load-bearing property for cross-version part sharing).
+pub fn encode(part: &ManifestPart) -> Vec<u8> {
     // Use schemaless Avro datum encoding (no OCF container).
     // The OCF wrapper carries a random 16-byte sync marker, which
     // would break content-addressing: encoding the same logical
@@ -349,22 +350,36 @@ pub fn encode(part: &ManifestPart, zstd_level: i32) -> Vec<u8> {
         ("superfiles".into(), AvroValue::Array(superfile_records)),
     ]);
 
-    let avro_bytes = to_avro_datum(schema(), record).expect("avro datum encode");
-    stream::encode_all(avro_bytes.as_slice(), zstd_level).expect("zstd encode")
+    to_avro_datum(schema(), record).expect("avro datum encode")
 }
 
-/// Decode a manifest-part byte buffer (zstd-wrapped Avro)
-/// back into a [`ManifestPart`].
+/// Leading magic of a zstd frame (little-endian `0xFD2FB528`). Parts
+/// written before compression was dropped start with it; raw Avro datum
+/// bytes cannot (the first byte is a record field's string length, and the
+/// full four-byte sequence never prefixes our schema's encoding).
+const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Decode a manifest-part byte buffer back into a [`ManifestPart`].
+///
+/// Accepts both encodings: raw Avro datum bytes (current writers) and
+/// legacy zstd-framed Avro (sniffed by the frame magic).
 ///
 /// Verifies format-version compatibility (major must match
 /// the constant [`FORMAT_VERSION`]; minor differences are
 /// accepted).
 pub fn decode(bytes: &[u8]) -> Result<ManifestPart, PartParseError> {
-    let avro_bytes = stream::decode_all(bytes).map_err(|e| PartParseError::Zstd(e.to_string()))?;
+    let legacy_decompressed;
+    let avro_bytes: &[u8] = if bytes.starts_with(&ZSTD_FRAME_MAGIC) {
+        legacy_decompressed =
+            stream::decode_all(bytes).map_err(|e| PartParseError::Zstd(e.to_string()))?;
+        &legacy_decompressed
+    } else {
+        bytes
+    };
     // Schemaless datum decode — mirrors `to_avro_datum` in
     // `encode`. The schema is in-source (compiled in), so the
     // reader doesn't need a wire-side schema.
-    let mut cursor = Cursor::new(avro_bytes.as_slice());
+    let mut cursor = Cursor::new(avro_bytes);
     let value = from_avro_datum(schema(), &mut cursor, None)
         .map_err(|e| PartParseError::Avro(e.to_string()))?;
 
@@ -964,7 +979,7 @@ mod tests {
     #[test]
     fn empty_part_roundtrip() {
         let part = fresh_part(vec![]);
-        let bytes = encode(&part, 3);
+        let bytes = encode(&part);
         let decoded = decode(&bytes).expect("decode empty");
         assert_eq!(decoded.format_version, FORMAT_VERSION);
         assert_eq!(decoded.part_id, part.part_id);
@@ -974,7 +989,7 @@ mod tests {
     #[test]
     fn single_minimal_superfile_roundtrip() {
         let part = fresh_part(vec![fresh_superfile(100)]);
-        let bytes = encode(&part, 3);
+        let bytes = encode(&part);
         let decoded = decode(&bytes).expect("decode minimal");
         assert_eq!(decoded.superfiles.len(), 1);
         assert_superfiles_equal(&decoded.superfiles[0], &part.superfiles[0]);
@@ -984,7 +999,7 @@ mod tests {
     fn multi_superfile_with_full_summaries_roundtrip() {
         let superfiles: Vec<Arc<SuperfileEntry>> = (0..5).map(|_| make_rich_superfile()).collect();
         let part = fresh_part(superfiles);
-        let bytes = encode(&part, 3);
+        let bytes = encode(&part);
         let decoded = decode(&bytes).expect("decode rich");
         assert_eq!(decoded.superfiles.len(), 5);
         for (a, b) in decoded.superfiles.iter().zip(part.superfiles.iter()) {
@@ -995,7 +1010,7 @@ mod tests {
     #[test]
     fn content_hash_covers_all_bytes() {
         let part = fresh_part(vec![make_rich_superfile()]);
-        let bytes = encode(&part, 3);
+        let bytes = encode(&part);
         let hash = ContentHash::of(&bytes);
 
         let mut tampered = bytes.clone();
@@ -1025,8 +1040,8 @@ mod tests {
             superfiles,
         };
 
-        let bytes_a = encode(&part_a, 3);
-        let bytes_b = encode(&part_b, 3);
+        let bytes_a = encode(&part_a);
+        let bytes_b = encode(&part_b);
         assert_eq!(bytes_a, bytes_b, "same logical content → same bytes");
         assert_eq!(
             ContentHash::of(&bytes_a),
@@ -1070,7 +1085,7 @@ mod tests {
             subsection_offsets: None,
         });
         let part = fresh_part(vec![seg_with.clone(), seg_without.clone()]);
-        let bytes = encode(&part, 3);
+        let bytes = encode(&part);
         let decoded = decode(&bytes).expect("decode mixed-hint");
         assert_eq!(decoded.superfiles.len(), 2);
         assert_eq!(decoded.superfiles[0].partition_hint, Some(0xdead_beef));
@@ -1083,7 +1098,7 @@ mod tests {
     fn incompatible_major_version_rejected() {
         let mut part = fresh_part(vec![fresh_superfile(1)]);
         part.format_version = "2.0".into();
-        let bytes = encode(&part, 3);
+        let bytes = encode(&part);
         let err = decode(&bytes).expect_err("major 2 must reject");
         assert!(
             matches!(err, PartParseError::IncompatibleMajorVersion { .. }),
@@ -1095,7 +1110,7 @@ mod tests {
     fn minor_version_compatible() {
         let mut part = fresh_part(vec![fresh_superfile(7)]);
         part.format_version = "1.99".into();
-        let bytes = encode(&part, 3);
+        let bytes = encode(&part);
         let decoded = decode(&bytes).expect("minor 99 must accept");
         assert_eq!(decoded.format_version, "1.99");
         assert_eq!(decoded.superfiles.len(), 1);
@@ -1104,7 +1119,7 @@ mod tests {
     #[test]
     fn zstd_corruption_surfaces_typed_error() {
         let part = fresh_part(vec![fresh_superfile(1)]);
-        let mut bytes = encode(&part, 3);
+        let mut bytes = encode(&part);
         bytes[0] ^= 0xff;
         bytes[1] ^= 0xff;
         let err = decode(&bytes).expect_err("corrupt zstd must fail");
@@ -1114,12 +1129,38 @@ mod tests {
         );
     }
 
+    /// Parts written before compression was dropped are zstd-framed;
+    /// `decode` must keep reading them by magic-byte sniff, and a framed
+    /// part with a corrupt body must surface the typed zstd error.
+    #[test]
+    fn legacy_zstd_framed_part_round_trips() {
+        let part = fresh_part(vec![make_rich_superfile()]);
+        let raw = encode(&part);
+        let legacy = stream::encode_all(raw.as_slice(), 3).expect("zstd encode");
+        assert!(
+            legacy.starts_with(&ZSTD_FRAME_MAGIC),
+            "legacy frame must carry the zstd magic"
+        );
+        let decoded = decode(&legacy).expect("legacy zstd part must decode");
+        assert_eq!(decoded.part_id, part.part_id);
+        assert_eq!(decoded.superfiles.len(), part.superfiles.len());
+
+        let mut corrupt = legacy.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xff;
+        let err = decode(&corrupt).expect_err("corrupt legacy frame must fail");
+        assert!(
+            matches!(err, PartParseError::Zstd(_)),
+            "expected Zstd error for corrupt legacy frame, got {err:?}"
+        );
+    }
+
     #[test]
     fn bytes_payload_is_well_formed_use_via_bytes_type() {
         // Sanity: wire shape is acceptable to bytes::Bytes
         // for the storage layer downstream.
         let part = fresh_part(vec![make_rich_superfile()]);
-        let raw = encode(&part, 3);
+        let raw = encode(&part);
         let wrapped = Bytes::from(raw.clone());
         let decoded = decode(&wrapped).expect("decode from Bytes");
         assert_eq!(decoded.superfiles.len(), 1);
@@ -1195,7 +1236,7 @@ mod tests {
             subsection_offsets: Some(off.clone()),
         });
         let part = fresh_part(vec![seg]);
-        let decoded = decode(&encode(&part, 3)).expect("decode");
+        let decoded = decode(&encode(&part)).expect("decode");
         let got = decoded.superfiles[0]
             .subsection_offsets
             .as_ref()
@@ -1225,7 +1266,7 @@ mod tests {
             subsection_offsets: None,
         });
         let part = fresh_part(vec![seg]);
-        let decoded = decode(&encode(&part, 3)).expect("decode");
+        let decoded = decode(&encode(&part)).expect("decode");
         assert_eq!(
             decoded.superfiles[0].vector_layout,
             VectorLayout::CellPosting
@@ -1261,7 +1302,7 @@ mod tests {
             subsection_offsets: Some(off.clone()),
         });
         let part = fresh_part(vec![seg]);
-        let decoded = decode(&encode(&part, 3)).expect("decode");
+        let decoded = decode(&encode(&part)).expect("decode");
         assert_eq!(
             *decoded.superfiles[0]
                 .subsection_offsets
