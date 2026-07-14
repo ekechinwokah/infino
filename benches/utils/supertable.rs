@@ -1104,6 +1104,7 @@ pub mod fts {
 
 pub mod vector {
     use std::{
+        cmp::Ordering,
         collections::{HashMap, HashSet},
         hint::black_box,
     };
@@ -1119,7 +1120,16 @@ pub mod vector {
 
     // Correctness gate, recall targets, calibration grid, and p50 iters
     // live in `crate::executors::vector` (shared by both tiers).
-    const N_CORRECTNESS_QUERIES: usize = 20;
+    //
+    // 100 correctness queries: recall is dominated by the per-query
+    // probability of a bad cell tie (~5% on the synthetic corpus), and at 20
+    // queries the standard error on that rate (±4.9%) exceeded the effect —
+    // recall moved in 0.05 quanta run to run. 100 queries brings the standard
+    // error to ±2.2% and the occurrence granularity to 0.001. Ground-truth
+    // caches are keyed by the query set, so the first run per scale recomputes
+    // them once; numbers recorded before this constant changed were measured
+    // at 20 queries.
+    const N_CORRECTNESS_QUERIES: usize = 100;
     const N_CALIBRATION_QUERIES: usize = 100;
     /// Steady-state cache-budget multiple of the user index for the shared
     /// vector consumer. The hidden per-cell IVF index is a second on-storage
@@ -1438,6 +1448,24 @@ pub mod vector {
         ))
     }
 
+    /// 1-based rank of every index in a scored list: sorts ascending by
+    /// score (index breaks ties, matching the engine's lowest-index-wins
+    /// rule) and scatters positions into a dense `len`-slot map
+    /// (`usize::MAX` = never scored). Shared by the audit's grid, routed,
+    /// and fine-run coverage curves.
+    fn rank_map(mut scored: Vec<(usize, f32)>, len: usize) -> Vec<usize> {
+        scored.sort_unstable_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let mut rank_by_index = vec![usize::MAX; len];
+        for (rank, (idx, _)) in scored.iter().enumerate() {
+            rank_by_index[*idx] = rank + 1;
+        }
+        rank_by_index
+    }
+
     /// Post-drain assignment audit: separates "the drain stored rows in the
     /// wrong cells" from "the query's nearest cell doesn't contain the true
     /// neighbors". Three measurements against the user table's global grid:
@@ -1448,6 +1476,13 @@ pub mod vector {
     /// 3. neighbor coverage — for each ground-truth neighbor, the rank of its
     ///    STORED cell (and separately its geometrically-nearest cell) in the
     ///    query's cell ordering; `p1` is the ceiling of `cells 1..1` recall.
+    ///
+    /// Deliberate replication: the oracle math here — the naive
+    /// `nearest_cell` scan and the tie-window threshold expression — is
+    /// intentionally written against the plain scalar formulas rather than
+    /// the engine's blocked kernels or `relative_score_window` (which are
+    /// crate-private anyway). A bug in an engine kernel must show up as a
+    /// disagreement in this audit, not silently agree with itself.
     fn report_post_drain_assignment_audit(
         consumer: &Supertable,
         vectors: &[f32],
@@ -1557,40 +1592,28 @@ pub mod vector {
         let mut total = 0usize;
         let mut missing = 0usize;
         for (query, truth) in queries.iter().zip(ground_truth) {
-            let mut ranked: Vec<(u32, f32)> = (0..n_cells)
-                .map(|cell| (cell as u32, grid.score_one(metric, cell, query)))
-                .collect();
-            ranked.sort_unstable_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            let mut rank_by_cell = vec![usize::MAX; n_cells];
-            for (rank, (cell, _)) in ranked.iter().enumerate() {
-                rank_by_cell[*cell as usize] = rank + 1;
-            }
+            let rank_by_cell = rank_map(
+                (0..n_cells)
+                    .map(|cell| (cell, grid.score_one(metric, cell, query)))
+                    .collect(),
+                n_cells,
+            );
             // Query-path replica: rank cells by min fine-centroid score.
-            let mut routed: Vec<(u32, f32)> = fine_by_cell
-                .iter()
-                .map(|(cell_id, cluster_sets)| {
-                    let mut best = f32::INFINITY;
-                    for clusters in cluster_sets {
-                        clusters.score_clusters_into(metric, query, |_, score| {
-                            best = best.min(score);
-                        });
-                    }
-                    (*cell_id, best)
-                })
-                .collect();
-            routed.sort_unstable_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            let mut routed_rank_by_cell = vec![usize::MAX; n_cells];
-            for (rank, (cell, _)) in routed.iter().enumerate() {
-                routed_rank_by_cell[*cell as usize] = rank + 1;
-            }
+            let routed_rank_by_cell = rank_map(
+                fine_by_cell
+                    .iter()
+                    .map(|(cell_id, cluster_sets)| {
+                        let mut best = f32::INFINITY;
+                        for clusters in cluster_sets {
+                            clusters.score_clusters_into(metric, query, |_, score| {
+                                best = best.min(score);
+                            });
+                        }
+                        (*cell_id as usize, best)
+                    })
+                    .collect(),
+                n_cells,
+            );
             for id in truth {
                 let start = *id as usize * DIM;
                 if start + DIM > vectors.len() {
@@ -1696,8 +1719,7 @@ pub mod vector {
                 let mut scores: Vec<f32> = (0..n_cells)
                     .map(|cell| grid.score_one(metric, cell, row))
                     .collect();
-                scores
-                    .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                scores.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
                 let primary = scores[0];
                 let mut out = [0usize; CLOSURE_RATIO_CANDIDATES.len()];
                 for (i, ratio) in CLOSURE_RATIO_CANDIDATES.iter().enumerate() {
@@ -1735,7 +1757,7 @@ pub mod vector {
             let mut scores: Vec<f32> = (0..n_cells)
                 .map(|cell| grid.score_one(metric, cell, query))
                 .collect();
-            scores.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            scores.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
             let top = scores[0];
             for (si, slack) in TIE_SLACK_CANDIDATES.iter().enumerate() {
                 let threshold = top + top.abs().max(f32::EPSILON) * slack;
@@ -1788,15 +1810,7 @@ pub mod vector {
                 });
                 flat_base += clusters.n_cent as usize;
             }
-            query_scores.sort_unstable_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            let mut rank_of = vec![usize::MAX; flat_base];
-            for (rank, (idx, _)) in query_scores.iter().enumerate() {
-                rank_of[*idx] = rank + 1;
-            }
+            let rank_of = rank_map(query_scores, flat_base);
             for id in truth {
                 let start = *id as usize * DIM;
                 if start + DIM > vectors.len() {
