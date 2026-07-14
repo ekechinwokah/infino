@@ -1696,4 +1696,125 @@ mod tests {
         assert_eq!(h, same);
         assert_eq!(h.to_hex().len(), BLAKE3_HEX_LEN);
     }
+
+    // -----------------------------------------------------------------
+    // Cold-open decode cost attribution (scratch diagnostic, run
+    // manually with `--ignored --nocapture` in release). Builds one
+    // manifest part at the measured 10M-doc shape (7 superfile entries,
+    // each carrying ~4000 cells × 1 cluster × dim 1024 fp32) and times
+    // each stage of the decode pipeline separately so the cold-open
+    // CPU bill can be attributed: zstd frame, Avro value walk, and the
+    // per-summary binary decode.
+    // -----------------------------------------------------------------
+
+    /// Entries per synthetic part (measured: 128 superfiles / 18 parts).
+    const TIMING_ENTRIES_PER_PART: usize = 7;
+    /// Populated cells per superfile summary at 10M docs / 4096-cell grid.
+    const TIMING_CELLS_PER_SF: usize = 4000;
+    /// Vector dim of the measured corpus.
+    const TIMING_DIM: usize = 1024;
+    /// Parts in the measured 10M user manifest (18 GET at open).
+    const TIMING_PARTS_PER_MANIFEST: usize = 18;
+
+    fn timing_superfile() -> Arc<SuperfileEntry> {
+        use crate::supertable::manifest::{CellVectorSummary, ClusterCentroids};
+        let id = Uuid::new_v4();
+        let cells: Vec<CellVectorSummary> = (0..TIMING_CELLS_PER_SF)
+            .map(|cell| {
+                let centroids: Vec<f32> = (0..TIMING_DIM)
+                    .map(|d| (cell * 31 + d) as f32 * 1e-3)
+                    .collect();
+                CellVectorSummary {
+                    cell_id: Some(cell as u32),
+                    clusters: ClusterCentroids::from_fp32(
+                        1,
+                        TIMING_DIM as u32,
+                        &centroids,
+                        vec![19],
+                    ),
+                }
+            })
+            .collect();
+        let mut vec_summary = HashMap::new();
+        vec_summary.insert(
+            "emb".to_string(),
+            VectorSummary {
+                centroid: vec![0.5; TIMING_DIM],
+                cells,
+            },
+        );
+        Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: id,
+            uri: SuperfileUri(id),
+            n_docs: 78_000,
+            id_min: 0,
+            id_max: 77_999,
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: vec_summary,
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
+            subsection_offsets: None,
+        })
+    }
+
+    #[test]
+    #[ignore = "manual diagnostic: attributes cold-open manifest decode cost by stage"]
+    fn timing_manifest_part_decode_stages() {
+        use std::time::Instant;
+
+        use crate::supertable::manifest::encoding::decode_vector_summary_map;
+
+        let entries: Vec<Arc<SuperfileEntry>> = (0..TIMING_ENTRIES_PER_PART)
+            .map(|_| timing_superfile())
+            .collect();
+        let summary_bytes_one = encode_vector_summary_map(&entries[0].vector_summary);
+        let part = fresh_part(entries);
+
+        let t = Instant::now();
+        let encoded = encode(&part);
+        let t_encode = t.elapsed();
+
+        let t = Instant::now();
+        let mut cursor = Cursor::new(encoded.as_slice());
+        let value = from_avro_datum(schema(), &mut cursor, None).expect("avro");
+        let t_avro = t.elapsed();
+        drop(value);
+
+        let t = Instant::now();
+        let mut summaries = 0usize;
+        for _ in 0..TIMING_ENTRIES_PER_PART {
+            summaries += decode_vector_summary_map(&summary_bytes_one)
+                .expect("summary")
+                .len();
+        }
+        let t_summary = t.elapsed();
+
+        let t = Instant::now();
+        let decoded = decode(&encoded).expect("full decode");
+        let t_full = t.elapsed();
+
+        let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+        eprintln!(
+            "[part-timing] shape: {} entries × {} cells × dim {} — raw part {:.3} GiB",
+            TIMING_ENTRIES_PER_PART,
+            TIMING_CELLS_PER_SF,
+            TIMING_DIM,
+            gib(encoded.len()),
+        );
+        eprintln!(
+            "[part-timing] encode {:?} | avro-walk {:?} | summary-decode {:?} ({} summaries) | full decode {:?}",
+            t_encode, t_avro, t_summary, summaries, t_full,
+        );
+        eprintln!(
+            "[part-timing] manifest-scale (×{} parts): avro {:.1?} | summary {:.1?} | full {:.1?}",
+            TIMING_PARTS_PER_MANIFEST,
+            t_avro * TIMING_PARTS_PER_MANIFEST as u32,
+            t_summary * TIMING_PARTS_PER_MANIFEST as u32,
+            t_full * TIMING_PARTS_PER_MANIFEST as u32,
+        );
+        assert_eq!(decoded.superfiles.len(), TIMING_ENTRIES_PER_PART);
+    }
 }

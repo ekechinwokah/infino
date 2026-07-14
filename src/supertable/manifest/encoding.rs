@@ -526,13 +526,13 @@ pub fn encode_fts_summary(s: &FtsSummaryAgg) -> Vec<u8> {
 pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummaryAgg, DecodeError> {
     let mut c = Cursor::new(bytes);
     let bloom_len = read_u32(&mut c, "bloom_len")? as usize;
-    let bloom_bytes = read_n(&mut c, bloom_len, "bloom_bytes")?;
+    let bloom_bytes = view_n(&mut c, bloom_len, "bloom_bytes")?;
     // Empty bloom run ⇒ "no bloom info" (None); a non-empty run must be a
     // valid bloom layout.
     let term_bloom = if bloom_bytes.is_empty() {
         None
     } else {
-        Some(Bloom::from_bytes(&bloom_bytes).ok_or(DecodeError::InvalidBloomLayout(bloom_len))?)
+        Some(Bloom::from_bytes(bloom_bytes).ok_or(DecodeError::InvalidBloomLayout(bloom_len))?)
     };
     let n_terms_distinct = u64::from(read_u32(&mut c, "n_terms_distinct")?);
     let min_len = read_u32(&mut c, "min_term_len")? as usize;
@@ -605,25 +605,15 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, Decode
         )));
     }
 
-    let counts_b = read_n(&mut c, n_cent * 4, "cluster_counts")?;
-    if counts_b.len() != n_cent * 4 {
-        return Err(DecodeError::InvalidVectorSummary(
-            "truncated cluster counts".into(),
-        ));
-    }
+    let counts_b = view_n(&mut c, n_cent * 4, "cluster_counts")?;
     let counts: Vec<u32> = counts_b
         .chunks_exact(4)
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
 
     let body = n_cent * cdim;
-    let centroids_b = read_n(&mut c, body * 4, "cluster_centroids")?;
-    if centroids_b.len() != body * 4 {
-        return Err(DecodeError::InvalidVectorSummary(
-            "truncated fp32 cluster centroids".into(),
-        ));
-    }
-    let centroids = decode_f32_le_vec(&centroids_b);
+    let centroids_b = view_n(&mut c, body * 4, "cluster_centroids")?;
+    let centroids = decode_f32_le_vec(centroids_b);
 
     Ok(ClusterCentroids {
         n_cent: n_cent as u32,
@@ -653,25 +643,18 @@ pub fn encode_vector_summary(s: &VectorSummary) -> Vec<u8> {
 pub fn decode_vector_summary(bytes: &[u8]) -> Result<VectorSummary, DecodeError> {
     let mut c = Cursor::new(bytes);
     let dim = read_u32(&mut c, "dim")? as usize;
-    let centroid_bytes = read_n(&mut c, dim * 4, "centroid")?;
-    if centroid_bytes.len() != dim * 4 {
-        return Err(DecodeError::InvalidVectorSummary(format!(
-            "truncated centroid: expected {} bytes, got {}",
-            dim * 4,
-            centroid_bytes.len()
-        )));
-    }
-    let centroid = decode_f32_le_vec(&centroid_bytes);
+    let centroid_bytes = view_n(&mut c, dim * 4, "centroid")?;
+    let centroid = decode_f32_le_vec(centroid_bytes);
 
     let n_cells = read_u32(&mut c, "vector_summary_n_cells")? as usize;
     let mut cells = Vec::with_capacity(n_cells);
     for _ in 0..n_cells {
         let raw_cell_id = read_u32(&mut c, "vector_summary_cell_id")?;
         let block_len = read_u32(&mut c, "vector_summary_cluster_block_len")? as usize;
-        let block = read_n(&mut c, block_len, "vector_summary_cluster_block")?;
+        let block = view_n(&mut c, block_len, "vector_summary_cluster_block")?;
         cells.push(CellVectorSummary {
             cell_id: (raw_cell_id != u32::MAX).then_some(raw_cell_id),
-            clusters: decode_cluster_centroids(&block)?,
+            clusters: decode_cluster_centroids(block)?,
         });
     }
     Ok(VectorSummary { centroid, cells })
@@ -715,8 +698,8 @@ pub fn decode_fts_summary_map(bytes: &[u8]) -> Result<HashMap<String, FtsSummary
         let key = String::from_utf8(k)
             .map_err(|e| DecodeError::ArrowIpc(format!("fts key utf-8: {e}")))?;
         let vl = read_u32(&mut c, "fts_value_len")? as usize;
-        let v = read_n(&mut c, vl, "fts_value")?;
-        out.insert(key, decode_fts_summary(&v)?);
+        let v = view_n(&mut c, vl, "fts_value")?;
+        out.insert(key, decode_fts_summary(v)?);
     }
     Ok(out)
 }
@@ -749,8 +732,8 @@ pub fn decode_vector_summary_map(
         let key = String::from_utf8(k)
             .map_err(|e| DecodeError::ArrowIpc(format!("vec key utf-8: {e}")))?;
         let vl = read_u32(&mut c, "vec_value_len")? as usize;
-        let v = read_n(&mut c, vl, "vec_value")?;
-        out.insert(key, decode_vector_summary(&v)?);
+        let v = view_n(&mut c, vl, "vec_value")?;
+        out.insert(key, decode_vector_summary(v)?);
     }
     Ok(out)
 }
@@ -760,11 +743,24 @@ pub fn decode_vector_summary_map(
 // ---------------------------------------------------------
 
 fn read_u32(c: &mut Cursor<&[u8]>, what: &'static str) -> Result<u32, DecodeError> {
-    let b = read_n(c, 4, what)?;
+    let b = view_n(c, 4, what)?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 fn read_n(c: &mut Cursor<&[u8]>, n: usize, what: &'static str) -> Result<Vec<u8>, DecodeError> {
+    view_n(c, n, what).map(<[u8]>::to_vec)
+}
+
+/// Borrow the next `n` bytes from the cursor without copying. The payload
+/// decoders (centroids, bloom blocks) view the wire bytes in place and do
+/// one SIMD pass straight into their final allocation — the manifest's
+/// centroid regions are pure little-endian fp32, so decode stays a bounds
+/// check plus a cast-speed copy, never a per-element parse.
+fn view_n<'a>(
+    c: &mut Cursor<&'a [u8]>,
+    n: usize,
+    what: &'static str,
+) -> Result<&'a [u8], DecodeError> {
     let pos = c.position() as usize;
     let buf = *c.get_ref();
     if pos + n > buf.len() {
@@ -774,9 +770,8 @@ fn read_n(c: &mut Cursor<&[u8]>, n: usize, what: &'static str) -> Result<Vec<u8>
             had: buf.len().saturating_sub(pos),
         });
     }
-    let out = buf[pos..pos + n].to_vec();
     c.set_position((pos + n) as u64);
-    Ok(out)
+    Ok(&buf[pos..pos + n])
 }
 
 #[cfg(test)]
