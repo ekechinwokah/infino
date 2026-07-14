@@ -80,6 +80,7 @@ use crate::{
                 },
                 vector_exec::arg_to_query_vector,
             },
+            vector::user_placement_for_scalar_resolve,
         },
     },
 };
@@ -196,12 +197,16 @@ impl Supertable {
             .hybrid_search(text_col, q_text, mode, vec_col, q_vec, options, k)
             .map_err(|e| InfinoError::from(e).with_context("hybrid_search", None))?;
         let batch = self
-            .block_on_query(resolve_hits_named(
-                &reader,
-                &hits,
-                projection,
-                "hybrid_search",
-            ))
+            .block_on_query(async {
+                // Boundary-replica stubs carry an IVF local that does not
+                // address a Parquet row; remap to the owning placement by
+                // stable id before the scalar decode, exactly as the
+                // hybrid TVF and `vector_search` paths do.
+                let hits = user_placement_for_scalar_resolve(&reader, &hits).await?;
+                resolve_hits_named(&reader, &hits, projection, "hybrid_search")
+                    .await
+                    .map_err(|e| QueryError::Execute(e.to_string()))
+            })
             .map_err(|e| InfinoError::Query(e.to_string()).with_context("hybrid_search", None))?;
         Ok(vec![batch])
     }
@@ -475,6 +480,13 @@ impl ExecutionPlan for HybridSearchExec {
                 .hybrid_search_async(&text_col, &q_text, mode, &vec_col, &q_vec, options, k)
                 .await
                 .map_err(search_query_df_error)?;
+            // Cell-packed user hits can be boundary stubs whose IVF local
+            // does not address a Parquet row; remap those to their owning
+            // placement by stable id before the scalar decode — the same
+            // step the vector TVF takes.
+            let fused = user_placement_for_scalar_resolve(&reader, &fused)
+                .await
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             resolve_hits(
                 &reader,
                 &fused,

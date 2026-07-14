@@ -427,7 +427,14 @@ async fn read_ids_for_locals(
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.as_ref();
     let reader = dispatch::open_reader(&store, disk_cache, storage, entry).await?;
-    if allow_inline_region {
+    // The inline IVF region is usable as an `_id` source only when its rows
+    // map 1:1 to Parquet rows. Boundary-replicated user commits break that:
+    // the IVF carries stub rows beyond the Parquet count, so inline order
+    // diverges from Parquet row order and the shortcut would pair ids with
+    // the wrong locals. Hidden cells keep the shortcut — their replicas are
+    // real Parquet rows, so the counts (and orders) match.
+    let inline_is_parquet_ordered = reader.vec().is_none_or(|v| v.n_docs() == reader.n_docs());
+    if allow_inline_region && inline_is_parquet_ordered {
         // Hidden cell superfiles inline the stable `_id` in the IVF blob — resolve
         // straight from it (resident; no scalar `_id` column read) when available.
         if let Some(ids) = reader

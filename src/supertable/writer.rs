@@ -6757,15 +6757,23 @@ mod tests {
                 && cell.clusters.counts.len() == cell.clusters.n_cent as usize
                 && cell.clusters.centroids.len() == cell.clusters.n_cent as usize * dim
         }));
-        // Every indexed doc lands in exactly one cluster, so the
-        // per-cluster counts sum to the superfile's doc count.
+        // Every Parquet row lands in at least one cluster; boundary
+        // replication (on by default) may add stub copies up to the
+        // configured storage-amplification budget on top.
         let total: u64 = vs
             .cells
             .iter()
             .flat_map(|cell| cell.clusters.counts.iter())
             .map(|&count| count as u64)
             .sum();
-        assert_eq!(total, seg.n_docs);
+        assert!(total >= seg.n_docs, "counts {total} < rows {}", seg.n_docs);
+        let budget_cap = (seg.n_docs as f64
+            * f64::from(config::global().vector.drain_replica_target_factor.max(1.0)))
+        .ceil() as u64;
+        assert!(
+            total <= budget_cap,
+            "counts {total} exceed replica budget cap {budget_cap}"
+        );
     }
 
     #[test]
@@ -6812,7 +6820,23 @@ mod tests {
             .expect("decimal ids")
             .values()
             .to_vec();
-        assert_eq!(parquet_ids, vector_ids);
+        // Parquet stores each row once, in vector (cell) order. The IVF
+        // additionally carries boundary-replica stubs (replication is on by
+        // default), so the inline id stream is the parquet order plus stub
+        // duplicates: first occurrences must line up 1:1 with parquet, and
+        // every remaining inline id must duplicate some parquet row.
+        let mut seen = HashSet::new();
+        let first_occurrence: Vec<i128> = vector_ids
+            .iter()
+            .copied()
+            .filter(|id| seen.insert(*id))
+            .collect();
+        assert_eq!(parquet_ids, first_occurrence);
+        let parquet_set: HashSet<i128> = parquet_ids.iter().copied().collect();
+        assert!(
+            vector_ids.iter().all(|id| parquet_set.contains(id)),
+            "every stub must duplicate a parquet row"
+        );
     }
 
     #[test]
