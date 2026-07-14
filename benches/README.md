@@ -108,26 +108,21 @@ emulator self-cleans and reproduces request/byte volume, not network latency.
 
 ## Vector search tuning
 
-The vector benches calibrate each recall target by sweeping a probe/refine
-grid, then report a user-facing `default` row. The `default` row always
-measures the engine defaults — probe count, rerank multiplier, and codec are
-deliberately **not** env-tunable, so a leaked shell variable can never skew
-recorded numbers. Engine behavior changes belong in the config YAML
-(`vector:` section), never in the environment.
+The supertable vector benches report the user-facing `default` row, which
+always measures the engine defaults — probe count, rerank multiplier, and
+codec are deliberately **not** env-tunable, so a leaked shell variable can
+never skew recorded numbers. Engine behavior changes belong in the config
+YAML (`vector:` section), never in the environment.
 
-- `INFINO_BENCH_SKIP_CALIBRATION=1` — measure the fixed `(nprobe, rerank)`
-  `default` row without the recall-target calibration sweep or the
-  high-nprobe correctness gate. Brute-force ground truth for the
-  correctness query set (and filtered GT) is still built so default /
-  filtered recall can be reported. This is the fast path for a fixed-config
-  latency number on a many-segment table, where sweeping the full grid is
-  prohibitively slow.
-
-```sh
-# Fast fixed-config cold vector latency (no calibration sweep):
-INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SKIP_CALIBRATION=1 \
-  cargo bench -- supertable vector cold
-```
+The recall-target calibration sweep (probe/refine grid per target) is **off
+by default**: the shipped search process routes p=1 over the cell grid and
+buys recall with write-side replication plus config defaults, so there is no
+per-query nprobe/rerank surface left to tune. Default and filtered recall
+are still measured on brute-force ground truth every run. To run the legacy
+sweep for a tuning investigation, flip `RUN_CALIBRATION_GRID` in
+`benches/utils/supertable.rs` (it still auto-offs above 1M docs). The
+superfile tier keeps its calibration: single-superfile search has a real
+`nprobe` knob.
 
 ## Prepared datasets
 

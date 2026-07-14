@@ -1579,9 +1579,10 @@ pub mod vector {
         let mut rows: Vec<RecallRow> = Vec::new();
         let default_recall: Option<f32>;
         if skip_calibration {
-            // Skip-calibration mode (INFINO_BENCH_SKIP_CALIBRATION): no
-            // high-recall correctness gate, no recall-target grid — only
-            // the fixed `(default_nprobe, default_rerank)` recall sample.
+            // Skip-calibration mode (the supertable tier's default — see
+            // `RUN_CALIBRATION_GRID`): no high-recall correctness gate, no
+            // recall-target grid — only the fixed
+            // `(default_nprobe, default_rerank)` recall sample.
             if gt_correct.is_empty() {
                 // No brute-force ground truth was built (skip-calibration / no
                 // corpus). Recall is not measured — render "—", not a bogus 0.000.

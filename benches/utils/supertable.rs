@@ -1162,16 +1162,22 @@ pub mod vector {
     /// Stored rows self-queried by the post-drain assignment audit.
     const DRAIN_DIAG_SELF_QUERY_SAMPLE: usize = 500;
 
-    /// Calibration policy for supertable vector benches:
-    /// - force off when `INFINO_BENCH_SKIP_CALIBRATION=1`
-    /// - otherwise auto-off above 1M docs
-    /// - on for 1M docs or less
-    ///
-    /// Even when calibration is off we still compute default recall (and
-    /// filtered recall), we just skip the recall-target sweep.
+    /// Recall-target calibration grid — off by default. The shipped search
+    /// process routes p=1 over the cell grid and buys recall with write-side
+    /// replication plus the fine-probe/slack config defaults, so there is no
+    /// per-query nprobe/rerank surface left to tune: the sweep burned minutes
+    /// of grid queries per phase to produce rows with no real knob behind
+    /// them. Flip to `true` for legacy tuning investigations on the
+    /// pre-routing search path.
+    const RUN_CALIBRATION_GRID: bool = false;
+
+    /// Calibration policy for supertable vector benches: the grid runs only
+    /// when [`RUN_CALIBRATION_GRID`] is flipped on, and even then auto-offs
+    /// above [`exec_vec::FULL_CALIBRATION_MAX_DOCS`]. Default and filtered
+    /// recall are always computed either way — only the recall-target sweep
+    /// is skipped.
     fn skip_calibration(n_docs: usize) -> bool {
-        std::env::var_os("INFINO_BENCH_SKIP_CALIBRATION").is_some()
-            || n_docs > exec_vec::FULL_CALIBRATION_MAX_DOCS
+        !RUN_CALIBRATION_GRID || n_docs > exec_vec::FULL_CALIBRATION_MAX_DOCS
     }
 
     /// Probe count for the `default` row: the engine default, never a bench
