@@ -1136,6 +1136,72 @@ fn materialized_chunk_rows_for_dim(dim: usize) -> usize {
     (PASS2_CHUNK_MEM_BUDGET_BYTES / row_bytes).clamp(PASS2_CHUNK_ROWS_MIN, PASS2_CHUNK_ROWS_MAX)
 }
 
+/// Strided training-sample index: sample `s` of `sample_size` maps to corpus
+/// row `s·n_docs/sample_size` (identity when the sample covers the whole
+/// corpus). One definition shared by every cell-pack training sampler, so
+/// the spilled / in-RAM / fp32 feeders train fine centroids on the same rows.
+#[inline]
+fn strided_sample_index(s: usize, sample_size: usize, n_docs: usize) -> usize {
+    if sample_size == n_docs {
+        s
+    } else {
+        s * n_docs / sample_size
+    }
+}
+
+/// Payload half of one bucket record: pinned Sq8+ε bytes copied verbatim
+/// (fixed-quantizer codecs) or the fp32 row (fitted codecs, which also fold
+/// the per-cluster min/max for the later quantizer fit).
+enum BucketRecordPayload<'a> {
+    FixedSq8 {
+        codes: &'a [u8],
+        residuals: &'a [u8],
+    },
+    Fp32(&'a [f32]),
+}
+
+/// Append one bucket record (`local id ‖ RaBitQ code ‖ payload`) plus its
+/// stable-id entry, and bump the bucket count. The single owner of the
+/// bucket record layout — every feeder (spilled, in-RAM encoded, fp32) goes
+/// through here, so the streamed pack readers see one format.
+#[allow(clippy::too_many_arguments)]
+fn write_bucket_record(
+    cluster: usize,
+    local_doc_id: u32,
+    stable_id: i128,
+    rabitq_code: &[u8],
+    payload: BucketRecordPayload<'_>,
+    dim: usize,
+    bucket_writers: &mut [BufWriter<File>],
+    bucket_counts: &mut [u32],
+    stable_ids: &mut BufWriter<File>,
+    min_max: &mut Option<(&mut [f32], &mut [f32])>,
+) -> Result<(), BuildError> {
+    stable_ids.write_all(&stable_id.to_le_bytes())?;
+    let writer = &mut bucket_writers[cluster];
+    writer.write_all(&local_doc_id.to_le_bytes())?;
+    writer.write_all(rabitq_code)?;
+    match payload {
+        BucketRecordPayload::FixedSq8 { codes, residuals } => {
+            writer.write_all(codes)?;
+            writer.write_all(residuals)?;
+        }
+        BucketRecordPayload::Fp32(fp) => {
+            writer.write_all(bytemuck::cast_slice(fp))?;
+            if let Some((min, max)) = min_max.as_mut() {
+                let offset = cluster * dim;
+                update_min_max(
+                    fp,
+                    &mut min[offset..offset + dim],
+                    &mut max[offset..offset + dim],
+                );
+            }
+        }
+    }
+    bucket_counts[cluster] = bucket_counts[cluster].saturating_add(1);
+    Ok(())
+}
+
 fn sample_spilled_materialized_rows(
     spill: &SpilledCellRows,
     sample_size: usize,
@@ -1147,13 +1213,7 @@ fn sample_spilled_materialized_rows(
     let n_docs = spill.n_rows();
     let dim = spill.dim();
     let targets: Vec<usize> = (0..sample_size)
-        .map(|sample| {
-            if sample_size == n_docs {
-                sample
-            } else {
-                sample * n_docs / sample_size
-            }
-        })
+        .map(|sample| strided_sample_index(sample, sample_size, n_docs))
         .collect();
     let mut sample = vec![0.0f32; sample_size * dim];
     let mut reader = spill.reader()?;
@@ -1243,28 +1303,26 @@ fn bucket_encoded_rows_chunk(
     let mut assignments = vec![0u32; rows.len()];
     assign_to_centroids(&decoded, centroids, dim, n_cent, &mut assignments);
     for (row_idx, (row, &cluster)) in rows.iter().zip(&assignments).enumerate() {
-        let cluster = cluster as usize;
-        let local_doc_id = base_local + row_idx as u32;
-        stable_ids.write_all(&row.stable_id.to_le_bytes())?;
-        let writer = &mut bucket_writers[cluster];
-        writer.write_all(&local_doc_id.to_le_bytes())?;
-        writer.write_all(&row.rabitq_code)?;
-        if fixed {
-            writer.write_all(&row.encoded.codes)?;
-            writer.write_all(&row.encoded.residuals)?;
-        } else {
-            let fp = &decoded[row_idx * dim..(row_idx + 1) * dim];
-            writer.write_all(bytemuck::cast_slice(fp))?;
-            if let Some((min, max)) = min_max.as_mut() {
-                let offset = cluster * dim;
-                update_min_max(
-                    fp,
-                    &mut min[offset..offset + dim],
-                    &mut max[offset..offset + dim],
-                );
+        let payload = if fixed {
+            BucketRecordPayload::FixedSq8 {
+                codes: &row.encoded.codes,
+                residuals: &row.encoded.residuals,
             }
-        }
-        bucket_counts[cluster] = bucket_counts[cluster].saturating_add(1);
+        } else {
+            BucketRecordPayload::Fp32(&decoded[row_idx * dim..(row_idx + 1) * dim])
+        };
+        write_bucket_record(
+            cluster as usize,
+            base_local + row_idx as u32,
+            row.stable_id,
+            &row.rabitq_code,
+            payload,
+            dim,
+            bucket_writers,
+            bucket_counts,
+            stable_ids,
+            min_max,
+        )?;
     }
     Ok(())
 }
@@ -1417,27 +1475,25 @@ fn stream_fp32_rows_to_buckets(
                 );
         }
         for i in 0..take {
-            let cluster = assignments[i] as usize;
-            let local_doc_id = (row_base + i) as u32;
-            stable_ids.write_all(&stable_ids_in[row_base + i].to_le_bytes())?;
-            let writer = &mut bucket_writers[cluster];
-            writer.write_all(&local_doc_id.to_le_bytes())?;
-            writer.write_all(&chunk_codes[i * code_bytes..(i + 1) * code_bytes])?;
-            if fixed {
-                writer.write_all(&chunk_payload[i * dim * 2..(i + 1) * dim * 2])?;
+            let payload = if fixed {
+                let (codes, residuals) =
+                    chunk_payload[i * dim * 2..(i + 1) * dim * 2].split_at(dim);
+                BucketRecordPayload::FixedSq8 { codes, residuals }
             } else {
-                let fp = &chunk[i * dim..(i + 1) * dim];
-                writer.write_all(bytemuck::cast_slice(fp))?;
-                if let Some((min, max)) = min_max.as_mut() {
-                    let offset = cluster * dim;
-                    update_min_max(
-                        fp,
-                        &mut min[offset..offset + dim],
-                        &mut max[offset..offset + dim],
-                    );
-                }
-            }
-            bucket_counts[cluster] = bucket_counts[cluster].saturating_add(1);
+                BucketRecordPayload::Fp32(&chunk[i * dim..(i + 1) * dim])
+            };
+            write_bucket_record(
+                assignments[i] as usize,
+                (row_base + i) as u32,
+                stable_ids_in[row_base + i],
+                &chunk_codes[i * code_bytes..(i + 1) * code_bytes],
+                payload,
+                dim,
+                bucket_writers,
+                bucket_counts,
+                stable_ids,
+                &mut min_max,
+            )?;
         }
         row_base += take;
     }
@@ -1592,11 +1648,7 @@ fn sample_ram_materialized_rows(
     let n_docs = rows.len();
     let mut sample = vec![0.0f32; sample_size * dim];
     for s in 0..sample_size {
-        let idx = if sample_size == n_docs {
-            s
-        } else {
-            s * n_docs / sample_size
-        };
+        let idx = strided_sample_index(s, sample_size, n_docs);
         let enc = &rows[idx].encoded;
         dequantize_sq8_residual_into(
             &enc.scale,
@@ -1617,11 +1669,7 @@ fn sample_fp32_rows(vectors: &[f32], sample_size: usize, dim: usize) -> Vec<f32>
     let n_docs = vectors.len() / dim.max(1);
     let mut sample = vec![0.0f32; sample_size * dim];
     for s in 0..sample_size {
-        let idx = if sample_size == n_docs {
-            s
-        } else {
-            s * n_docs / sample_size
-        };
+        let idx = strided_sample_index(s, sample_size, n_docs);
         sample[s * dim..(s + 1) * dim].copy_from_slice(&vectors[idx * dim..(idx + 1) * dim]);
     }
     sample
