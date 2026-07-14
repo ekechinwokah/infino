@@ -1647,6 +1647,126 @@ pub mod vector {
             fmt_curve(&cov_routed, total),
         );
 
+        // Closure-window forensics: for every neighbor the p=1 probe misses,
+        // report the distance ratio and closure depth a replica into the
+        // query's top-1 cell would have needed — i.e. what
+        // REPLICA_CLOSURE_DISTANCE_RATIO / MAX_REPLICAS must cover to fix it.
+        for (query, truth) in queries.iter().zip(ground_truth) {
+            let probed = nearest_cell(query);
+            for id in truth {
+                let start = *id as usize * DIM;
+                if start + DIM > vectors.len() {
+                    continue;
+                }
+                if stored_by_dense
+                    .get(id)
+                    .is_some_and(|cells| cells.contains(&probed))
+                {
+                    continue;
+                }
+                let neighbor = &vectors[start..start + DIM];
+                let own = nearest_cell(neighbor);
+                let own_score = grid.score_one(metric, own as usize, neighbor);
+                let rescue_score = grid.score_one(metric, probed as usize, neighbor);
+                let needed_ratio = rescue_score / own_score.abs().max(f32::EPSILON);
+                let mut depth = 0usize;
+                for cell in 0..n_cells {
+                    let score = grid.score_one(metric, cell, neighbor);
+                    if cell as u32 != own && score < rescue_score {
+                        depth += 1;
+                    }
+                }
+                eprintln!(
+                    "[drain-diag] miss: neighbor {id} stored in cell {own}, probe hits cell {probed}; rescue needs ratio {needed_ratio:.3} at closure depth {}",
+                    depth + 1,
+                );
+            }
+        }
+
+        // Amplification price list: fraction of corpus rows with k cells
+        // inside each candidate ratio window (sampled), i.e. the storage
+        // factor each REPLICA_CLOSURE_DISTANCE_RATIO setting would buy.
+        const CLOSURE_RATIO_CANDIDATES: [f32; 3] = [1.2, 1.5, 2.0];
+        let sample_step = (n_rows / DRAIN_DIAG_SELF_QUERY_SAMPLE).max(1);
+        let sampled: Vec<usize> = (0..n_rows).step_by(sample_step).collect();
+        let copies: Vec<[usize; CLOSURE_RATIO_CANDIDATES.len()]> = sampled
+            .par_iter()
+            .map(|&row_idx| {
+                let row = &vectors[row_idx * DIM..(row_idx + 1) * DIM];
+                let mut scores: Vec<f32> = (0..n_cells)
+                    .map(|cell| grid.score_one(metric, cell, row))
+                    .collect();
+                scores
+                    .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let primary = scores[0];
+                let mut out = [0usize; CLOSURE_RATIO_CANDIDATES.len()];
+                for (i, ratio) in CLOSURE_RATIO_CANDIDATES.iter().enumerate() {
+                    let threshold = primary + primary.abs().max(f32::EPSILON) * (ratio - 1.0);
+                    out[i] = scores[1..].iter().filter(|s| **s <= threshold).count();
+                }
+                out
+            })
+            .collect();
+        let price_list = CLOSURE_RATIO_CANDIDATES
+            .iter()
+            .enumerate()
+            .map(|(i, ratio)| {
+                let extra: usize = copies.iter().map(|c| c[i]).sum();
+                format!(
+                    "ratio {ratio}: {:.2}x",
+                    1.0 + extra as f64 / copies.len().max(1) as f64
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        eprintln!(
+            "[drain-diag] unbudgeted closure amplification over {} sampled rows: {price_list}",
+            copies.len(),
+        );
+
+        // Tie-window price list for near-tie probe widening: the fraction of
+        // queries whose rank-2..4 cells fall within each slack window of the
+        // top cell. Sums to the expected probe amplification at that slack
+        // (`nprobe_min=1, nprobe_max=4`). Scale-invariant: this is query
+        // distribution vs grid geometry, independent of corpus size.
+        const TIE_SLACK_CANDIDATES: [f32; 3] = [0.02, 0.04, 0.08];
+        let mut tie_counts = [[0usize; 3]; TIE_SLACK_CANDIDATES.len()];
+        for query in queries {
+            let mut scores: Vec<f32> = (0..n_cells)
+                .map(|cell| grid.score_one(metric, cell, query))
+                .collect();
+            scores.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let top = scores[0];
+            for (si, slack) in TIE_SLACK_CANDIDATES.iter().enumerate() {
+                let threshold = top + top.abs().max(f32::EPSILON) * slack;
+                for (ri, tie_count) in tie_counts[si].iter_mut().enumerate() {
+                    if scores.get(ri + 1).is_some_and(|s| *s <= threshold) {
+                        *tie_count += 1;
+                    }
+                }
+            }
+        }
+        let tie_list = TIE_SLACK_CANDIDATES
+            .iter()
+            .enumerate()
+            .map(|(si, slack)| {
+                let extra: usize = tie_counts[si].iter().sum();
+                format!(
+                    "slack {:.0}%: rank2 {:.2} · rank3 {:.2} · rank4 {:.2} → amp {:.2}x",
+                    slack * 100.0,
+                    tie_counts[si][0] as f64 / queries.len().max(1) as f64,
+                    tie_counts[si][1] as f64 / queries.len().max(1) as f64,
+                    tie_counts[si][2] as f64 / queries.len().max(1) as f64,
+                    1.0 + extra as f64 / queries.len().max(1) as f64,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        eprintln!(
+            "[drain-diag] near-tie widening price over {} queries: {tie_list}",
+            queries.len(),
+        );
+
         // Within-cell fine-run spread: for neighbors stored in the query's
         // probed (grid-top-1) cell, rank that cell's fine centroids by query
         // distance and record the rank of the neighbor's own run. Directly
