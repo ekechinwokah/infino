@@ -266,14 +266,15 @@ const DEFAULT_VECTOR_GLOBAL_CELL_COUNT: usize = 64;
 /// base shard stays a merge candidate and absorbs later deltas rather than
 /// being sealed as over-target on the first pass.
 const DEFAULT_VECTOR_COMPACTION_TARGET_MB: u64 = 2048;
-/// Default hidden vector-index compaction min-fill: `0` disables the size leg,
-/// so a cell consolidates on the fragment-count floor alone (>= 2 inputs). Any
-/// non-zero fraction of the 2 GB target dwarfs real per-shard sizes below very
-/// large scale, so it would leave a cell's base shard and its incremental delta
-/// fragments unmerged — and each unmerged drain generation adds a fine-run cost
-/// to every query. The read-optimized hidden index wants generations collapsed
-/// whenever there are two, so the floor is off.
-const DEFAULT_VECTOR_COMPACTION_MIN_FILL_PERCENT: u8 = 0;
+/// Default hidden vector-index compaction min-fill. STOPGAP at 40%: read-side
+/// consolidation wants `0` (merge on the >= 2 fragment count alone so drain
+/// generations collapse and post-compact cold GET stays at post-drain level),
+/// but a merge triggers the post-compaction cell split, whose grid
+/// reconciliation is currently broken during a multi-job compaction pass — it
+/// leaves the hidden grid unqueryable and the query falls back to the user
+/// index. Held high so merges (and thus splits) do not fire until the
+/// split-during-compaction is fixed; revert toward 0 then.
+const DEFAULT_VECTOR_COMPACTION_MIN_FILL_PERCENT: u8 = 40;
 /// Default hidden vector-index compaction per-pass memory ceiling (MiB). Must
 /// stay >= the target or it caps the packed inputs below a full output.
 const DEFAULT_VECTOR_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_VECTOR_COMPACTION_TARGET_MB + 2048;

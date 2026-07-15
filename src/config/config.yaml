@@ -192,16 +192,17 @@ vector:
   # bytes packed into one merge pass and must stay >= the target, or the
   # target is never reached.
   #
-  # compaction_min_fill_percent = 0 disables the byte floor, so a cell
-  # consolidates on fragment count alone (the merge floor of >= 2 inputs).
-  # This tier is read-optimized: every query probes each fragment (drain
-  # generation) of a cell, so an unmerged delta permanently costs a fine-run.
-  # A non-zero floor is a fraction of the 2 GB target and would dwarf real
-  # per-shard sizes below very large scale, leaving generations unmerged — so
-  # the floor is off here (contrast the user table, which keeps an 80% floor
-  # to amortize writes on its transient data).
+  # STOPGAP: held at 40% (byte floor ~819 MB) so hidden compaction does not
+  # merge at typical scales. Read-side consolidation wants this at 0 (merge on
+  # fragment count alone, so generations collapse and post-compact cold GET
+  # stays at the post-drain level) — but a merge here triggers the
+  # post-compaction cell split, and that split's grid reconciliation is
+  # currently broken during a multi-job compaction pass (leaves the hidden
+  # grid unqueryable; the query then falls back to the user index). Until the
+  # split-during-compaction is fixed, keep merges (hence splits) from firing.
+  # Revert toward 0 once that lands.
   compaction_target_mb: 2048
-  compaction_min_fill_percent: 0
+  compaction_min_fill_percent: 40
   compaction_max_memory_mb: 4096
 
 # Diagnostic and hardware-capability toggles. Each gates
