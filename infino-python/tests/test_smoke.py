@@ -20,6 +20,8 @@ def test_package_metadata():
     assert set(infino.__all__) == {
         "connect",
         "Connection",
+        "InfinoError",
+        "ConnectionMemoryBudgetError",
         "Table",
         "IndexSpec",
         "MutationStats",
@@ -76,6 +78,36 @@ def test_connect_accepts_cache_options(tmp_path):
     t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
     t.append([{"title": "the quick brown fox"}])
     assert t.token_match("title", "fox").num_rows == 1
+
+
+def test_connection_memory_budget_admits_under_an_ample_limit():
+    # A generous heap budget must not refuse ordinary work.
+    db = infino.connect("memory://", connection_memory_budget_bytes=1 << 30)
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append(_title_batch(["the quick brown fox"]))
+    assert t.bm25_search("title", "fox", 10).num_rows == 1
+
+
+def test_connection_memory_budget_zero_is_measure_only():
+    # 0 means "measure usage, never enforce" (same as omitting it), so ordinary
+    # work is admitted rather than refused. Guards against 0 being read as a
+    # zero-byte budget that rejects everything.
+    db = infino.connect("memory://", connection_memory_budget_bytes=0)
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    t.append(_title_batch(["the quick brown fox"]))
+    assert t.bm25_search("title", "fox", 10).num_rows == 1
+
+
+def test_connection_memory_budget_over_budget_raises_typed_error():
+    # A 1-byte budget floors the enforced gate to 0, so building the appended
+    # rows crosses it. The refusal must surface as the typed
+    # ConnectionMemoryBudgetError, which (subclassing InfinoError) is also
+    # catchable by a broad `except infino.InfinoError`.
+    assert issubclass(infino.ConnectionMemoryBudgetError, infino.InfinoError)
+    db = infino.connect("memory://", connection_memory_budget_bytes=1)
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
+    with pytest.raises(infino.ConnectionMemoryBudgetError):
+        t.append(_title_batch(["the quick brown fox", "a lazy dog"]))
 
 
 def test_connect_cold_fetch_mode_is_case_insensitive():

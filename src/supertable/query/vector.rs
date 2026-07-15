@@ -76,10 +76,7 @@ use super::{SuperfileHit, candidate::CandidatePlan, dispatch, exec::common::reso
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::{
     superfile::{
-        SuperfileReader,
-        error::{ReadError, VectorError},
-        fts::reader::BoolMode,
-        vector::distance::Metric,
+        SuperfileReader, error::ReadError, fts::reader::BoolMode, vector::distance::Metric,
     },
     supertable::{
         error::QueryError,
@@ -90,17 +87,13 @@ use crate::{
 };
 
 /// Map a per-superfile vector-search error to a query error. A budget refusal
-/// (the kernel's `VectorError::OverBudget`, boxed in `ReadError::Vector`) keeps
-/// its own variant so it surfaces as the public `InfinoError::OverBudget`;
-/// anything else is a generic query error.
+/// keeps its own variant (found via `ReadError::over_budget`) so it surfaces as
+/// the public `InfinoError::OverBudget`; anything else is a generic query error.
 fn vector_read_query_error(e: ReadError) -> QueryError {
-    match e {
-        ReadError::Vector(v) => match *v {
-            VectorError::OverBudget(m) => QueryError::OverBudget(m),
-            other => QueryError::Parquet(other.to_string()),
-        },
-        other => QueryError::Parquet(other.to_string()),
+    if let Some(msg) = e.over_budget() {
+        return QueryError::OverBudget(msg.to_string());
     }
+    QueryError::Parquet(e.to_string())
 }
 
 /// An optional text-predicate filter for vector kNN search. When
@@ -769,6 +762,10 @@ impl Supertable {
     /// Single-column vector kNN search over the current snapshot,
     /// returning Arrow rows nearest-first (distance score, smaller is
     /// nearer).
+    ///
+    /// `score` is a distance (`0.0` = perfect match) — the opposite
+    /// direction from [`Supertable::bm25_search`]'s similarity. Fuse the
+    /// two with [`Supertable::hybrid_search`], not by raw score.
     ///
     /// Pins a fresh reader (applying the read-consistency policy), runs
     /// the IVF fan-out, and resolves the top-`k` nearest hits to Arrow

@@ -24,9 +24,18 @@ def connect(
     storage_options: Mapping[str, str] | None = ...,
     cache_dir: str | None = ...,
     cache_budget_bytes: int | None = ...,
+    connection_memory_budget_bytes: int | None = ...,
     cold_fetch_mode: ColdFetchMode | None = ...,
     validate: bool | None = ...,
 ) -> Connection: ...
+
+class InfinoError(Exception):
+    """Base class for infino's errors. Catch it to handle any infino failure."""
+
+class ConnectionMemoryBudgetError(InfinoError):
+    """Raised when an ingest or query would exceed the connection's memory budget
+    (set via ``connect(connection_memory_budget_bytes=...)``). Recoverable: catch
+    it and back off, e.g. narrow the query, split the ingest, or raise the budget."""
 
 class Connection:
     def create_table(self, name: str, schema: Schema, indexes: IndexSpec) -> Table: ...
