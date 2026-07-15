@@ -182,6 +182,18 @@ vector:
   # affects new tables only.
   global_cell_count: 64
 
+  # Hidden vector-index compaction (distinct from the top-level
+  # `compaction:` section, which governs the user table). A packed cell
+  # shard stays a merge candidate until it reaches compaction_target_mb,
+  # so incremental deltas are absorbed into it instead of being sealed
+  # off as separate fragments. compaction_max_memory_mb caps the input
+  # bytes packed into one merge pass and must stay >= the target, or the
+  # target is never reached. A merge fires only once the combined inputs
+  # reach compaction_min_fill_percent of the target.
+  compaction_target_mb: 2048
+  compaction_min_fill_percent: 40
+  compaction_max_memory_mb: 4096
+
 # Diagnostic and hardware-capability toggles. Each gates
 # instrumentation or forces a slower code path for A/B measurement;
 # none of them change query results. Leave everything off unless you
