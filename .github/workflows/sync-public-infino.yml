@@ -39,12 +39,14 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      # Mint an sbg-ci token: sbg-ci is the branch-protection bypass actor on
-      # main, so the sync's direct pushes skip the "require PR + 1 approval"
-      # ruleset that gates humans. Checking out with this token authenticates the
-      # `origin` remote as sbg-ci, so every `git push` below bypasses. (PR
-      # creation still uses the default GITHUB_TOKEN, which has pull-requests
-      # write; sbg-ci only has contents.)
+      # Mint an sbg-ci token, used for everything below (checkout, push, PR ops).
+      # sbg-ci is the branch-protection bypass actor on main, so the sync's direct
+      # pushes skip the "require PR + 1 approval" ruleset that gates humans;
+      # checking out with it authenticates `origin` as sbg-ci so every `git push`
+      # bypasses. It also opens the resolution PR (contents + pull-requests write)
+      # — the default GITHUB_TOKEN can't, since the org disallows Actions creating
+      # PRs. The workflow only ever *creates* a PR, never approves, so the human
+      # approval gate holds.
       - name: Mint sbg-ci token
         id: token
         uses: actions/create-github-app-token@v1
@@ -73,7 +75,7 @@ jobs:
       - name: Classify the sync
         id: plan
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
           set -euo pipefail
           # Pause while a prior conflict / CI-failure is still awaiting a human:
@@ -125,7 +127,14 @@ jobs:
         if: steps.plan.outputs.mode == 'merge'
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, llvm-tools-preview
+      # `make ci`'s coverage target runs `cargo llvm-cov`, so the plugin must be
+      # present (prebuilt binary — no from-source cargo install).
+      - name: Install cargo-llvm-cov
+        if: steps.plan.outputs.mode == 'merge'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
       - name: CI gate (make ci)
         if: steps.plan.outputs.mode == 'merge'
         id: build
@@ -143,7 +152,7 @@ jobs:
       - name: Open resolution PR and fail
         if: steps.plan.outputs.mode == 'conflict' || (steps.plan.outputs.mode == 'merge' && steps.build.outputs.ok == 'false')
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
           set -euo pipefail
           BR="${{ steps.plan.outputs.branch }}"
