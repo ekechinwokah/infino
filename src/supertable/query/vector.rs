@@ -126,14 +126,24 @@ test_visible! {
 const USER_FINE_RUNS_PER_FRAGMENT: usize = 8;
 }
 
-/// Build the fine-cluster probe set, keeping up to `keep_per_fragment` of each
-/// `(cell, fragment)`'s nearest runs, then refilling globally (best score
-/// first) toward `gated_target` postings. The per-fragment floor guarantees
-/// every superfile of a selected cell contributes to the shortlist: a cell may
-/// span multiple fragments (a base shard plus incrementally drained deltas),
-/// each an independent IVF, so a small fragment is still probed rather than
-/// crowded out by a larger sibling in the same cell. Candidates without a cell
-/// go to `scored` for the flat (non-cell) path.
+/// Build the fine-cluster probe set, then refill globally (best score first)
+/// toward `gated_target` postings. Candidates without a cell go to `scored`
+/// for the flat (non-cell) path.
+///
+/// The floor's grouping key depends on `generation_of`:
+///
+/// * `Some(birth_versions)` — the hidden drain path. A drain wave writes one
+///   packed superfile per shard, each spanning several cells, all sharing the
+///   wave's `birth_version`. Keep `keep_per_fragment` runs **per drain wave,
+///   pooled across every cell and shard that wave wrote**. A freshly drained
+///   delta wave keeps its share of the shortlist beside the large base wave,
+///   yet read volume tracks the number of drain waves — not the probed-cell
+///   count, which the older per-`(cell, superfile)` key multiplied against.
+/// * `None` — the user/pre-drain path. Keep `keep_per_fragment` per
+///   `(cell, superfile)`: an undrained cell's rows scatter across every commit
+///   fragment, so each fragment of a selected cell is probed (accepted read
+///   amplification), and a small fragment is not crowded out by a larger
+///   sibling in the same cell.
 fn gate_fine_candidates_by_fragment(
     candidates: Vec<(usize, u32, f32, Option<u32>, u64)>,
     selected: &HashSet<u32>,
@@ -142,7 +152,73 @@ fn gate_fine_candidates_by_fragment(
     gated_target: u64,
     candidate_counts: &HashMap<(usize, u32), u64>,
     scored: &mut Vec<(usize, u32, f32)>,
+    generation_of: Option<&[u64]>,
 ) -> Vec<(usize, u32, f32)> {
+    // Shared global refill: append best-scored leftovers until the shortlist
+    // holds `gated_target` postings.
+    let refill = |mut gated: Vec<(usize, u32, f32)>,
+                  mut remaining: Vec<(usize, u32, f32, u64)>|
+     -> Vec<(usize, u32, f32)> {
+        let mut postings: u64 = gated
+            .iter()
+            .map(|(si, cluster, _)| candidate_counts.get(&(*si, *cluster)).copied().unwrap_or(0))
+            .sum();
+        if postings < gated_target {
+            remaining.sort_unstable_by(|a, b| {
+                a.2.partial_cmp(&b.2)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
+            });
+            for (si, cluster, score, count) in remaining {
+                gated.push((si, cluster, score));
+                postings += count;
+                if postings >= gated_target {
+                    break;
+                }
+            }
+        }
+        gated
+    };
+    if let Some(gen_of) = generation_of {
+        // Pool a drain wave's fine runs across all its cells and shards, keyed
+        // by `birth_version`, and keep the closest `keep_per_fragment` per wave.
+        let mut fine_by_generation: HashMap<u64, Vec<(usize, u32, f32, u64)>> = HashMap::new();
+        for (si, cluster, score, cell, count) in candidates {
+            match cell {
+                Some(cell) if selected.contains(&cell) => {
+                    let generation = gen_of.get(si).copied().unwrap_or(0);
+                    fine_by_generation
+                        .entry(generation)
+                        .or_default()
+                        .push((si, cluster, score, count));
+                }
+                Some(_) => {}
+                None => scored.push((si, cluster, score)),
+            }
+        }
+        let mut gated = Vec::new();
+        let mut remaining = Vec::new();
+        let mut generations: Vec<u64> = fine_by_generation.keys().copied().collect();
+        generations.sort_unstable();
+        for generation in generations {
+            let Some(mut fine) = fine_by_generation.remove(&generation) else {
+                continue;
+            };
+            fine.sort_unstable_by(|a, b| {
+                a.2.partial_cmp(&b.2)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
+            });
+            let keep = keep_per_fragment.max(1).min(fine.len());
+            let tail = fine.split_off(keep);
+            gated.extend(
+                fine.into_iter()
+                    .map(|(si, cluster, score, _)| (si, cluster, score)),
+            );
+            remaining.extend(tail);
+        }
+        return refill(gated, remaining);
+    }
     let mut fine_by_fragment: HashMap<(u32, usize), Vec<(u32, f32, u64)>> = HashMap::new();
     for (si, cluster, score, cell, count) in candidates {
         match cell {
@@ -183,25 +259,7 @@ fn gate_fine_candidates_by_fragment(
             );
         }
     }
-    let mut postings: u64 = gated
-        .iter()
-        .map(|(si, cluster, _)| candidate_counts.get(&(*si, *cluster)).copied().unwrap_or(0))
-        .sum();
-    if postings < gated_target {
-        remaining.sort_unstable_by(|a, b| {
-            a.2.partial_cmp(&b.2)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
-        });
-        for (si, cluster, score, count) in remaining {
-            gated.push((si, cluster, score));
-            postings += count;
-            if postings >= gated_target {
-                break;
-            }
-        }
-    }
-    gated
+    refill(gated, remaining)
 }
 
 /// Rank cells by their best (minimum) fine-run score among the query's
@@ -851,6 +909,11 @@ impl SupertableReader {
             .iter()
             .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
             .collect();
+        // Drain-generation of each superfile (by fan-out index), so the hidden
+        // path can bound its fine-run budget per drain wave rather than per
+        // (cell, superfile). All superfiles a single drain commit wrote share a
+        // `birth_version`.
+        let birth_versions: Vec<u64> = superfiles.iter().map(|e| e.birth_version).collect();
         let gated_target = (k as f64
             * f64::from(config::global().vector.drain_replica_target_factor.max(1.0)))
         .ceil() as u64;
@@ -910,10 +973,11 @@ impl SupertableReader {
                     let selected_cells_ordered = union_cell_selection(&grid_cells, &fine_cells);
                     let selected_cells: HashSet<u32> =
                         selected_cells_ordered.iter().copied().collect();
-                    // Probe each fragment of the selected cell(s): after a
-                    // compaction a cell can hold a large base shard beside a
-                    // small drained-delta shard, and the delta's rows only reach
-                    // the shortlist if its fragment keeps a share of the budget.
+                    // Bound the fine-run budget per drain wave, pooled across
+                    // the cells that wave wrote: a freshly drained delta wave
+                    // keeps its share of the shortlist beside the large base
+                    // wave, while read volume stays a function of the number of
+                    // drain waves rather than the probed-cell count.
                     gated = gate_fine_candidates_by_fragment(
                         candidates,
                         &selected_cells,
@@ -922,6 +986,7 @@ impl SupertableReader {
                         gated_target,
                         &candidate_counts,
                         &mut scored,
+                        Some(&birth_versions),
                     );
                 } else {
                     // Same dual-ranking union as the hidden branch (see
@@ -983,6 +1048,7 @@ impl SupertableReader {
                         gated_target,
                         &candidate_counts,
                         &mut scored,
+                        None,
                     );
                 }
             }
@@ -2334,11 +2400,10 @@ mod tests {
         assert!(is_hidden_vector_manifest(&manifest));
     }
 
-    /// A small fragment sharing a cell with a much larger one must still be
-    /// probed: its fine runs score worse and would lose every slot under a
-    /// single global cap, so the per-fragment keep has to floor it in. Guards
-    /// the post-compaction case where a cell holds a base shard plus a small
-    /// drained-delta shard.
+    /// User path (`generation_of = None`): a small fragment sharing a cell with
+    /// a much larger one must still be probed: its fine runs score worse and
+    /// would lose every slot under a single global cap, so the per-`(cell,
+    /// fragment)` keep floors it in.
     #[test]
     fn per_fragment_keep_probes_small_fragment_in_shared_cell() {
         // Cell 0, fragment 0 (large base): three near clusters.
@@ -2364,6 +2429,7 @@ mod tests {
             1, // gated_target: tiny so the global refill can't mask the floor
             &candidate_counts,
             &mut scored,
+            None,
         );
         // The small fragment (si=1) is probed despite its worse score.
         assert!(
@@ -2371,6 +2437,92 @@ mod tests {
             "small fragment starved from the probe set: {gated:?}"
         );
         // The large fragment keeps exactly keep_per_fragment=2 of its 3 runs.
+        assert_eq!(gated.iter().filter(|(si, _, _)| *si == 0).count(), 2);
+    }
+
+    /// Hidden path (`generation_of = Some`): the fine-run keep is bounded per
+    /// drain wave, pooled across every cell that wave wrote — so probing more
+    /// cells does not multiply read volume. A single base wave packed across
+    /// two probed cells keeps only `keep_per_fragment` runs total, not
+    /// `keep_per_fragment` per cell.
+    #[test]
+    fn per_generation_keep_bounds_across_probed_cells() {
+        // One drain wave (birth_version 100), superfile 0, packed across cells
+        // 0 and 1 — three clusters in each.
+        let candidates = vec![
+            (0usize, 10u32, 0.10f32, Some(0u32), 5u64),
+            (0, 11, 0.11, Some(0), 5),
+            (0, 12, 0.12, Some(0), 5),
+            (0, 20, 0.13, Some(1), 5),
+            (0, 21, 0.14, Some(1), 5),
+            (0, 22, 0.15, Some(1), 5),
+        ];
+        let selected: HashSet<u32> = [0, 1].into_iter().collect();
+        let selected_ordered = [0u32, 1];
+        let birth_versions = [100u64];
+        let candidate_counts: HashMap<(usize, u32), u64> = candidates
+            .iter()
+            .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
+            .collect();
+        let mut scored = Vec::new();
+        let gated = gate_fine_candidates_by_fragment(
+            candidates,
+            &selected,
+            &selected_ordered,
+            2, // keep_per_fragment
+            1, // gated_target: tiny so the global refill can't mask the floor
+            &candidate_counts,
+            &mut scored,
+            Some(&birth_versions),
+        );
+        // Bounded per wave across both cells: 2 total, not 2 per cell (=4).
+        assert_eq!(
+            gated.len(),
+            2,
+            "per-wave keep multiplied by cells: {gated:?}"
+        );
+        // The two globally-best runs win the slots, regardless of cell.
+        let kept: HashSet<u32> = gated.iter().map(|(_, c, _)| *c).collect();
+        assert_eq!(kept, [10u32, 11].into_iter().collect());
+    }
+
+    /// Hidden path: a freshly drained delta wave sharing a cell with a large
+    /// base wave still keeps its share — the per-wave floor protects it, the
+    /// same invariant the user path relies on but keyed by `birth_version`.
+    #[test]
+    fn per_generation_keep_probes_small_delta_wave() {
+        // Base wave (birth_version 100), superfile 0, cell 0: three near runs.
+        // Delta wave (birth_version 200), superfile 1, cell 0: one farther run.
+        let candidates = vec![
+            (0usize, 10u32, 0.10f32, Some(0u32), 5u64),
+            (0, 11, 0.11, Some(0), 5),
+            (0, 12, 0.12, Some(0), 5),
+            (1, 20, 0.30, Some(0), 5),
+        ];
+        let selected: HashSet<u32> = [0].into_iter().collect();
+        let selected_ordered = [0u32];
+        let birth_versions = [100u64, 200];
+        let candidate_counts: HashMap<(usize, u32), u64> = candidates
+            .iter()
+            .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
+            .collect();
+        let mut scored = Vec::new();
+        let gated = gate_fine_candidates_by_fragment(
+            candidates,
+            &selected,
+            &selected_ordered,
+            2, // keep_per_fragment
+            1, // gated_target
+            &candidate_counts,
+            &mut scored,
+            Some(&birth_versions),
+        );
+        // The delta wave (si=1) is probed despite its worse score.
+        assert!(
+            gated.iter().any(|(si, _, _)| *si == 1),
+            "small delta wave starved from the probe set: {gated:?}"
+        );
+        // The base wave keeps exactly keep_per_fragment=2 of its 3 runs.
         assert_eq!(gated.iter().filter(|(si, _, _)| *si == 0).count(), 2);
     }
 
