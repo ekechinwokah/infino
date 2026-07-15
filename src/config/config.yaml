@@ -144,7 +144,15 @@ vector:
 
   # Doc count above which a merged cell superfile is split into two
   # sub-cells during hidden-index maintenance.
-  cell_split_doc_cap: 50000
+  #
+  # STOPGAP: set very high to DISABLE the split. It currently routes the
+  # extracted rows into the retired INCOMING staging cell — which nothing
+  # reads or drains anymore — stranding them and leaving the hidden index
+  # unqueryable, so the query falls back to the user index. Disabled until the
+  # split is reworked to re-cluster the extracted rows into the new sub-cells
+  # inline; restore to ~50000 then. Recall is unaffected at current scales
+  # (cells just stay coarser).
+  cell_split_doc_cap: 100000000
 
   # How user-superfile clusters align to the global cell grid:
   #   local  — per-superfile k-means (default).
@@ -192,17 +200,14 @@ vector:
   # bytes packed into one merge pass and must stay >= the target, or the
   # target is never reached.
   #
-  # STOPGAP: held at 40% (byte floor ~819 MB) so hidden compaction does not
-  # merge at typical scales. Read-side consolidation wants this at 0 (merge on
-  # fragment count alone, so generations collapse and post-compact cold GET
-  # stays at the post-drain level) — but a merge here triggers the
-  # post-compaction cell split, and that split's grid reconciliation is
-  # currently broken during a multi-job compaction pass (leaves the hidden
-  # grid unqueryable; the query then falls back to the user index). Until the
-  # split-during-compaction is fixed, keep merges (hence splits) from firing.
-  # Revert toward 0 once that lands.
+  # 0 disables the byte floor, so a cell consolidates on fragment count alone
+  # (the >= 2 merge floor): drain generations collapse and post-compact cold
+  # GET stays at the post-drain level. This is safe now that the post-compaction
+  # cell split is disabled (see cell_split_doc_cap) — merging no longer triggers
+  # the broken split path. Contrast the user table, which keeps an 80% floor to
+  # amortize writes on its transient data.
   compaction_target_mb: 2048
-  compaction_min_fill_percent: 40
+  compaction_min_fill_percent: 0
   compaction_max_memory_mb: 4096
 
 # Diagnostic and hardware-capability toggles. Each gates
