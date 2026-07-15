@@ -204,6 +204,60 @@ fn gate_fine_candidates_by_fragment(
     gated
 }
 
+/// Rank cells by their best (minimum) fine-run score among the query's
+/// candidates — the fine-centroid cell ranking. Ascending score, ties broken
+/// by lower cell id; cells with no candidate fine run are absent (they hold
+/// no committed rows for this query's fan-out and cannot be probed anyway).
+fn cells_ranked_by_fine_score(
+    candidates: &[(usize, u32, f32, Option<u32>, u64)],
+) -> Vec<(u32, f32)> {
+    let mut best: HashMap<u32, f32> = HashMap::new();
+    for &(_, _, score, cell, _) in candidates {
+        if let Some(cell) = cell {
+            best.entry(cell)
+                .and_modify(|s| *s = s.min(score))
+                .or_insert(score);
+        }
+    }
+    let mut ranked: Vec<(u32, f32)> = best.into_iter().collect();
+    ranked.sort_unstable_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    ranked
+}
+
+/// Minimum fine-ranked picks in the union cell selection — HIDDEN table
+/// only (the user branch's fine side matches its grid cutoff). The fine
+/// ranking's second pick is what closes the last coverage gap at scale —
+/// measured at 10M/64c: fine p1 coverage 0.919 (union recall landed exactly
+/// on it at 0.921) vs fine p2 coverage 0.997. An explicit caller probe width
+/// larger than this takes precedence.
+const UNION_FINE_PICKS_MIN: usize = 2;
+
+/// Union of the grid-ranked and fine-ranked cell selections, in probe
+/// priority order: grid picks first, then fine picks not already selected.
+///
+/// The two rankings fail in opposite regimes, so probing their union holds
+/// the coverage floor at every measured scale. Small cells (100K/64c: ~1.5K
+/// rows, ~3 fine runs each) make fine centroids noisy — grid ranking wins
+/// (measured neighbor coverage 0.950 grid vs 0.700 fine). Large cells
+/// (10M/64c: ~230K rows, ~250 fine runs each) make the single grid centroid
+/// a poor proxy for the cell's extent — fine ranking wins (0.919 fine vs
+/// 0.629 grid; fine p2 = 0.997). Grid-only p=1 routing pinned 10M recall to
+/// the 0.63 ceiling; the union restores the better ranking at each scale for
+/// at most one extra probed cell per pick.
+fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
+    let mut selected: Vec<u32> = Vec::with_capacity(grid.len() + fine.len());
+    for &cell in grid.iter().chain(fine) {
+        if !selected.contains(&cell) {
+            selected.push(cell);
+        }
+    }
+    selected
+}
+
 /// Map a per-superfile vector-search error to a query error. A budget refusal
 /// keeps its own variant (found via `ReadError::over_budget`) so it surfaces as
 /// the public `InfinoError::OverBudget`; anything else is a generic query error.
@@ -812,19 +866,15 @@ impl SupertableReader {
                 }
                 if hidden_vector_index {
                     let routing = hidden_routing.expect("hidden manifest carries routing");
-                    // Rank the cell cutoff by the SAME grid centroids the drain
-                    // assigns rows against, not by each cell's best fine
-                    // centroid: rows live in their grid-Voronoi cell, and near
-                    // a boundary a neighboring cell's edge cluster commonly
-                    // out-scores the owning cell's fine centroids. At
-                    // nprobe_max=1 that mis-pick forfeits the query's true
-                    // neighbors entirely (measured at 100K: 0.950 neighbor
-                    // coverage grid-ranked vs 0.700 fine-ranked — recall
-                    // followed the fine-ranked curve exactly). Fine centroids
-                    // still rank the within-cell probe below; cells absent
-                    // from the candidate set (no committed superfiles) are
-                    // skipped. No fallback ranking: a hidden manifest without
-                    // its cell grid is malformed and errors loudly.
+                    // Dual cell ranking, probed as a union (see
+                    // [`union_cell_selection`] for the measured scale
+                    // inversion): the grid ranking scores the SAME centroids
+                    // the drain assigns rows against; the fine ranking scores
+                    // each cell's best fine centroid from the candidate set.
+                    // Cells absent from the candidate set (no committed
+                    // superfiles) are skipped. No fallback ranking: a hidden
+                    // manifest without its cell grid is malformed and errors
+                    // loudly.
                     let ranked_hidden: Vec<(u32, f32)> = ranked_cells_scored
                         .as_ref()
                         .ok_or_else(|| {
@@ -847,10 +897,17 @@ impl SupertableReader {
                         ));
                     }
                     let cutoff = grid_cell_cutoff(&ranked_hidden, &routing);
-                    let selected_cells_ordered: Vec<u32> = ranked_hidden[..cutoff]
+                    let grid_cells: Vec<u32> = ranked_hidden[..cutoff]
                         .iter()
                         .map(|(cell, _)| *cell)
                         .collect();
+                    let fine_ranked = cells_ranked_by_fine_score(&candidates);
+                    let fine_cells: Vec<u32> = fine_ranked
+                        .iter()
+                        .take(cutoff.max(UNION_FINE_PICKS_MIN))
+                        .map(|(cell, _)| *cell)
+                        .collect();
+                    let selected_cells_ordered = union_cell_selection(&grid_cells, &fine_cells);
                     let selected_cells: HashSet<u32> =
                         selected_cells_ordered.iter().copied().collect();
                     // Probe each fragment of the selected cell(s): after a
@@ -867,16 +924,16 @@ impl SupertableReader {
                         &mut scored,
                     );
                 } else {
-                    // Same cell routing as the hidden index: probe the single
-                    // grid-nearest cell by default (bounded default, slack
-                    // widening on near-ties); an explicit caller `nprobe` (and
-                    // the filtered path's boosted probe) pins min == max. The
-                    // difference from the hidden path is physical, not policy:
-                    // an undrained cell's rows are scattered across every
-                    // commit fragment, so within each selected cell EVERY
-                    // fragment holding that cell is probed — accepted read
-                    // amplification — keeping the closest
-                    // `USER_FINE_RUNS_PER_FRAGMENT` fine runs per fragment.
+                    // Same dual-ranking union as the hidden branch (see
+                    // [`union_cell_selection`]); an explicit caller `nprobe`
+                    // (and the filtered path's boosted probe) pins the
+                    // per-ranking cutoff min == max. The difference from the
+                    // hidden path is physical, not policy: an undrained
+                    // cell's rows are scattered across every commit fragment,
+                    // so within each selected cell EVERY fragment holding
+                    // that cell is probed — accepted read amplification —
+                    // keeping the closest `USER_FINE_RUNS_PER_FRAGMENT` fine
+                    // runs per fragment.
                     let user_routing = if filtered || options.nprobe.is_some() {
                         CellRoutingParams {
                             nprobe_min: nprobe.max(1),
@@ -889,23 +946,39 @@ impl SupertableReader {
                     let ranked_scored = ranked_cells_scored
                         .as_ref()
                         .expect("scored cell ranking exists whenever ranked_cells does");
-                    let mut cutoff = grid_cell_cutoff(ranked_scored, &user_routing);
+                    let cutoff = grid_cell_cutoff(ranked_scored, &user_routing);
+                    let grid_cells: Vec<u32> = ranked[..cutoff].to_vec();
+                    // User space: fine side matches the grid cutoff (no extra
+                    // pick — the deeper fine reach is hidden-table only).
+                    let fine_ranked = cells_ranked_by_fine_score(&candidates);
+                    let fine_cells: Vec<u32> = fine_ranked
+                        .iter()
+                        .take(cutoff)
+                        .map(|(cell, _)| *cell)
+                        .collect();
+                    let mut selected_cells = union_cell_selection(&grid_cells, &fine_cells);
                     // Widen past the routed cells only if they cannot fill
-                    // top-k (tiny tables, heavily deleted cells).
-                    let mut covered: u64 = ranked[..cutoff]
+                    // top-k (tiny tables, heavily deleted cells): append
+                    // grid-ranked cells not already selected by the union.
+                    let mut covered: u64 = selected_cells
                         .iter()
                         .map(|cell| postings_by_cell.get(cell).copied().unwrap_or(0))
                         .sum();
-                    while cutoff < ranked.len() && covered < gated_target {
-                        covered += postings_by_cell.get(&ranked[cutoff]).copied().unwrap_or(0);
-                        cutoff += 1;
+                    for cell in ranked.iter().copied() {
+                        if covered >= gated_target {
+                            break;
+                        }
+                        if selected_cells.contains(&cell) {
+                            continue;
+                        }
+                        covered += postings_by_cell.get(&cell).copied().unwrap_or(0);
+                        selected_cells.push(cell);
                     }
-                    let selected_cells = &ranked[..cutoff];
                     let selected: HashSet<u32> = selected_cells.iter().copied().collect();
                     gated = gate_fine_candidates_by_fragment(
                         candidates,
                         &selected,
-                        selected_cells,
+                        &selected_cells,
                         USER_FINE_RUNS_PER_FRAGMENT,
                         gated_target,
                         &candidate_counts,
@@ -2180,8 +2253,9 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        VectorFilter, VectorSearchOptions, gate_fine_candidates_by_fragment,
-        is_hidden_vector_manifest, vector_read_query_error,
+        VectorFilter, VectorSearchOptions, cells_ranked_by_fine_score,
+        gate_fine_candidates_by_fragment, is_hidden_vector_manifest, union_cell_selection,
+        vector_read_query_error,
     };
     use crate::{
         InfinoError,
@@ -2209,6 +2283,36 @@ mod tests {
             .build()
             .expect("test runtime")
             .block_on(fut)
+    }
+
+    /// Fine ranking takes each cell's best (minimum) candidate score,
+    /// sorts ascending with lower-id tie-break, and ignores untagged
+    /// (legacy, `None`-cell) candidates.
+    #[test]
+    fn cells_ranked_by_fine_score_takes_min_per_cell_in_order() {
+        let candidates: Vec<(usize, u32, f32, Option<u32>, u64)> = vec![
+            (0, 0, 0.9, Some(7), 10),
+            (0, 1, 0.2, Some(7), 10),  // cell 7 best = 0.2
+            (1, 2, 0.5, Some(3), 10),  // cell 3 best = 0.5
+            (1, 3, 0.5, Some(2), 10),  // cell 2 ties cell 3 → lower id first
+            (0, 4, 0.1, None, 10),     // untagged: ignored
+        ];
+        let ranked = cells_ranked_by_fine_score(&candidates);
+        assert_eq!(ranked.len(), 3);
+        assert_eq!(ranked[0], (7, 0.2));
+        assert_eq!(ranked[1].0, 2, "score tie broken by lower cell id");
+        assert_eq!(ranked[2].0, 3);
+    }
+
+    /// Union keeps grid picks first (probe priority), appends fine picks
+    /// not already selected, and collapses to one cell when both rankings
+    /// agree.
+    #[test]
+    fn union_cell_selection_dedups_with_grid_priority() {
+        assert_eq!(union_cell_selection(&[4], &[9]), vec![4, 9]);
+        assert_eq!(union_cell_selection(&[4], &[4]), vec![4]);
+        assert_eq!(union_cell_selection(&[4, 9], &[9, 1]), vec![4, 9, 1]);
+        assert_eq!(union_cell_selection(&[], &[2]), vec![2]);
     }
 
     #[test]
