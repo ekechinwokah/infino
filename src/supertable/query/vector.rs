@@ -1962,6 +1962,16 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let Some(vit) = self.vector_index_table() else {
+            // A configured+materialized hidden index that failed to open is
+            // present-but-broken: fail loud rather than silently brute-scanning
+            // the user table (which would hide corruption and, if drained rows
+            // were ever reclaimed, return incomplete results). A genuinely absent
+            // index (never configured, or pre-first-drain) falls back.
+            if let Some(reason) = self.hidden_index_open_error() {
+                return Err(QueryError::Execute(format!(
+                    "hidden vector index present but failed to open: {reason}"
+                )));
+            }
             return self
                 .vector_search_user_table_async(column, query, k, options)
                 .await;

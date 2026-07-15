@@ -35,9 +35,6 @@ use crate::{
     supertable::manifest::ClusterCentroids,
 };
 
-/// Lloyd iterations for 2-way Sq8+ε k-means at split time.
-const CELL_SPLIT_KMEANS_ITERS: usize = 5;
-
 /// Overflow threshold for cell split (OPANN step 7). Sourced from
 /// `vector.cell_split_doc_cap`.
 pub(crate) fn cell_split_doc_cap() -> u64 {
@@ -273,72 +270,108 @@ fn medoid_index(metric: Metric, shard: &[EncodedCellRow]) -> usize {
 
 /// 2-way Lloyd k-means on Sq8+ε overflow rows. Returns manifest centroid
 /// components (dim each) for the two sub-cells.
+/// Plan a binary split of `split_cell`: returns the two sub-cell centroids and,
+/// aligned to `rows`, a `0/1` assignment of each row to sub-cell 0 / sub-cell 1
+/// (reconciled with the empty-shard fixups, so it exactly matches the two
+/// shards the centroids were derived from). The caller routes the cell's
+/// materialized rows into the two sub-cells by this assignment.
+/// The two diameter endpoints of `split_cell`'s rows: `seed1` is the row
+/// farthest from the cell's existing centroid (an extreme edge point); `seed0`
+/// is the row farthest from `seed1` (the opposite edge). The `seed0 → seed1`
+/// line is the axis the split bisects along. Picking closest-to-centroid vs
+/// farthest instead would seed a radius (center + edge), peeling a thin shell
+/// off the dense core.
+fn pick_split_seeds(
+    rows: &[EncodedCellRow],
+    clusters: &ClusterCentroids,
+    split_cell: usize,
+    metric: Metric,
+) -> (usize, usize) {
+    let seed1 = rows
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| {
+            score_row_against_cell(clusters, metric, split_cell, a)
+                .partial_cmp(&score_row_against_cell(clusters, metric, split_cell, b))
+                .unwrap_or(Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let cent1 = centroid_prototype_from_row(clusters, &rows[seed1]);
+    let seed0 = rows
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| {
+            score_row_against_cell(&cent1, metric, 0, a)
+                .partial_cmp(&score_row_against_cell(&cent1, metric, 0, b))
+                .unwrap_or(Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    (seed0, seed1)
+}
+
+/// Dequantize one Sq8+ε residual row to fp32.
+fn dequantize_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
+    let mut out = vec![0f32; dim];
+    dequantize_sq8_residual_into(
+        &row.scale,
+        &row.offset,
+        &row.codes,
+        &row.residuals,
+        row.rerank_codec
+            .residual_divisor()
+            .expect("encoded row uses residual-family codec"),
+        &mut out,
+    );
+    out
+}
+
 pub(crate) fn plan_sq8_split(
     rows: &[EncodedCellRow],
     clusters: &ClusterCentroids,
     split_cell: u32,
     metric: Metric,
-) -> (Vec<f32>, Vec<f32>) {
+) -> (Vec<f32>, Vec<f32>, Vec<u8>) {
     let dim = clusters.dim as usize;
     let p = split_cell as usize;
-
-    let seed0 = rows
-        .iter()
-        .enumerate()
-        .min_by(|(_, a), (_, b)| {
-            score_row_against_cell(clusters, metric, p, a)
-                .partial_cmp(&score_row_against_cell(clusters, metric, p, b))
-                .unwrap_or(Ordering::Equal)
-        })
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    let seed1 = rows
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| {
-            score_row_against_cell(clusters, metric, p, a)
-                .partial_cmp(&score_row_against_cell(clusters, metric, p, b))
-                .unwrap_or(Ordering::Equal)
-        })
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-
-    let mut cent0 = centroid_prototype_from_row(clusters, &rows[seed0]);
-    let mut cent1 = centroid_prototype_from_row(clusters, &rows[seed1]);
-
     let mut assign = vec![0u8; rows.len()];
-    for _ in 0..CELL_SPLIT_KMEANS_ITERS {
-        for (i, row) in rows.iter().enumerate() {
-            let d0 = score_row_against_cell(&cent0, metric, 0, row);
-            let d1 = score_row_against_cell(&cent1, metric, 0, row);
-            assign[i] = u8::from(d1 < d0);
-        }
-        let mut shard0 = Vec::new();
-        let mut shard1 = Vec::new();
-        for (i, row) in rows.iter().enumerate() {
-            if assign[i] == 0 {
-                shard0.push(row.clone());
-            } else {
-                shard1.push(row.clone());
-            }
-        }
-        if shard0.is_empty() || shard1.is_empty() {
-            break;
-        }
-        let m0 = medoid_index(metric, &shard0);
-        let m1 = medoid_index(metric, &shard1);
-        cent0 = centroid_prototype_from_row(clusters, &shard0[m0]);
-        cent1 = centroid_prototype_from_row(clusters, &shard1[m1]);
+    if rows.len() < 2 {
+        // Caller guards on MIN_ROWS_TO_SPLIT_CELL; stay defensive so a degenerate
+        // input can't panic in medoid_index on an empty shard.
+        let c = manifest_centroid_components_from_row(&rows[0], dim);
+        return (c.clone(), c, assign);
     }
 
-    // Re-assign against the converged centroids: the loop's last `assign` pass
-    // ran against the *previous* iteration's centroids (cent0/cent1 are updated
-    // after it), so the final shards must reflect one more assignment pass.
-    for (i, row) in rows.iter().enumerate() {
-        let d0 = score_row_against_cell(&cent0, metric, 0, row);
-        let d1 = score_row_against_cell(&cent1, metric, 0, row);
-        assign[i] = u8::from(d1 < d0);
+    // Bisect along a DIAMETER of the cell: project every row onto the `seed0 →
+    // seed1` axis and split at the MEDIAN. This makes the two sub-cells equal-
+    // sized (±1) regardless of density, so any cell up to 2× the cap converges
+    // in a single pass. A nearest-seed (k-means) assignment instead lets the
+    // dense bulk fall to whichever seed it is closer to — lopsided in high
+    // dimensions, where the two farthest points are outliers and the bulk favors
+    // one — leaving sub-cells over-cap that re-split for several passes. The flat
+    // median cut costs no recall: per-sub-cell fine re-clustering downstream
+    // restores intra-cell routing.
+    let (seed0, seed1) = pick_split_seeds(rows, clusters, p, metric);
+    let v0 = dequantize_row(&rows[seed0], dim);
+    let v1 = dequantize_row(&rows[seed1], dim);
+    let axis: Vec<f32> = (0..dim).map(|d| v1[d] - v0[d]).collect();
+
+    let mut proj: Vec<(usize, f32)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let rv = dequantize_row(row, dim);
+            let s: f32 = (0..dim).map(|d| rv[d] * axis[d]).sum();
+            (i, s)
+        })
+        .collect();
+    proj.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    let mid = rows.len() / 2;
+    for (rank, (i, _)) in proj.iter().enumerate() {
+        assign[*i] = u8::from(rank >= mid);
     }
+
     let mut shard0 = Vec::new();
     let mut shard1 = Vec::new();
     for (i, row) in rows.iter().enumerate() {
@@ -348,20 +381,13 @@ pub(crate) fn plan_sq8_split(
             shard1.push(row.clone());
         }
     }
-    if shard1.is_empty() {
-        shard1.push(rows[seed1].clone());
-        shard0.retain(|r| r.stable_id != rows[seed1].stable_id);
-    }
-    if shard0.is_empty() {
-        shard0.push(rows[seed0].clone());
-        shard1.retain(|r| r.stable_id != rows[seed0].stable_id);
-    }
 
     let m0 = medoid_index(metric, &shard0);
     let m1 = medoid_index(metric, &shard1);
     (
         manifest_centroid_components_from_row(&shard0[m0], dim),
         manifest_centroid_components_from_row(&shard1[m1], dim),
+        assign,
     )
 }
 
@@ -384,40 +410,14 @@ pub(crate) fn insert_split_centroid(
     fp32[p * dim..(p + 1) * dim].copy_from_slice(&sub_centroids[..dim]);
     fp32[old_n * dim..new_n * dim].copy_from_slice(&sub_centroids[dim..2 * dim]);
 
-    let counts = base.counts.clone();
+    // Counts must have one entry per cell: grow to `new_n` so the split cell and
+    // the new sub-cell both have a slot. Cloning `base.counts` alone leaves it at
+    // `old_n`, which silently passes in-memory but truncates the wire encoding
+    // (counts and centroids are adjacent) → the grid fails to reopen from storage.
+    let mut counts = base.counts.clone();
+    counts.resize(new_n, 0);
     let updated = ClusterCentroids::from_fp32(new_n as u32, base.dim, &fp32, counts);
     (updated, new_cell_id)
-}
-
-/// Neighbor cells touched by a split of `split_cell`: P−1, P, the new sub-cell, P+1.
-pub(crate) fn reassign_neighborhood(
-    split_cell: u32,
-    old_n_cent: u32,
-    new_cell_id: u32,
-) -> Vec<u32> {
-    let mut ids = Vec::new();
-    if split_cell > 0 {
-        ids.push(split_cell - 1);
-    }
-    ids.push(split_cell);
-    ids.push(new_cell_id);
-    if split_cell + 1 < old_n_cent {
-        ids.push(split_cell + 1);
-    }
-    ids.sort_unstable();
-    ids.dedup();
-    ids
-}
-
-/// Clear per-cell counts when superfiles for those cells are removed and
-/// rows are redriven through the incoming staging region.
-pub(crate) fn zero_cell_counts(clusters: &mut ClusterCentroids, cells: &[u32]) {
-    for &cell in cells {
-        let c = cell as usize;
-        if c < clusters.counts.len() {
-            clusters.counts[c] = 0;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -521,13 +521,18 @@ mod tests {
         let (updated, new_id) = insert_split_centroid(&base, 2, &sub);
         assert_eq!(new_id, 4);
         assert_eq!(updated.n_cent, 5);
+        // Counts and centroids must both match n_cent, or the wire encoding
+        // (counts adjacent to centroids) truncates and the grid fails to reopen.
+        assert_eq!(updated.counts.len(), 5);
+        assert_eq!(updated.centroids.len(), 5 * base.dim as usize);
+        // Round-trips through the manifest wire format cleanly.
+        let bytes = crate::supertable::manifest::encoding::encode_cluster_centroids(&updated);
+        let decoded = crate::supertable::manifest::encoding::decode_cluster_centroids(&bytes)
+            .expect("split grid must reopen from wire bytes");
+        assert_eq!(decoded.n_cent, 5);
+        assert_eq!(decoded.centroids.len(), 5 * base.dim as usize);
     }
 
-    #[test]
-    fn reassign_neighborhood_includes_neighbors_and_new_cell() {
-        let ids = reassign_neighborhood(3, 8, 8);
-        assert_eq!(ids, vec![2, 3, 4, 8]);
-    }
 
     #[test]
     fn plan_sq8_split_separates_two_blobs() {
@@ -535,11 +540,18 @@ mod tests {
         let mut rows = synth_rows(dim, 10, 0.0);
         rows.extend(synth_rows(dim, 10, 10.0));
         let clusters = synth_centroids(4, dim as u32);
-        let (c0, c1) = plan_sq8_split(&rows, &clusters, 1, Metric::L2Sq);
+        let (c0, c1, assign) = plan_sq8_split(&rows, &clusters, 1, Metric::L2Sq);
         assert_eq!(c0.len(), dim);
         assert_eq!(c1.len(), dim);
         let dist: f32 = (0..dim).map(|d| (c0[d] - c1[d]).abs()).sum();
         assert!(dist > 1.0, "split centroids should separate, got {dist}");
+        // Assignment is aligned to `rows` and routes each row to one sub-cell;
+        // the two well-separated blobs land on opposite sides.
+        assert_eq!(assign.len(), rows.len());
+        assert_ne!(
+            assign[0], assign[rows.len() - 1],
+            "the two separated blobs should split across sub-cells"
+        );
     }
 
     #[test]
@@ -552,7 +564,7 @@ mod tests {
             .map(|row| (row.codes.clone(), row.residuals.clone()))
             .collect();
         let clusters = synth_centroids(4, dim as u32);
-        let (left, right) = plan_sq8_split(&rows, &clusters, 1, Metric::Cosine);
+        let (left, right, _assign) = plan_sq8_split(&rows, &clusters, 1, Metric::Cosine);
         let separation: f32 = left.iter().zip(&right).map(|(a, b)| (a - b).abs()).sum();
         assert!(separation > 1.0);
         let after: Vec<(Vec<u8>, Vec<u8>)> = rows
@@ -560,5 +572,44 @@ mod tests {
             .map(|row| (row.codes.clone(), row.residuals.clone()))
             .collect();
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn pick_split_seeds_returns_diameter_endpoints() {
+        let dim = 4usize;
+        // 20 rows evenly spaced along a line (row i ≈ 0.01·i per dim), centroid
+        // pinned at the line's middle. The two farthest-apart rows are the
+        // endpoints (0 and 19) — NOT the middle row a closest-to-centroid seed
+        // would pick — so the returned pair must be {0, 19}.
+        let rows = synth_rows(dim, 20, 0.0);
+        let mid = vec![0.095f32, 0.096, 0.097, 0.098];
+        let clusters = ClusterCentroids::from_fp32(1, dim as u32, &mid, vec![rows.len() as u32]);
+        let (seed0, seed1) = pick_split_seeds(&rows, &clusters, 0, Metric::L2Sq);
+        let mut ends = [seed0, seed1];
+        ends.sort_unstable();
+        assert_eq!(
+            ends,
+            [0, rows.len() - 1],
+            "seeds must be the diameter endpoints, got {ends:?}"
+        );
+    }
+
+    #[test]
+    fn plan_sq8_split_median_cut_balances_skewed_cell() {
+        let dim = 4usize;
+        // A dense core (16 rows near origin) plus a far sparse tail (4 rows). A
+        // nearest-seed split would peel the 4 tail rows off (16/4); the median cut
+        // splits by count regardless of density, so the halves come out ~10/10.
+        let mut rows = synth_rows(dim, 16, 0.0);
+        rows.extend(synth_rows(dim, 4, 50.0));
+        let clusters =
+            ClusterCentroids::from_fp32(1, dim as u32, &vec![0.0f32; dim], vec![rows.len() as u32]);
+        let (_c0, _c1, assign) = plan_sq8_split(&rows, &clusters, 0, Metric::L2Sq);
+        let ones = assign.iter().filter(|&&a| a == 1).count();
+        let zeros = assign.len() - ones;
+        assert!(
+            (ones as i64 - zeros as i64).abs() <= 1,
+            "median cut must balance the split, got {zeros} vs {ones}"
+        );
     }
 }

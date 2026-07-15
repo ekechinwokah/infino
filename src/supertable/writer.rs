@@ -3813,26 +3813,6 @@ async fn cell_doc_counts_for_entry(
     }
 }
 
-/// Build one Sq8 IVF superfile via the normal superfile/vector builder.
-fn build_prepared_ivf_from_materialized(
-    inner: &SupertableInner,
-    partition_hint: u32,
-    rows: Vec<MaterializedIvfRow>,
-) -> Result<PreparedSuperfile, BuildError> {
-    if rows.is_empty() {
-        return Err(BuildError::NoDocsToBuild);
-    }
-    let shard = build_one_shard_from_materialized(&rows, &inner.options, VectorLayout::Ivf)?;
-    let prepared = prepare_superfile(inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
-    let entry = finish_superfile_entry(prepared.entry, Some(partition_hint))?;
-    Ok(PreparedSuperfile {
-        entry,
-        bytes_for_store: prepared.bytes_for_store,
-        bytes_for_storage: prepared.bytes_for_storage,
-        bytes_for_cache: prepared.bytes_for_cache,
-    })
-}
-
 /// Coarse current RSS in MiB from `/proc/self/status` (Linux); `None` elsewhere
 /// or on parse failure. Drain instrumentation only — not a hot path.
 fn proc_rss_mib() -> Option<f64> {
@@ -4846,58 +4826,20 @@ fn build_shard_parquet_and_fts(
     Ok((builder, id_min, id_max, n_docs, scalar_stats))
 }
 
-/// Same as [`build_one_shard_with_layout`] but feeds Sq8+ε materialized IVF rows
-/// into the normal vector builder — no fp32 corpus decode.
-fn build_one_shard_from_materialized(
-    rows: &[MaterializedIvfRow],
-    options: &SupertableOptions,
-    vector_layout: crate::superfile::vector::layout::VectorLayout,
-) -> Result<ShardOutput, BuildError> {
-    let id_array = Decimal128Array::from_iter_values(rows.iter().map(|r| r.stable_id))
-        .with_precision_and_scale(
-            crate::supertable::options::DECIMAL128_PRECISION,
-            crate::supertable::options::DECIMAL128_SCALE,
-        )
-        .expect("invariant: precision 38 + scale 0 always valid for any i128 payload");
-    let scalar = RecordBatch::try_new(
-        options.scalar_schema(),
-        vec![Arc::new(id_array) as ArrayRef],
-    )
-    .map_err(|_| BuildError::BatchSchemaMismatch)?;
-
-    let mut builder =
-        SuperfileBuilder::new(options.builder_options().with_vector_layout(vector_layout))?;
-    builder.add_batch_ids_only(&scalar)?;
-    builder.load_materialized_ivf_rows(rows.to_vec())?;
-
-    let id_min = rows.iter().map(|r| r.stable_id).min().unwrap_or(0);
-    let id_max = rows.iter().map(|r| r.stable_id).max().unwrap_or(0);
-    let n_docs = rows.len() as u64;
-    let scalar_stats = ScalarStatsAgg::from_batches(&options.scalar_schema(), &[&scalar]);
-    let bytes = Bytes::from(builder.finish()?);
-
-    Ok(ShardOutput {
-        bytes,
-        n_docs,
-        id_min,
-        id_max,
-        scalar_stats,
-    })
-}
-
 /// Minimum overflow rows required to split a cell into two sub-cells — a split
 /// needs at least one row per side, so fewer than this is a no-op.
 const MIN_ROWS_TO_SPLIT_CELL: usize = 2;
 
-/// OPANN steps 7–9 after hidden compaction: find the overflow **global cell**
-/// via the merged file's cell directory (not `partition_hint`, which is a
-/// shard id for packed files), Sq8-split it, pull neighborhood cells out of
-/// packed/legacy files by cell directory, redrive those rows through
-/// `INCOMING_VECTOR_CELL`, and republish any non-neighborhood cells that
-/// shared a packed shard.
-pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
+/// Split one over-cap **global cell** into two balanced sub-cells. Extracts the
+/// cell's live rows (dropping tombstones) from every superfile that holds it,
+/// median-splits them into two centroids, rebuilds both sub-cells (and
+/// republishes any other cells that shared a packed shard) as fresh packed
+/// superfiles, and atomically swaps the grid `{..,P,..}` → `{..,P,new..}` in one
+/// commit. `split_cell` stays live and queryable until the swap lands. The
+/// caller ([`split_overflow_cells`]) picks the cell from the live grid counts.
+pub(in crate::supertable) async fn split_overflow_cell(
     inner: Arc<SupertableInner>,
-    merged_entry: &Arc<SuperfileEntry>,
+    split_cell: u32,
 ) -> Result<(), BuildError> {
     let manifest = inner.manifest.load_full();
     let (clusters, column, routing, metric, _vec_dim) = match manifest.get_partition_strategy() {
@@ -4913,64 +4855,22 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
         }
         _ => return Ok(()),
     };
-    if clusters.n_cent == 0 || clusters.dim == 0 {
+    if clusters.n_cent == 0 || clusters.dim == 0 || split_cell >= clusters.n_cent {
         return Ok(());
     }
 
     let now = time::Instant::now();
-    let cell_counts = cell_doc_counts_for_entry(&inner, merged_entry).await?;
-    // Overflow cell = largest cell in this merged object that exceeds the cap.
-    // Packed shards may hold many cells; never treat partition_hint (shard id)
-    // as a cell id.
-    let Some((split_cell, split_n_docs)) = cell_counts
-        .iter()
-        .copied()
-        .filter(|(cell, _)| *cell != super::handle::INCOMING_VECTOR_CELL)
-        .filter(|(_, n)| opann::split_overflow_needed(u64::from(*n)))
-        .max_by_key(|(_, n)| *n)
-    else {
-        return Ok(());
-    };
-    if (split_n_docs as usize) < MIN_ROWS_TO_SPLIT_CELL {
-        return Ok(());
-    }
-
     let storage = inner
         .options
         .storage
         .clone()
         .ok_or_else(|| BuildError::Store("cell split requires storage".into()))?;
 
-    let overflow_materialized = load_materialized_rows_from_ivf_superfile(
-        &inner,
-        merged_entry,
-        &column,
-        now,
-        Some(&[split_cell]),
-    )
-    .await?;
-    if overflow_materialized.len() < MIN_ROWS_TO_SPLIT_CELL {
-        return Ok(());
-    }
-    let overflow_encoded: Vec<EncodedCellRow> = overflow_materialized
-        .iter()
-        .map(|r| r.encoded.clone())
-        .collect();
-
-    let (sub0, sub1) = maint_pool()
-        .install(|| opann::plan_sq8_split(&overflow_encoded, &clusters, split_cell, metric));
-    let mut sub_centroids = sub0;
-    sub_centroids.extend_from_slice(&sub1);
-
-    let old_n_cent = clusters.n_cent;
-    let (mut updated_clusters, new_cell_id) =
-        opann::insert_split_centroid(&clusters, split_cell, &sub_centroids);
-    let neighborhood = opann::reassign_neighborhood(split_cell, old_n_cent, new_cell_id);
-    let neighborhood_slice: Vec<u32> = neighborhood
-        .iter()
-        .copied()
-        .filter(|&c| c != super::handle::INCOMING_VECTOR_CELL)
-        .collect();
+    // Shadow split scoped to `split_cell`: extract its live rows, route them
+    // into two sub-cells, and swap atomically. No neighbor rebalance (deferred;
+    // nprobe >= 2 covers the shifted boundary), no count zeroing, no INCOMING
+    // staging. `split_cell` stays live and queryable until the swap commit.
+    let neighborhood_slice = [split_cell];
 
     // Select files that actually contain a neighborhood cell (cell directory
     // for packed; partition_hint == cell_id for legacy).
@@ -5016,12 +4916,21 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
         .await?;
         all_materialized.append(&mut rows);
     }
-    if all_materialized.is_empty() {
+    if all_materialized.len() < MIN_ROWS_TO_SPLIT_CELL {
         return Ok(());
     }
 
-    // Rows leave the neighborhood cells; counts reset until routing lands them.
-    opann::zero_cell_counts(&mut updated_clusters, &neighborhood);
+    // Plan the binary split over exactly the extracted (live) rows: `assign[i]`
+    // routes all_materialized[i] to sub-cell 0 (keeps split_cell's id) or 1
+    // (new_cell_id). Insert the second sub-centroid into the grid.
+    let split_encoded: Vec<EncodedCellRow> =
+        all_materialized.iter().map(|r| r.encoded.clone()).collect();
+    let (sub0, sub1, assign) = maint_pool()
+        .install(|| opann::plan_sq8_split(&split_encoded, &clusters, split_cell, metric));
+    let mut sub_centroids = sub0;
+    sub_centroids.extend_from_slice(&sub1);
+    let (updated_clusters, new_cell_id) =
+        opann::insert_split_centroid(&clusters, split_cell, &sub_centroids);
 
     // Republish non-neighborhood cells that shared a packed shard so they are
     // not deleted with the neighborhood extract. Use the tombstone-aware
@@ -5070,28 +4979,73 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
         prepared_keep.push(build_prepared_from_packed_cells(&inner, shard_id, packed)?);
     }
 
-    let incoming_prepared = maint_pool().install(|| -> Result<PreparedSuperfile, BuildError> {
-        let mut rows = all_materialized;
-        rows.sort_by_key(|r| r.stable_id);
-        for (local, row) in rows.iter_mut().enumerate() {
-            row.local_doc_id = local as u32;
+    // Route the extracted rows into the two sub-cells and build each as a packed
+    // cell with the same builder the republish above uses (no new packing).
+    // Rows keep their inherited L2 fine-cluster ordinal (a per-sub-cell
+    // re-cluster is a later refinement).
+    let mut group0: Vec<MaterializedIvfRow> = Vec::new();
+    let mut group1: Vec<MaterializedIvfRow> = Vec::new();
+    for (row, &side) in all_materialized.into_iter().zip(assign.iter()) {
+        if side == 0 {
+            group0.push(row);
+        } else {
+            group1.push(row);
         }
-        build_prepared_ivf_from_materialized(&inner, super::handle::INCOMING_VECTOR_CELL, rows)
-    })?;
-
+    }
+    let n0 = group0.len() as u32;
+    let n1 = group1.len() as u32;
+    let build_subcell = |cell_id: u32,
+                         mut rows: Vec<MaterializedIvfRow>|
+     -> Result<Option<PreparedSuperfile>, BuildError> {
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        for (i, row) in rows.iter_mut().enumerate() {
+            row.local_doc_id = i as u32;
+        }
+        let stable_ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
+        let mut cfg = inner
+            .options
+            .vector_columns
+            .first()
+            .cloned()
+            .ok_or_else(|| BuildError::Store("missing vector column".into()))?;
+        cfg.n_cent = rows
+            .iter()
+            .map(|r| r.cluster as usize + 1)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let sub = build_merged_subsection_from_materialized(cfg, rows)?;
+        let shard_id = packed_cell_shard(cell_id, packed_cell_shard_count(&inner.options)) as u32;
+        build_prepared_from_packed_cells(&inner, shard_id, vec![(cell_id, sub, stable_ids)]).map(Some)
+    };
     let mut all_prepared = prepared_keep;
-    all_prepared.push(incoming_prepared);
+    all_prepared.extend(build_subcell(split_cell, group0)?);
+    all_prepared.extend(build_subcell(new_cell_id, group1)?);
+    if all_prepared.is_empty() {
+        return Ok(());
+    }
+
+    // Set the two sub-cell counts from the routing; every other cell unchanged.
+    let updated_clusters = opann::apply_cell_count_updates(
+        &updated_clusters,
+        &std::collections::HashMap::from([(split_cell, n0), (new_cell_id, n1)]),
+    );
+
     let batch = collect_prepared_superfiles(&inner, all_prepared)?;
 
-    inner
-        .manifest
-        .store(Arc::new(manifest.with_partition_strategy(
-            PartitionStrategy::VectorCell {
-                column: column.clone(),
-                clusters: updated_clusters.clone(),
-                routing,
-            },
-        )));
+    // Publish the new grid; `with_partition_strategy` clones the full list, so
+    // the drain watermark (`drained_ranges`) and every other manifest field ride
+    // through unchanged — a hidden-space reorg consumes no user commit and must
+    // not disturb coverage.
+    inner.manifest.store(Arc::new(manifest.with_partition_strategy(
+        PartitionStrategy::VectorCell {
+            column: column.clone(),
+            clusters: updated_clusters.clone(),
+            routing,
+        },
+    )));
 
     let new_manifest = persist_commit_async(
         &inner,
@@ -5107,6 +5061,63 @@ pub(in crate::supertable) async fn split_overflow_cell_after_compaction(
 
     schedule_background_storage_reclaim(Arc::clone(&inner));
 
+    Ok(())
+}
+
+/// Split-then-merge phase 1: repeatedly split the largest over-cap global cell
+/// until every cell is within `cell_split_doc_cap`. Eligibility is read from the
+/// live grid counts (not a just-merged shard), which keeps the split its own
+/// snapshot-consistent phase — it never removes a superfile a later merge job
+/// planned to use — and lets an over-cap cell converge within one `optimize`
+/// rather than one split per pass. Each split commits atomically, so a mid-loop
+/// failure leaves a valid, partially-split grid that the next `optimize`
+/// finishes. Splitting first also avoids merging a cell that is about to be
+/// re-split (the merge output would be discarded immediately).
+pub(in crate::supertable) async fn split_overflow_cells(
+    inner: Arc<SupertableInner>,
+) -> Result<(), BuildError> {
+    // Safety bound only: a balanced (median) cut halves a cell each split, so a
+    // cell converges in ~log2(size / cap) splits — far below this. It just stops
+    // a pathological non-shrinking split from looping forever.
+    const MAX_SPLITS_PER_OPTIMIZE: usize = 4096;
+    for iteration in 0..MAX_SPLITS_PER_OPTIMIZE {
+        let manifest = inner.manifest.load_full();
+        if !matches!(
+            manifest.get_partition_strategy(),
+            PartitionStrategy::VectorCell { .. }
+        ) {
+            return Ok(());
+        }
+        // Per-cell live doc counts, summed across every superfile that holds the
+        // cell. The grid's own `counts` can lag the true doc count, so eligibility
+        // is measured from the files (the same source the drain/merge read).
+        let mut cell_counts: HashMap<u32, u64> = HashMap::new();
+        for entry in manifest.superfiles.iter() {
+            for (cell, n) in cell_doc_counts_for_entry(&inner, entry).await? {
+                *cell_counts.entry(cell).or_default() += u64::from(n);
+            }
+        }
+        let mut best: Option<(u32, u64)> = None;
+        for (cell, n) in &cell_counts {
+            let n = *n;
+            if opann::split_overflow_needed(n) && best.is_none_or(|(_, b)| n > b) {
+                best = Some((*cell, n));
+            }
+        }
+        let Some((split_cell, n)) = best else {
+            return Ok(());
+        };
+        if (n as usize) < MIN_ROWS_TO_SPLIT_CELL {
+            return Ok(());
+        }
+        split_overflow_cell(Arc::clone(&inner), split_cell).await?;
+        if iteration + 1 == MAX_SPLITS_PER_OPTIMIZE {
+            tracing::warn!(
+                "cell split: hit per-optimize split bound ({MAX_SPLITS_PER_OPTIMIZE}); \
+                 over-cap cells remain and will converge on the next optimize"
+            );
+        }
+    }
     Ok(())
 }
 

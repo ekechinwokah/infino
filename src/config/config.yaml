@@ -145,14 +145,14 @@ vector:
   # Doc count above which a merged cell superfile is split into two
   # sub-cells during hidden-index maintenance.
   #
-  # STOPGAP: set very high to DISABLE the split. It currently routes the
-  # extracted rows into the retired INCOMING staging cell — which nothing
-  # reads or drains anymore — stranding them and leaving the hidden index
-  # unqueryable, so the query falls back to the user index. Disabled until the
-  # split is reworked to re-cluster the extracted rows into the new sub-cells
-  # inline; restore to ~50000 then. Recall is unaffected at current scales
-  # (cells just stay coarser).
-  cell_split_doc_cap: 100000000
+  # Max docs in a global cell before compaction splits it into two. A cell this
+  # size serves fine on its own (bench: ~500K docs/cell → recall 0.994, ~17 MiB
+  # per query, since the per-cell fine IVF prunes within the cell), so the cap is
+  # set high to keep the grid coarse and split-free at ≤10M (at 64 cells, cells
+  # stay ~156K even at 10M). The split only engages at 100M/1B, where it bounds
+  # cell size so build/query cost stays flat; lower this if higher-scale recall
+  # needs a finer grid.
+  cell_split_doc_cap: 500000
 
   # How user-superfile clusters align to the global cell grid:
   #   local  — per-superfile k-means (default).

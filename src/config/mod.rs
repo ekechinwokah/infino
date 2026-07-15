@@ -247,11 +247,12 @@ pub const DEFAULT_GC_SAFETY_GAP: Duration = Duration::from_secs(86_400);
 // Vector-tuning defaults. Kept equal to the historical inline
 // literals so folding these knobs into config preserves behavior.
 /// Default overflow threshold before a merged cell superfile is split. STOPGAP:
-/// set very high to disable the split — it routes the extracted rows into the
-/// retired INCOMING staging cell, stranding them so the hidden index goes
-/// unqueryable. Restore to ~50_000 once the split re-clusters the extracted
-/// rows into the new sub-cells inline.
-const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 100_000_000;
+/// Max docs in a global cell before compaction splits it in two. Set high: a
+/// cell this size serves well on its own (the per-cell fine IVF prunes within
+/// it), so the grid stays coarse and split-free at <= 10M (cells stay ~156K at
+/// 64 cells even at 10M). The split engages only at 100M/1B to bound cell size;
+/// lower this if higher-scale recall needs a finer grid.
+const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 500_000;
 /// Default k-means training points per centroid for per-cell sub-builds.
 const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
 /// Default user superfiles the hidden-index drain materializes per batch.
@@ -272,10 +273,7 @@ const DEFAULT_VECTOR_GLOBAL_CELL_COUNT: usize = 64;
 const DEFAULT_VECTOR_COMPACTION_TARGET_MB: u64 = 2048;
 /// Default hidden vector-index compaction min-fill: `0` disables the size leg,
 /// so a cell consolidates on the >= 2 fragment count alone — drain generations
-/// collapse and post-compact cold GET stays at the post-drain level. Safe now
-/// that the post-compaction cell split is disabled (see
-/// `DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP`): merging no longer triggers the broken
-/// split path that stranded rows in the retired INCOMING staging cell.
+/// collapse and post-compact cold GET stays at the post-drain level.
 const DEFAULT_VECTOR_COMPACTION_MIN_FILL_PERCENT: u8 = 0;
 /// Default hidden vector-index compaction per-pass memory ceiling (MiB). Must
 /// stay >= the target or it caps the packed inputs below a full output.
@@ -1109,7 +1107,7 @@ supertable:
         let cfg = Config::defaults().expect("embedded default must parse");
         assert_eq!(cfg.vector, VectorSettings::default());
         assert_eq!(cfg.vector.inner_budget, None);
-        assert_eq!(cfg.vector.cell_split_doc_cap, 100_000_000);
+        assert_eq!(cfg.vector.cell_split_doc_cap, 500_000);
         assert_eq!(cfg.vector.user_centroids, CentroidAlignment::Local);
         assert_eq!(cfg.vector.drain_consolidate, DrainConsolidate::Kmeans);
         assert_eq!(cfg.vector.rerank_codec, RerankCodec::Sq8FixedResidual);

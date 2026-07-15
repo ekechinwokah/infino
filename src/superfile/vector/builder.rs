@@ -420,7 +420,10 @@ impl VectorBuilder {
     }
 
     /// Load Sq8+ε maintenance rows for one column. Reuses the normal IVF
-    /// subsection writer on finish — no fp32 corpus decode.
+    /// subsection writer on finish — no fp32 corpus decode. Currently a
+    /// test-only helper (the live maintenance paths splice prebuilt subsections);
+    /// it backs the materialized-row / inline-stable-id round-trip tests.
+    #[allow(dead_code)]
     pub(crate) fn load_materialized_rows(
         &mut self,
         column_id: u32,

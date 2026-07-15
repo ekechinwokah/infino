@@ -44,7 +44,7 @@ use crate::{
         writer::{
             NewEntryBirthVersions, PreparedSuperfile, ShardOutput, backoff_delay,
             finalize_compaction_commit, prepare_superfile, refresh_slow_vector_state,
-            split_overflow_cell_after_compaction, try_commit_attempt,
+            split_overflow_cells, try_commit_attempt,
         },
     },
 };
@@ -245,6 +245,17 @@ impl Supertable {
             Err(_) => return Err(CompactionError::AlreadyCompacting),
         }
         let _slot = CompactionSlot(&inner.compaction_outstanding);
+
+        // Phase 1 (split-then-merge): split every over-cap cell first, from the
+        // live grid, before merge-job selection. An over-cap cell is thus never
+        // merged just to be re-split (the merge output would be discarded), and
+        // the split runs as its own snapshot-consistent phase, so it can't remove
+        // a superfile a later merge job in this pass planned to use.
+        if is_hidden_vector_index_table(&inner.options) {
+            split_overflow_cells(Arc::clone(inner))
+                .await
+                .map_err(|e| CompactionError::Build(e.to_string()))?;
+        }
 
         let manifest = inner.manifest.load_full();
 
@@ -567,15 +578,6 @@ impl Supertable {
                         pending_cache_inserts,
                     )
                     .await;
-                    if is_hidden_vector_index_table(&inner.options)
-                        && let Err(e) =
-                            split_overflow_cell_after_compaction(Arc::clone(inner), &new_entries[0])
-                                .await
-                    {
-                        tracing::warn!(
-                            "supertable: hidden cell split after compaction failed: {e}"
-                        );
-                    }
                     return Ok(());
                 }
                 Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {

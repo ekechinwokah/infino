@@ -663,26 +663,13 @@ impl SuperfileBuilder {
     }
 
     /// Append a scalar-only batch (ids without vector payloads). Used when the
-    /// vector blob is supplied via [`Self::load_materialized_ivf_rows`].
+    /// vector blob is supplied separately via a prebuilt IVF subsection.
     pub(crate) fn add_batch_ids_only(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
         if batch.schema().fields() != self.opts.schema.fields() {
             return Err(BuildError::BatchSchemaMismatch);
         }
         self.next_local_doc_id += batch.num_rows() as u32;
         self.batches.push(batch.clone());
-        Ok(())
-    }
-
-    /// Sq8-native maintenance: feed preserved IVF rows into the normal vector builder.
-    pub(crate) fn load_materialized_ivf_rows(
-        &mut self,
-        rows: Vec<MaterializedIvfRow>,
-    ) -> Result<(), BuildError> {
-        let vb = self
-            .vec_builder
-            .as_mut()
-            .ok_or_else(|| BuildError::VectorSchemaMismatch("no vector builder".into()))?;
-        vb.load_materialized_rows(0, rows)?;
         Ok(())
     }
 

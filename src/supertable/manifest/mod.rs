@@ -2521,6 +2521,25 @@ impl ClusterCentroids {
         centroids: Vec<f32>,
         counts: Vec<u32>,
     ) -> Self {
+        // A grid must carry exactly one count and one centroid per cell. A
+        // mismatch (e.g. counts left at the old length after a split) silently
+        // passes in memory but truncates the wire encoding — counts and centroids
+        // are serialized adjacently — so the grid fails to reopen from storage.
+        // Assert here to catch the malformed construction at its source.
+        debug_assert_eq!(
+            counts.len(),
+            n_cent as usize,
+            "cluster grid counts ({}) must match n_cent ({n_cent})",
+            counts.len()
+        );
+        debug_assert_eq!(
+            centroids.len(),
+            n_cent as usize * dim as usize,
+            "cluster grid centroids ({}) must be n_cent*dim ({}*{})",
+            centroids.len(),
+            n_cent,
+            dim
+        );
         Self {
             n_cent,
             dim,

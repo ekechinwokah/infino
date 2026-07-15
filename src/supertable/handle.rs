@@ -148,6 +148,14 @@ pub(super) struct SupertableInner {
     /// Hidden sibling supertable storing vectors only, partitioned by
     /// global centroids so unfiltered search can route by nearest cell.
     pub(super) vector_index_table: Option<Arc<Supertable>>,
+    /// Set once at open when the hidden vector index is **configured and
+    /// materialized** (its storage pointer exists) but fails to load/open — i.e.
+    /// present-but-broken, distinct from never-configured or not-yet-drained
+    /// (both leave `vector_index_table = None` with this unset). Vector search
+    /// errors on a broken index rather than silently brute-scanning the user
+    /// table; a genuinely absent index still falls back. Unset for the hidden
+    /// table's own inner (no nested index).
+    pub(super) hidden_index_open_error: std::sync::OnceLock<String>,
     /// Last time the read path checked the storage manifest pointer
     /// for freshness, under [`Consistency::BoundedStaleness`]. `None`
     /// until the first check (so the first query always refreshes).
@@ -288,7 +296,16 @@ impl Supertable {
             .clone();
         let options_arc = Arc::new(options);
         let manifest = ManifestSnapshot::load(None, storage, Some(options_arc.clone())).await?;
-        let vector_index_table = if let Some(hidden_opts) =
+        // Resolve the hidden vector index into one of three states:
+        //  * Present  — configured, materialized, opened → `Some(handle)`.
+        //  * Absent   — not configured, or configured but no pointer yet
+        //               (pre-first-drain) → `None`, no error. Queries fall back
+        //               to the user table (its rows are the source of truth).
+        //  * Broken   — configured and materialized (pointer exists) but the
+        //               manifest/table won't load/open → `None` + an error.
+        //               Vector queries surface the error instead of silently
+        //               brute-scanning the user table.
+        let (vector_index_table, hidden_index_broken) = if let Some(hidden_opts) =
             build_vector_index_options(options_arc.as_ref(), Some(manifest.as_ref()), None)
         {
             let hidden_storage = hidden_opts.storage.clone().ok_or_else(|| {
@@ -302,29 +319,42 @@ impl Supertable {
                     match ManifestSnapshot::load(None, hidden_storage, Some(hidden_arc.clone()))
                         .await
                     {
-                        Ok(hidden_manifest) => open_table_async(hidden_arc, hidden_manifest, None)
-                            .await
-                            .ok()
-                            .map(Arc::new),
+                        Ok(hidden_manifest) => {
+                            match open_table_async(hidden_arc, hidden_manifest, None).await {
+                                Ok(t) => (Some(Arc::new(t)), None),
+                                Err(e) => {
+                                    warn!(
+                                        "supertable: hidden vector-index table failed to open: {e}"
+                                    );
+                                    (None, Some(e.to_string()))
+                                }
+                            }
+                        }
                         Err(e) => {
-                            warn!("supertable: hidden vector-index table unavailable: {e}");
-                            None
+                            warn!("supertable: hidden vector-index manifest failed to load: {e}");
+                            (None, Some(e.to_string()))
                         }
                     }
                 }
-                Ok(None) => create_table_async(hidden_opts, None, None)
-                    .await
-                    .ok()
-                    .map(Arc::new),
+                Ok(None) => (
+                    create_table_async(hidden_opts, None, None)
+                        .await
+                        .ok()
+                        .map(Arc::new),
+                    None,
+                ),
                 Err(e) => {
-                    warn!("supertable: hidden vector-index table unavailable: {e}");
-                    None
+                    warn!("supertable: hidden vector-index pointer unreadable: {e}");
+                    (None, Some(e.to_string()))
                 }
             }
         } else {
-            None
+            (None, None)
         };
         let handle = open_table_async(options_arc, manifest, vector_index_table).await?;
+        if let Some(err) = hidden_index_broken {
+            let _ = handle.inner.hidden_index_open_error.set(err);
+        }
         // The manifests are loaded now, so the attached disk cache can be
         // sized against the real footprint (user + hidden index) instead
         // of whatever fixed default it was constructed with.
@@ -1241,6 +1271,7 @@ async fn build_handle(
         tombstone_cache,
         handle_id,
         vector_index_table,
+        hidden_index_open_error: std::sync::OnceLock::new(),
         last_pointer_check: Mutex::new(None),
         last_pointer_etag: Mutex::new(None),
         hidden_deleted_cache: Mutex::new(None),
@@ -1533,6 +1564,14 @@ impl SupertableReader {
 
     pub(crate) fn vector_index_table(&self) -> Option<&Arc<Supertable>> {
         self.inner.vector_index_table.as_ref()
+    }
+
+    /// `Some(reason)` when a **configured and materialized** hidden vector index
+    /// failed to load/open at table-open (present-but-broken). `None` when the
+    /// index is present (usable) or genuinely absent. Vector search uses this to
+    /// fail loud on a broken index instead of falling back to a user-table scan.
+    pub(crate) fn hidden_index_open_error(&self) -> Option<&str> {
+        self.inner.hidden_index_open_error.get().map(String::as_str)
     }
 
     /// Decoded hidden deleted-`_id` set for this reader's pinned manifest,
