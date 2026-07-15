@@ -266,14 +266,14 @@ const DEFAULT_VECTOR_GLOBAL_CELL_COUNT: usize = 64;
 /// base shard stays a merge candidate and absorbs later deltas rather than
 /// being sealed as over-target on the first pass.
 const DEFAULT_VECTOR_COMPACTION_TARGET_MB: u64 = 2048;
-/// Default hidden vector-index compaction min-fill: merge only once the
-/// combined inputs reach this percentage of the target size. Kept low so a
-/// cell's base shard consolidates with its incremental delta fragments rather
-/// than accumulating unmerged drain generations (each of which adds a bounded
-/// fine-run cost per query). Stopgap: it is a fraction of the target, so the
-/// floor only clears real per-shard sizes at ~1M+ docs; the durable fix is to
-/// consolidate whenever a cell carries >= 2 fragments regardless of the floor.
-const DEFAULT_VECTOR_COMPACTION_MIN_FILL_PERCENT: u8 = 5;
+/// Default hidden vector-index compaction min-fill: `0` disables the size leg,
+/// so a cell consolidates on the fragment-count floor alone (>= 2 inputs). Any
+/// non-zero fraction of the 2 GB target dwarfs real per-shard sizes below very
+/// large scale, so it would leave a cell's base shard and its incremental delta
+/// fragments unmerged — and each unmerged drain generation adds a fine-run cost
+/// to every query. The read-optimized hidden index wants generations collapsed
+/// whenever there are two, so the floor is off.
+const DEFAULT_VECTOR_COMPACTION_MIN_FILL_PERCENT: u8 = 0;
 /// Default hidden vector-index compaction per-pass memory ceiling (MiB). Must
 /// stay >= the target or it caps the packed inputs below a full output.
 const DEFAULT_VECTOR_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_VECTOR_COMPACTION_TARGET_MB + 2048;

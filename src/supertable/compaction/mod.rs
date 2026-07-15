@@ -101,8 +101,11 @@ pub struct CompactionJob {
 /// reach the floor are left for next time.
 pub fn select(superfiles: &[SuperfileStats], cfg: &CompactionSettings) -> Vec<CompactionJob> {
     let target_bytes = cfg.target_superfile_size_mb.saturating_mul(MIB);
+    // `0%` disables the size leg: a merge then fires on the fragment-count
+    // floor alone (>= 2 inputs), which is how the hidden index consolidates
+    // drain generations that are far below any byte threshold.
     let min_output_bytes =
-        (target_bytes as u128 * cfg.min_fill_percent.clamp(1, 100) as u128 / 100) as u64;
+        (target_bytes as u128 * cfg.min_fill_percent.clamp(0, 100) as u128 / 100) as u64;
     let max_memory_bytes = cfg.max_memory_mb.saturating_mul(MIB);
 
     let mut by_partition: BTreeMap<&[u8], Vec<&SuperfileStats>> = BTreeMap::new();
@@ -1137,6 +1140,39 @@ mod tests {
         );
         assert_eq!(jobs[0].partition_key, 3u32.to_le_bytes().to_vec());
         assert!(jobs[0].inputs.len() >= 2);
+    }
+
+    #[test]
+    fn zero_fill_floor_merges_tiny_fragments_on_count() {
+        // Hidden-index policy: a 0% fill floor drives consolidation on the
+        // >= 2 fragment count alone. Two sub-target fragments in one cell must
+        // merge even though their combined bytes are a tiny fraction of the
+        // target — each unmerged fragment is a drain generation that costs a
+        // query a fine-run. Under a byte floor the same fragments never merge.
+        let mut segs = Vec::new();
+        for i in 0..2 {
+            let mut s = seg(i, 1, 1000, 0); // 1 MiB each
+            s.partition_key = 7u32.to_le_bytes().to_vec();
+            segs.push(s);
+        }
+        let count_driven = CompactionSettings {
+            target_superfile_size_mb: 2048,
+            min_fill_percent: 0,
+            ..CompactionSettings::default()
+        };
+        let jobs = select(&segs, &count_driven);
+        assert_eq!(jobs.len(), 1, "0% floor must merge 2 tiny fragments on count");
+        assert_eq!(jobs[0].inputs.len(), 2);
+
+        // 2 MiB is far below 40% of a 2 GiB target → the byte floor blocks it.
+        let byte_floored = CompactionSettings {
+            min_fill_percent: 40,
+            ..count_driven.clone()
+        };
+        assert!(
+            select(&segs, &byte_floored).is_empty(),
+            "a byte floor must block consolidation of tiny fragments"
+        );
     }
 
     #[test]

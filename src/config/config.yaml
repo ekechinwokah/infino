@@ -190,19 +190,18 @@ vector:
   # so incremental deltas are absorbed into it instead of being sealed
   # off as separate fragments. compaction_max_memory_mb caps the input
   # bytes packed into one merge pass and must stay >= the target, or the
-  # target is never reached. A merge fires only once the combined inputs
-  # reach compaction_min_fill_percent of the target.
+  # target is never reached.
   #
-  # CAVEAT: min_fill is a fraction of compaction_target_mb, so the merge
-  # floor (5% x 2048 MB ~= 102 MB) is a stopgap: it only clears real
-  # per-shard fragment sizes at roughly >= 1M-doc scale. Below that,
-  # deltas can still accumulate unmerged, and every unmerged drain
-  # generation adds a bounded fine-run cost to each query. The durable
-  # fix is to trigger consolidation whenever a cell carries >= 2 fragments
-  # (drain generations), merging them up to the target regardless of the
-  # byte floor.
+  # compaction_min_fill_percent = 0 disables the byte floor, so a cell
+  # consolidates on fragment count alone (the merge floor of >= 2 inputs).
+  # This tier is read-optimized: every query probes each fragment (drain
+  # generation) of a cell, so an unmerged delta permanently costs a fine-run.
+  # A non-zero floor is a fraction of the 2 GB target and would dwarf real
+  # per-shard sizes below very large scale, leaving generations unmerged — so
+  # the floor is off here (contrast the user table, which keeps an 80% floor
+  # to amortize writes on its transient data).
   compaction_target_mb: 2048
-  compaction_min_fill_percent: 5
+  compaction_min_fill_percent: 0
   compaction_max_memory_mb: 4096
 
 # Diagnostic and hardware-capability toggles. Each gates
