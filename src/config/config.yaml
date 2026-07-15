@@ -159,12 +159,14 @@ vector:
   drain_batch_superfiles: 64
 
   # Target storage amplification for boundary-only replication (shared
-  # by commit and drain). 1.5 lets at most 0.5 × rows extra copies of
-  # rows near a Voronoi boundary be stored, thinnest margins first —
-  # what makes the single-probed cell (p=1 routing) carry its boundary
-  # neighbors, keeping the per-query GET count at the 1–2 GET target.
-  # <= 1.0 disables replication.
-  drain_replica_target_factor: 1.5
+  # by commit and drain). <= 1.0 disables replication (the default).
+  # Replication was measured a net loss at 10M: its extra boundary copies
+  # inflated cell size (159K -> 232K rows/cell), which crowded the RaBitQ
+  # shortlist and displaced true neighbors before rerank — dropping
+  # post-drain recall 0.997 -> 0.975 while adding ~50% storage and ~35%
+  # more GETs/query. Grid+fine union routing carries boundary coverage
+  # instead. Raise above 1.0 only with evidence it helps at your scale.
+  drain_replica_target_factor: 1.0
 
   # Per-cell consolidation op the drain applies:
   #   kmeans — re-cluster each cell's rows (default).

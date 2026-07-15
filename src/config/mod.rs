@@ -252,11 +252,13 @@ const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 50_000;
 const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
 /// Default user superfiles the hidden-index drain materializes per batch.
 const DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES: i64 = 64;
-/// Default boundary-replication budget (commit + drain): up to 0.5 × rows
-/// extra boundary copies, thinnest margins first. Replication is what lets
-/// p=1 cell routing hit the 1–2 GET query target — the probed cell carries
-/// its boundary neighbors instead of forcing a second-cell probe.
-const DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR: f32 = 1.5;
+/// Default boundary-replication budget (commit + drain). `<= 1.0` disables
+/// replication, which is the default: at 10M it was a measured net loss —
+/// the extra boundary copies inflated cell size (159K → 232K rows), crowding
+/// the RaBitQ shortlist and displacing true neighbors before rerank (recall
+/// 0.997 → 0.975) while adding ~50% storage and ~35% GETs/query. Grid+fine
+/// union routing carries boundary coverage instead.
+const DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR: f32 = 1.0;
 /// Default global vector-index cell count for routed search.
 const DEFAULT_VECTOR_GLOBAL_CELL_COUNT: usize = 64;
 /// Default hidden vector-index compaction target superfile size (MiB). Sized
@@ -728,7 +730,7 @@ mod tests {
             cfg.supertable.commit_threshold_size_mb, 1024,
             "engine config must come from YAML only"
         );
-        assert_eq!(cfg.vector.drain_replica_target_factor, 1.5);
+        assert_eq!(cfg.vector.drain_replica_target_factor, 1.0);
         assert!(!cfg.diagnostics.io_timeline);
         unsafe {
             env::remove_var("INFINO_SUPERTABLE__COMMIT_THRESHOLD_SIZE_MB");
