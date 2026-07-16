@@ -3025,9 +3025,10 @@ mod tests {
         assert!(!hits_before.is_empty(), "docs retrievable before split");
 
         // Split the over-cap cell directly (bypasses the 500k cap gate).
-        hidden
+        let split_committed = hidden
             .block_on_query(split_overflow_cell(hidden.inner().clone(), split_cell))
             .expect("split");
+        assert!(split_committed, "live rows present, split must commit");
 
         // The grid gained a sub-cell, and the two sub-cells together account for
         // exactly the live docs (`split_cell` keeps its id; the new cell is

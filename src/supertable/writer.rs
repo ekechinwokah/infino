@@ -4857,10 +4857,15 @@ const MIN_ROWS_TO_SPLIT_CELL: usize = 2;
 /// superfiles, and atomically swaps the grid `{..,P,..}` → `{..,P,new..}` in one
 /// commit. `split_cell` stays live and queryable until the swap lands. The
 /// caller ([`split_overflow_cells`]) picks the cell from the live grid counts.
+///
+/// Returns whether a split was committed: `false` means the cell's LIVE rows
+/// (physical minus tombstones) can't populate two sub-cells — a no-op the
+/// caller must remember, because the cell's physical count stays over the cap
+/// and would otherwise be re-picked forever.
 pub(in crate::supertable) async fn split_overflow_cell(
     inner: Arc<SupertableInner>,
     split_cell: u32,
-) -> Result<(), BuildError> {
+) -> Result<bool, BuildError> {
     let manifest = inner.manifest.load_full();
     let (clusters, column, routing, metric, _vec_dim) = match manifest.get_partition_strategy() {
         PartitionStrategy::VectorCell {
@@ -4869,14 +4874,14 @@ pub(in crate::supertable) async fn split_overflow_cell(
             routing,
         } => {
             let Some(vec_col) = inner.options.vector_columns.first() else {
-                return Ok(());
+                return Ok(false);
             };
             (clusters, column, routing, vec_col.metric, vec_col.dim)
         }
-        _ => return Ok(()),
+        _ => return Ok(false),
     };
     if clusters.n_cent == 0 || clusters.dim == 0 || split_cell >= clusters.n_cent {
-        return Ok(());
+        return Ok(false);
     }
 
     let now = time::Instant::now();
@@ -4937,7 +4942,7 @@ pub(in crate::supertable) async fn split_overflow_cell(
         all_materialized.append(&mut rows);
     }
     if all_materialized.len() < MIN_ROWS_TO_SPLIT_CELL {
-        return Ok(());
+        return Ok(false);
     }
 
     // Plan the binary split over exactly the extracted (live) rows: `assign[i]`
@@ -5045,7 +5050,7 @@ pub(in crate::supertable) async fn split_overflow_cell(
     all_prepared.extend(build_subcell(split_cell, group0)?);
     all_prepared.extend(build_subcell(new_cell_id, group1)?);
     if all_prepared.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     // Set the two sub-cell counts from the routing; every other cell unchanged.
@@ -5084,7 +5089,7 @@ pub(in crate::supertable) async fn split_overflow_cell(
 
     schedule_background_storage_reclaim(Arc::clone(&inner));
 
-    Ok(())
+    Ok(true)
 }
 
 /// Split-then-merge phase 1: repeatedly split the largest over-cap global cell
@@ -5103,6 +5108,12 @@ pub(in crate::supertable) async fn split_overflow_cells(
     // cell converges in ~log2(size / cap) splits — far below this. It just stops
     // a pathological non-shrinking split from looping forever.
     const MAX_SPLITS_PER_OPTIMIZE: usize = 4096;
+    // Cells whose split no-op'd this pass: their PHYSICAL count is over the
+    // cap but their LIVE rows can't populate two sub-cells (delete-heavy
+    // cell). Selection is by physical count, so without this set the same
+    // cell is re-picked every iteration — up to the full split bound of
+    // no-op passes, each re-opening every superfile for the recount.
+    let mut unsplittable: HashSet<u32> = HashSet::new();
     for iteration in 0..MAX_SPLITS_PER_OPTIMIZE {
         let manifest = inner.manifest.load_full();
         if !matches!(
@@ -5123,7 +5134,10 @@ pub(in crate::supertable) async fn split_overflow_cells(
         let mut best: Option<(u32, u64)> = None;
         for (cell, n) in &cell_counts {
             let n = *n;
-            if opann::split_overflow_needed(n) && best.is_none_or(|(_, b)| n > b) {
+            if opann::split_overflow_needed(n)
+                && !unsplittable.contains(cell)
+                && best.is_none_or(|(_, b)| n > b)
+            {
                 best = Some((*cell, n));
             }
         }
@@ -5133,7 +5147,9 @@ pub(in crate::supertable) async fn split_overflow_cells(
         if (n as usize) < MIN_ROWS_TO_SPLIT_CELL {
             return Ok(());
         }
-        split_overflow_cell(Arc::clone(&inner), split_cell).await?;
+        if !split_overflow_cell(Arc::clone(&inner), split_cell).await? {
+            unsplittable.insert(split_cell);
+        }
         if iteration + 1 == MAX_SPLITS_PER_OPTIMIZE {
             tracing::warn!(
                 "cell split: hit per-optimize split bound ({MAX_SPLITS_PER_OPTIMIZE}); \
