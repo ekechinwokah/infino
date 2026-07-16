@@ -3624,6 +3624,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         }
         let n_shard_files = new_entries.len();
 
+        // Grid cell counts are read only as a populated/empty marker (`== 0`),
+        // never for their magnitude — the precise live-doc total is derived
+        // from the files when it matters (e.g. split eligibility reads
+        // tombstone-aware per-cell counts). This running sum is therefore an
+        // approximate population signal, not an exact cumulative doc count.
         let mut cell_updates: HashMap<u32, u32> = HashMap::new();
         for (cell, added) in &added_per_cell {
             let base = running_clusters
