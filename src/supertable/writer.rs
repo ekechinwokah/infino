@@ -6014,6 +6014,25 @@ mod tests {
     /// Boundary test target that permits one extra posting per input row.
     const BOUNDARY_STUB_TARGET_FACTOR: f32 = 2.0;
 
+    /// `SupertableWriter`'s `Debug` impl renders its buffered-batch summary.
+    #[test]
+    fn supertable_writer_debug_renders() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let table = Supertable::create(
+            options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM, COMMIT_AS_DRAIN_TEST_ROWS)
+                .with_storage(storage),
+        )
+        .expect("create");
+        let writer = table.writer().expect("writer");
+        let rendered = format!("{writer:?}");
+        assert!(
+            rendered.contains("SupertableWriter"),
+            "debug must render the writer, got {rendered}"
+        );
+    }
+
     /// `split_buffer_by_vector_cell` routes each buffered row to its
     /// nearest-centroid shard: rows near e_0 land in cell 0, rows near e_1 in
     /// cell 1, and empty cells are dropped.
@@ -6361,6 +6380,64 @@ mod tests {
         let titles =
             LargeStringArray::from((0..n).map(|i| format!("doc {i} alpha")).collect::<Vec<_>>());
         RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles)]).expect("build batch")
+    }
+
+    /// Splice-mode multi-batch drain where both single-superfile batches route
+    /// the same directions into the same cells: batch 1 spills each cell, batch
+    /// 2 concatenates onto it via the fragment-merge path
+    /// (`spill_packed_cell` → `merge_fragment_subsections` → reload). Every
+    /// ingested doc must survive into the hidden cell index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn splice_drain_concatenates_same_cell_across_batches() {
+        use crate::superfile::reader::VectorSearchOptions;
+
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let options = options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM, COMMIT_AS_DRAIN_TEST_ROWS)
+            .with_storage(storage)
+            .with_drain_consolidate(DrainConsolidate::Splice)
+            .with_drain_batch_superfiles(1);
+        let table = Supertable::create(options).expect("create");
+        for _ in 0..2 {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch(
+                    COMMIT_AS_DRAIN_TEST_ROWS,
+                    COMMIT_AS_DRAIN_TEST_DIM,
+                ))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let (hidden, _epoch) = current_drain_epoch(&table).await;
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("splice drain across batches");
+        assert!(
+            hidden.reader().n_superfiles() > 0,
+            "splice drain must populate the hidden cell index"
+        );
+        // The e_0 direction (one doc per batch) still resolves through the
+        // concatenated cell.
+        let mut q = vec![0.0f32; COMMIT_AS_DRAIN_TEST_DIM];
+        q[0] = 1.0;
+        let hits = table
+            .reader()
+            .vector_hits(
+                "emb",
+                &q,
+                COMMIT_AS_DRAIN_TEST_ROWS * 2,
+                VectorSearchOptions::new().with_nprobe(32),
+                None,
+            )
+            .expect("search");
+        assert!(
+            !hits.is_empty(),
+            "docs survive the cross-batch splice concatenate"
+        );
     }
 
     fn options_title_emb_serial(dim: usize, n_cent: usize) -> SupertableOptions {

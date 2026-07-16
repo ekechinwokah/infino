@@ -856,6 +856,34 @@ mod tests {
         build_merged_subsection_from_fp32(cfg, Arc::new(vectors), &ids).expect("cell build")
     }
 
+    /// `merge_fragment_subsections` concatenates two fragment cells verbatim:
+    /// the merged cell holds every doc from both inputs and carries all their
+    /// stable ids (the multi-batch splice-drain path).
+    #[test]
+    fn merge_fragment_subsections_concatenates_docs_and_ids() {
+        use std::collections::HashSet;
+
+        let left = fixed_subsection_with_empty_clusters(1_000);
+        let right = fixed_subsection_with_empty_clusters(2_000);
+        let left_ids: Vec<i128> = (0..ROWS as i128).map(|i| 1_000 + i).collect();
+        let right_ids: Vec<i128> = (0..ROWS as i128).map(|i| 2_000 + i).collect();
+
+        let (merged, ids) =
+            merge_fragment_subsections(&left, &left_ids, &right, &right_ids, DIM, Metric::Cosine)
+                .expect("fragment merge");
+
+        assert_eq!(
+            merged.n_docs as usize,
+            2 * ROWS,
+            "merged cell holds every doc from both fragments"
+        );
+        assert_eq!(ids.len(), 2 * ROWS, "one stable id per merged doc");
+        let got: HashSet<i128> = ids.into_iter().collect();
+        for id in left_ids.iter().chain(right_ids.iter()) {
+            assert!(got.contains(id), "merged ids must include {id}");
+        }
+    }
+
     /// Splice-merging inputs that share an all-empty cluster must leave the
     /// pinned scale/offset constants in that cluster's codec-meta slots: the
     /// open-time validator requires every slot — populated or empty — to be

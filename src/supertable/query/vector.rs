@@ -3149,6 +3149,277 @@ mod tests {
         );
     }
 
+    /// Post-drain compaction workload: a larger corpus is drained then
+    /// optimized (compaction merges/splits cells), searched, partly deleted,
+    /// and optimized again — exercising the compaction path and confirming
+    /// search survives it.
+    #[test]
+    fn compaction_after_drain_preserves_search() {
+        use datafusion::prelude::{col, lit};
+
+        use crate::config::OptimizeOptions;
+
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_superfile_per_commit(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(storage)).expect("create");
+        for c in 0..4u64 {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_vector_batch(c * 32, 32, dim, schema.clone()))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let search = |st: &Supertable| {
+            st.reader()
+                .vector_hits(
+                    "emb",
+                    &q,
+                    20,
+                    VectorSearchOptions::new().with_nprobe(4),
+                    None,
+                )
+                .expect("search")
+                .len()
+        };
+        assert!(
+            search(&st) >= 8,
+            "e_0's exact matches present pre-compaction"
+        );
+
+        st.optimize(&OptimizeOptions::default()).expect("optimize");
+        assert!(
+            search(&st) >= 8,
+            "compaction must preserve the exact-match docs"
+        );
+
+        // Delete then compact again; search must still work.
+        let stats = st.delete(col("title").eq(lit("doc 0"))).expect("delete");
+        assert!(stats.n_tombstoned() >= 1, "delete tombstones matching docs");
+        st.optimize(&OptimizeOptions::default())
+            .expect("optimize after delete");
+        assert!(
+            !st.reader()
+                .vector_hits(
+                    "emb",
+                    &q,
+                    20,
+                    VectorSearchOptions::new().with_nprobe(4),
+                    None
+                )
+                .expect("search after delete+compact")
+                .is_empty(),
+            "search still returns hits after delete + compaction"
+        );
+    }
+
+    /// A larger post-drain corpus (many docs across several commits, drained
+    /// into multiple cells) searched with a wider `k` and `nprobe`, so the
+    /// query reranks candidates spanning multiple clusters — the multi-cluster
+    /// rerank / candidate-block path a single-cell search never reaches.
+    #[test]
+    fn vector_search_multi_cell_rerank_over_larger_corpus() {
+        use crate::superfile::fts::reader::BoolMode;
+
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_superfile_per_commit(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(storage)).expect("create");
+        // Four commits × 32 docs → 128 docs over 16 one-hot directions, several
+        // per cell, so a drained query reranks across multiple cells.
+        for c in 0..4u64 {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_vector_batch(c * 32, 32, dim, schema.clone()))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        // Wide k + nprobe: rerank spans several probed cells.
+        let hits = st
+            .reader()
+            .vector_hits(
+                "emb",
+                &q,
+                20,
+                VectorSearchOptions::new().with_nprobe(4),
+                None,
+            )
+            .expect("wide search");
+        assert!(
+            hits.len() >= 8,
+            "e_0 has 8 exact matches across commits; wide search must find them, got {}",
+            hits.len()
+        );
+
+        // Filtered variant over the same corpus.
+        let filtered = st
+            .reader()
+            .vector_hits(
+                "emb",
+                &q,
+                20,
+                VectorSearchOptions::new().with_nprobe(4),
+                Some(VectorFilter {
+                    column: "title",
+                    query: "doc",
+                    mode: BoolMode::Or,
+                }),
+            )
+            .expect("filtered wide search");
+        assert!(!filtered.is_empty(), "filtered wide search returns hits");
+    }
+
+    /// The `Supertable::vector_search` handle wrapper (tests normally call
+    /// `reader().vector_search`) delegates to the reader and returns rows.
+    #[test]
+    fn supertable_vector_search_wrapper_returns_rows() {
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_superfile_per_commit(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(storage)).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, 16, dim, schema.clone()))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let batches = st
+            .vector_search(
+                "emb",
+                &q,
+                5,
+                VectorSearchOptions::new(),
+                None,
+                Some(&["_id"]),
+            )
+            .expect("handle-level vector_search");
+        assert!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>() >= 1,
+            "handle wrapper must return rows"
+        );
+    }
+
+    /// Bitmap-filtered vector search over corpus-global ids
+    /// (`vector_hits_global_allow_async` → `prepare_vector_global_allow_async`,
+    /// user-table path): only the allowed global rows (contiguous ingest order)
+    /// are eligible, so every hit is within the allow-set.
+    #[test]
+    fn vector_hits_global_allow_restricts_to_allowed_ids() {
+        use roaring::RoaringBitmap;
+
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_superfile_per_commit(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(storage)).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, 16, dim, schema.clone()))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        // Pre-drain: allow only global rows 0,1,2 (ingest order → docs at dims
+        // 0,1,2), mapped by the user-table path.
+        let allow: Arc<RoaringBitmap> = Arc::new([0u32, 1, 2].into_iter().collect());
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let hits = block_on(st.reader().vector_hits_global_allow_async(
+            "emb",
+            &q,
+            16,
+            VectorSearchOptions::new().with_nprobe(32),
+            allow,
+        ))
+        .expect("global-allow search");
+        assert!(!hits.is_empty(), "the e_0 doc is allowed and must be found");
+        assert!(
+            hits.len() <= 3,
+            "only the 3 allowed global rows may appear, got {}",
+            hits.len()
+        );
+    }
+
+    /// `prepare_vector_stable_allow_async` on a *valid* drained id resolves it
+    /// to a hidden-cell allow-set (the success path; the existing test only
+    /// covers the unknown-id error). Post-drain it must key the allow-set by
+    /// hidden-index URIs and be non-empty.
+    #[test]
+    fn prepare_vector_stable_allow_maps_valid_drained_id() {
+        use arrow_array::Decimal128Array;
+
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_superfile_per_commit(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(storage)).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, 16, dim, schema.clone()))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        // Pull one real stable id from a row-returning search.
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let batches = st
+            .reader()
+            .vector_search(
+                "emb",
+                &q,
+                1,
+                VectorSearchOptions::new(),
+                None,
+                Some(&["_id"]),
+            )
+            .expect("row search");
+        let id = batches
+            .iter()
+            .find_map(|b| {
+                b.column_by_name("_id")
+                    .and_then(|c| c.as_any().downcast_ref::<Decimal128Array>())
+                    .filter(|c| !c.is_empty())
+                    .map(|c| c.value(0))
+            })
+            .expect("a resolved _id");
+
+        let prepared = block_on(
+            st.reader()
+                .prepare_vector_stable_allow_async(Arc::new(vec![id])),
+        )
+        .expect("valid drained id must map");
+        assert!(
+            prepared.use_hidden_index,
+            "post-drain allow-set is keyed by the hidden index"
+        );
+        assert!(
+            !prepared.allow_by_uri.is_empty(),
+            "a valid id resolves to a non-empty hidden-cell allow-set"
+        );
+    }
+
     /// Row-returning vector search AFTER a drain resolves hidden-cell hits back
     /// to user `_id`s via the inline stable-id region — a path the pre-drain
     /// row-return test never reaches. The exact-match doc's id must come back.
@@ -3252,6 +3523,81 @@ mod tests {
         assert!(
             rows >= 1,
             "filtered fan-out must resolve rows across user superfiles"
+        );
+    }
+
+    /// Filtered vector search driven by a lowered [`CandidatePlan`] — the
+    /// boolean-plan fan-out (`candidate_bitmaps_from_plan`). The plan resolves
+    /// the title predicate to per-superfile candidate bitmaps, then vector
+    /// ranking runs over the survivors.
+    #[test]
+    fn vector_hits_filtered_by_plan_returns_matching_docs() {
+        use std::collections::HashSet;
+
+        use datafusion::prelude::{col, lit};
+
+        use crate::{
+            superfile::vector::rerank_codec::RerankCodec,
+            supertable::query::candidate::CandidatePlan,
+        };
+
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let opts = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(tok()),
+        )
+        .expect("valid options")
+        .with_writer_pool(pool);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(storage)).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, 32, dim, schema.clone()))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let reader = st.reader();
+        let manifest = reader.manifest();
+        let fts_cols: HashSet<&str> = HashSet::from(["title"]);
+        let filters = [col("title").eq(lit("doc"))];
+        let plan =
+            CandidatePlan::from_filters(&filters, &fts_cols, manifest.options.tokenizer.as_ref());
+
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let hits = block_on(reader.vector_hits_filtered_by_plan(
+            "emb",
+            &q,
+            10,
+            VectorSearchOptions::new(),
+            &plan,
+        ))
+        .expect("plan-filtered vector search");
+        assert!(
+            !hits.is_empty(),
+            "the title-token plan must admit docs for vector ranking"
         );
     }
 

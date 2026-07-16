@@ -5202,6 +5202,257 @@ mod tests {
         assert_eq!(eager_hits, lazy_hits);
     }
 
+    /// The fitted-`Sq8Residual` lazy read path fetches each candidate cluster's
+    /// scale/offset (and per-doc norms) from storage on demand during rerank —
+    /// the `Sq8ColumnMeta::Lazy` branch a warm/eager open never reaches. Its
+    /// results must match the eager reader's exactly.
+    #[tokio::test]
+    async fn sq8_residual_lazy_search_matches_eager() {
+        let (blob, json, vectors) =
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8Residual, Metric::Cosine);
+        let eager = VectorReader::open(blob.clone(), &json).expect("eager open");
+        let source = StdArc::new(CountingLazyByteSource::new(blob));
+        let lazy = VectorReader::open_lazy(
+            StdArc::clone(&source) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("lazy open");
+        let eager_hits = eager
+            .search_async("v", &vectors[17], 5, 4, 20, None, None, None, None)
+            .await
+            .expect("eager search");
+        let lazy_hits = lazy
+            .search_async("v", &vectors[17], 5, 4, 20, None, None, None, None)
+            .await
+            .expect("lazy search");
+        assert_eq!(
+            eager_hits, lazy_hits,
+            "lazy fitted-residual rerank must match eager results"
+        );
+    }
+
+    /// Lazily opening a packed multi-cell (v2) blob routes through
+    /// `open_lazy_multi_cell` and fetches per-cell metadata on demand during a
+    /// multi-cluster search. Results must match the eager multi-cell reader.
+    #[tokio::test]
+    async fn multi_cell_lazy_search_matches_eager() {
+        use crate::superfile::vector::{
+            builder::{build_merged_subsection_from_materialized, finish_multi_cell_blob},
+            cell_posting::EncodedCellRow,
+        };
+
+        let dim = 16usize;
+        let make_rows = |cell: u32, n: usize| -> Vec<MaterializedIvfRow> {
+            let scale: StdArc<[f32]> = StdArc::from(vec![1.0f32; dim]);
+            let offset: StdArc<[f32]> = StdArc::from(vec![0.0f32; dim]);
+            (0..n)
+                .map(|i| {
+                    let local = i as u32;
+                    let stable_id = (cell as i128) * 1_000 + local as i128;
+                    let mut codes = vec![0u8; dim];
+                    codes[0] = (cell as u8).wrapping_add(i as u8);
+                    MaterializedIvfRow {
+                        local_doc_id: local,
+                        stable_id,
+                        cluster: 0,
+                        rabitq_code: vec![0u8; dim.div_ceil(8)],
+                        encoded: EncodedCellRow {
+                            stable_id,
+                            rerank_codec: RerankCodec::Sq8Residual,
+                            scale: StdArc::clone(&scale),
+                            offset: StdArc::clone(&offset),
+                            codes,
+                            residuals: vec![0u8; dim],
+                            norm_sq: Some(1.0),
+                        },
+                    }
+                })
+                .collect()
+        };
+        let cfg = |n_cent: usize| VectorConfig {
+            column: "emb".into(),
+            dim,
+            n_cent,
+            rot_seed: 1,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        };
+        let sub0 =
+            build_merged_subsection_from_materialized(cfg(2), make_rows(0, 4)).expect("cell 0");
+        let sub1 =
+            build_merged_subsection_from_materialized(cfg(2), make_rows(1, 3)).expect("cell 1");
+        let blob = Bytes::from(finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack"));
+        let json =
+            format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
+
+        let eager = VectorReader::open(blob.clone(), &json).expect("eager open");
+        let source = StdArc::new(CountingLazyByteSource::new(blob));
+        let lazy = VectorReader::open_lazy(
+            StdArc::clone(&source) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("lazy multi-cell open");
+
+        let q = vec![0.0f32; dim];
+        let eager_hits = eager
+            .search_clusters_async("emb", &q, 3, &[0, 1, 2, 3], 8, None, None, None, None)
+            .await
+            .expect("eager multi-cell search");
+        let lazy_hits = lazy
+            .search_clusters_async("emb", &q, 3, &[0, 1, 2, 3], 8, None, None, None, None)
+            .await
+            .expect("lazy multi-cell search");
+        assert_eq!(
+            eager_hits, lazy_hits,
+            "lazy multi-cell search must match the eager reader"
+        );
+    }
+
+    /// `packed_cell_stable_ids_async` reads each packed cell's inline
+    /// stable-`_id` region and returns the ids per cell, in cell order.
+    #[tokio::test]
+    async fn packed_cell_stable_ids_async_returns_per_cell_ids() {
+        use std::collections::HashMap;
+
+        use crate::superfile::vector::{
+            builder::{build_merged_subsection_from_materialized, finish_multi_cell_blob},
+            cell_posting::EncodedCellRow,
+        };
+
+        let dim = 16usize;
+        let make_rows = |cell: u32, n: usize| -> Vec<MaterializedIvfRow> {
+            let scale: StdArc<[f32]> = StdArc::from(vec![1.0f32; dim]);
+            let offset: StdArc<[f32]> = StdArc::from(vec![0.0f32; dim]);
+            (0..n)
+                .map(|i| {
+                    let local = i as u32;
+                    let stable_id = (cell as i128) * 1_000 + local as i128;
+                    let mut codes = vec![0u8; dim];
+                    codes[0] = (cell as u8).wrapping_add(i as u8);
+                    MaterializedIvfRow {
+                        local_doc_id: local,
+                        stable_id,
+                        cluster: 0,
+                        rabitq_code: vec![0u8; dim.div_ceil(8)],
+                        encoded: EncodedCellRow {
+                            stable_id,
+                            rerank_codec: RerankCodec::Sq8Residual,
+                            scale: StdArc::clone(&scale),
+                            offset: StdArc::clone(&offset),
+                            codes,
+                            residuals: vec![0u8; dim],
+                            norm_sq: Some(1.0),
+                        },
+                    }
+                })
+                .collect()
+        };
+        let cfg = |n_cent: usize| VectorConfig {
+            column: "emb".into(),
+            dim,
+            n_cent,
+            rot_seed: 1,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        };
+        let sub0 =
+            build_merged_subsection_from_materialized(cfg(2), make_rows(0, 4)).expect("cell 0");
+        let sub1 =
+            build_merged_subsection_from_materialized(cfg(2), make_rows(1, 3)).expect("cell 1");
+        let blob = Bytes::from(finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack"));
+        let json =
+            format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
+        let reader = VectorReader::open(blob, &json).expect("open");
+
+        let per_cell = reader
+            .packed_cell_stable_ids_async()
+            .await
+            .expect("stable-id read")
+            .expect("multi-cell blob carries an inline stable-id region");
+        let map: HashMap<u32, Vec<i128>> = per_cell.into_iter().collect();
+        assert_eq!(
+            map.get(&0),
+            Some(&vec![0, 1, 2, 3]),
+            "cell 0 ids round-trip from the inline region"
+        );
+        assert_eq!(
+            map.get(&1),
+            Some(&vec![1_000, 1_001, 1_002]),
+            "cell 1 ids round-trip from the inline region"
+        );
+    }
+
+    /// `inline_stable_ids_for_locals_async` resolves file-local doc ids (which
+    /// span cells) to their inline stable ids on a packed multi-cell reader.
+    #[tokio::test]
+    async fn inline_stable_ids_for_locals_async_resolves_across_cells() {
+        use crate::superfile::vector::{
+            builder::{build_merged_subsection_from_materialized, finish_multi_cell_blob},
+            cell_posting::EncodedCellRow,
+        };
+
+        let dim = 16usize;
+        let make_rows = |cell: u32, n: usize| -> Vec<MaterializedIvfRow> {
+            let scale: StdArc<[f32]> = StdArc::from(vec![1.0f32; dim]);
+            let offset: StdArc<[f32]> = StdArc::from(vec![0.0f32; dim]);
+            (0..n)
+                .map(|i| {
+                    let local = i as u32;
+                    let stable_id = (cell as i128) * 1_000 + local as i128;
+                    let mut codes = vec![0u8; dim];
+                    codes[0] = (cell as u8).wrapping_add(i as u8);
+                    MaterializedIvfRow {
+                        local_doc_id: local,
+                        stable_id,
+                        cluster: 0,
+                        rabitq_code: vec![0u8; dim.div_ceil(8)],
+                        encoded: EncodedCellRow {
+                            stable_id,
+                            rerank_codec: RerankCodec::Sq8Residual,
+                            scale: StdArc::clone(&scale),
+                            offset: StdArc::clone(&offset),
+                            codes,
+                            residuals: vec![0u8; dim],
+                            norm_sq: Some(1.0),
+                        },
+                    }
+                })
+                .collect()
+        };
+        let cfg = |n_cent: usize| VectorConfig {
+            column: "emb".into(),
+            dim,
+            n_cent,
+            rot_seed: 1,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        };
+        let sub0 =
+            build_merged_subsection_from_materialized(cfg(2), make_rows(0, 4)).expect("cell 0");
+        let sub1 =
+            build_merged_subsection_from_materialized(cfg(2), make_rows(1, 3)).expect("cell 1");
+        let blob = Bytes::from(finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack"));
+        let json =
+            format!(r#"[{{"column":"emb","dim":{dim},"n_cent":2,"rot_seed":1,"metric":"l2sq"}}]"#);
+        let reader = VectorReader::open(blob, &json).expect("open");
+
+        // File-local 0 → cell 0 local 0 (id 0); file-local 4 → cell 1 local 0
+        // (id 1000).
+        let ids = reader
+            .inline_stable_ids_for_locals_async(&[0, 4])
+            .await
+            .expect("stable-id resolve")
+            .expect("multi-cell blob has an inline region");
+        assert_eq!(ids, vec![0, 1_000], "file-locals resolve to per-cell ids");
+    }
+
     #[test]
     fn sq8_fixed_residual_rejects_non_fixed_metadata() {
         let (blob, json, _) =

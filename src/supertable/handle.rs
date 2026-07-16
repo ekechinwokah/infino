@@ -2917,6 +2917,231 @@ mod tests {
         );
     }
 
+    /// After a drain, `open_all_superfiles` force-opens every user + hidden
+    /// reader without error, and `hidden_cell_stable_id_sets` audits the drained
+    /// cells — the sum of per-cell stable ids equals the ingested doc count.
+    #[test]
+    fn open_all_superfiles_and_hidden_stable_id_audit() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        const N: usize = 6;
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let flat = Float32Array::from(vec![1.0f32; N * dim]);
+        let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        // Cold-open every reader (user + hidden); must not error.
+        st.open_all_superfiles();
+
+        // Audit: the drained cells' inline stable ids cover every doc.
+        let sets = st
+            .hidden_cell_stable_id_sets()
+            .expect("post-drain hidden cells expose stable-id sets");
+        let total: usize = sets.iter().map(|(_, ids)| ids.len()).sum();
+        assert_eq!(
+            total, N,
+            "every drained doc carries a stable id in some cell"
+        );
+    }
+
+    /// Splitting a cell whose packed shard also holds *other* cells must
+    /// republish those neighbours intact (the keep-cells branch). Ingest two
+    /// vector directions (→ two cells in one shard), split the busiest, and
+    /// confirm both directions still resolve afterward.
+    #[test]
+    fn split_overflow_cell_republishes_neighbour_cells() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{manifest::list::PartitionStrategy, writer::split_overflow_cell},
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        // 8 rows at e_0 and 8 at e_1 → two distinct cells packed in one shard.
+        const N: usize = 16;
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let mut flat = vec![0.0f32; N * dim];
+        for r in 0..N {
+            flat[r * dim + usize::from(r >= N / 2)] = 1.0; // first half e_0, second half e_1
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field.clone(),
+            dim as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        // Two populated cells (the two directions). Split the busiest; the
+        // other populated cell is the neighbour whose count must survive.
+        let (busiest, neighbour, neighbour_count, n_cent_before) =
+            match hidden.reader().manifest().get_partition_strategy() {
+                PartitionStrategy::VectorCell { clusters, .. } => {
+                    let mut populated: Vec<u32> = (0..clusters.n_cent)
+                        .filter(|&c| clusters.counts[c as usize] > 0)
+                        .collect();
+                    assert!(
+                        populated.len() >= 2,
+                        "two directions must drain into two cells, got {:?}",
+                        clusters.counts
+                    );
+                    populated.sort_by_key(|&c| std::cmp::Reverse(clusters.counts[c as usize]));
+                    let busiest = populated[0];
+                    let neighbour = populated[1];
+                    (
+                        busiest,
+                        neighbour,
+                        clusters.counts[neighbour as usize],
+                        clusters.n_cent,
+                    )
+                }
+                other => panic!("hidden must be VectorCell after drain, got {other:?}"),
+            };
+
+        hidden
+            .block_on_query(split_overflow_cell(hidden.inner().clone(), busiest))
+            .expect("split");
+
+        // The split grows the grid by one sub-cell and republishes the
+        // neighbour cell untouched — its doc count is unchanged.
+        match hidden.reader().manifest().get_partition_strategy() {
+            PartitionStrategy::VectorCell { clusters, .. } => {
+                assert_eq!(
+                    clusters.n_cent,
+                    n_cent_before + 1,
+                    "split adds one sub-cell"
+                );
+                assert_eq!(
+                    clusters.counts[neighbour as usize], neighbour_count,
+                    "the republished neighbour cell keeps its docs"
+                );
+            }
+            other => panic!("still VectorCell, got {other:?}"),
+        }
+    }
+
     /// Directly exercises the over-cap cell split (`split_overflow_cell`). The
     /// normal `optimize` path only reaches it once a cell passes the 500k
     /// `cell_split_doc_cap`; calling the inner routine on a drained cell covers

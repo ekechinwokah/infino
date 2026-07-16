@@ -919,6 +919,30 @@ mod tests {
         },
     };
 
+    /// `compute_encoded_norms` returns exactly one residual norm-squared per
+    /// row, and each is finite and non-negative — the recompute path taken when
+    /// a decoded posting carries no stored per-doc norms.
+    #[test]
+    fn compute_encoded_norms_one_nonneg_norm_per_row() {
+        let dim = 4usize;
+        let n_docs = 3usize;
+        let posting = DecodedPosting {
+            dim,
+            metric: Metric::Cosine,
+            ids: (0..n_docs as u32).collect(),
+            scale: vec![SQ8_FIXED_SCALE; dim],
+            offset: vec![SQ8_FIXED_OFFSET; dim],
+            rows: (0..(n_docs * dim * ROW_BYTES_PER_DIM) as u8).collect(),
+            per_doc_norms: None,
+        };
+        let norms = compute_encoded_norms(&posting);
+        assert_eq!(norms.len(), n_docs, "one norm per row");
+        assert!(
+            norms.iter().all(|n| n.is_finite() && *n >= 0.0),
+            "residual norm-squared is finite and non-negative, got {norms:?}"
+        );
+    }
+
     #[test]
     fn roundtrip_and_search() {
         let dim = 8usize;
