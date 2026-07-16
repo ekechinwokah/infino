@@ -11,6 +11,7 @@ use tracing::{debug, warn};
 use crate::{
     Supertable,
     runtime_bridge::bridge_on_runtime,
+    storage::StorageError,
     supertable::{
         ManifestSnapshot,
         error::GcError,
@@ -94,9 +95,18 @@ pub(super) async fn gc_storage_sweep_for_inner(
     let manifest = inner.manifest.load_full();
     let (mut live, superfiles_complete) = build_live_set(&manifest);
     if let Some((uri, hash)) = manifest.slow_vector_state_blob() {
+        // An unreadable slow-state blob is a permanent storage-level failure
+        // on that URI (missing, corrupt, or hash-mismatched bytes) — surface
+        // it through the existing `Storage` variant rather than a dedicated
+        // public error variant.
         let state = slow_vector_state::load_full_state(storage.as_ref(), uri, &hash)
             .await
-            .map_err(|error| GcError::DrainCheckpoint(error.to_string()))?;
+            .map_err(|error| {
+                GcError::Storage(StorageError::Permanent {
+                    uri: uri.to_string(),
+                    source: Box::new(error),
+                })
+            })?;
         if let Some(pending) = state.pending_drain {
             live.extend(pending.entries.iter().map(|entry| entry.uri.storage_path()));
         }

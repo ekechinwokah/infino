@@ -412,9 +412,6 @@ pub enum GcError {
     /// A storage operation failed while listing or deleting objects.
     #[error("storage error during gc: {0}")]
     Storage(#[from] crate::storage::StorageError),
-
-    #[error("invalid active drain checkpoint during gc: {0}")]
-    DrainCheckpoint(String),
 }
 
 /// Errors raised by query-time methods on [`crate::supertable::Supertable`]
