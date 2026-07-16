@@ -264,7 +264,7 @@ fn fp32_distance_between_rows(metric: Metric, a: &EncodedCellRow, b: &EncodedCel
 
 /// Medoid index under fp32 dequant + [`distance`] row↔row (discrete k-means
 /// centroid update).
-fn medoid_index(metric: Metric, shard: &[EncodedCellRow]) -> usize {
+fn medoid_index(metric: Metric, shard: &[&EncodedCellRow]) -> usize {
     medoid_index_by(shard, |a, b| fp32_distance_between_rows(metric, a, b))
 }
 
@@ -282,13 +282,14 @@ fn medoid_index(metric: Metric, shard: &[EncodedCellRow]) -> usize {
 /// farthest instead would seed a radius (center + edge), peeling a thin shell
 /// off the dense core.
 fn pick_split_seeds(
-    rows: &[EncodedCellRow],
+    rows: &[&EncodedCellRow],
     clusters: &ClusterCentroids,
     split_cell: usize,
     metric: Metric,
 ) -> (usize, usize) {
     let seed1 = rows
         .iter()
+        .copied()
         .enumerate()
         .max_by(|(_, a), (_, b)| {
             score_row_against_cell(clusters, metric, split_cell, a)
@@ -297,9 +298,10 @@ fn pick_split_seeds(
         })
         .map(|(i, _)| i)
         .unwrap_or(0);
-    let cent1 = centroid_prototype_from_row(clusters, &rows[seed1]);
+    let cent1 = centroid_prototype_from_row(clusters, rows[seed1]);
     let seed0 = rows
         .iter()
+        .copied()
         .enumerate()
         .max_by(|(_, a), (_, b)| {
             score_row_against_cell(&cent1, metric, 0, a)
@@ -328,7 +330,7 @@ fn dequantize_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
 }
 
 pub(crate) fn plan_sq8_split(
-    rows: &[EncodedCellRow],
+    rows: &[&EncodedCellRow],
     clusters: &ClusterCentroids,
     split_cell: u32,
     metric: Metric,
@@ -339,7 +341,7 @@ pub(crate) fn plan_sq8_split(
     if rows.len() < 2 {
         // Caller guards on MIN_ROWS_TO_SPLIT_CELL; stay defensive so a degenerate
         // input can't panic in medoid_index on an empty shard.
-        let c = manifest_centroid_components_from_row(&rows[0], dim);
+        let c = manifest_centroid_components_from_row(rows[0], dim);
         return (c.clone(), c, assign);
     }
 
@@ -353,12 +355,13 @@ pub(crate) fn plan_sq8_split(
     // median cut costs no recall: per-sub-cell fine re-clustering downstream
     // restores intra-cell routing.
     let (seed0, seed1) = pick_split_seeds(rows, clusters, p, metric);
-    let v0 = dequantize_row(&rows[seed0], dim);
-    let v1 = dequantize_row(&rows[seed1], dim);
+    let v0 = dequantize_row(rows[seed0], dim);
+    let v1 = dequantize_row(rows[seed1], dim);
     let axis: Vec<f32> = (0..dim).map(|d| v1[d] - v0[d]).collect();
 
     let mut proj: Vec<(usize, f32)> = rows
         .iter()
+        .copied()
         .enumerate()
         .map(|(i, row)| {
             let rv = dequantize_row(row, dim);
@@ -372,21 +375,24 @@ pub(crate) fn plan_sq8_split(
         assign[*i] = u8::from(rank >= mid);
     }
 
-    let mut shard0 = Vec::new();
-    let mut shard1 = Vec::new();
-    for (i, row) in rows.iter().enumerate() {
+    // Shards borrow the input rows (no payload clone) — the split extracts up
+    // to a full over-cap cell (≈2× the ~500K cap), so cloning every row's
+    // Sq8+ε bytes here would double the biggest cell's resident footprint.
+    let mut shard0: Vec<&EncodedCellRow> = Vec::new();
+    let mut shard1: Vec<&EncodedCellRow> = Vec::new();
+    for (i, row) in rows.iter().copied().enumerate() {
         if assign[i] == 0 {
-            shard0.push(row.clone());
+            shard0.push(row);
         } else {
-            shard1.push(row.clone());
+            shard1.push(row);
         }
     }
 
     let m0 = medoid_index(metric, &shard0);
     let m1 = medoid_index(metric, &shard1);
     (
-        manifest_centroid_components_from_row(&shard0[m0], dim),
-        manifest_centroid_components_from_row(&shard1[m1], dim),
+        manifest_centroid_components_from_row(shard0[m0], dim),
+        manifest_centroid_components_from_row(shard1[m1], dim),
         assign,
     )
 }
@@ -539,7 +545,8 @@ mod tests {
         let mut rows = synth_rows(dim, 10, 0.0);
         rows.extend(synth_rows(dim, 10, 10.0));
         let clusters = synth_centroids(4, dim as u32);
-        let (c0, c1, assign) = plan_sq8_split(&rows, &clusters, 1, Metric::L2Sq);
+        let refs: Vec<&EncodedCellRow> = rows.iter().collect();
+        let (c0, c1, assign) = plan_sq8_split(&refs, &clusters, 1, Metric::L2Sq);
         assert_eq!(c0.len(), dim);
         assert_eq!(c1.len(), dim);
         let dist: f32 = (0..dim).map(|d| (c0[d] - c1[d]).abs()).sum();
@@ -564,7 +571,8 @@ mod tests {
             .map(|row| (row.codes.clone(), row.residuals.clone()))
             .collect();
         let clusters = synth_centroids(4, dim as u32);
-        let (left, right, _assign) = plan_sq8_split(&rows, &clusters, 1, Metric::Cosine);
+        let refs: Vec<&EncodedCellRow> = rows.iter().collect();
+        let (left, right, _assign) = plan_sq8_split(&refs, &clusters, 1, Metric::Cosine);
         let separation: f32 = left.iter().zip(&right).map(|(a, b)| (a - b).abs()).sum();
         assert!(separation > 1.0);
         let after: Vec<(Vec<u8>, Vec<u8>)> = rows
@@ -584,7 +592,8 @@ mod tests {
         let rows = synth_rows(dim, 20, 0.0);
         let mid = vec![0.095f32, 0.096, 0.097, 0.098];
         let clusters = ClusterCentroids::from_fp32(1, dim as u32, &mid, vec![rows.len() as u32]);
-        let (seed0, seed1) = pick_split_seeds(&rows, &clusters, 0, Metric::L2Sq);
+        let refs: Vec<&EncodedCellRow> = rows.iter().collect();
+        let (seed0, seed1) = pick_split_seeds(&refs, &clusters, 0, Metric::L2Sq);
         let mut ends = [seed0, seed1];
         ends.sort_unstable();
         assert_eq!(
@@ -604,7 +613,8 @@ mod tests {
         rows.extend(synth_rows(dim, 4, 50.0));
         let clusters =
             ClusterCentroids::from_fp32(1, dim as u32, &vec![0.0f32; dim], vec![rows.len() as u32]);
-        let (_c0, _c1, assign) = plan_sq8_split(&rows, &clusters, 0, Metric::L2Sq);
+        let refs: Vec<&EncodedCellRow> = rows.iter().collect();
+        let (_c0, _c1, assign) = plan_sq8_split(&refs, &clusters, 0, Metric::L2Sq);
         let ones = assign.iter().filter(|&&a| a == 1).count();
         let zeros = assign.len() - ones;
         assert!(

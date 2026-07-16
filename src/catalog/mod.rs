@@ -56,9 +56,7 @@ use crate::{
     supertable::{
         Supertable,
         options::{Consistency, SupertableOptions},
-        reader_cache::{
-            DiskCacheConfig, DiskCacheError, DiskCacheStore, disk::ForegroundQueryGuard,
-        },
+        reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
     },
 };
 
@@ -580,7 +578,6 @@ impl Connection {
         tracing::instrument(skip_all, fields(sql = sql))
     )]
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
-        let _foreground = ForegroundQueryGuard::enter();
         debug!(sql, "running sql query");
 
         // Gate SQL heap on the connection budget: DataFusion allocates the

@@ -25,24 +25,35 @@ const DELETED_IDS_HEADER_LEN: usize = 4 + 1 + 4;
 /// Bytes per serialized `_id` (a little-endian `i128`).
 const DELETED_ID_LEN: usize = 16;
 
-/// Serialize the consolidated deleted user-`_id` set. Sorted, deduplicated
-/// on-disk order is a WIRE INVARIANT — consumers `binary_search` the decoded
-/// set, so an unsorted blob silently resurrects deleted rows. Enforced here
-/// rather than trusted to callers: a future second encode call site must not
-/// be able to break search correctness.
+/// Whether ids are in their canonical set representation: strictly ascending
+/// (therefore sorted and deduplicated).
+fn is_canonical_deleted_id_set(ids: &[i128]) -> bool {
+    ids.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+/// Serialize the consolidated deleted user-`_id` set. Strictly ascending
+/// on-disk order is a wire invariant — consumers `binary_search` the decoded
+/// set, so an unsorted blob silently resurrects deleted rows. The normal
+/// caller already passes canonical ids; borrow that slice without copying.
+/// An unsorted or duplicate-containing future caller is canonicalized here.
 pub(crate) fn encode_deleted_ids(ids: &[i128]) -> Vec<u8> {
-    let sorted_ids: Vec<i128> = if ids.is_sorted() {
-        ids.to_vec()
+    let canonical_ids;
+    let ids = if is_canonical_deleted_id_set(ids) {
+        ids
     } else {
-        let mut sorted = ids.to_vec();
-        sorted.sort_unstable();
-        sorted
+        canonical_ids = {
+            let mut canonical = ids.to_vec();
+            canonical.sort_unstable();
+            canonical.dedup();
+            canonical
+        };
+        canonical_ids.as_slice()
     };
-    let mut out = Vec::with_capacity(DELETED_IDS_HEADER_LEN + sorted_ids.len() * DELETED_ID_LEN);
+    let mut out = Vec::with_capacity(DELETED_IDS_HEADER_LEN + ids.len() * DELETED_ID_LEN);
     out.extend_from_slice(DELETED_IDS_MAGIC);
     out.push(DELETED_IDS_VERSION);
-    out.extend_from_slice(&(sorted_ids.len() as u32).to_le_bytes());
-    for id in &sorted_ids {
+    out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+    for id in ids {
         out.extend_from_slice(&id.to_le_bytes());
     }
     out
@@ -81,9 +92,12 @@ pub(crate) fn decode_deleted_ids(bytes: &[u8]) -> Result<Vec<i128>, HiddenDelete
         buf.copy_from_slice(chunk);
         ids.push(i128::from_le_bytes(buf));
     }
-    // Consumers `binary_search` this set; the encoder guarantees sorted
+    // Consumers `binary_search` this set; the encoder guarantees canonical
     // order on the wire (see `encode_deleted_ids`).
-    debug_assert!(ids.is_sorted(), "deleted-id set must be sorted on the wire");
+    debug_assert!(
+        is_canonical_deleted_id_set(&ids),
+        "deleted-id set must be strictly ascending on the wire"
+    );
     Ok(ids)
 }
 
@@ -124,7 +138,7 @@ mod tests {
     fn unsorted_input_encodes_sorted() {
         let ids: Vec<i128> = vec![42, -1, i128::MAX, 0, 42];
         let decoded = decode_deleted_ids(&encode_deleted_ids(&ids)).expect("decode");
-        assert!(decoded.is_sorted());
+        assert_eq!(decoded, vec![-1, 0, 42, i128::MAX]);
         assert!(decoded.binary_search(&-1).is_ok());
         assert!(decoded.binary_search(&i128::MAX).is_ok());
     }

@@ -241,7 +241,16 @@ fn open_segmented_blob(bytes: &[u8]) -> Result<Vec<DecodedPosting>, String> {
         }
         let n_docs = u32_le(&body[off..off + 4])? as usize;
         off += 4;
-        let segment_len = dim * 8 + n_docs * dim * ROW_BYTES_PER_DIM + n_docs * 4 + n_docs * 4;
+        // The trailing per-doc norms block exists exactly when the encoder
+        // wrote one — the same `matches!(metric, L2Sq | Cosine)` gate
+        // `encode_segmented_blob` writes it under; NegDot segments omit it. An
+        // unconditional norms term mis-sliced every segmented NegDot blob.
+        let norms_len = if matches!(metric, Metric::L2Sq | Metric::Cosine) {
+            n_docs * 4
+        } else {
+            0
+        };
+        let segment_len = dim * 8 + n_docs * dim * ROW_BYTES_PER_DIM + n_docs * 4 + norms_len;
         if body.len() < off + segment_len {
             return Err("segmented cell posting segment body truncated".into());
         }
@@ -820,18 +829,18 @@ const MEDOID_SAMPLE_CAP: usize = 512;
 /// (the same strided-sample shape the materialized k-means uses), and returns an
 /// index into the *original* shard. For `len <= cap` it is the exact all-pairs
 /// medoid (`step == 1`), so small shards are unchanged.
-pub(crate) fn medoid_index_by<F>(shard: &[EncodedCellRow], dist: F) -> usize
+pub(crate) fn medoid_index_by<F>(shard: &[&EncodedCellRow], dist: F) -> usize
 where
     F: Fn(&EncodedCellRow, &EncodedCellRow) -> f32,
 {
     let n = shard.len();
     let step = n.div_ceil(MEDOID_SAMPLE_CAP).max(1);
-    let refs: Vec<&EncodedCellRow> = shard.iter().step_by(step).collect();
+    let refs: Vec<&EncodedCellRow> = shard.iter().step_by(step).copied().collect();
     let mut best_idx = 0usize;
     let mut best_sum = f32::INFINITY;
     let mut i = 0usize;
     while i < n {
-        let row_i = &shard[i];
+        let row_i = shard[i];
         let sum: f32 = refs.iter().map(|row_j| dist(row_i, row_j)).sum();
         if sum < best_sum {
             best_sum = sum;
@@ -961,6 +970,37 @@ mod tests {
         let hits = search_blob(&blob, &q, 5).expect("search");
         assert_eq!(hits.len(), 5);
         assert_eq!(hits[0].0, 31);
+    }
+
+    /// A segmented NegDot blob has NO per-doc norms block (the encoder gates
+    /// it on metric), so the open path must not slice one — the old
+    /// unconditional `n_docs * 4` norms term mis-sliced every NegDot segment.
+    #[test]
+    fn segmented_negdot_blob_round_trips_without_norms() {
+        let dim = 8usize;
+        let mut ids = Vec::new();
+        let mut vecs = Vec::new();
+        for i in 0..16u32 {
+            ids.push(i);
+            for d in 0..dim {
+                vecs.push(if d == 0 { 1.0 + i as f32 * 0.01 } else { 0.0 });
+            }
+        }
+        let seg = open_legacy_blob(
+            &encode_blob(Metric::NegDot, dim, &ids, &vecs, RerankCodec::Sq8Residual)
+                .expect("encode"),
+        )
+        .expect("open legacy");
+        assert!(seg.per_doc_norms.is_none(), "NegDot carries no norms");
+        let blob = encode_segmented_blob(dim, Metric::NegDot, &[seg]).expect("encode segmented");
+        let segments = open_segmented_blob(&blob).expect("open segmented NegDot");
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].ids, ids);
+        // Highest dot product wins under NegDot: the largest first component.
+        let mut q = vec![0f32; dim];
+        q[0] = 1.0;
+        let hits = search_blob(&blob, &q, 3).expect("search segmented NegDot");
+        assert_eq!(hits[0].0, 15);
     }
 
     #[test]

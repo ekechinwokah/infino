@@ -1097,12 +1097,7 @@ impl VectorReader {
                 if let Some(meta_bytes) = source.try_get_range_sync(meta_abs_start..meta_abs_end) {
                     let scale = parse_f32_le_vec(&meta_bytes[0..scale_end]);
                     let offset = parse_f32_le_vec(&meta_bytes[scale_end..offset_end]);
-                    validate_fixed_quantizer_meta(
-                        rerank_codec,
-                        &scale,
-                        &offset,
-                        cfg.column.as_str(),
-                    )?;
+                    validate_quantizer_meta(rerank_codec, &scale, &offset, cfg.column.as_str())?;
                     let per_doc_norms: Option<Arc<[f32]>> =
                         if matches!(metric, Metric::L2Sq | Metric::Cosine) {
                             let norms_end = offset_end + (col_n_docs as usize) * 4;
@@ -1633,7 +1628,7 @@ impl VectorReader {
             if let Some(meta_bytes) = source.try_get_range_sync(meta_abs_start..meta_abs_end) {
                 let scale = parse_f32_le_vec(&meta_bytes[0..scale_end]);
                 let offset = parse_f32_le_vec(&meta_bytes[scale_end..offset_end]);
-                validate_fixed_quantizer_meta(rerank_codec, &scale, &offset, cfg.column.as_str())?;
+                validate_quantizer_meta(rerank_codec, &scale, &offset, cfg.column.as_str())?;
                 let per_doc_norms: Option<Arc<[f32]>> =
                     if matches!(metric, Metric::L2Sq | Metric::Cosine) {
                         let norms_end = offset_end + (col_n_docs as usize) * 4;
@@ -3514,7 +3509,11 @@ async fn build_shortlist(
     // is intentionally ignored — there's nothing to refine.
     if matches!(col.rerank_codec, RerankCodec::RabitqOnly) {
         let _ = ctx.rerank_mult;
-        shortlist.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        // `total_cmp` (not `partial_cmp`→Equal) so a NaN score orders
+        // deterministically here exactly as it does on the multi-cell
+        // merge path — otherwise the two paths diverge on top-k for a
+        // corrupt/degenerate score.
+        shortlist.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         return ShortlistOutcome::Done(
             shortlist
                 .into_iter()
@@ -4128,7 +4127,10 @@ async fn rerank_candidates_from_blocks(
 }
 
 fn finalize_reranked(mut reranked: Vec<(u32, f32)>, k: usize) -> Vec<(u32, f32)> {
-    reranked.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    // Distance ascending, `total_cmp` + id tie-break so single-cell top-k
+    // is bit-for-bit the same ordering the multi-cell merge produces
+    // (both must agree on where a NaN score lands).
+    reranked.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
     reranked.truncate(k);
     reranked
 }
@@ -4226,9 +4228,7 @@ fn parse_sq8_meta_bytes(
     let offset_end = scale_end + so_block_bytes;
     let scale = parse_f32_le_vec(&bytes[0..scale_end]);
     let offset = parse_f32_le_vec(&bytes[scale_end..offset_end]);
-    debug_assert!(
-        validate_fixed_quantizer_meta(rerank_codec, &scale, &offset, "lazy metadata").is_ok()
-    );
+    debug_assert!(validate_quantizer_meta(rerank_codec, &scale, &offset, "lazy metadata").is_ok());
     let per_doc_norms = has_norms.then(|| {
         let norms_end = offset_end + n_docs * 4;
         Arc::from(parse_f32_le_vec(&bytes[offset_end..norms_end]))
@@ -4240,12 +4240,21 @@ fn parse_sq8_meta_bytes(
     }
 }
 
-fn validate_fixed_quantizer_meta(
+fn validate_quantizer_meta(
     rerank_codec: RerankCodec,
     scale: &[f32],
     offset: &[f32],
     column: &str,
 ) -> Result<(), VectorError> {
+    if scale
+        .iter()
+        .chain(offset.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            "column {column:?} has non-finite quantizer metadata"
+        ))));
+    }
     if !rerank_codec.uses_fixed_quantizer() {
         return Ok(());
     }
@@ -4465,6 +4474,7 @@ mod tests {
         fs::File,
         hint::black_box,
         path::{Path, PathBuf},
+        sync::Arc,
         time::Duration,
     };
 
@@ -4474,7 +4484,13 @@ mod tests {
     use tokio::time::sleep;
 
     use super::*;
-    use crate::superfile::vector::builder::{VectorBuilder, VectorConfig};
+    use crate::superfile::vector::{
+        builder::{
+            VectorBuilder, VectorConfig, build_merged_subsection_from_materialized,
+            finish_multi_cell_blob,
+        },
+        cell_posting::{EncodedCellRow, MaterializedIvfRow},
+    };
 
     fn build_blob(n_docs: u32, dim: usize, n_cent: usize, metric: Metric) -> (Bytes, String) {
         let mut b = VectorBuilder::new();
@@ -4505,6 +4521,70 @@ mod tests {
             r#"[{{"column":"embedding","dim":{dim},"n_cent":{n_cent},"rot_seed":7,"metric":"{metric_s}"}}]"#
         );
         (Bytes::from(bytes), json)
+    }
+
+    /// Small valid v2 blob used by corruption tests below. Keeping construction
+    /// in one helper makes each test mutate exactly one independent invariant.
+    fn build_multi_cell_blob() -> (Vec<u8>, String) {
+        let dim = 16usize;
+        let make_rows = |cell: u32, n: usize| -> Vec<MaterializedIvfRow> {
+            let scale: Arc<[f32]> = Arc::from(vec![1.0f32; dim]);
+            let offset: Arc<[f32]> = Arc::from(vec![0.0f32; dim]);
+            (0..n)
+                .map(|index| {
+                    let local_doc_id = index as u32;
+                    let stable_id = i128::from(cell) * 1_000 + i128::from(local_doc_id);
+                    MaterializedIvfRow {
+                        local_doc_id,
+                        stable_id,
+                        cluster: 0,
+                        rabitq_code: vec![0; dim.div_ceil(8)],
+                        encoded: EncodedCellRow {
+                            stable_id,
+                            rerank_codec: RerankCodec::Sq8Residual,
+                            scale: Arc::clone(&scale),
+                            offset: Arc::clone(&offset),
+                            codes: vec![cell as u8; dim],
+                            residuals: vec![0; dim],
+                            norm_sq: Some(0.0),
+                        },
+                    }
+                })
+                .collect()
+        };
+        let config = VectorConfig {
+            column: "embedding".into(),
+            dim,
+            n_cent: 2,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        };
+        let first = build_merged_subsection_from_materialized(config.clone(), make_rows(7, 3))
+            .expect("first cell subsection");
+        let second = build_merged_subsection_from_materialized(config, make_rows(15, 2))
+            .expect("second cell subsection");
+        let blob = finish_multi_cell_blob(&[(7, first), (15, second)]).expect("multi-cell blob");
+        let json = r#"[{"column":"embedding","dim":16,"n_cent":2,"rot_seed":7,"metric":"l2sq"}]"#
+            .to_string();
+        (blob, json)
+    }
+
+    /// `(offset, len)` of the first v2 cell subsection.
+    fn first_multi_cell_subsection(bytes: &[u8]) -> (usize, usize) {
+        let directory_offset =
+            read_u64_le(&bytes[outer_hdr::DIR_OFFSET_OFF..outer_hdr::DIR_OFFSET_OFF + U64_BYTES])
+                as usize;
+        let subsection_offset = read_u64_le(
+            &bytes[directory_offset + cell_dir_entry::SUBSECTION_OFF_OFF
+                ..directory_offset + cell_dir_entry::SUBSECTION_OFF_OFF + U64_BYTES],
+        ) as usize;
+        let subsection_len = read_u64_le(
+            &bytes[directory_offset + cell_dir_entry::SUBSECTION_LEN_OFF
+                ..directory_offset + cell_dir_entry::SUBSECTION_LEN_OFF + U64_BYTES],
+        ) as usize;
+        (subsection_offset, subsection_len)
     }
 
     #[tokio::test]
@@ -4587,6 +4667,121 @@ mod tests {
             err,
             VectorError::Read(ReadError::ChecksumMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn multi_cell_open_rejects_outer_doc_count_mismatch_without_crc() {
+        let (mut bytes, json) = build_multi_cell_blob();
+        bytes[outer_hdr::N_DOCS_OFF..outer_hdr::N_DOCS_OFF + U64_BYTES]
+            .copy_from_slice(&0u64.to_le_bytes());
+        let error =
+            VectorReader::open_with(Bytes::from(bytes), &json, OpenOptions { verify_crc: false })
+                .expect_err("outer n_docs must match the cell subsections");
+        assert!(
+            matches!(
+                &error,
+                VectorError::Read(ReadError::MalformedVersion(message))
+                    if message.contains("summed cell docs")
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn multi_cell_open_verifies_trailing_outer_crc() {
+        let (mut bytes, json) = build_multi_cell_blob();
+        let outer_crc_byte = bytes.len() - 1;
+        bytes[outer_crc_byte] ^= 0xFF;
+        let error =
+            VectorReader::open(Bytes::from(bytes), &json).expect_err("outer CRC must be verified");
+        assert!(
+            matches!(
+                &error,
+                VectorError::Read(ReadError::ChecksumMismatch {
+                    section: "vector/multi_cell_outer",
+                    ..
+                })
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn multi_cell_open_rejects_inverted_centroid_offsets_without_crc() {
+        let (mut bytes, json) = build_multi_cell_blob();
+        let (subsection_offset, _) = first_multi_cell_subsection(&bytes);
+        let centroids_offset = read_u64_le(
+            &bytes[subsection_offset + sub_hdr::CENTROIDS_OFF_OFF
+                ..subsection_offset + sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES],
+        );
+        let inverted_cluster_index_offset = centroids_offset - 1;
+        bytes[subsection_offset + sub_hdr::CLUSTER_IDX_OFF_OFF
+            ..subsection_offset + sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES]
+            .copy_from_slice(&inverted_cluster_index_offset.to_le_bytes());
+
+        let error =
+            VectorReader::open_with(Bytes::from(bytes), &json, OpenOptions { verify_crc: false })
+                .expect_err("inverted centroid offsets must be malformed");
+        assert!(
+            matches!(
+                &error,
+                VectorError::Read(ReadError::MalformedVersion(message))
+                    if message.contains("cluster_idx_off precedes centroids_off")
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn multi_cell_open_rejects_blocks_offset_past_subsection_crc_without_crc() {
+        let (mut bytes, json) = build_multi_cell_blob();
+        let (subsection_offset, subsection_len) = first_multi_cell_subsection(&bytes);
+        bytes[subsection_offset + sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF
+            ..subsection_offset + sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES]
+            .copy_from_slice(&(subsection_len as u64).to_le_bytes());
+
+        let error =
+            VectorReader::open_with(Bytes::from(bytes), &json, OpenOptions { verify_crc: false })
+                .expect_err("blocks offset past the subsection CRC must be malformed");
+        assert!(
+            matches!(
+                &error,
+                VectorError::Read(ReadError::MalformedVersion(message))
+                    if message.contains("per_cluster_blocks_off past the subsection CRC")
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn multi_cell_open_rejects_non_finite_quantizer_metadata_without_crc() {
+        let (mut bytes, json) = build_multi_cell_blob();
+        let (subsection_offset, _) = first_multi_cell_subsection(&bytes);
+        let centroids_offset = read_u64_le(
+            &bytes[subsection_offset + sub_hdr::CENTROIDS_OFF_OFF
+                ..subsection_offset + sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES],
+        ) as usize;
+        let cluster_index_offset = read_u64_le(
+            &bytes[subsection_offset + sub_hdr::CLUSTER_IDX_OFF_OFF
+                ..subsection_offset + sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES],
+        ) as usize;
+        let dim = 16usize;
+        let n_cent = (cluster_index_offset - centroids_offset) / (dim * 4);
+        let codec_meta_offset =
+            subsection_offset + cluster_index_offset + n_cent * CLUSTER_IDX_ENTRY_BYTES;
+        bytes[codec_meta_offset..codec_meta_offset + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+
+        let error =
+            VectorReader::open_with(Bytes::from(bytes), &json, OpenOptions { verify_crc: false })
+                .expect_err("non-finite scale must be malformed");
+        assert!(
+            matches!(
+                &error,
+                VectorError::Read(ReadError::MalformedVersion(message))
+                    if message.contains("non-finite quantizer metadata")
+            ),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

@@ -10,9 +10,10 @@ use std::{
     fmt, fs, io,
     io::SeekFrom,
     os::unix::fs::FileExt,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock, Weak,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -76,33 +77,6 @@ const STORE_UPGRADE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Filename suffix for per-superfile sparse block-cache files.
 const BLOCKS_FILE_SUFFIX: &str = ".blocks";
-
-/// Process-global count of in-flight foreground queries.
-static FOREGROUND_QUERIES: AtomicU64 = AtomicU64::new(0);
-/// Wakes background fills so their in-flight range futures can be cancelled
-/// when foreground work arrives.
-static FOREGROUND_NOTIFY: OnceLock<Notify> = OnceLock::new();
-
-fn foreground_notify() -> &'static Notify {
-    FOREGROUND_NOTIFY.get_or_init(Notify::new)
-}
-
-/// RAII guard marking a foreground query in flight for its lifetime.
-pub struct ForegroundQueryGuard(());
-
-impl ForegroundQueryGuard {
-    pub fn enter() -> Self {
-        FOREGROUND_QUERIES.fetch_add(1, Ordering::AcqRel);
-        foreground_notify().notify_waiters();
-        ForegroundQueryGuard(())
-    }
-}
-
-impl Drop for ForegroundQueryGuard {
-    fn drop(&mut self) {
-        FOREGROUND_QUERIES.fetch_sub(1, Ordering::AcqRel);
-    }
-}
 
 /// Errors surfaced by [`DiskCacheStore::reader`].
 #[derive(Debug, Error)]
@@ -254,6 +228,11 @@ pub struct DiskCacheStore {
     pinned_fn: std::sync::Mutex<Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync>>,
     /// Global cap on concurrent background full-superfile fills.
     prefetch_semaphore: Arc<Semaphore>,
+    /// Cache-root restoration runs after construction so opening a table never
+    /// synchronously mmaps and parses every prior cache file. Readers await this
+    /// latch before deciding a URI is cold, avoiding duplicate downloads.
+    restore_complete: AtomicBool,
+    restore_notify: Notify,
 }
 
 impl fmt::Debug for DiskCacheStore {
@@ -310,12 +289,31 @@ impl DiskCacheStore {
             n_promotion_waiters: AtomicU64::new(0),
             pinned_fn: std::sync::Mutex::new(pinned_fn),
             prefetch_semaphore,
+            restore_complete: AtomicBool::new(false),
+            restore_notify: Notify::new(),
         });
 
         // Reuse any cache files a prior run (or another handle) left on disk:
-        // rebuild the in-memory index so reads hit the NVMe bytes instead of
-        // cold-fetching them back from object storage.
-        store.restore_from_cache_root();
+        // rebuild the in-memory index off the constructor thread so opening a
+        // table is independent of cache-root size. `reader_with_hints` awaits
+        // completion before declaring a URI cold, so restore cannot race a
+        // duplicate object-store fetch.
+        let restore_store = Arc::clone(&store);
+        thread::Builder::new()
+            .name("infino-disk-cache-restore".into())
+            .spawn(move || {
+                let restored =
+                    catch_unwind(AssertUnwindSafe(|| restore_store.restore_from_cache_root()));
+                restore_store
+                    .restore_complete
+                    .store(true, Ordering::Release);
+                restore_store.restore_notify.notify_waiters();
+                if restored.is_err() {
+                    tracing::warn!(
+                        "disk-cache restore thread panicked; continuing with cold cache"
+                    );
+                }
+            })?;
 
         // Idle-threshold sweep thread. Library-not-service
         // shape: holds a Weak<Self> and exits naturally when the last Arc
@@ -462,6 +460,16 @@ impl DiskCacheStore {
         self.reader_with_hints(uri, None, None).await
     }
 
+    async fn wait_for_restore(&self) {
+        while !self.restore_complete.load(Ordering::Acquire) {
+            let notified = self.restore_notify.notified();
+            if self.restore_complete.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
+    }
+
     /// like [`Self::reader`] but takes a precomputed
     /// [`SubsectionOffsets`] hint (sourced from the manifest's
     /// [`crate::supertable::manifest::SuperfileEntry::subsection_offsets`]).
@@ -481,6 +489,7 @@ impl DiskCacheStore {
         offsets: Option<&SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
+        self.wait_for_restore().await;
         match self.config.cold_fetch_mode {
             ColdFetchMode::HybridWithPrefetch => self.reader_hybrid(uri, storage).await,
             ColdFetchMode::RangeOnly => Err(DiskCacheError::SuperfileOpen(
@@ -1926,6 +1935,10 @@ fn background_store_abandoned(store: &Arc<DiskCacheStore>) -> bool {
     Arc::strong_count(store) == 1
 }
 
+fn reader_blocks_background_fill(store: &DiskCacheStore, reader: &Weak<SuperfileReader>) -> bool {
+    reader.strong_count() > 1 && store.n_promotion_waiters.load(Ordering::Acquire) == 0
+}
+
 async fn wait_for_lazy_foreground_release(
     store: &Weak<DiskCacheStore>,
     reader: &Weak<SuperfileReader>,
@@ -1952,18 +1965,29 @@ async fn wait_for_lazy_foreground_release(
     }
 }
 
-/// Wait for a quiet interval with no foreground query. The grace re-check
-/// prevents a fill from starting between reader open and query execution.
-async fn wait_for_foreground_quiescence(store: &Arc<DiskCacheStore>) -> bool {
+/// Wait until this URI's lazy reader has no foreground holder. The cache entry
+/// itself owns one `Arc`; additional strong references are active readers for
+/// this exact superfile. This keeps unrelated table/URI fills moving instead
+/// of pausing every process-wide fill for any foreground query.
+async fn wait_for_reader_quiescence(
+    store: &Arc<DiskCacheStore>,
+    reader: &Weak<SuperfileReader>,
+) -> bool {
     loop {
-        while FOREGROUND_QUERIES.load(Ordering::Acquire) > 0 {
+        while reader_blocks_background_fill(store, reader) {
             if background_store_abandoned(store) {
                 return false;
             }
             tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
         }
+        if reader.strong_count() == 0 {
+            return false;
+        }
         tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
-        if FOREGROUND_QUERIES.load(Ordering::Acquire) == 0 {
+        if reader.strong_count() == 0 {
+            return false;
+        }
+        if !reader_blocks_background_fill(store, reader) {
             return !background_store_abandoned(store);
         }
     }
@@ -1978,28 +2002,44 @@ enum BackgroundFillOutcome {
 
 async fn cold_fetch_to_disk_cancelable(
     store: &Arc<DiskCacheStore>,
+    reader: &Weak<SuperfileReader>,
     fetch_storage: &Arc<dyn StorageProvider>,
     storage_uri: &str,
     dest_path: &Path,
     size: u64,
+    filled: &mut Vec<bool>,
 ) -> Result<BackgroundFillOutcome, DiskCacheError> {
     let n_streams = store.config.cold_fetch_streams.max(1);
     let chunk_size = store.config.cold_fetch_chunk_bytes.max(1);
-    let file = {
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(dest_path)?;
-        file.set_len(size)?;
-        Arc::new(file)
-    };
-
     let n_chunks = if size == 0 {
         0
     } else {
         size.div_ceil(chunk_size)
     };
+    // `filled` is the resume cursor, owned by the caller across pause/resume:
+    // an entry is `true` once its chunk is durably written. On the first
+    // attempt it is empty; size it and truncate the destination. On a resume
+    // (a same-URI reader paused the previous attempt) it carries the
+    // already-written chunks, so the fetch skips them instead of re-downloading
+    // the whole object from byte 0.
+    let first_attempt = filled.len() != n_chunks as usize;
+    if first_attempt {
+        filled.clear();
+        filled.resize(n_chunks as usize, false);
+    }
+    let file = {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true);
+        if first_attempt {
+            opts.truncate(true);
+        }
+        let file = opts.open(dest_path)?;
+        if first_attempt {
+            file.set_len(size)?;
+        }
+        Arc::new(file)
+    };
+
     let mut next_chunk = 0u64;
     let mut in_flight = FuturesUnordered::new();
 
@@ -2007,13 +2047,22 @@ async fn cold_fetch_to_disk_cancelable(
     // short-lived cache that requested this background fill is dropped.
     loop {
         while next_chunk < n_chunks && in_flight.len() < n_streams {
+            // Skip chunks a prior attempt already wrote (resume cursor).
+            if filled[next_chunk as usize] {
+                next_chunk += 1;
+                continue;
+            }
             if background_store_abandoned(store) {
                 return Ok(BackgroundFillOutcome::Abandoned);
             }
-            if FOREGROUND_QUERIES.load(Ordering::Acquire) > 0 {
+            if reader.strong_count() == 0 {
+                return Ok(BackgroundFillOutcome::Abandoned);
+            }
+            if reader_blocks_background_fill(store, reader) {
                 return Ok(BackgroundFillOutcome::Paused);
             }
-            let start = next_chunk * chunk_size;
+            let chunk_idx = next_chunk;
+            let start = chunk_idx * chunk_size;
             let end = (start + chunk_size).min(size);
             let storage = Arc::clone(fetch_storage);
             let file = Arc::clone(&file);
@@ -2025,24 +2074,31 @@ async fn cold_fetch_to_disk_cancelable(
                     .map_err(|error| {
                         DiskCacheError::SuperfileOpen(format!("write join: {error}"))
                     })??;
-                Ok::<(), DiskCacheError>(())
+                Ok::<u64, DiskCacheError>(chunk_idx)
             });
             next_chunk += 1;
         }
 
-        let foreground = foreground_notify().notified();
-        tokio::pin!(foreground);
-        let _ = foreground.as_mut().enable();
-        if FOREGROUND_QUERIES.load(Ordering::Acquire) > 0 {
+        if reader.strong_count() == 0 {
+            return Ok(BackgroundFillOutcome::Abandoned);
+        }
+        if reader_blocks_background_fill(store, reader) {
             return Ok(BackgroundFillOutcome::Paused);
         }
         tokio::select! {
             biased;
-            _ = &mut foreground => {
-                return Ok(BackgroundFillOutcome::Paused);
+            _ = tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL) => {
+                if reader.strong_count() == 0 {
+                    return Ok(BackgroundFillOutcome::Abandoned);
+                }
+                if reader_blocks_background_fill(store, reader) {
+                    return Ok(BackgroundFillOutcome::Paused);
+                }
             }
             result = in_flight.next() => match result {
-                Some(result) => result?,
+                // Mark the chunk durable only once its write completes, so a
+                // pause mid-flight re-fetches just the unfinished chunks.
+                Some(result) => filled[result? as usize] = true,
                 None => break,
             }
         }
@@ -2054,7 +2110,10 @@ async fn cold_fetch_to_disk_cancelable(
     if background_store_abandoned(store) {
         return Ok(BackgroundFillOutcome::Abandoned);
     }
-    if FOREGROUND_QUERIES.load(Ordering::Acquire) > 0 {
+    if reader.strong_count() == 0 {
+        return Ok(BackgroundFillOutcome::Abandoned);
+    }
+    if reader_blocks_background_fill(store, reader) {
         return Ok(BackgroundFillOutcome::Paused);
     }
     spawn_blocking(move || file.sync_all())
@@ -2108,18 +2167,30 @@ async fn lazy_background_fill(
             )));
         }
     };
+    // Resume cursor: chunks durably written so far, preserved across
+    // pause/resume so a same-URI reader interrupting the fill costs only the
+    // unfinished chunks rather than a re-download of the whole object.
+    let mut filled: Vec<bool> = Vec::new();
     loop {
-        if !wait_for_foreground_quiescence(&store).await {
+        if !wait_for_reader_quiescence(&store, &reader).await {
             rollback_lazy_background_fill(&store, &uri, &tmp);
             return Ok(());
         }
-        match cold_fetch_to_disk_cancelable(&store, &fetch_storage, &storage_uri, &tmp, size)
-            .await?
+        match cold_fetch_to_disk_cancelable(
+            &store,
+            &reader,
+            &fetch_storage,
+            &storage_uri,
+            &tmp,
+            size,
+            &mut filled,
+        )
+        .await?
         {
             BackgroundFillOutcome::Complete => break,
-            BackgroundFillOutcome::Paused => {
-                let _ = fs::remove_file(&tmp);
-            }
+            // Keep the partial `tmp` and the `filled` cursor: the next attempt
+            // resumes from the first unwritten chunk.
+            BackgroundFillOutcome::Paused => {}
             BackgroundFillOutcome::Abandoned => {
                 rollback_lazy_background_fill(&store, &uri, &tmp);
                 return Ok(());
@@ -2226,7 +2297,7 @@ mod tests {
     /// Local-filesystem background promotion should finish well within this.
     const PROMOTE_TIMEOUT: Duration = Duration::from_secs(10);
     /// Long enough to cover several background quiet-interval checks.
-    const FOREGROUND_GUARD_HOLD: Duration = Duration::from_millis(50);
+    const READER_HOLD_INTERVAL: Duration = Duration::from_millis(50);
     /// Large enough that one-byte sequential range reads cannot finish before
     /// the preemption test enters its foreground guard.
     const PREEMPT_TEST_BYTES: usize = 1 << 20;
@@ -2508,6 +2579,7 @@ mod tests {
             ..Default::default()
         };
         let store2 = DiskCacheStore::new_unpinned(Arc::clone(&storage), cfg2).expect("store2");
+        store2.wait_for_restore().await;
 
         let s = store2.stats();
         assert_eq!(s.n_entries, 1, "rebuilt index has the cached superfile");
@@ -2862,7 +2934,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_fill_waits_for_foreground_query_guard() {
+    async fn background_fill_waits_for_same_uri_reader() {
         let (_dir, store) = test_store_with(|cfg| {
             cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
         });
@@ -2870,23 +2942,46 @@ mod tests {
         put_superfile(&store, &uri, tiny_superfile_bytes()).await;
 
         let reader = store.reader(&uri).await.expect("lazy cold");
-        let foreground = ForegroundQueryGuard::enter();
-        drop(reader);
-        tokio::time::sleep(FOREGROUND_GUARD_HOLD).await;
+        tokio::time::sleep(READER_HOLD_INTERVAL).await;
         assert!(
             !store.is_mmap_promoted(&uri),
-            "background promotion must yield while a foreground query is active"
+            "background promotion must yield while the URI's lazy reader is held"
         );
 
-        drop(foreground);
+        drop(reader);
         store
             .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
             .await
-            .expect("promotion resumes after foreground query");
+            .expect("promotion resumes after the URI reader is released");
     }
 
     #[tokio::test]
-    async fn foreground_query_cancels_in_flight_background_ranges() {
+    async fn reader_for_one_uri_does_not_pause_another_uri_fill() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.prefetch_concurrency = 2;
+        });
+        let held_uri = SuperfileUri::new_v4();
+        let fill_uri = SuperfileUri::new_v4();
+        put_superfile(&store, &held_uri, tiny_superfile_bytes()).await;
+        put_superfile(&store, &fill_uri, tiny_superfile_bytes()).await;
+
+        let held_reader = store.reader(&held_uri).await.expect("held lazy reader");
+        let fill_reader = store.reader(&fill_uri).await.expect("fill lazy reader");
+        drop(fill_reader);
+        store
+            .wait_until_mmap_promoted(&fill_uri, PROMOTE_TIMEOUT)
+            .await
+            .expect("unrelated URI must promote");
+        assert!(
+            !store.is_mmap_promoted(&held_uri),
+            "only the URI with an active reader should remain paused"
+        );
+        drop(held_reader);
+    }
+
+    #[tokio::test]
+    async fn same_uri_reader_pauses_in_flight_background_ranges() {
         let (dir, store) = test_store_with(|cfg| {
             cfg.cold_fetch_streams = 1;
             cfg.cold_fetch_chunk_bytes = 1;
@@ -2902,15 +2997,23 @@ mod tests {
         let fill_store = Arc::clone(&store);
         let fill_storage = Arc::clone(&store.storage);
         let fill_destination = destination.clone();
+        let signal_reader = Arc::new(
+            SuperfileReader::open(tiny_superfile_bytes()).expect("foreground signal reader"),
+        );
+        let signal_weak = Arc::downgrade(&signal_reader);
         let fill = spawn(async move {
-            cold_fetch_to_disk_cancelable(
+            let mut filled = Vec::new();
+            let outcome = cold_fetch_to_disk_cancelable(
                 &fill_store,
+                &signal_weak,
                 &fill_storage,
                 &storage_uri,
                 &fill_destination,
                 PREEMPT_TEST_BYTES as u64,
+                &mut filled,
             )
-            .await
+            .await;
+            (outcome, filled)
         });
 
         timeout(PROMOTE_TIMEOUT, async {
@@ -2920,12 +3023,17 @@ mod tests {
         })
         .await
         .expect("background fill started");
-        let foreground = ForegroundQueryGuard::enter();
-        let outcome = fill
-            .await
-            .expect("background task joined")
-            .expect("background fill returned an outcome");
+        let foreground = Arc::clone(&signal_reader);
+        let (outcome, filled) = fill.await.expect("background task joined");
+        let outcome = outcome.expect("background fill returned an outcome");
         assert_eq!(outcome, BackgroundFillOutcome::Paused);
+        // The resume cursor is sized to the object's chunk count and preserved
+        // across the pause, so a later attempt resumes rather than restarting.
+        assert_eq!(filled.len(), PREEMPT_TEST_BYTES);
+        assert!(
+            filled.iter().any(|&done| !done),
+            "a foreground pause must leave unfinished chunks for the resume"
+        );
         drop(foreground);
     }
 

@@ -101,7 +101,6 @@ use crate::{
             exec::common::{resolve_hits_named, take_rows_byte_source},
             prune::{PruneLeaf, select_superfiles},
         },
-        reader_cache::disk::ForegroundQueryGuard,
         tombstones::SidecarCache,
     },
 };
@@ -793,7 +792,6 @@ impl SupertableReader {
         mode: BoolMode,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
-        let _foreground = ForegroundQueryGuard::enter();
         self.block_on(async {
             let hits = self.bm25_search_async(column, query, k, mode).await?;
             // `projection` selects columns by name (any of `_id`, the
@@ -826,7 +824,6 @@ impl SupertableReader {
         k: usize,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        let _foreground = ForegroundQueryGuard::enter();
         self.block_on(self.bm25_search_async(column, query, k, mode))
     }
 
@@ -838,7 +835,6 @@ impl SupertableReader {
         prefix: &str,
         k: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        let _foreground = ForegroundQueryGuard::enter();
         self.block_on(self.bm25_search_prefix_async(column, prefix, k))
     }
 
@@ -854,7 +850,6 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        let _foreground = ForegroundQueryGuard::enter();
         self.block_on(self.token_match_async(column, query, mode))
     }
 
@@ -864,7 +859,6 @@ impl SupertableReader {
     /// resolves in O(1) from the stored document frequency. Drives the
     /// async kernel via the sync→async bridge.
     pub fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, QueryError> {
-        let _foreground = ForegroundQueryGuard::enter();
         self.block_on(self.token_match_count_async(column, query, mode))
     }
 
@@ -875,7 +869,6 @@ impl SupertableReader {
     /// Returns the rows whose stored value equals `value` exactly;
     /// hits are **unranked** (`score` is `0.0`).
     pub fn exact_match(&self, column: &str, value: &str) -> Result<Vec<SuperfileHit>, QueryError> {
-        let _foreground = ForegroundQueryGuard::enter();
         self.block_on(self.exact_match_async(column, value))
     }
 }

@@ -41,6 +41,20 @@ use crate::superfile::{
     },
 };
 
+/// Read a fragment's stable id at `src_local` (a doc id decoded from stored
+/// bytes), bounds-checked against the fragment's stable-id table. A corrupt or
+/// boundary-replicated short slice can push `src_local` past the table; return
+/// a typed `BuildError` rather than panicking the rayon drain worker on an
+/// out-of-range index.
+#[inline]
+fn stable_id_at(sids: &[i128], src_local: u32) -> Result<i128, BuildError> {
+    sids.get(src_local as usize).copied().ok_or_else(|| {
+        BuildError::VectorSchemaMismatch(
+            "cell fragment doc-id out of range for stable-id table".into(),
+        )
+    })
+}
+
 /// One input superfile column for byte-splice merge.
 pub(crate) struct Sq8IvfMergeInput {
     pub sub: Vec<u8>,
@@ -296,8 +310,10 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
                     // (remapped) local id. `produce_region` guarantees every
                     // input has `stable_ids`, so the index is in range.
                     if let Some(region_off) = stable_ids_region_off {
-                        let sid =
-                            inp.stable_ids.as_ref().expect("produce_region")[src_local as usize];
+                        let sid = stable_id_at(
+                            inp.stable_ids.as_ref().expect("produce_region"),
+                            src_local,
+                        )?;
                         let p = region_off + (local_id as usize) * STABLE_ID_BYTES;
                         bytes[p..p + STABLE_ID_BYTES].copy_from_slice(&sid.to_le_bytes());
                     }
@@ -524,7 +540,7 @@ pub(crate) fn splice_fragments_into_cell(
                     inp.sub[idb + 2],
                     inp.sub[idb + 3],
                 ]);
-                let sid = sids[src_local as usize];
+                let sid = stable_id_at(sids, src_local)?;
                 out_stable_ids[out_row] = sid;
                 if let Some(region_off) = stable_ids_region_off {
                     let p = region_off + out_row * STABLE_ID_BYTES;
@@ -941,5 +957,48 @@ mod tests {
                 i / DIM
             );
         }
+    }
+
+    /// A fragment doc id is stored bytes, not a trusted slice index. Corrupting
+    /// it past the stable-id table must return a typed build error instead of
+    /// panicking the drain worker.
+    #[test]
+    fn splice_fragment_rejects_doc_id_past_stable_ids() {
+        let subsection = fixed_subsection_with_empty_clusters(1_000);
+        let stable_ids: Vec<i128> = (0..ROWS as i128).map(|id| 1_000 + id).collect();
+        let mut input = sq8_ivf_merge_input_from_subsection(
+            &subsection.bytes,
+            DIM,
+            subsection.n_cent,
+            subsection.n_docs,
+            Metric::Cosine,
+            RerankCodec::Sq8FixedResidual,
+            None,
+        )
+        .expect("parse merge input");
+        let (cluster, doc_off, count) = (0..input.n_cent)
+            .find_map(|cluster| {
+                let (doc_off, count) = cluster_entry(&input.sub, input.cluster_idx_off, cluster);
+                (count > 0).then_some((cluster, doc_off, count))
+            })
+            .expect("fixture has a populated cluster");
+        let block = input.per_cluster_blocks_off + doc_off * input.stride;
+        let first_doc_id = block + count * input.code_bytes;
+        input.sub[first_doc_id..first_doc_id + DOC_ID_BYTES]
+            .copy_from_slice(&(ROWS as u32).to_le_bytes());
+
+        let fragments = [(&input, cluster, stable_ids.as_slice())];
+        let error = match splice_fragments_into_cell(&fragments) {
+            Err(error) => error,
+            Ok(_) => panic!("out-of-range stored doc id must fail"),
+        };
+        assert!(
+            matches!(
+                &error,
+                BuildError::VectorSchemaMismatch(message)
+                    if message.contains("doc-id out of range")
+            ),
+            "unexpected error: {error}"
+        );
     }
 }
