@@ -1049,10 +1049,19 @@ impl Supertable {
 /// genuinely-in-flight pin set (URIs a query is actively
 /// holding) can be wired here if a workload ever needs it —
 /// but that is a *bounded* set, never the whole manifest.
-/// Global vector-index cell count used when bootstrapping a table's cell
-/// grid, from `vector.global_cell_count` (YAML-only; no env override).
-pub(crate) fn global_vector_cell_count() -> usize {
-    config::global().vector.global_cell_count.max(1)
+/// Cell count for the **user** table's grid, trained at the first commit —
+/// used to cell-pack user superfiles and route the pre-drain query. From
+/// `vector.user_cell_count` (YAML-only; no env override).
+pub(crate) fn user_vector_cell_count() -> usize {
+    config::global().vector.user_cell_count.max(1)
+}
+
+/// Cell count for the **hidden** vector index: `global_vector_index.grid` is
+/// trained at this count and the drain reads it verbatim; post-drain routing
+/// runs at this granularity. From `vector.hidden_cell_count` (YAML-only; no
+/// env override).
+pub(crate) fn hidden_vector_cell_count() -> usize {
+    config::global().vector.hidden_cell_count.max(1)
 }
 
 /// Reserved VectorCell partition id for the hidden index's "incoming" append
@@ -1237,7 +1246,7 @@ fn build_vector_index_options(
     }
     if let Some(manifest) = user_manifest
         && let Some(clusters) =
-            train_global_centroids(user_opts, manifest, global_vector_cell_count())
+            train_global_centroids(user_opts, manifest, hidden_vector_cell_count())
     {
         hidden_opts = hidden_opts.with_partition_strategy(
             crate::supertable::manifest::list::PartitionStrategy::VectorCell {
@@ -2072,6 +2081,23 @@ mod tests {
                 .get_global_vector_index()
                 .is_some_and(|g| g.grid.n_cent > 0 && g.grid.dim > 0),
             "commit must bootstrap the global cell grid into the user manifest"
+        );
+        // The finer user-side grid is trained exactly when the two counts
+        // differ; with the default single grid (`user_cell_count` ==
+        // `hidden_cell_count`) it stays `None` and the user side falls back
+        // to `grid` via `into_user_grid`.
+        let user_grid_trained = st
+            .reader()
+            .manifest()
+            .get_global_vector_index()
+            .is_some_and(|g| g
+                .user_grid
+                .as_ref()
+                .is_some_and(|u| u.n_cent > 0 && u.dim > 0));
+        assert_eq!(
+            user_grid_trained,
+            user_vector_cell_count() != hidden_vector_cell_count(),
+            "user-side grid must be trained exactly when the cell counts differ"
         );
         assert_eq!(
             st.reader().manifest().superfiles[0].vector_layout,

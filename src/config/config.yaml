@@ -187,10 +187,19 @@ vector:
   # integer.
   drain_read_concurrency: auto
 
-  # Global vector-index cell count used when bootstrapping a table's
-  # cell grid. Stamped into the manifest at create; changing it later
+  # Cell count for the USER table's grid, trained at the first commit —
+  # controls user-superfile cell packing and pre-drain query routing. Finer
+  # than the hidden grid on purpose: smaller cells make the single pre-drain
+  # probe more precise and cheaper. Stamped at create; changing it later
   # affects new tables only.
-  global_cell_count: 64
+  user_cell_count: 256
+
+  # Cell count for the HIDDEN vector index grid, trained at the same first
+  # commit. The drain reads this grid verbatim; post-drain routing runs at
+  # this granularity. Equal to user_cell_count: one 256-cell grid drives
+  # packing, pre-drain routing, the drain, and post-drain routing (user_grid
+  # degenerates to None when the counts match).
+  hidden_cell_count: 256
 
   # Hidden vector-index compaction (distinct from the top-level
   # `compaction:` section, which governs the user table). A packed cell

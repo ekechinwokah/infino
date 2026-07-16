@@ -116,11 +116,13 @@ pub struct Manifest {
     /// create when vector columns are configured; immutable.
     pub vector_index_storage_prefix: Option<String>,
     /// Global vector cell-index coordination state, owned by THIS (the user)
-    /// table. Source of truth for the immutable global cell grid, trained from
-    /// the first committed batch. The hidden cell-index sibling mirrors the
-    /// grid into its own `PartitionStrategy::VectorCell` (a derived copy the
-    /// drain writes, carrying live per-cell counts on top). `None` until
-    /// the first commit with vectors, and on tables without vector columns.
+    /// table. Source of truth for the immutable cell grids trained from the
+    /// first committed batch: `grid` at `hidden_cell_count` cells (read
+    /// verbatim by the drain, which writes it as the hidden sibling's
+    /// `PartitionStrategy::VectorCell` with live per-cell counts on top) and
+    /// the optional finer `user_grid` at `user_cell_count` cells (user-side
+    /// packing + pre-drain routing only). `None` until the first commit with
+    /// vectors, and on tables without vector columns.
     pub global_vector_index: Option<GlobalVectorIndex>,
     /// Drained user commit-versions — **hidden manifest only** (empty on the
     /// user manifest). The hidden-index drain advances this as it consumes user
@@ -168,9 +170,27 @@ pub struct Manifest {
 pub struct GlobalVectorIndex {
     /// Vector column this grid indexes.
     pub column: String,
-    /// Immutable global cell centroids, trained at first commit. Cell `c` of
-    /// the hidden index corresponds to centroid `c` here.
+    /// Immutable cell centroids trained at first commit at
+    /// `hidden_cell_count` cells. This is the grid the drain reads verbatim
+    /// to build the hidden cell index. When `user_grid` is absent it also
+    /// serves the user side (packing + pre-drain routing).
     pub grid: super::ClusterCentroids,
+    /// Optional finer grid trained at the same first commit at
+    /// `user_cell_count` cells. Used only on the user side: cell-packing
+    /// user superfiles at commit and routing the pre-drain query. The drain
+    /// never reads it. `None` on tables created before it existed (and when
+    /// `user_cell_count == hidden_cell_count`) — consumers fall back to
+    /// `grid` via [`Self::into_user_grid`].
+    pub user_grid: Option<super::ClusterCentroids>,
+}
+
+impl GlobalVectorIndex {
+    /// The grid the user side (commit packing + pre-drain routing) uses:
+    /// `user_grid` when trained, else `grid`. Cell tags stamped into user
+    /// superfiles and the query's cell ranking must come from this one grid.
+    pub fn into_user_grid(self) -> super::ClusterCentroids {
+        self.user_grid.unwrap_or(self.grid)
+    }
 }
 
 /// Normalized set of drained user commit-versions, stored **only on the hidden
@@ -1005,6 +1025,9 @@ struct ManifestDto {
 struct GlobalVectorIndexDto {
     column: String,
     grid_b64: String,
+    /// Absent on manifests written before the user-side grid existed.
+    #[serde(default)]
+    user_grid_b64: Option<String>,
 }
 
 // VectorColumnInfo's `dim`/`n_cent` are `usize` in memory but
@@ -1490,6 +1513,10 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
             .map(|g| GlobalVectorIndexDto {
                 column: g.column.clone(),
                 grid_b64: encode_b64(&encode_cluster_centroids(&g.grid)),
+                user_grid_b64: g
+                    .user_grid
+                    .as_ref()
+                    .map(|grid| encode_b64(&encode_cluster_centroids(grid))),
             }),
         drained_ranges: l.drained_ranges.intervals().to_vec(),
         deleted_user_ids_inline_b64: l.deleted_user_ids_inline.as_deref().map(encode_b64),
@@ -1539,9 +1566,23 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
                 let grid = decode_cluster_centroids(&bytes).map_err(|e| {
                     ListParseError::BadFieldValue("global_vector_index.grid", e.to_string())
                 })?;
+                let user_grid = g
+                    .user_grid_b64
+                    .as_deref()
+                    .map(|b64| -> Result<_, ListParseError> {
+                        let bytes = decode_b64(b64, "global_vector_index.user_grid")?;
+                        decode_cluster_centroids(&bytes).map_err(|e| {
+                            ListParseError::BadFieldValue(
+                                "global_vector_index.user_grid",
+                                e.to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?;
                 Ok(GlobalVectorIndex {
                     column: g.column,
                     grid,
+                    user_grid,
                 })
             })
             .transpose()?,
@@ -2346,10 +2387,38 @@ mod tests {
                 &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
                 vec![3, 5],
             ),
+            user_grid: None,
         });
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");
         assert_eq!(decoded.global_vector_index, list.global_vector_index);
+        // With no user grid, the user side falls back to the drain grid.
+        let fallback = decoded
+            .global_vector_index
+            .clone()
+            .expect("index present")
+            .into_user_grid();
+        assert_eq!(
+            Some(&fallback),
+            list.global_vector_index.as_ref().map(|g| &g.grid)
+        );
+
+        // Finer user-side grid rides along and decodes distinct from `grid`.
+        let user_grid =
+            ClusterCentroids::from_fp32(1, 4, &[8.0, 9.0, 10.0, 11.0], vec![7]);
+        if let Some(g) = list.global_vector_index.as_mut() {
+            g.user_grid = Some(user_grid.clone());
+        }
+        let bytes = encode(&list).expect("encode with user grid");
+        let decoded = decode(&bytes).expect("decode with user grid");
+        assert_eq!(decoded.global_vector_index, list.global_vector_index);
+        assert_eq!(
+            decoded
+                .global_vector_index
+                .expect("index present")
+                .into_user_grid(),
+            user_grid
+        );
         // Absent by default (back-compat: old manifests without the field).
         assert!(empty_list().global_vector_index.is_none());
     }

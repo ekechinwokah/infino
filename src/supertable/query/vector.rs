@@ -101,6 +101,7 @@ use crate::{
             ManifestSnapshot, SuperfileEntry, SuperfileUri,
             list::{CellRoutingParams, PartitionStrategy},
         },
+        opann::REPLICA_CLOSURE_DISTANCE_RATIO,
         tombstones::SidecarCache,
     },
 };
@@ -286,12 +287,11 @@ fn cells_ranked_by_fine_score(
     ranked
 }
 
-/// Minimum fine-ranked picks in the union cell selection — HIDDEN table
-/// only (the user branch's fine side matches its grid cutoff). The fine
-/// ranking's second pick is what closes the last coverage gap at scale —
-/// measured at 10M/64c: fine p1 coverage 0.919 (union recall landed exactly
-/// on it at 0.921) vs fine p2 coverage 0.997. An explicit caller probe width
-/// larger than this takes precedence.
+/// Minimum fine-ranked picks in the union cell selection, shared by the
+/// hidden and user branches. The fine ranking's second pick is what closes
+/// the last coverage gap at scale — measured at 10M/64c: fine p1 coverage
+/// 0.919 (union recall landed exactly on it at 0.921) vs fine p2 coverage
+/// 0.997. An explicit caller probe width larger than this takes precedence.
 const UNION_FINE_PICKS_MIN: usize = 2;
 
 /// Union of the grid-ranked and fine-ranked cell selections, in probe
@@ -796,10 +796,13 @@ impl SupertableReader {
 
         let grid = manifest
             .get_global_vector_index()
-            .filter(|g| {
-                g.column == column && g.grid.n_cent > 0 && g.grid.dim as usize == query.len()
-            })
-            .map(|g| g.grid)
+            .filter(|g| g.column == column)
+            // Route on the same grid commit packing stamped cell tags from:
+            // the finer user grid when trained, else the drain grid. (Hidden
+            // manifests carry no `global_vector_index` and take the
+            // `VectorCell` branch below.)
+            .map(|g| g.into_user_grid())
+            .filter(|grid| grid.n_cent > 0 && grid.dim as usize == query.len())
             .or_else(|| match manifest.get_partition_strategy() {
                 PartitionStrategy::VectorCell {
                     column: cell_column,
@@ -989,16 +992,12 @@ impl SupertableReader {
                         Some(&birth_versions),
                     );
                 } else {
-                    // Same dual-ranking union as the hidden branch (see
-                    // [`union_cell_selection`]); an explicit caller `nprobe`
-                    // (and the filtered path's boosted probe) pins the
-                    // per-ranking cutoff min == max. The difference from the
-                    // hidden path is physical, not policy: an undrained
-                    // cell's rows are scattered across every commit fragment,
-                    // so within each selected cell EVERY fragment holding
-                    // that cell is probed — accepted read amplification —
-                    // keeping the closest `USER_FINE_RUNS_PER_FRAGMENT` fine
-                    // runs per fragment.
+                    // Default user routing is fine-first p=1 with a grid
+                    // near-tie fallback. Explicit nprobe and filtered search
+                    // retain the existing grid/fine union. Within each
+                    // selected cell, every commit fragment holding that cell
+                    // is probed, keeping its closest
+                    // `USER_FINE_RUNS_PER_FRAGMENT` fine runs.
                     let user_routing = if filtered || options.nprobe.is_some() {
                         CellRoutingParams {
                             nprobe_min: nprobe.max(1),
@@ -1012,16 +1011,41 @@ impl SupertableReader {
                         .as_ref()
                         .expect("scored cell ranking exists whenever ranked_cells does");
                     let cutoff = grid_cell_cutoff(ranked_scored, &user_routing);
-                    let grid_cells: Vec<u32> = ranked[..cutoff].to_vec();
-                    // User space: fine side matches the grid cutoff (no extra
-                    // pick — the deeper fine reach is hidden-table only).
                     let fine_ranked = cells_ranked_by_fine_score(&candidates);
-                    let fine_cells: Vec<u32> = fine_ranked
-                        .iter()
-                        .take(cutoff)
-                        .map(|(cell, _)| *cell)
-                        .collect();
-                    let mut selected_cells = union_cell_selection(&grid_cells, &fine_cells);
+                    let default_p1 =
+                        !filtered && options.nprobe.is_none() && cutoff == 1;
+                    let mut selected_cells: Vec<u32> =
+                        if default_p1 && !fine_ranked.is_empty() {
+                            let (fine_top, fine_top_score) = fine_ranked[0];
+                            let mut cells = vec![fine_top];
+                            let grid_top = ranked[0];
+                            if grid_top != fine_top {
+                                let tie_threshold = relative_score_window(
+                                    fine_top_score,
+                                    REPLICA_CLOSURE_DISTANCE_RATIO - 1.0,
+                                );
+                                let grid_top_fine_score = fine_ranked
+                                    .iter()
+                                    .find(|(cell, _)| *cell == grid_top)
+                                    .map(|(_, score)| *score);
+                                if grid_top_fine_score
+                                    .is_some_and(|score| score <= tie_threshold)
+                                {
+                                    cells.push(grid_top);
+                                }
+                            }
+                            cells
+                        } else {
+                            // Explicit nprobe and filtered searches retain the
+                            // existing grid/fine union policy.
+                            let grid_cells: Vec<u32> = ranked[..cutoff].to_vec();
+                            let fine_cells: Vec<u32> = fine_ranked
+                                .iter()
+                                .take(cutoff)
+                                .map(|(cell, _)| *cell)
+                                .collect();
+                            union_cell_selection(&grid_cells, &fine_cells)
+                        };
                     // Widen past the routed cells only if they cannot fill
                     // top-k (tiny tables, heavily deleted cells): append
                     // grid-ranked cells not already selected by the union.

@@ -1440,12 +1440,23 @@ impl SupertableWriter {
             && let Some(grid) = bootstrap_centroids_from_batch(
                 &buffer,
                 vc.dim,
-                super::handle::global_vector_cell_count(),
+                super::handle::hidden_vector_cell_count(),
             )
         {
+            // `global_vector_index.grid` is the grid the drain reads to build
+            // the hidden index, so it is trained at `hidden_cell_count`. The
+            // finer `user_cell_count` grid (user-superfile packing + pre-drain
+            // routing) is trained here too, from the same batch by the same
+            // helper, but stored separately so the hidden path never sees it.
+            let hidden_cells = super::handle::hidden_vector_cell_count();
+            let user_cells = super::handle::user_vector_cell_count();
+            let user_grid = (user_cells != hidden_cells)
+                .then(|| bootstrap_centroids_from_batch(&buffer, vc.dim, user_cells))
+                .flatten();
             let index = super::manifest::GlobalVectorIndex {
                 column: vc.column.clone(),
                 grid,
+                user_grid,
             };
             self.inner.manifest.store(Arc::new(
                 self.inner.manifest.load().with_global_vector_index(index),
@@ -1477,8 +1488,12 @@ impl SupertableWriter {
                 .first()
                 .map(|vc| vc.metric)
                 .unwrap_or(Metric::L2Sq);
+            // Pack against the finer user grid when trained; the drain keeps
+            // its own `grid` and re-assigns rows from scratch, so the two
+            // sides never need to agree on cell ids.
+            let pack_grid = global.into_user_grid();
             let (outputs, cell_hints) =
-                commit_shards_via_drain(buffer, &self.inner, &global.grid, metric)?;
+                commit_shards_via_drain(buffer, &self.inner, &pack_grid, metric)?;
             let build_elapsed = commit_t0.elapsed();
             let output_bytes: usize = outputs.iter().map(|output| output.bytes.len()).sum();
             let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;

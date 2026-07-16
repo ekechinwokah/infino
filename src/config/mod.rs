@@ -264,8 +264,17 @@ const DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES: i64 = 64;
 /// 0.997 → 0.975) while adding ~50% storage and ~35% GETs/query. Grid+fine
 /// union routing carries boundary coverage instead.
 const DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR: f32 = 1.0;
-/// Default global vector-index cell count for routed search.
-const DEFAULT_VECTOR_GLOBAL_CELL_COUNT: usize = 64;
+/// Default cell count for the **user** table's grid — the grid trained at the
+/// first commit, used to cell-pack user superfiles and to route the pre-drain
+/// query. Finer cells make the default single-cell pre-drain probe both more
+/// precise and cheaper.
+const DEFAULT_VECTOR_USER_CELL_COUNT: usize = 256;
+/// Default cell count for the **hidden** vector index. The drain trains and
+/// reads its grid at this count; post-drain routing runs at this granularity.
+/// Equal to the user count by default — one 256-cell grid drives packing,
+/// pre-drain routing, the drain, and post-drain routing (`user_grid` is
+/// trained only when the counts differ).
+const DEFAULT_VECTOR_HIDDEN_CELL_COUNT: usize = 256;
 /// Default hidden vector-index compaction target superfile size (MiB). Sized
 /// to hold a full packed cell shard plus incremental deltas so the drain's
 /// base shard stays a merge candidate and absorbs later deltas rather than
@@ -351,10 +360,16 @@ pub struct VectorSettings {
     /// to one in-flight read per hardware thread, floored at the
     /// background-fill default and capped at 64.
     pub drain_read_concurrency: ThreadCount,
-    /// Global vector-index cell count used when bootstrapping a table's
-    /// cell grid. Stamped into the manifest at create; changing it later
-    /// affects new tables only.
-    pub global_cell_count: usize,
+    /// Cell count for the **user** table's grid, trained at the first commit —
+    /// controls user-superfile cell packing and pre-drain query routing.
+    /// Stamped into the manifest at create; changing it later affects new
+    /// tables only.
+    pub user_cell_count: usize,
+    /// Cell count for the **hidden** vector index grid, trained at the same
+    /// first commit. Independent of `user_cell_count` so the pre-drain and
+    /// post-drain grids can be tuned separately; the drain reads this grid
+    /// verbatim.
+    pub hidden_cell_count: usize,
     /// Hidden vector-index compaction target superfile size (MiB). Distinct
     /// from the user table's `compaction.target_superfile_size_mb`; a
     /// packed cell shard stays a merge candidate until it reaches this.
@@ -380,7 +395,8 @@ impl Default for VectorSettings {
             drain_replica_target_factor: DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR,
             drain_consolidate: DrainConsolidate::Kmeans,
             drain_read_concurrency: ThreadCount::Auto,
-            global_cell_count: DEFAULT_VECTOR_GLOBAL_CELL_COUNT,
+            user_cell_count: DEFAULT_VECTOR_USER_CELL_COUNT,
+            hidden_cell_count: DEFAULT_VECTOR_HIDDEN_CELL_COUNT,
             compaction_target_mb: DEFAULT_VECTOR_COMPACTION_TARGET_MB,
             compaction_min_fill_percent: DEFAULT_VECTOR_COMPACTION_MIN_FILL_PERCENT,
             compaction_max_memory_mb: DEFAULT_VECTOR_COMPACTION_MAX_MEMORY_MB,
