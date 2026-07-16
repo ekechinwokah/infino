@@ -64,6 +64,12 @@ const SUMMARY_QUERIES_PER_MONTH: f64 = 1.0e6;
 /// Warm fraction of the blended monthly read line (the rest pay the cold
 /// per-query cost).
 const SUMMARY_READ_WARM_FRACTION: f64 = 0.95;
+/// Maintenance cadence assumed by the monthly summary: one drain pass per
+/// this many commits.
+const SUMMARY_COMMITS_PER_DRAIN: f64 = 16.0;
+/// Maintenance cadence assumed by the monthly summary: one compaction
+/// (optimize) pass per this many drains.
+const SUMMARY_DRAINS_PER_COMPACTION: f64 = 16.0;
 
 /// The instance the model prices against. Default is a portable cloud SKU
 /// with local NVMe; override via `INFINO_BENCH_COST_*` env vars.
@@ -371,6 +377,16 @@ fn latency_per_usd_cell(per_query_usd: f64, latency_s: f64) -> Cell {
     text(fmt_count(
         latency_secs_per_usd(per_query_usd, latency_s) as usize
     ))
+}
+
+/// Event count for the maintenance cadence line: integers plain, fractional
+/// cadences with two decimals (`1` / `0.06`).
+fn fmt_events(n: f64) -> String {
+    if (n - n.round()).abs() < 1e-9 {
+        format!("{n:.0}")
+    } else {
+        format!("{n:.2}")
+    }
 }
 
 fn usd_per_gb(v: f64) -> String {
@@ -1377,17 +1393,95 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             metric(month, usd(month), Better::Lower),
         ]);
     }
-    // Writes priced at the corpus scale the bench actually measured: the
-    // whole table written once per month.
-    let writes_month = write_total;
+    // Writes priced at the corpus scale the bench actually measured — the
+    // whole table written once per month — covering COMMITS only (ingest +
+    // the delta commit). Drain and compaction move to the maintenance lines
+    // below so the total never double-counts them.
+    let writes_month = ingest_compute.unwrap_or(0.0)
+        + ingest_req_usd
+        + delta_compute.unwrap_or(0.0)
+        + delta_req_usd;
     summary_rows.push(vec![
         text(format!(
-            "Writes — {} docs/mo (full write path)",
+            "Writes — {} docs/mo (commits)",
             fmt_count(c.n_docs)
         )),
-        text(format!("{}/1M docs", usd(write_per_million_docs))),
+        text(format!("{}/1M docs", usd(per_million_docs(writes_month)))),
         metric(writes_month, usd(writes_month), Better::Lower),
     ]);
+    // Maintenance: per-event rates for open / drain / compaction, then one
+    // billed line at the stated cadence — a drain pass every
+    // `SUMMARY_COMMITS_PER_DRAIN` commits, a compaction pass every
+    // `SUMMARY_DRAINS_PER_COMPACTION` drains, one table open per pass.
+    let drain_pass_usd = has_drain.then(|| drain_compute.unwrap_or(0.0) + drain_req_usd);
+    let compact_pass_usd =
+        has_compaction.then(|| compaction_compute.unwrap_or(0.0) + compaction_req_usd);
+    let steady_open_usd = query_states
+        .last()
+        .map(|state| {
+            let compute = match (state.cold_open_s, state.cold_open_cpu_s) {
+                (Some(wall_s), Some(cpu_s)) => {
+                    let ram_bytes = state.ram_bytes.unwrap_or(c.resident_anon_bytes);
+                    inst.compute_usd(cpu_s.max(inst.ram_leg(wall_s, Some(ram_bytes))))
+                }
+                _ => 0.0,
+            };
+            let req = state.io.cold_open.map(|io| request_usd(&io)).unwrap_or(0.0);
+            compute + req
+        })
+        .or_else(|| {
+            anchor_cold.map(|q| {
+                q.open_cpu_s.map(|cpu| inst.compute_usd(cpu)).unwrap_or(0.0)
+                    + c.store.cold_open.map(|io| request_usd(&io)).unwrap_or(0.0)
+            })
+        });
+    if let Some(open) = steady_open_usd {
+        summary_rows.push(vec![
+            text("Open — cold table open"),
+            text(format!("{}/open", usd(open))),
+            text(""),
+        ]);
+    }
+    if let Some(drain) = drain_pass_usd {
+        summary_rows.push(vec![
+            text(format!(
+                "Drain — one pass over {} commits",
+                fmt_events(SUMMARY_COMMITS_PER_DRAIN)
+            )),
+            text(format!("{}/pass", usd(drain))),
+            text(""),
+        ]);
+    }
+    if let Some(compact) = compact_pass_usd {
+        summary_rows.push(vec![
+            text("Compaction — one optimize pass"),
+            text(format!("{}/pass", usd(compact))),
+            text(""),
+        ]);
+    }
+    let maintenance_month = drain_pass_usd.map(|drain| {
+        let drains_mo = c.n_commits.max(1) as f64 / SUMMARY_COMMITS_PER_DRAIN;
+        let compacts_mo = drains_mo / SUMMARY_DRAINS_PER_COMPACTION;
+        let opens_mo = drains_mo + compacts_mo;
+        let month = drains_mo * drain
+            + compacts_mo * compact_pass_usd.unwrap_or(0.0)
+            + opens_mo * steady_open_usd.unwrap_or(0.0);
+        summary_rows.push(vec![
+            text(format!(
+                "Maintenance — drain / {} commits, compaction / {} drains",
+                fmt_events(SUMMARY_COMMITS_PER_DRAIN),
+                fmt_events(SUMMARY_DRAINS_PER_COMPACTION),
+            )),
+            text(format!(
+                "{} drains + {} compactions + {} opens/mo",
+                fmt_events(drains_mo),
+                fmt_events(compacts_mo),
+                fmt_events(opens_mo),
+            )),
+            metric(month, usd(month), Better::Lower),
+        ]);
+        month
+    });
     summary_rows.push(vec![
         text("Open table — RAM residency"),
         text(format!(
@@ -1403,9 +1497,10 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             .map(|q| q * SUMMARY_QUERIES_PER_MONTH)
             .unwrap_or(0.0)
         + writes_month
+        + maintenance_month.unwrap_or(0.0)
         + residency_month;
     summary_rows.push(vec![
-        text("Total (storage + blended reads + writes + residency)"),
+        text("Total (storage + blended reads + writes + maintenance + residency)"),
         text("—"),
         metric(monthly_total, usd(monthly_total), Better::Lower),
     ]);
