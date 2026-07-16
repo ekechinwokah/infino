@@ -53,8 +53,14 @@ const BYTES_PER_GIB: f64 = (1u64 << 30) as f64;
 const BYTES_PER_GB: f64 = 1.0e9;
 /// Seconds per hour.
 const SECS_PER_HOUR: f64 = 3600.0;
+/// Hours per month for standing-cost lines (365.25 days / 12 months).
+const HOURS_PER_MONTH: f64 = 730.5;
 /// Queries per "per-million" pricing unit.
 const PER_MILLION: f64 = 1.0e6;
+/// Queries per month assumed by the monthly read line. The write line uses
+/// the cell's own corpus size (`n_docs`/month) so the summary prices writing
+/// THIS table, not a synthetic volume.
+const SUMMARY_QUERIES_PER_MONTH: f64 = 1.0e6;
 
 /// The instance the model prices against. Default is a portable cloud SKU
 /// with local NVMe; override via `INFINO_BENCH_COST_*` env vars.
@@ -348,6 +354,20 @@ fn usd_per_million(per_unit: f64) -> String {
 /// Per-query cost with both scales visible — prevents comparing $/open to $/1M.
 fn usd_per_query_both_scales(per_query: f64) -> String {
     format!("{}/query ({})", usd(per_query), usd_per_million(per_query))
+}
+
+/// Latency per dollar: seconds of query latency per dollar of per-query
+/// cost (`p50 ÷ $/query`). Not delta-tracked — cost and latency pull it in
+/// opposite directions, so neither day-over-day direction is "better".
+fn latency_secs_per_usd(per_query_usd: f64, latency_s: f64) -> f64 {
+    latency_s / per_query_usd.max(f64::MIN_POSITIVE)
+}
+
+/// `s/$` cell rendered at count scale (`11.7K`).
+fn latency_per_usd_cell(per_query_usd: f64, latency_s: f64) -> Cell {
+    text(fmt_count(
+        latency_secs_per_usd(per_query_usd, latency_s) as usize
+    ))
 }
 
 fn usd_per_gb(v: f64) -> String {
@@ -1183,6 +1203,11 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
 
     // ---- Block 4: serving ----
     let mut serving_rows: Vec<Vec<Cell>> = Vec::new();
+    // Steady-state per-query dollars for the monthly summary: the LAST
+    // populated query state (post-compact when the lifecycle ran) is the
+    // shape a long-lived table serves.
+    let mut steady_warm: Option<(String, f64)> = None;
+    let mut steady_cold: Option<(String, f64)> = None;
     if query_states.is_empty() {
         serving_rows.extend(c.warm.iter().filter_map(|(name, p50_s, cpu_s)| {
             let cpu = (*cpu_s)?;
@@ -1196,9 +1221,19 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                     format!("{queries_per_usd:.0}"),
                     Better::Higher,
                 ),
+                latency_per_usd_cell(per_q, *p50_s),
                 text(usd(per_q * PER_MILLION)),
             ])
         }));
+        if let Some((name, p50_s, Some(cpu))) = c
+            .warm
+            .iter()
+            .find(|(n, _, _)| n == "ten_term_or")
+            .or_else(|| c.warm.first())
+        {
+            let per_q = inst.per_query_usd(*cpu, *p50_s, c.resident_anon_bytes);
+            steady_warm = Some((format!("warm ({name})"), per_q));
+        }
         if let (Some(q), Some(per_q)) = (anchor_cold, cold_query_usd) {
             let queries_per_usd = 1.0 / per_q.max(f64::MIN_POSITIVE);
             serving_rows.push(vec![
@@ -1209,8 +1244,10 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                     format!("{queries_per_usd:.0}"),
                     Better::Higher,
                 ),
+                latency_per_usd_cell(per_q, q.search_s),
                 text(usd(per_q * PER_MILLION)),
             ]);
+            steady_cold = Some((format!("cold ({})", q.name), per_q));
         }
     } else {
         for state in &query_states {
@@ -1227,8 +1264,10 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                         format!("{queries_per_usd:.0}"),
                         Better::Higher,
                     ),
+                    latency_per_usd_cell(per_q, p50_s),
                     text(usd(per_q * PER_MILLION)),
                 ]);
+                steady_warm = Some((format!("warm — {label}"), per_q));
             }
             if let (Some(wall_s), Some(cpu_s), Some(io)) = (
                 state.cold_query_s,
@@ -1247,20 +1286,112 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                         format!("{queries_per_usd:.0}"),
                         Better::Higher,
                     ),
+                    latency_per_usd_cell(per_q, wall_s),
                     text(usd(per_q * PER_MILLION)),
                 ]);
+                steady_cold = Some((format!("cold — {label} ({} GET)", io.get_count), per_q));
             }
         }
     }
     let serving = Block {
-        subtitle: "Serving — query latency and cost by lifecycle state.".into(),
+        subtitle: "Serving — query latency and cost by lifecycle state; s/$ is \
+                   latency per dollar (p50 seconds ÷ $/query)."
+            .into(),
         headers: vec![
             "Query".into(),
             "p50".into(),
             "queries/$".into(),
+            "s/$".into(),
             "$/1M queries".into(),
         ],
         rows: serving_rows,
+    };
+
+    // ---- Block 5: monthly cost summary ----
+    // The standing bill for one table at an assumed steady load: capacity,
+    // reads, writes, and the RAM residency an open table pins. Reads/writes
+    // price the measured steady-state per-unit costs at 1M units/month;
+    // residency prices the resident set's share of the instance for a full
+    // month. All inputs are measured — a line without a measurement is
+    // omitted, never guessed.
+    let steady_ram_bytes = query_states
+        .last()
+        .and_then(|state| state.ram_bytes)
+        .unwrap_or(c.resident_anon_bytes);
+    let residency_month = inst.ram_share(steady_ram_bytes) * inst.usd_per_hour * HOURS_PER_MONTH;
+    let mut summary_rows: Vec<Vec<Cell>> = vec![vec![
+        text("Storage"),
+        text(format!(
+            "{} stored for {} docs, {retention_months:.0} mo retention",
+            fmt_bytes(c.stored_bytes),
+            fmt_count(c.n_docs),
+        )),
+        metric(storage_month, usd(storage_month), Better::Lower),
+    ]];
+    if let Some((label, per_q)) = &steady_warm {
+        let month = per_q * SUMMARY_QUERIES_PER_MONTH;
+        summary_rows.push(vec![
+            text(format!(
+                "Reads — {} queries/mo, {label}",
+                fmt_count(SUMMARY_QUERIES_PER_MONTH as usize)
+            )),
+            text(usd_per_million(*per_q)),
+            metric(month, usd(month), Better::Lower),
+        ]);
+    }
+    if let Some((label, per_q)) = &steady_cold {
+        let month = per_q * SUMMARY_QUERIES_PER_MONTH;
+        summary_rows.push(vec![
+            text(format!(
+                "Reads — {} queries/mo, {label}",
+                fmt_count(SUMMARY_QUERIES_PER_MONTH as usize)
+            )),
+            text(usd_per_million(*per_q)),
+            metric(month, usd(month), Better::Lower),
+        ]);
+    }
+    // Writes priced at the corpus scale the bench actually measured: the
+    // whole table written once per month.
+    let writes_month = write_total;
+    summary_rows.push(vec![
+        text(format!(
+            "Writes — {} docs/mo (full write path)",
+            fmt_count(c.n_docs)
+        )),
+        text(format!("{}/1M docs", usd(write_per_million_docs))),
+        metric(writes_month, usd(writes_month), Better::Lower),
+    ]);
+    summary_rows.push(vec![
+        text("Open table — RAM residency"),
+        text(format!(
+            "{} resident ({:.0}% of {})",
+            fmt_bytes(steady_ram_bytes),
+            inst.ram_share(steady_ram_bytes) * 100.0,
+            inst.name,
+        )),
+        metric(residency_month, usd(residency_month), Better::Lower),
+    ]);
+    let monthly_total = storage_month
+        + steady_warm
+            .as_ref()
+            .map(|(_, q)| q * SUMMARY_QUERIES_PER_MONTH)
+            .unwrap_or(0.0)
+        + writes_month
+        + residency_month;
+    summary_rows.push(vec![
+        text("Total (storage + warm reads + writes + residency)"),
+        text("—"),
+        metric(monthly_total, usd(monthly_total), Better::Lower),
+    ]);
+    let monthly_summary = Block {
+        subtitle: format!(
+            "Monthly cost summary — one open table, {} queries served + {} docs \
+             written per month, steady state.",
+            fmt_count(SUMMARY_QUERIES_PER_MONTH as usize),
+            fmt_count(c.n_docs),
+        ),
+        headers: vec!["Line".into(), "Basis".into(), "$/month".into()],
+        rows: summary_rows,
     };
 
     let mut blocks = vec![rate_card];
@@ -1269,6 +1400,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     }
     blocks.push(compute_ledger);
     blocks.push(serving);
+    blocks.push(monthly_summary);
 
     report.emit(&Section {
         anchor: anchor.into(),
