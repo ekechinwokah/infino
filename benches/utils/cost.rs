@@ -61,6 +61,9 @@ const PER_MILLION: f64 = 1.0e6;
 /// the cell's own corpus size (`n_docs`/month) so the summary prices writing
 /// THIS table, not a synthetic volume.
 const SUMMARY_QUERIES_PER_MONTH: f64 = 1.0e6;
+/// Warm fraction of the blended monthly read line (the rest pay the cold
+/// per-query cost).
+const SUMMARY_READ_WARM_FRACTION: f64 = 0.95;
 
 /// The instance the model prices against. Default is a portable cloud SKU
 /// with local NVMe; override via `INFINO_BENCH_COST_*` env vars.
@@ -1328,25 +1331,49 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         )),
         metric(storage_month, usd(storage_month), Better::Lower),
     ]];
+    // Warm and cold read lines are rate references (empty $/month); the
+    // blended line — most queries warm, a small tail paying the cold fetch —
+    // is the billed monthly read cost.
+    let blended_read_q = match (&steady_warm, &steady_cold) {
+        (Some((_, warm_q)), Some((_, cold_q))) => {
+            Some(warm_q * SUMMARY_READ_WARM_FRACTION + cold_q * (1.0 - SUMMARY_READ_WARM_FRACTION))
+        }
+        (Some((_, warm_q)), None) => Some(*warm_q),
+        _ => None,
+    };
     if let Some((label, per_q)) = &steady_warm {
-        let month = per_q * SUMMARY_QUERIES_PER_MONTH;
         summary_rows.push(vec![
             text(format!(
                 "Reads — {} queries/mo, {label}",
                 fmt_count(SUMMARY_QUERIES_PER_MONTH as usize)
             )),
             text(usd_per_million(*per_q)),
-            metric(month, usd(month), Better::Lower),
+            text(""),
         ]);
     }
     if let Some((label, per_q)) = &steady_cold {
-        let month = per_q * SUMMARY_QUERIES_PER_MONTH;
         summary_rows.push(vec![
             text(format!(
                 "Reads — {} queries/mo, {label}",
                 fmt_count(SUMMARY_QUERIES_PER_MONTH as usize)
             )),
             text(usd_per_million(*per_q)),
+            text(""),
+        ]);
+    }
+    if steady_warm.is_some()
+        && steady_cold.is_some()
+        && let Some(blended_q) = blended_read_q
+    {
+        let month = blended_q * SUMMARY_QUERIES_PER_MONTH;
+        summary_rows.push(vec![
+            text(format!(
+                "Reads — {} queries/mo, {:.0}% warm / {:.0}% cold blend",
+                fmt_count(SUMMARY_QUERIES_PER_MONTH as usize),
+                SUMMARY_READ_WARM_FRACTION * 100.0,
+                (1.0 - SUMMARY_READ_WARM_FRACTION) * 100.0,
+            )),
+            text(usd_per_million(blended_q)),
             metric(month, usd(month), Better::Lower),
         ]);
     }
@@ -1372,14 +1399,13 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         metric(residency_month, usd(residency_month), Better::Lower),
     ]);
     let monthly_total = storage_month
-        + steady_warm
-            .as_ref()
-            .map(|(_, q)| q * SUMMARY_QUERIES_PER_MONTH)
+        + blended_read_q
+            .map(|q| q * SUMMARY_QUERIES_PER_MONTH)
             .unwrap_or(0.0)
         + writes_month
         + residency_month;
     summary_rows.push(vec![
-        text("Total (storage + warm reads + writes + residency)"),
+        text("Total (storage + blended reads + writes + residency)"),
         text("—"),
         metric(monthly_total, usd(monthly_total), Better::Lower),
     ]);
