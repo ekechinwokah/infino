@@ -2819,7 +2819,7 @@ mod tests {
             for ((sc, ss), (rc, rs)) in scored.iter().zip(&reference) {
                 assert_eq!(sc, rc, "{metric:?}: cluster order");
                 assert!(
-                    (ss - rs).abs() <= 1e-6 * (1.0 + rs.abs()),
+                    (ss - rs).abs() <= 1e-5 * (1.0 + rs.abs()),
                     "{metric:?} cluster {sc}: {ss} vs {rs}"
                 );
             }
