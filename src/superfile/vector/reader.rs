@@ -1323,6 +1323,43 @@ impl VectorReader {
             cell_ids.push(cell_id);
         }
 
+        // The outer header is NOT covered by the directory CRC, so cross-check
+        // its `n_docs` against the summed per-cell doc counts (derived from
+        // the validated subsection geometry). A corrupt header — e.g. a
+        // bit-flipped `n_docs` of 0 — must fail the open instead of opening
+        // clean and silently returning empty results.
+        let summed_docs: u64 = columns.iter().map(|col| u64::from(col.n_docs)).sum();
+        if n_docs != summed_docs {
+            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                "multi-cell outer header n_docs={n_docs} != summed cell docs {summed_docs}"
+            ))));
+        }
+        // Trailing whole-blob CRC (header + directory + dir CRC + every cell
+        // subsection), verified under the same opt-in flag the per-subsection
+        // CRCs use — v1 verifies its outer CRC on this flag, and v2 must not
+        // regress that integrity check on eager opens.
+        if opts.verify_crc {
+            let blob_len = source.len();
+            if blob_len < format::CRC_BYTES {
+                return Err(VectorError::Read(ReadError::MalformedVersion(
+                    "multi-cell blob shorter than its trailing CRC".into(),
+                )));
+            }
+            let crc_pos = blob_len - format::CRC_BYTES;
+            let body = fetch_sync(&source, 0..crc_pos, "multi-cell outer crc body")?;
+            let expected = read_u32_le(&fetch_sync(
+                &source,
+                crc_pos..blob_len,
+                "multi-cell outer crc",
+            )?);
+            if expected != crc32c(&body) {
+                return Err(VectorError::Read(ReadError::ChecksumMismatch {
+                    section: "vector/multi_cell_outer",
+                    column: cfg.column.clone(),
+                }));
+            }
+        }
+
         let mut column_id_by_name = HashMap::new();
         column_id_by_name.insert(cfg.column.clone(), 0);
 
@@ -1519,16 +1556,22 @@ impl VectorReader {
                 ..sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF + U64_BYTES],
         ) as usize;
 
-        if dim == 0
-            || !cluster_idx_off
-                .saturating_sub(centroids_off)
-                .is_multiple_of(dim * 4)
-        {
+        // Untrusted sub-header offsets: validate ordering with checked
+        // arithmetic — inverted offsets must surface as MalformedVersion,
+        // not an integer underflow, because the CRC-off lazy open path
+        // (object-store reads) skips the checksum that would otherwise
+        // catch the corruption.
+        let centroids_span = cluster_idx_off.checked_sub(centroids_off).ok_or_else(|| {
+            VectorError::Read(ReadError::MalformedVersion(
+                "cell subsection offsets inverted: cluster_idx_off precedes centroids_off".into(),
+            ))
+        })?;
+        if dim == 0 || !centroids_span.is_multiple_of(dim * 4) {
             return Err(VectorError::Read(ReadError::MalformedVersion(
                 "cell subsection centroids region not divisible by dim*4".into(),
             )));
         }
-        let n_cent = (cluster_idx_off - centroids_off) / (dim * 4);
+        let n_cent = centroids_span / (dim * 4);
         let n_cent_u32 = n_cent as u32;
         let cluster_idx_size = n_cent * CLUSTER_IDX_ENTRY_BYTES;
         let codec_meta_off = if codec_meta_size == 0 {
@@ -1549,7 +1592,16 @@ impl VectorReader {
                     "cell subsection regions overrun per_cluster_blocks_off".into(),
                 ))
             })?;
-        let blocks_region_size = sub_crc_pos - per_cluster_blocks_off;
+        let blocks_region_size =
+            sub_crc_pos
+                .checked_sub(per_cluster_blocks_off)
+                .ok_or_else(|| {
+                    VectorError::Read(ReadError::MalformedVersion(
+                        "cell subsection offsets inverted: per_cluster_blocks_off past the \
+                     subsection CRC"
+                            .into(),
+                    ))
+                })?;
         let per_doc_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
         if per_doc_stride == 0 || !blocks_region_size.is_multiple_of(per_doc_stride) {
             return Err(VectorError::Read(ReadError::MalformedVersion(format!(
