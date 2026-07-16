@@ -2119,11 +2119,17 @@ mod tests {
             &mut decoded,
         );
         let expected = dot(&decoded, &decoded);
-        assert!(approx(
-            sq8_residual_norm_sq(&scale, &offset, &codes, &residuals, SQ8_RESIDUAL_DIVISOR),
-            expected,
-            1e-4
-        ));
+        let got = sq8_residual_norm_sq(&scale, &offset, &codes, &residuals, SQ8_RESIDUAL_DIVISOR);
+        // Relative tolerance: the norm's magnitude here is ~1e4, where an
+        // absolute 1e-4 sits below f32 rounding noise — the SIMD kernel and
+        // the scalar dequant+dot reference sum in different orders (and CI's
+        // coverage build changes codegen), so they legitimately diverge past
+        // it. 1e-5 relative matches the cross-arch bound the cluster-scorer
+        // self-check uses.
+        assert!(
+            (got - expected).abs() <= 1e-5 * (1.0 + expected.abs()),
+            "norm {got} vs dequant-dot-self {expected}"
+        );
     }
 
     #[test]

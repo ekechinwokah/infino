@@ -501,15 +501,16 @@ fn compute_encoded_norms(p: &DecodedPosting) -> Vec<f32> {
     let mut norms = Vec::with_capacity(p.ids.len());
     for row in 0..p.ids.len() {
         let base = row * dim * ROW_BYTES_PER_DIM;
-        let mut acc = 0.0f64;
-        for d in 0..dim {
-            let code = p.rows[base + d] as f32;
-            let eps = i8::from_le_bytes([p.rows[base + dim + d]]) as f32;
-            let step = p.scale[d] / residual_divisor;
-            let x = p.offset[d] + code * p.scale[d] + eps * step;
-            acc += (x as f64) * (x as f64);
-        }
-        norms.push(acc as f32);
+        // One residual-norm implementation: the same kernel the read path
+        // applies to these bytes, so stored and recomputed norms can never
+        // drift apart.
+        norms.push(sq8_residual_norm_sq(
+            &p.scale,
+            &p.offset,
+            &p.rows[base..base + dim],
+            &p.rows[base + dim..base + 2 * dim],
+            residual_divisor,
+        ));
     }
     norms
 }
@@ -581,7 +582,6 @@ fn encode_rows(
         let code_start = encoded.len();
         encoded.resize(code_start + dim * ROW_BYTES_PER_DIM, 0);
         let eps_start = code_start + dim;
-        let mut acc = 0.0f64;
         for d in 0..dim {
             let q = if scale[d] > 0.0 {
                 ((src[d] - offset[d]) / scale[d])
@@ -601,13 +601,18 @@ fn encode_rows(
             };
             encoded[code_start + d] = q;
             encoded[eps_start + d] = eps.to_le_bytes()[0];
-            if store_norms {
-                let x = base + (eps as f32) * step;
-                acc += (x as f64) * (x as f64);
-            }
         }
+        // Norm of exactly the bytes just stored, through the one shared
+        // kernel — never a transcription of the formula that can drift from
+        // what the read path computes.
         if let Some(norms) = per_doc_norms.as_mut() {
-            norms.push(acc as f32);
+            norms.push(sq8_residual_norm_sq(
+                &scale,
+                &offset,
+                &encoded[code_start..code_start + dim],
+                &encoded[eps_start..eps_start + dim],
+                residual_divisor,
+            ));
         }
     }
     Ok(EncodedRows {
@@ -766,7 +771,6 @@ pub(crate) fn materialize_sq8_residual_row_into_cluster_quant(
         .zip(dst_offset.iter())
         .map(|(s, o)| (-o).mul_add(1.0 / s, 0.5))
         .collect();
-    let mut acc = 0.0f64;
     for d in 0..dim {
         let v = row_fp[d];
         let q = v.mul_add(inv_scale[d], c2[d]).clamp(0.0, SQ8_CODE_MAX);
@@ -782,12 +786,19 @@ pub(crate) fn materialize_sq8_residual_row_into_cluster_quant(
             0
         };
         out[res_off + d] = rq.to_le_bytes()[0];
-        if store_norm {
-            let x = base + (rq as f32) * step;
-            acc += (x as f64) * (x as f64);
-        }
     }
-    Ok(store_norm.then_some(acc as f32))
+    // Norm of the transcoded bytes through the one shared kernel (see
+    // `compute_encoded_norms`) — the third hand-rolled copy of this formula
+    // is what the drift warning in the review was about.
+    Ok(store_norm.then(|| {
+        sq8_residual_norm_sq(
+            dst_scale,
+            dst_offset,
+            &out[code_off..code_off + dim],
+            &out[res_off..res_off + dim],
+            dst_divisor,
+        )
+    }))
 }
 
 pub(crate) use crate::superfile::vector::distance::{
