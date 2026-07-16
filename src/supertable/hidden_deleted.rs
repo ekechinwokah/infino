@@ -25,14 +25,24 @@ const DELETED_IDS_HEADER_LEN: usize = 4 + 1 + 4;
 /// Bytes per serialized `_id` (a little-endian `i128`).
 const DELETED_ID_LEN: usize = 16;
 
-/// Serialize the consolidated deleted user-`_id` set. The caller passes a
-/// sorted, deduplicated slice so the on-disk order is canonical.
-pub(crate) fn encode_deleted_ids(sorted_ids: &[i128]) -> Vec<u8> {
+/// Serialize the consolidated deleted user-`_id` set. Sorted, deduplicated
+/// on-disk order is a WIRE INVARIANT — consumers `binary_search` the decoded
+/// set, so an unsorted blob silently resurrects deleted rows. Enforced here
+/// rather than trusted to callers: a future second encode call site must not
+/// be able to break search correctness.
+pub(crate) fn encode_deleted_ids(ids: &[i128]) -> Vec<u8> {
+    let sorted_ids: Vec<i128> = if ids.is_sorted() {
+        ids.to_vec()
+    } else {
+        let mut sorted = ids.to_vec();
+        sorted.sort_unstable();
+        sorted
+    };
     let mut out = Vec::with_capacity(DELETED_IDS_HEADER_LEN + sorted_ids.len() * DELETED_ID_LEN);
     out.extend_from_slice(DELETED_IDS_MAGIC);
     out.push(DELETED_IDS_VERSION);
     out.extend_from_slice(&(sorted_ids.len() as u32).to_le_bytes());
-    for id in sorted_ids {
+    for id in &sorted_ids {
         out.extend_from_slice(&id.to_le_bytes());
     }
     out
@@ -71,6 +81,9 @@ pub(crate) fn decode_deleted_ids(bytes: &[u8]) -> Result<Vec<i128>, HiddenDelete
         buf.copy_from_slice(chunk);
         ids.push(i128::from_le_bytes(buf));
     }
+    // Consumers `binary_search` this set; the encoder guarantees sorted
+    // order on the wire (see `encode_deleted_ids`).
+    debug_assert!(ids.is_sorted(), "deleted-id set must be sorted on the wire");
     Ok(ids)
 }
 
@@ -102,5 +115,17 @@ mod tests {
                 .expect("empty")
                 .is_empty()
         );
+    }
+
+    /// An unsorted caller must still produce a sorted wire blob — consumers
+    /// `binary_search` the decoded set, so order is a correctness invariant,
+    /// not a convention.
+    #[test]
+    fn unsorted_input_encodes_sorted() {
+        let ids: Vec<i128> = vec![42, -1, i128::MAX, 0, 42];
+        let decoded = decode_deleted_ids(&encode_deleted_ids(&ids)).expect("decode");
+        assert!(decoded.is_sorted());
+        assert!(decoded.binary_search(&-1).is_ok());
+        assert!(decoded.binary_search(&i128::MAX).is_ok());
     }
 }
