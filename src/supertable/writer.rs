@@ -5033,7 +5033,8 @@ pub(in crate::supertable) async fn split_overflow_cell(
             .max(1);
         let sub = build_merged_subsection_from_materialized(cfg, rows)?;
         let shard_id = packed_cell_shard(cell_id, packed_cell_shard_count(&inner.options)) as u32;
-        build_prepared_from_packed_cells(&inner, shard_id, vec![(cell_id, sub, stable_ids)]).map(Some)
+        build_prepared_from_packed_cells(&inner, shard_id, vec![(cell_id, sub, stable_ids)])
+            .map(Some)
     };
     let mut all_prepared = prepared_keep;
     all_prepared.extend(build_subcell(split_cell, group0)?);
@@ -5054,13 +5055,15 @@ pub(in crate::supertable) async fn split_overflow_cell(
     // the drain watermark (`drained_ranges`) and every other manifest field ride
     // through unchanged — a hidden-space reorg consumes no user commit and must
     // not disturb coverage.
-    inner.manifest.store(Arc::new(manifest.with_partition_strategy(
-        PartitionStrategy::VectorCell {
-            column: column.clone(),
-            clusters: updated_clusters.clone(),
-            routing,
-        },
-    )));
+    inner
+        .manifest
+        .store(Arc::new(manifest.with_partition_strategy(
+            PartitionStrategy::VectorCell {
+                column: column.clone(),
+                clusters: updated_clusters.clone(),
+                routing,
+            },
+        )));
 
     let new_manifest = persist_commit_async(
         &inner,

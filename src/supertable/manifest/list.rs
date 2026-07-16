@@ -2404,8 +2404,7 @@ mod tests {
         );
 
         // Finer user-side grid rides along and decodes distinct from `grid`.
-        let user_grid =
-            ClusterCentroids::from_fp32(1, 4, &[8.0, 9.0, 10.0, 11.0], vec![7]);
+        let user_grid = ClusterCentroids::from_fp32(1, 4, &[8.0, 9.0, 10.0, 11.0], vec![7]);
         if let Some(g) = list.global_vector_index.as_mut() {
             g.user_grid = Some(user_grid.clone());
         }

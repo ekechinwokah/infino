@@ -1012,40 +1012,36 @@ impl SupertableReader {
                         .expect("scored cell ranking exists whenever ranked_cells does");
                     let cutoff = grid_cell_cutoff(ranked_scored, &user_routing);
                     let fine_ranked = cells_ranked_by_fine_score(&candidates);
-                    let default_p1 =
-                        !filtered && options.nprobe.is_none() && cutoff == 1;
-                    let mut selected_cells: Vec<u32> =
-                        if default_p1 && !fine_ranked.is_empty() {
-                            let (fine_top, fine_top_score) = fine_ranked[0];
-                            let mut cells = vec![fine_top];
-                            let grid_top = ranked[0];
-                            if grid_top != fine_top {
-                                let tie_threshold = relative_score_window(
-                                    fine_top_score,
-                                    REPLICA_CLOSURE_DISTANCE_RATIO - 1.0,
-                                );
-                                let grid_top_fine_score = fine_ranked
-                                    .iter()
-                                    .find(|(cell, _)| *cell == grid_top)
-                                    .map(|(_, score)| *score);
-                                if grid_top_fine_score
-                                    .is_some_and(|score| score <= tie_threshold)
-                                {
-                                    cells.push(grid_top);
-                                }
-                            }
-                            cells
-                        } else {
-                            // Explicit nprobe and filtered searches retain the
-                            // existing grid/fine union policy.
-                            let grid_cells: Vec<u32> = ranked[..cutoff].to_vec();
-                            let fine_cells: Vec<u32> = fine_ranked
+                    let default_p1 = !filtered && options.nprobe.is_none() && cutoff == 1;
+                    let mut selected_cells: Vec<u32> = if default_p1 && !fine_ranked.is_empty() {
+                        let (fine_top, fine_top_score) = fine_ranked[0];
+                        let mut cells = vec![fine_top];
+                        let grid_top = ranked[0];
+                        if grid_top != fine_top {
+                            let tie_threshold = relative_score_window(
+                                fine_top_score,
+                                REPLICA_CLOSURE_DISTANCE_RATIO - 1.0,
+                            );
+                            let grid_top_fine_score = fine_ranked
                                 .iter()
-                                .take(cutoff)
-                                .map(|(cell, _)| *cell)
-                                .collect();
-                            union_cell_selection(&grid_cells, &fine_cells)
-                        };
+                                .find(|(cell, _)| *cell == grid_top)
+                                .map(|(_, score)| *score);
+                            if grid_top_fine_score.is_some_and(|score| score <= tie_threshold) {
+                                cells.push(grid_top);
+                            }
+                        }
+                        cells
+                    } else {
+                        // Explicit nprobe and filtered searches retain the
+                        // existing grid/fine union policy.
+                        let grid_cells: Vec<u32> = ranked[..cutoff].to_vec();
+                        let fine_cells: Vec<u32> = fine_ranked
+                            .iter()
+                            .take(cutoff)
+                            .map(|(cell, _)| *cell)
+                            .collect();
+                        union_cell_selection(&grid_cells, &fine_cells)
+                    };
                     // Widen past the routed cells only if they cannot fill
                     // top-k (tiny tables, heavily deleted cells): append
                     // grid-ranked cells not already selected by the union.
@@ -2392,10 +2388,10 @@ mod tests {
     fn cells_ranked_by_fine_score_takes_min_per_cell_in_order() {
         let candidates: Vec<(usize, u32, f32, Option<u32>, u64)> = vec![
             (0, 0, 0.9, Some(7), 10),
-            (0, 1, 0.2, Some(7), 10),  // cell 7 best = 0.2
-            (1, 2, 0.5, Some(3), 10),  // cell 3 best = 0.5
-            (1, 3, 0.5, Some(2), 10),  // cell 2 ties cell 3 → lower id first
-            (0, 4, 0.1, None, 10),     // untagged: ignored
+            (0, 1, 0.2, Some(7), 10), // cell 7 best = 0.2
+            (1, 2, 0.5, Some(3), 10), // cell 3 best = 0.5
+            (1, 3, 0.5, Some(2), 10), // cell 2 ties cell 3 → lower id first
+            (0, 4, 0.1, None, 10),    // untagged: ignored
         ];
         let ranked = cells_ranked_by_fine_score(&candidates);
         assert_eq!(ranked.len(), 3);

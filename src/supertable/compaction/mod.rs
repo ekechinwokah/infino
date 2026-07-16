@@ -1163,7 +1163,11 @@ mod tests {
             ..CompactionSettings::default()
         };
         let jobs = select(&segs, &count_driven);
-        assert_eq!(jobs.len(), 1, "0% floor must merge 2 tiny fragments on count");
+        assert_eq!(
+            jobs.len(),
+            1,
+            "0% floor must merge 2 tiny fragments on count"
+        );
         assert_eq!(jobs[0].inputs.len(), 2);
 
         // 2 MiB is far below 40% of a 2 GiB target → the byte floor blocks it.

@@ -2090,10 +2090,11 @@ mod tests {
             .reader()
             .manifest()
             .get_global_vector_index()
-            .is_some_and(|g| g
-                .user_grid
-                .as_ref()
-                .is_some_and(|u| u.n_cent > 0 && u.dim > 0));
+            .is_some_and(|g| {
+                g.user_grid
+                    .as_ref()
+                    .is_some_and(|u| u.n_cent > 0 && u.dim > 0)
+            });
         assert_eq!(
             user_grid_trained,
             user_vector_cell_count() != hidden_vector_cell_count(),

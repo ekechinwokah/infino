@@ -533,7 +533,6 @@ mod tests {
         assert_eq!(decoded.centroids.len(), 5 * base.dim as usize);
     }
 
-
     #[test]
     fn plan_sq8_split_separates_two_blobs() {
         let dim = 4usize;
@@ -549,7 +548,8 @@ mod tests {
         // the two well-separated blobs land on opposite sides.
         assert_eq!(assign.len(), rows.len());
         assert_ne!(
-            assign[0], assign[rows.len() - 1],
+            assign[0],
+            assign[rows.len() - 1],
             "the two separated blobs should split across sub-cells"
         );
     }
