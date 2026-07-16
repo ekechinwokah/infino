@@ -844,8 +844,8 @@ impl SupertableReader {
                     for cell in &vs.cells {
                         if cell.clusters.dim as usize != query.len() {
                             return Err(QueryError::Execute(format!(
-                                "vector summary dim {} for column `{column}` on superfile {} \
-                                 does not match query dim {}",
+                                "vector summary dimension {} for column `{column}` on superfile {} \
+                                 does not match query dimension {}",
                                 cell.clusters.dim,
                                 entry.superfile_id,
                                 query.len()
