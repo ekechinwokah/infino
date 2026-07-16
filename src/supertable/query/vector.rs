@@ -3149,6 +3149,54 @@ mod tests {
         );
     }
 
+    /// Pre-drain filtered, row-returning vector search across several user
+    /// superfiles: exercises the token candidate-bitmap fan-out over the
+    /// survivors and the stable-id resolution for row projection — the
+    /// user-table filtered path (post-drain search fans out on the hidden
+    /// index instead).
+    #[test]
+    fn filtered_vector_search_row_return_fans_out_over_user_superfiles() {
+        use crate::superfile::fts::reader::BoolMode;
+
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_superfile_per_commit(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(storage)).expect("create");
+        // Three commits → three user superfiles the filter must fan out across.
+        for start in [0u64, 16, 32] {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_vector_batch(start, 16, dim, schema.clone()))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let batches = st
+            .reader()
+            .vector_search(
+                "emb",
+                &q,
+                10,
+                VectorSearchOptions::new(),
+                Some(VectorFilter {
+                    column: "title",
+                    query: "doc",
+                    mode: BoolMode::Or,
+                }),
+                Some(&["_id", "score"]),
+            )
+            .expect("filtered row search");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(
+            rows >= 1,
+            "filtered fan-out must resolve rows across user superfiles"
+        );
+    }
+
     /// Post-drain filtered search must fan out on the hidden index (same as
     /// the bench), not the user table. Predicate still resolves on user FTS.
     #[test]
@@ -3247,6 +3295,78 @@ mod tests {
                 .to_string()
                 .contains("did not map to any hidden superfile"),
             "unexpected mapping error: {mapping_error}"
+        );
+    }
+
+    /// A post-drain vector search resolves hidden hits back to user `_id`s and
+    /// subtracts tombstones: after deleting a doc that the query would return,
+    /// it must drop out of the result set. Exercises the hidden-hit id
+    /// resolution and tombstone-subtraction paths on the plain (unfiltered)
+    /// query.
+    #[test]
+    fn vector_search_post_drain_excludes_deleted() {
+        use datafusion::prelude::{col, lit};
+
+        use crate::superfile::vector::rerank_codec::RerankCodec;
+
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let opts = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(tok()),
+        )
+        .expect("valid options")
+        .with_writer_pool(pool);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(storage)).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, 32, dim, schema.clone()))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w); // release the writer so the later delete can acquire one
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        // Query the one-hot e_0; doc 0 is an exact match, so it is returned.
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let hits_before = st
+            .reader()
+            .vector_hits("emb", &q, 32, VectorSearchOptions::new(), None)
+            .expect("pre-delete search");
+        assert!(!hits_before.is_empty(), "docs retrievable pre-delete");
+
+        // Delete that exact match; the query must subtract its tombstone.
+        let stats = st.delete(col("title").eq(lit("doc 0"))).expect("delete");
+        assert_eq!(stats.n_tombstoned(), 1, "exactly one row tombstoned");
+
+        let hits_after = st
+            .reader()
+            .vector_hits("emb", &q, 32, VectorSearchOptions::new(), None)
+            .expect("post-delete search");
+        assert_eq!(
+            hits_after.len(),
+            hits_before.len() - 1,
+            "the deleted doc must drop out of the results"
         );
     }
 

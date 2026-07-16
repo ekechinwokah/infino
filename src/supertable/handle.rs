@@ -2917,6 +2917,142 @@ mod tests {
         );
     }
 
+    /// Directly exercises the over-cap cell split (`split_overflow_cell`). The
+    /// normal `optimize` path only reaches it once a cell passes the 500k
+    /// `cell_split_doc_cap`; calling the inner routine on a drained cell covers
+    /// the extract → split → rebuild → atomic-swap chain without that volume. The
+    /// split must add a sub-cell to the grid and lose no doc.
+    #[test]
+    fn split_overflow_cell_grows_grid_and_preserves_docs() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                reader::VectorSearchOptions,
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::{manifest::list::PartitionStrategy, writer::split_overflow_cell},
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+
+        // Identical embeddings route every doc into one global cell; drain them
+        // into the hidden per-cell index so a single real cell holds all N.
+        const N: usize = 6;
+        let titles = LargeStringArray::from((0..N).map(|i| format!("doc-{i}")).collect::<Vec<_>>());
+        let flat = Float32Array::from(vec![1.0f32; N * dim]);
+        let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        st.drain_vectors_to_cells_sync().expect("drain to cells");
+
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+
+        // The most-populated cell in the hidden grid holds all N docs.
+        let (split_cell, n_cent_before, docs_in_cell) =
+            match hidden.reader().manifest().get_partition_strategy() {
+                PartitionStrategy::VectorCell { clusters, .. } => {
+                    let cell = (0..clusters.n_cent)
+                        .max_by_key(|&c| clusters.counts.get(c as usize).copied().unwrap_or(0))
+                        .expect("at least one cell");
+                    (cell, clusters.n_cent, clusters.counts[cell as usize])
+                }
+                other => panic!("hidden index must be VectorCell after drain, got {other:?}"),
+            };
+        assert!(docs_in_cell >= 2, "the split cell needs at least two docs");
+
+        // Sanity: the drained docs are retrievable before the split.
+        let q = vec![1.0f32; dim];
+        let hits_before = st
+            .reader()
+            .vector_hits("emb", &q, N, VectorSearchOptions::new(), None)
+            .expect("pre-split search");
+        assert!(!hits_before.is_empty(), "docs retrievable before split");
+
+        // Split the over-cap cell directly (bypasses the 500k cap gate).
+        hidden
+            .block_on_query(split_overflow_cell(hidden.inner().clone(), split_cell))
+            .expect("split");
+
+        // The grid gained a sub-cell, and the two sub-cells together account for
+        // exactly the live docs (`split_cell` keeps its id; the new cell is
+        // appended at the old `n_cent`). Routing-independent — it reads the
+        // counts the split re-derives from the actual live rows, which also
+        // corrects the pre-split grid count (that count can lag the true total).
+        match hidden.reader().manifest().get_partition_strategy() {
+            PartitionStrategy::VectorCell { clusters, .. } => {
+                assert_eq!(
+                    clusters.n_cent,
+                    n_cent_before + 1,
+                    "split inserts one sub-centroid into the grid"
+                );
+                let kept = clusters.counts[split_cell as usize];
+                let moved = clusters.counts[n_cent_before as usize];
+                assert_eq!(
+                    kept + moved,
+                    N as u32,
+                    "the two sub-cells must account for every live doc"
+                );
+            }
+            other => panic!("still VectorCell after split, got {other:?}"),
+        }
+    }
+
     /// With writer_pool=N>1 and multiple touched cells, drain publishes at most
     /// N packed shard objects and stamps partition_hint = shard_id (cell % N).
     #[test]
