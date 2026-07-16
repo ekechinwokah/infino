@@ -35,7 +35,7 @@ use crate::{
         BuildError, CommitError, ManifestSnapshot, SuperfileEntry, SuperfileUri,
         error::CompactionError,
         handle::{hidden_vector_index_compaction_settings, is_hidden_vector_index_table},
-        manifest::list::PartitionStrategy,
+        manifest::list::{DrainedVersionRanges, PartitionStrategy},
         query::dispatch::open_compaction_input,
         wal::{
             Etag, SealRecord, TombstonesSidecar, WalStore,
@@ -71,6 +71,11 @@ pub struct SuperfileStats {
     pub tombstoned_docs: u64,
     /// Already owned by another compaction so skip it.
     pub sealed_by_other: bool,
+    /// Commit version the superfile was born at. A merged superfile carries
+    /// the OLDEST input's `birth_version`, so user-table merge jobs must
+    /// never mix inputs from opposite sides of the hidden drain watermark
+    /// (see [`split_stats_at_drain_watermark`]).
+    pub birth_version: u64,
 }
 
 impl SuperfileStats {
@@ -85,6 +90,24 @@ impl SuperfileStats {
         }
         (self.size_bytes as u128 * self.live_docs() as u128 / self.n_docs as u128) as u64
     }
+}
+
+/// Split merge candidates at the hidden drain watermark: inputs whose
+/// `birth_version` the hidden index has already drained versus inputs it has
+/// not. A merged superfile is stamped with the OLDEST input `birth_version`
+/// (see `run_compaction_job`), so a job mixing the two sides would inherit a
+/// drained version and the drain's `!drained.contains(birth_version)` filter
+/// would skip it — the undrained inputs' vectors would silently never enter
+/// the hidden index (a permanent recall hole). Merging within either side is
+/// safe: all-drained stays drained, all-undrained keeps an undrained version
+/// and is drained as one source.
+fn split_stats_at_drain_watermark(
+    stats: Vec<SuperfileStats>,
+    drained: &DrainedVersionRanges,
+) -> (Vec<SuperfileStats>, Vec<SuperfileStats>) {
+    stats
+        .into_iter()
+        .partition(|s| drained.contains(s.birth_version))
 }
 
 /// A set of superfiles to merge into one new superfile.
@@ -313,18 +336,32 @@ impl Supertable {
                     n_docs: entry.n_docs,
                     tombstoned_docs,
                     sealed_by_other,
+                    birth_version: entry.birth_version,
                 }
             })
             .collect();
 
-        let jobs = select(&stats, cfg);
-
-        for job in jobs {
-            table.run_compaction_job(job, stale_seal_timeout).await?;
-            table
-                .refresh()
-                .await
-                .map_err(|e| CompactionError::Refresh(e.to_string()))?;
+        // A user table with a hidden vector index selects jobs per side of
+        // the drain watermark, never across it (see
+        // [`split_stats_at_drain_watermark`] for why a mixed merge loses
+        // vectors). Tables without a hidden sibling select over everything.
+        let stat_groups: Vec<Vec<SuperfileStats>> = match inner.vector_index_table.as_ref() {
+            Some(hidden) => {
+                let drained = hidden.inner().manifest.load_full().get_drained_ranges();
+                let (drained_stats, undrained_stats) =
+                    split_stats_at_drain_watermark(stats, &drained);
+                vec![drained_stats, undrained_stats]
+            }
+            None => vec![stats],
+        };
+        for stats in &stat_groups {
+            for job in select(stats, cfg) {
+                table.run_compaction_job(job, stale_seal_timeout).await?;
+                table
+                    .refresh()
+                    .await
+                    .map_err(|e| CompactionError::Refresh(e.to_string()))?;
+            }
         }
 
         Ok(())
@@ -737,7 +774,56 @@ mod tests {
             n_docs,
             tombstoned_docs: tombstoned,
             sealed_by_other: false,
+            birth_version: 0,
         }
+    }
+
+    /// Two mergeable fragments on opposite sides of the drain watermark must
+    /// land in different selection groups: a single mixed job would stamp the
+    /// merged superfile with the drained input's (older) `birth_version` and
+    /// the drain would skip the undrained rows forever.
+    #[test]
+    fn drain_watermark_partition_never_mixes_drained_and_undrained() {
+        // Watermark: versions 0..=10 drained.
+        let drained = DrainedVersionRanges::from_intervals(vec![(0, 10)]);
+        let mut a = seg(1, 1, 1000, 0);
+        a.birth_version = 5; // drained
+        let mut b = seg(2, 1, 1000, 0);
+        b.birth_version = 20; // undrained
+        let mut c = seg(3, 1, 1000, 0);
+        c.birth_version = 21; // undrained
+
+        // Sanity: without the watermark split, selection would happily merge
+        // all three into one job — the exact F1 hazard.
+        let all = vec![a.clone(), b.clone(), c.clone()];
+        let cfg = CompactionSettings {
+            target_superfile_size_mb: 2048,
+            min_fill_percent: 0,
+            ..CompactionSettings::default()
+        };
+        let mixed = select(&all, &cfg);
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed[0].inputs.len(), 3, "guard: unsplit selection mixes");
+
+        let (drained_side, undrained_side) = split_stats_at_drain_watermark(all, &drained);
+        assert_eq!(
+            drained_side
+                .iter()
+                .map(|s| s.superfile_id)
+                .collect::<Vec<_>>(),
+            vec![Uuid::from_u128(1)]
+        );
+        assert_eq!(undrained_side.len(), 2);
+        // Group-wise selection: the drained side alone can't merge (one
+        // input); the undrained side merges its two fragments.
+        assert!(select(&drained_side, &cfg).is_empty());
+        let jobs = select(&undrained_side, &cfg);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].inputs.len(), 2);
+        assert!(
+            !jobs[0].inputs.contains(&Uuid::from_u128(1)),
+            "undrained job must not contain the drained input"
+        );
     }
 
     fn default_cfg() -> CompactionSettings {
