@@ -23,31 +23,33 @@ use std::{
 use rayon::prelude::*;
 use tempfile::{tempdir, tempdir_in};
 
-use crate::config;
-use crate::superfile::{
-    BuildError,
-    format::{
-        self, FST_SEPARATOR, RESERVED_PREFIX,
-        checksum::{crc32c, crc32c_append},
-        vec::{
-            CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES,
-            U32_BYTES, U64_BYTES, cell_dir_entry, sub_hdr,
+use crate::{
+    config,
+    superfile::{
+        BuildError,
+        format::{
+            self, FST_SEPARATOR, RESERVED_PREFIX,
+            checksum::{crc32c, crc32c_append},
+            vec::{
+                CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES,
+                MAGIC_BYTES, U32_BYTES, U64_BYTES, cell_dir_entry, sub_hdr,
+            },
         },
-    },
-    vector::{
-        cell_posting::{MaterializedIvfRow, sq8_residual_norm_sq},
-        distance::{Metric, dequantize_sq8_residual_into, mean_f32_cluster_major},
-        ivf_merge::MergedIvfSubsection,
-        kmeans::{assign_to_centroids, kmeans},
-        quant::BitQuantizer,
-        rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
-        reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
-        rotation::RandomRotation,
-        spill::{
-            ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
-            SpilledCellRows,
+        vector::{
+            cell_posting::{MaterializedIvfRow, sq8_residual_norm_sq},
+            distance::{Metric, dequantize_sq8_residual_into, mean_f32_cluster_major},
+            ivf_merge::MergedIvfSubsection,
+            kmeans::{assign_to_centroids, kmeans},
+            quant::BitQuantizer,
+            rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
+            reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
+            rotation::RandomRotation,
+            spill::{
+                ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
+                SpilledCellRows,
+            },
+            sq8_simd::{Sq8EncodeConsts, encode_sq8_residual_row, update_min_max},
         },
-        sq8_simd::{Sq8EncodeConsts, encode_sq8_residual_row, update_min_max},
     },
 };
 

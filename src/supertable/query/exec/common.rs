@@ -31,12 +31,11 @@ use futures::{
     future::{BoxFuture, try_join_all},
 };
 use object_store::{ObjectStore, path::Path as ObjPath};
-use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::{
     arrow::{
         ProjectionMask,
         arrow_reader::ArrowReaderOptions,
-        async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder},
+        async_reader::{AsyncFileReader, ParquetObjectReader, ParquetRecordBatchStreamBuilder},
     },
     errors::{ParquetError, Result as ParquetResult},
     file::metadata::ParquetMetaData,
