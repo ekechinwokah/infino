@@ -3149,6 +3149,64 @@ mod tests {
         );
     }
 
+    /// Row-returning vector search AFTER a drain resolves hidden-cell hits back
+    /// to user `_id`s via the inline stable-id region — a path the pre-drain
+    /// row-return test never reaches. The exact-match doc's id must come back.
+    #[test]
+    fn vector_search_rows_post_drain_resolve_hidden_ids() {
+        use arrow_array::Decimal128Array;
+
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_superfile_per_commit(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(storage)).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, 16, dim, schema.clone()))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        // e_0 is the exact vector of doc 0 (id 0); it must resolve back.
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let batches = st
+            .reader()
+            .vector_search(
+                "emb",
+                &q,
+                5,
+                VectorSearchOptions::new(),
+                None,
+                Some(&["_id", "score"]),
+            )
+            .expect("post-drain row search");
+        let mut ids = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("_id")
+                .expect("_id column")
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("_id is decimal128");
+            for i in 0..col.len() {
+                ids.push(col.value(i));
+            }
+        }
+        assert_eq!(ids.len(), 5, "k=5 over 16 docs returns 5 rows");
+        // Ids are assigned in append order (base + row index), so doc 0 — the
+        // exact match for e_0 — carries the smallest id. It must rank first,
+        // which proves the hidden-cell hit resolved back to the right user row.
+        assert_eq!(
+            ids[0],
+            *ids.iter().min().expect("ids is non-empty"),
+            "the exact-match doc must rank first, got {ids:?}"
+        );
+    }
+
     /// Pre-drain filtered, row-returning vector search across several user
     /// superfiles: exercises the token candidate-bitmap fan-out over the
     /// survivors and the stable-id resolution for row projection — the

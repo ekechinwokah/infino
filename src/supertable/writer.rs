@@ -6014,6 +6014,55 @@ mod tests {
     /// Boundary test target that permits one extra posting per input row.
     const BOUNDARY_STUB_TARGET_FACTOR: f32 = 2.0;
 
+    /// `split_buffer_by_vector_cell` routes each buffered row to its
+    /// nearest-centroid shard: rows near e_0 land in cell 0, rows near e_1 in
+    /// cell 1, and empty cells are dropped.
+    #[test]
+    fn split_buffer_by_vector_cell_routes_rows_to_nearest_cell() {
+        use std::collections::HashMap;
+
+        use arrow_array::{Float32Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let dim = 4usize;
+        // Two centroids: e_0 and e_1.
+        let centroids = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let cells = ClusterCentroids::from_fp32(2, dim as u32, &centroids, vec![1u32; 2]);
+
+        // Four rows: 0,1 point at e_0; 2,3 point at e_1.
+        let scalar = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("t", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(vec!["a", "b", "c", "d"]))],
+        )
+        .expect("scalar batch");
+        let vectors = Float32Array::from(vec![
+            0.9, 0.1, 0.0, 0.0, // near e_0
+            1.0, 0.0, 0.0, 0.0, // e_0
+            0.0, 0.9, 0.1, 0.0, // near e_1
+            0.0, 1.0, 0.0, 0.0, // e_1
+        ]);
+        let batch = BufferedBatch {
+            scalar,
+            vectors: vec![Arc::new(vectors)],
+        };
+
+        let out = split_buffer_by_vector_cell(vec![batch], &cells, Metric::Cosine, 0);
+        let mut rows_by_cell: HashMap<u32, usize> = HashMap::new();
+        for (cell, batches) in &out {
+            rows_by_cell.insert(*cell, batches.iter().map(|b| b.scalar.num_rows()).sum());
+        }
+        assert_eq!(
+            rows_by_cell.get(&0).copied(),
+            Some(2),
+            "two rows must route to the e_0 cell"
+        );
+        assert_eq!(
+            rows_by_cell.get(&1).copied(),
+            Some(2),
+            "two rows must route to the e_1 cell"
+        );
+    }
+
     #[test]
     fn drain_local_checkpoint_round_trips_and_rejects_other_epoch() {
         let directory = TempDir::new().expect("tempdir");
