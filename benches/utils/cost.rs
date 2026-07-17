@@ -888,6 +888,13 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             "Cold query (first on cold cache)",
             c.store.cold_query,
         );
+        let fill = match (c.store.cold_query, c.store.cold_repeat_query) {
+            (Some(q), Some(r)) => Some(q.merge_background_fill(&r)),
+            (Some(q), None) => Some(q.background_fill_meter()),
+            (None, Some(r)) => Some(r.background_fill_meter()),
+            (None, None) => None,
+        };
+        per_query_row(&mut io_rows, "Cache fill (during cold query)", fill);
         per_query_row(
             &mut io_rows,
             "Repeat query on cold consumer",
@@ -913,6 +920,15 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                 &format!("Cold — {label}"),
                 state.io.cold_query,
             );
+            // Background lazy→mmap fill concurrent with the cold/repeat
+            // windows — counted separately so query GETs stay foreground-only.
+            let fill = match (state.io.cold_query, state.io.cold_repeat) {
+                (Some(q), Some(r)) => Some(q.merge_background_fill(&r)),
+                (Some(q), None) => Some(q.background_fill_meter()),
+                (None, Some(r)) => Some(r.background_fill_meter()),
+                (None, None) => None,
+            };
+            per_query_row(&mut io_rows, &format!("Fill — {label}"), fill);
             per_query_row(
                 &mut io_rows,
                 &format!("Repeat — {label}"),

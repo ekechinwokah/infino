@@ -22,7 +22,10 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use infino::storage::{ObjectMeta, StorageError, StorageProvider};
+use infino::storage::{
+    ObjectMeta, StorageError, StorageProvider,
+    io_counters::io_is_background,
+};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta as OsObjectMeta,
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
@@ -116,8 +119,14 @@ pub struct TraceEntry {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ObjectStoreMeter {
     pub head_count: u64,
+    /// Foreground GETs (query-critical lazy/probe reads).
     pub get_count: u64,
     pub get_bytes: u64,
+    /// Background cache-fill GETs (lazy→mmap promotion), tagged via
+    /// [`infino::storage::io_counters::scope_background`]. Priced on a
+    /// separate ledger line so they do not inflate per-query cold GETs.
+    pub bg_get_count: u64,
+    pub bg_get_bytes: u64,
     pub put_count: u64,
     pub put_bytes: u64,
     /// LIST requests (billed at the PUT/list rate on S3).
@@ -145,11 +154,32 @@ impl ObjectStoreMeter {
             head_count: self.head_count.saturating_sub(earlier.head_count),
             get_count: self.get_count.saturating_sub(earlier.get_count),
             get_bytes: self.get_bytes.saturating_sub(earlier.get_bytes),
+            bg_get_count: self.bg_get_count.saturating_sub(earlier.bg_get_count),
+            bg_get_bytes: self.bg_get_bytes.saturating_sub(earlier.bg_get_bytes),
             put_count: self.put_count.saturating_sub(earlier.put_count),
             put_bytes: self.put_bytes.saturating_sub(earlier.put_bytes),
             list_count: self.list_count.saturating_sub(earlier.list_count),
             delete_count: self.delete_count.saturating_sub(earlier.delete_count),
             get_by_class,
+        }
+    }
+
+    /// View of this window's background-fill GETs as a foreground-shaped
+    /// meter so existing request/cost formatters can price the fill line.
+    pub fn background_fill_meter(&self) -> ObjectStoreMeter {
+        ObjectStoreMeter {
+            get_count: self.bg_get_count,
+            get_bytes: self.bg_get_bytes,
+            ..Default::default()
+        }
+    }
+
+    /// Merge background-fill GETs from two windows (e.g. cold + repeat).
+    pub fn merge_background_fill(&self, other: &ObjectStoreMeter) -> ObjectStoreMeter {
+        ObjectStoreMeter {
+            get_count: self.bg_get_count.saturating_add(other.bg_get_count),
+            get_bytes: self.bg_get_bytes.saturating_add(other.bg_get_bytes),
+            ..Default::default()
         }
     }
 
@@ -206,6 +236,8 @@ struct MeterCounters {
     head_count: AtomicU64,
     get_count: AtomicU64,
     get_bytes: AtomicU64,
+    bg_get_count: AtomicU64,
+    bg_get_bytes: AtomicU64,
     put_count: AtomicU64,
     put_bytes: AtomicU64,
     list_count: AtomicU64,
@@ -231,6 +263,8 @@ impl MeterCounters {
             head_count: self.head_count.load(Ordering::Relaxed),
             get_count: self.get_count.load(Ordering::Relaxed),
             get_bytes: self.get_bytes.load(Ordering::Relaxed),
+            bg_get_count: self.bg_get_count.load(Ordering::Relaxed),
+            bg_get_bytes: self.bg_get_bytes.load(Ordering::Relaxed),
             put_count: self.put_count.load(Ordering::Relaxed),
             put_bytes: self.put_bytes.load(Ordering::Relaxed),
             list_count: self.list_count.load(Ordering::Relaxed),
@@ -240,6 +274,14 @@ impl MeterCounters {
     }
 
     fn record_get(&self, uri: &str, range: Option<(u64, u64)>, bytes: u64) {
+        // Background cache-fill ranges run under `io_counters::scope_background`
+        // and land in `bg_get_*` so they do not inflate per-query cold GETs,
+        // but still appear on a dedicated fill ledger line.
+        if io_is_background() {
+            self.bg_get_count.fetch_add(1, Ordering::Relaxed);
+            self.bg_get_bytes.fetch_add(bytes, Ordering::Relaxed);
+            return;
+        }
         self.get_count.fetch_add(1, Ordering::Relaxed);
         self.get_bytes.fetch_add(bytes, Ordering::Relaxed);
         let class = UriClass::of(uri).index();
@@ -555,6 +597,8 @@ mod tests {
             head_count: 1,
             get_count: 10,
             get_bytes: 100,
+            bg_get_count: 2,
+            bg_get_bytes: 20,
             put_count: 5,
             put_bytes: 50,
             ..Default::default()
@@ -567,6 +611,8 @@ mod tests {
             head_count: 1,
             get_count: 25,
             get_bytes: 400,
+            bg_get_count: 5,
+            bg_get_bytes: 80,
             put_count: 9,
             put_bytes: 90,
             ..Default::default()
@@ -579,6 +625,8 @@ mod tests {
         assert_eq!(delta.head_count, 0);
         assert_eq!(delta.get_count, 15);
         assert_eq!(delta.get_bytes, 300);
+        assert_eq!(delta.bg_get_count, 3);
+        assert_eq!(delta.bg_get_bytes, 60);
         assert_eq!(delta.put_count, 4);
         assert_eq!(delta.put_bytes, 40);
         assert_eq!(

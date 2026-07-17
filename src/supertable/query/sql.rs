@@ -70,6 +70,7 @@ use crate::{
             },
             provider::{SupertableProvider, TABLE_NAME},
         },
+        reader_cache::disk::ForegroundQueryGuard,
     },
 };
 
@@ -167,6 +168,7 @@ impl SupertableReader {
         tracing::instrument(skip_all, fields(sql = sql))
     )]
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
+        let _foreground = ForegroundQueryGuard::enter();
         // Read-consistency was applied when `Supertable::reader()` created
         // this pinned reader. SQL therefore observes the same snapshot as
         // `bm25_search` and `vector_search` on this handle.
@@ -311,6 +313,7 @@ impl SupertableReader {
     /// captured-at-call semantics match SQL `UPDATE WHERE` /
     /// `DELETE WHERE`.
     pub(crate) fn scan_ids_matching(&self, expr: Expr) -> Result<Vec<i128>, QueryError> {
+        let _foreground = ForegroundQueryGuard::enter();
         // Resolve against this reader's pinned snapshot. Callers that need
         // current-state semantics create a fresh reader immediately before
         // invoking this helper.

@@ -882,6 +882,7 @@ impl Supertable {
                             Some(&storage),
                             &uri,
                             offsets.as_ref(),
+                            true,
                         )
                         .await
                     })
@@ -925,6 +926,7 @@ impl Supertable {
                         Some(&storage),
                         &uri,
                         offsets.as_ref(),
+                        true,
                     )
                     .await
                     .map_err(|e| e.to_string())?;
@@ -1660,6 +1662,7 @@ mod tests {
                 manifest.options.disk_cache.as_ref(),
                 manifest.options.storage.as_ref(),
                 &entry,
+                true,
             ))
             .expect("open superfile");
             let vector = reader.vec().expect("vector reader");

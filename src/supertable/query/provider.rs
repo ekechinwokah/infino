@@ -444,6 +444,7 @@ impl SupertableProvider {
                     storage.as_ref(),
                     &entry.uri,
                     entry.subsection_offsets.as_ref(),
+                    true,
                 )
                 .await
                 .map_err(|error| DataFusionError::Execution(error.to_string()))?;

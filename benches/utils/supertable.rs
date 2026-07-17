@@ -453,8 +453,16 @@ const COLD_TRACE_ENV: &str = "INFINO_TRACE_VECTOR_COLD_FAN";
 /// window followed by its per-class GET attribution (user vs hidden table,
 /// data vs manifest namespace).
 fn log_cold_split(prefix: &str, split: &storage_meter::ColdStoreSplit) {
+    let fill_gets = split
+        .first_query
+        .bg_get_count
+        .saturating_add(split.repeat_query.bg_get_count);
+    let fill_bytes = split
+        .first_query
+        .bg_get_bytes
+        .saturating_add(split.repeat_query.bg_get_bytes);
     eprintln!(
-        "[{prefix}] metered cold: open {} GET + {} HEAD ({} down), first query {} GET ({} down), repeat query {} GET ({} down)",
+        "[{prefix}] metered cold: open {} GET + {} HEAD ({} down), first query {} GET ({} down), repeat query {} GET ({} down), cache fill {} GET ({} down)",
         split.open.get_count,
         split.open.head_count,
         rss::fmt_bytes(split.open.get_bytes),
@@ -462,6 +470,8 @@ fn log_cold_split(prefix: &str, split: &storage_meter::ColdStoreSplit) {
         rss::fmt_bytes(split.first_query.get_bytes),
         split.repeat_query.get_count,
         rss::fmt_bytes(split.repeat_query.get_bytes),
+        fill_gets,
+        rss::fmt_bytes(fill_bytes),
     );
     eprintln!(
         "[{prefix}]   open: {} | first query: {} | repeat query: {}",

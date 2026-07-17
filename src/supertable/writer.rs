@@ -3797,7 +3797,7 @@ async fn open_ivf_reader_with_tombstones(
         .map(|t| t.bitmap_for(entry.superfile_id, now))
         .transpose()
         .map_err(|e| BuildError::Store(e.to_string()))?;
-    let reader = open_reader(&inner.options.store, disk_cache, Some(storage), entry)
+    let reader = open_reader(&inner.options.store, disk_cache, Some(storage), entry, true)
         .await
         .map_err(|e| BuildError::Store(e.to_string()))?;
     Ok((reader, bitmap))
@@ -3859,6 +3859,7 @@ async fn cell_doc_counts_for_entry(
         inner.options.disk_cache.as_ref(),
         Some(storage),
         entry,
+        true,
     )
     .await
     .map_err(|e| BuildError::Store(e.to_string()))?;

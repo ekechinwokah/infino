@@ -1112,6 +1112,7 @@ fn resolve_target_id_in_manifest(
             inner.options.storage.as_ref(),
             &entry.uri,
             entry.subsection_offsets.as_ref(),
+            true,
         )) {
             Ok(r) => r,
             Err(_) => {

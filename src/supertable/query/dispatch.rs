@@ -80,6 +80,7 @@ pub(crate) async fn open_reader(
     disk_cache: Option<&Arc<DiskCacheStore>>,
     storage: Option<&Arc<dyn StorageProvider>>,
     entry: &SuperfileEntry,
+    allow_background_fill: bool,
 ) -> Result<Arc<SuperfileReader>, QueryError> {
     superfile_reader(
         store,
@@ -87,6 +88,7 @@ pub(crate) async fn open_reader(
         storage,
         &entry.uri,
         entry.subsection_offsets.as_ref(),
+        allow_background_fill,
     )
     .await
     .map_err(|e| QueryError::Store(e.to_string()))
@@ -179,7 +181,8 @@ pub(crate) async fn open_compaction_input(
         let reader = SuperfileReader::open(bytes).map_err(|e| QueryError::Store(e.to_string()))?;
         return Ok(Arc::new(reader));
     }
-    open_reader(store, disk_cache, storage, entry).await
+    // Compaction is not a query modality; allow fill so inputs can promote.
+    open_reader(store, disk_cache, storage, entry, true).await
 }
 
 /// Tag a kernel's results with their source and stamp stable ids immediately
@@ -318,7 +321,9 @@ pub(crate) async fn attach_stable_ids_to_hits(
                 .ok_or_else(|| {
                     QueryError::Execute(format!("hit superfile {uri:?} missing from manifest"))
                 })?;
-            let reader = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry).await?;
+            // FTS post-topk id stamp — allow fill (same modality as the search).
+            let reader =
+                open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry, true).await?;
             let mut local_hits: Vec<SuperfileHit> =
                 indexed_hits.iter().map(|(_, hit)| *hit).collect();
             attach_stable_ids(&reader, &entry, &mut local_hits, true).await?;
@@ -474,6 +479,7 @@ where
         reader,
         units,
         true,
+        true, // FTS/local-hit path — background fill allowed
         move |r, entry, tombstone_cache, now, params| {
             let kernel = kernel.clone();
             async move {
@@ -509,6 +515,7 @@ pub(crate) async fn fanout_with<P, R, B, Fut>(
     reader: &SupertableReader,
     units: Vec<(Arc<SuperfileEntry>, P)>,
     prefetch_tombstones: bool,
+    allow_background_fill: bool,
     body: B,
 ) -> Result<Vec<R>, QueryError>
 where
@@ -552,7 +559,14 @@ where
     // fan-out below with a one-element result.
     if units.len() == 1 {
         let (entry, params) = units.into_iter().next().expect("len == 1");
-        let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry).await?;
+        let r = open_reader(
+            &store,
+            disk_cache.as_ref(),
+            storage.as_ref(),
+            &entry,
+            allow_background_fill,
+        )
+        .await?;
         verify_superfile_vector_codecs(&r, &vector_columns)?;
         let out = body(r, entry, tombstone_cache, now, params).await?;
         return Ok(vec![out]);
@@ -566,7 +580,14 @@ where
         let body = body.clone();
         let vector_columns = Arc::clone(&vector_columns);
         let handle = tokio::spawn(async move {
-            let r = open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry).await?;
+            let r = open_reader(
+                &store,
+                disk_cache.as_ref(),
+                storage.as_ref(),
+                &entry,
+                allow_background_fill,
+            )
+            .await?;
             verify_superfile_vector_codecs(&r, &vector_columns)?;
             body(r, entry, tombstone_cache, now, params).await
         });

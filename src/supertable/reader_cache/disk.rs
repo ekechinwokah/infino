@@ -10,16 +10,16 @@ use std::{
     fmt, fs, io,
     io::SeekFrom,
     os::unix::fs::FileExt,
-    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{
-        Arc, Weak,
+        Arc, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::{DashMap, mapref::entry::Entry};
 use futures::{
@@ -40,9 +40,10 @@ use super::{
 };
 use crate::{
     config::global as global_config,
-    storage::{StorageError, StorageProvider},
+    storage::{StorageError, StorageProvider, io_counters::scope_background},
     superfile::{
-        LazyByteSource, PrefetchedSource,
+        BytesLazyByteSource, LazyByteSource, LazyByteSourceError, PrefetchedSource,
+        format::{footer, kv},
         reader::{OpenOptions, SuperfileReader},
     },
     supertable::{
@@ -77,6 +78,50 @@ const STORE_UPGRADE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Filename suffix for per-superfile sparse block-cache files.
 const BLOCKS_FILE_SUFFIX: &str = ".blocks";
+
+/// Process-global count of in-flight foreground queries. Used with
+/// [`foreground_notify`] so a fill's `select!` wakes promptly when a query
+/// begins and can re-check its per-URI pause condition; it is **not** a
+/// process-wide pause signal (unrelated URI fills keep running).
+static FOREGROUND_QUERIES: AtomicU64 = AtomicU64::new(0);
+/// Wakes background fills so they re-check per-URI quiescence when a
+/// foreground query arrives.
+static FOREGROUND_NOTIFY: OnceLock<Notify> = OnceLock::new();
+
+fn foreground_notify() -> &'static Notify {
+    FOREGROUND_NOTIFY.get_or_init(Notify::new)
+}
+
+/// RAII guard marking a foreground query in flight for its lifetime.
+///
+/// Entering the guard notifies waiting fills so a same-URI fill can yield
+/// to lazy query reads. Unrelated URI fills are not paused by this guard —
+/// only by that URI's own reader hold ([`reader_blocks_background_fill`]).
+pub struct ForegroundQueryGuard(());
+
+impl ForegroundQueryGuard {
+    pub fn enter() -> Self {
+        FOREGROUND_QUERIES.fetch_add(1, Ordering::AcqRel);
+        foreground_notify().notify_waiters();
+        ForegroundQueryGuard(())
+    }
+}
+
+impl Drop for ForegroundQueryGuard {
+    fn drop(&mut self) {
+        FOREGROUND_QUERIES.fetch_sub(1, Ordering::AcqRel);
+        // Wake fills waiting on the notify so they can resume after the
+        // query releases same-URI readers.
+        foreground_notify().notify_waiters();
+    }
+}
+
+/// Pause this URI's background full-object fill while a caller besides the
+/// cache entry holds its lazy reader (`strong_count > 1`). Unrelated URIs
+/// are unaffected — that is the per-URI quiescence contract.
+fn reader_blocks_background_fill(reader: &Weak<SuperfileReader>) -> bool {
+    reader.strong_count() > 1
+}
 
 /// Errors surfaced by [`DiskCacheStore::reader`].
 #[derive(Debug, Error)]
@@ -141,8 +186,16 @@ struct CachedEntry {
     /// Who owns accounting release for this entry.
     accounting: EntryAccounting,
     /// Identity of the sparse source currently allowed to grow this lazy
-    /// entry. `None` for eager and mmap-backed entries.
+    /// entry. `None` for eager and fully mmap-backed entries.
     block_token: Option<Arc<()>>,
+    /// Live block-cache source for lazy (and hybrid mmap+hole) entries.
+    /// Retained across vector-excluding background fill so touched vector
+    /// ranges stay local after parquet/FTS promote to mmap.
+    block_source: Option<Arc<BlockCachedSource>>,
+    /// Whether a background fill task has been spawned for this URI.
+    /// Vector opens leave this false (block-cache only); an later FTS/SQL
+    /// open may flip it and start fill.
+    fill_spawned: AtomicBool,
     last_access_us: AtomicU64,
 }
 
@@ -228,11 +281,6 @@ pub struct DiskCacheStore {
     pinned_fn: std::sync::Mutex<Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync>>,
     /// Global cap on concurrent background full-superfile fills.
     prefetch_semaphore: Arc<Semaphore>,
-    /// Cache-root restoration runs after construction so opening a table never
-    /// synchronously mmaps and parses every prior cache file. Readers await this
-    /// latch before deciding a URI is cold, avoiding duplicate downloads.
-    restore_complete: AtomicBool,
-    restore_notify: Notify,
 }
 
 impl fmt::Debug for DiskCacheStore {
@@ -289,31 +337,12 @@ impl DiskCacheStore {
             n_promotion_waiters: AtomicU64::new(0),
             pinned_fn: std::sync::Mutex::new(pinned_fn),
             prefetch_semaphore,
-            restore_complete: AtomicBool::new(false),
-            restore_notify: Notify::new(),
         });
 
         // Reuse any cache files a prior run (or another handle) left on disk:
-        // rebuild the in-memory index off the constructor thread so opening a
-        // table is independent of cache-root size. `reader_with_hints` awaits
-        // completion before declaring a URI cold, so restore cannot race a
-        // duplicate object-store fetch.
-        let restore_store = Arc::clone(&store);
-        thread::Builder::new()
-            .name("infino-disk-cache-restore".into())
-            .spawn(move || {
-                let restored =
-                    catch_unwind(AssertUnwindSafe(|| restore_store.restore_from_cache_root()));
-                restore_store
-                    .restore_complete
-                    .store(true, Ordering::Release);
-                restore_store.restore_notify.notify_waiters();
-                if restored.is_err() {
-                    tracing::warn!(
-                        "disk-cache restore thread panicked; continuing with cold cache"
-                    );
-                }
-            })?;
+        // rebuild the in-memory index so reads hit the NVMe bytes instead of
+        // cold-fetching them back from object storage.
+        store.restore_from_cache_root();
 
         // Idle-threshold sweep thread. Library-not-service
         // shape: holds a Weak<Self> and exits naturally when the last Arc
@@ -457,17 +486,9 @@ impl DiskCacheStore {
         self: &Arc<Self>,
         uri: &SuperfileUri,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
-        self.reader_with_hints(uri, None, None).await
-    }
-
-    async fn wait_for_restore(&self) {
-        while !self.restore_complete.load(Ordering::Acquire) {
-            let notified = self.restore_notify.notified();
-            if self.restore_complete.load(Ordering::Acquire) {
-                break;
-            }
-            notified.await;
-        }
+        // Default allows fill — same as FTS/SQL. Vector search must call
+        // [`Self::reader_with_hints`] with `allow_background_fill = false`.
+        self.reader_with_hints(uri, None, None, true).await
     }
 
     /// like [`Self::reader`] but takes a precomputed
@@ -480,6 +501,10 @@ impl DiskCacheStore {
     /// instead of doing the parquet footer first and the
     /// subsection fetches second (2 RTTs).
     ///
+    /// `allow_background_fill` is the modality gate: FTS/SQL pass `true`
+    /// so parquet/FTS bytes can promote to mmap (vector blob skipped);
+    /// vector search passes `false` and retains only the block cache.
+    ///
     /// `None` falls back to the 2-RTT shape — same shape,
     /// slower. The other cold-fetch modes (`HybridWithPrefetch`,
     /// `RangeOnly`) ignore the hint today.
@@ -488,8 +513,8 @@ impl DiskCacheStore {
         uri: &SuperfileUri,
         offsets: Option<&SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
+        allow_background_fill: bool,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
-        self.wait_for_restore().await;
         match self.config.cold_fetch_mode {
             ColdFetchMode::HybridWithPrefetch => self.reader_hybrid(uri, storage).await,
             ColdFetchMode::RangeOnly => Err(DiskCacheError::SuperfileOpen(
@@ -498,8 +523,13 @@ impl DiskCacheStore {
                     .into(),
             )),
             ColdFetchMode::LazyForegroundWithBackgroundFill => {
-                self.reader_lazy_with_bg_fill_hinted(uri, offsets.cloned(), storage)
-                    .await
+                self.reader_lazy_with_bg_fill_hinted(
+                    uri,
+                    offsets.cloned(),
+                    storage,
+                    allow_background_fill,
+                )
+                .await
             }
         }
     }
@@ -1005,6 +1035,8 @@ impl DiskCacheStore {
             size_bytes: Arc::new(AtomicU64::new(size)),
             accounting: EntryAccounting::Eager,
             block_token: None,
+            block_source: None,
+            fill_spawned: AtomicBool::new(false),
             last_access_us: AtomicU64::new(self.now_us()),
         }))
     }
@@ -1204,6 +1236,8 @@ impl DiskCacheStore {
             size_bytes: Arc::new(AtomicU64::new(size)),
             accounting: EntryAccounting::Eager,
             block_token: None,
+            block_source: None,
+            fill_spawned: AtomicBool::new(false),
             last_access_us: AtomicU64::new(self.now_us()),
         });
         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
@@ -1256,9 +1290,13 @@ impl DiskCacheStore {
         uri: &SuperfileUri,
         offsets: Option<SubsectionOffsets>,
         storage: Option<&Arc<dyn StorageProvider>>,
+        allow_background_fill: bool,
     ) -> Result<Arc<SuperfileReader>, DiskCacheError> {
         if let Some(entry) = self.cached.get(uri) {
             entry.last_access_us.store(self.now_us(), Ordering::Release);
+            if allow_background_fill {
+                self.maybe_spawn_background_fill(uri, &entry, storage);
+            }
             return Ok(Arc::clone(&entry.reader));
         }
         let cell = self
@@ -1275,18 +1313,69 @@ impl DiskCacheStore {
             .await;
         let fetch_storage = self.resolve_storage(storage);
         match result {
-            Ok(entry) => Ok(Arc::clone(&entry.reader)),
+            Ok(entry) => {
+                if allow_background_fill {
+                    self.maybe_spawn_background_fill(uri, &entry, storage);
+                }
+                Ok(Arc::clone(&entry.reader))
+            }
             Err(_e) => {
                 self.coordinators.remove(uri);
-                Err(self
+                match self
                     .cold_fetch_lazy(uri, offsets.as_ref(), fetch_storage)
                     .await
-                    .err()
-                    .unwrap_or(DiskCacheError::SuperfileOpen(
-                        "lazy cold fetch error".into(),
-                    )))
+                {
+                    Ok(entry) => {
+                        if allow_background_fill {
+                            self.maybe_spawn_background_fill(uri, &entry, storage);
+                        }
+                        Ok(Arc::clone(&entry.reader))
+                    }
+                    Err(e) => Err(e),
+                }
             }
         }
+    }
+
+    /// Start parquet/FTS background fill once per URI when an FTS/SQL open
+    /// asks for it. Vector opens never call this — they keep block-cache
+    /// retention only. Fill skips the vector blob range.
+    fn maybe_spawn_background_fill(
+        self: &Arc<Self>,
+        uri: &SuperfileUri,
+        entry: &CachedEntry,
+        storage: Option<&Arc<dyn StorageProvider>>,
+    ) {
+        if skip_background_fill() || entry.mmap.is_some() {
+            return;
+        }
+        if entry
+            .fill_spawned
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let size = entry.size_bytes.load(Ordering::Acquire);
+        let skip_vec = vector_blob_range(&entry.reader);
+        let store = Arc::downgrade(self);
+        let reader = Arc::downgrade(&entry.reader);
+        let uri_owned = *uri;
+        let storage_uri_owned = Self::storage_path(uri);
+        let fetch_storage = self.resolve_storage(storage);
+        tokio::spawn(async move {
+            let _ = lazy_background_fill(
+                store,
+                reader,
+                uri_owned,
+                storage_uri_owned,
+                size,
+                size,
+                fetch_storage,
+                skip_vec,
+            )
+            .await;
+        });
     }
 
     /// Lazy cold-fetch path. Foreground builds a reader via
@@ -1311,7 +1400,7 @@ impl DiskCacheStore {
         fetch_storage: Arc<dyn StorageProvider>,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = Self::storage_path(uri);
-        let block_token: Arc<()>;
+        let block_source_arc: Arc<BlockCachedSource>;
         let (lazy_reader, size) = if let Some(offsets) = offsets {
             let total_size = offsets.total_size;
 
@@ -1358,7 +1447,7 @@ impl DiskCacheStore {
                 *uri,
                 self.blocks_path(uri),
             );
-            block_token = block_source.entry_token();
+            block_source_arc = Arc::clone(&block_source);
             let mut overlay = PrefetchedSource::new(block_source);
 
             if !offsets.open_blob.is_empty() {
@@ -1438,7 +1527,7 @@ impl DiskCacheStore {
                 *uri,
                 self.blocks_path(uri),
             );
-            block_token = block_source.entry_token();
+            block_source_arc = Arc::clone(&block_source);
             let source: Arc<dyn LazyByteSource> = block_source;
             let lazy_reader = SuperfileReader::open_lazy_with(
                 Arc::clone(&source),
@@ -1450,41 +1539,23 @@ impl DiskCacheStore {
         };
 
         self.reserve_manual(size).await?;
-        let reserved_bytes = size;
 
         let lazy_reader = Arc::new(lazy_reader);
+        let block_token = block_source_arc.entry_token();
         let entry = Arc::new(CachedEntry {
             reader: Arc::clone(&lazy_reader),
             mmap: None,
             size_bytes: Arc::new(AtomicU64::new(size)),
             accounting: EntryAccounting::Eager,
             block_token: Some(block_token),
+            block_source: Some(block_source_arc),
+            // Fill is modality-gated via [`Self::maybe_spawn_background_fill`]
+            // after the open returns — vector never starts it.
+            fill_spawned: AtomicBool::new(false),
             last_access_us: AtomicU64::new(self.now_us()),
         });
         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
         self.cached.insert(*uri, Arc::clone(&entry));
-
-        // Do not let the full download compete with the foreground lazy
-        // query. Once that reader is released, promote the immutable
-        // superfile to an mmap-backed cache entry.
-        if !skip_background_fill() {
-            let store = Arc::downgrade(self);
-            let reader = Arc::downgrade(&lazy_reader);
-            let uri_owned = *uri;
-            let storage_uri_owned = storage_uri;
-            tokio::spawn(async move {
-                let _ = lazy_background_fill(
-                    store,
-                    reader,
-                    uri_owned,
-                    storage_uri_owned,
-                    size,
-                    reserved_bytes,
-                    fetch_storage,
-                )
-                .await;
-            });
-        }
 
         Ok(entry)
     }
@@ -1528,6 +1599,8 @@ impl DiskCacheStore {
             size_bytes: Arc::new(AtomicU64::new(size)),
             accounting: EntryAccounting::Eager,
             block_token: None,
+            block_source: None,
+            fill_spawned: AtomicBool::new(false),
             last_access_us: AtomicU64::new(self.now_us()),
         });
         self.cached.insert(*uri, Arc::clone(&entry));
@@ -1612,6 +1685,8 @@ impl DiskCacheStore {
                 size_bytes: filled,
                 accounting: EntryAccounting::SourceOwned,
                 block_token: Some(block_token),
+                block_source: None,
+                fill_spawned: AtomicBool::new(false),
                 last_access_us: AtomicU64::new(self.now_us()),
             }),
         );
@@ -1870,6 +1945,8 @@ async fn finalize_to_mmap(
                     size_bytes: Arc::new(AtomicU64::new(size)),
                     accounting: EntryAccounting::Eager,
                     block_token: None,
+                    block_source: None,
+                    fill_spawned: AtomicBool::new(false),
                     last_access_us: AtomicU64::new(store.started_at.elapsed().as_micros() as u64),
                 });
             }
@@ -1923,10 +2000,6 @@ fn background_store_abandoned(store: &Arc<DiskCacheStore>) -> bool {
     Arc::strong_count(store) == 1
 }
 
-fn reader_blocks_background_fill(store: &DiskCacheStore, reader: &Weak<SuperfileReader>) -> bool {
-    reader.strong_count() > 1 && store.n_promotion_waiters.load(Ordering::Acquire) == 0
-}
-
 async fn wait_for_lazy_foreground_release(
     store: &Weak<DiskCacheStore>,
     reader: &Weak<SuperfileReader>,
@@ -1953,16 +2026,15 @@ async fn wait_for_lazy_foreground_release(
     }
 }
 
-/// Wait until this URI's lazy reader has no foreground holder. The cache entry
-/// itself owns one `Arc`; additional strong references are active readers for
-/// this exact superfile. This keeps unrelated table/URI fills moving instead
-/// of pausing every process-wide fill for any foreground query.
+/// Wait until this URI's lazy reader is held only by the cache entry.
+/// Unrelated table/URI fills are not gated here — only this reader's
+/// strong-count. A grace re-check covers the open→query handoff.
 async fn wait_for_reader_quiescence(
     store: &Arc<DiskCacheStore>,
     reader: &Weak<SuperfileReader>,
 ) -> bool {
     loop {
-        while reader_blocks_background_fill(store, reader) {
+        while reader_blocks_background_fill(reader) {
             if background_store_abandoned(store) {
                 return false;
             }
@@ -1975,7 +2047,7 @@ async fn wait_for_reader_quiescence(
         if reader.strong_count() == 0 {
             return false;
         }
-        if !reader_blocks_background_fill(store, reader) {
+        if !reader_blocks_background_fill(reader) {
             return !background_store_abandoned(store);
         }
     }
@@ -1996,6 +2068,7 @@ async fn cold_fetch_to_disk_cancelable(
     dest_path: &Path,
     size: u64,
     filled: &mut Vec<bool>,
+    skip_vec: Option<(u64, u64)>,
 ) -> Result<BackgroundFillOutcome, DiskCacheError> {
     let n_streams = store.config.cold_fetch_streams.max(1);
     let chunk_size = store.config.cold_fetch_chunk_bytes.max(1);
@@ -2008,8 +2081,8 @@ async fn cold_fetch_to_disk_cancelable(
     // an entry is `true` once its chunk is durably written. On the first
     // attempt it is empty; size it and truncate the destination. On a resume
     // (a same-URI reader paused the previous attempt) it carries the
-    // already-written chunks, so the fetch skips them instead of re-downloading
-    // the whole object from byte 0.
+    // already-written chunks, so the fetch skips them instead of
+    // re-downloading the whole object from byte 0.
     let first_attempt = filled.len() != n_chunks as usize;
     if first_attempt {
         filled.clear();
@@ -2046,40 +2119,61 @@ async fn cold_fetch_to_disk_cancelable(
             if reader.strong_count() == 0 {
                 return Ok(BackgroundFillOutcome::Abandoned);
             }
-            if reader_blocks_background_fill(store, reader) {
+            if reader_blocks_background_fill(reader) {
                 return Ok(BackgroundFillOutcome::Paused);
             }
             let chunk_idx = next_chunk;
             let start = chunk_idx * chunk_size;
             let end = (start + chunk_size).min(size);
+            // Vector blob stays on the block cache: leave those bytes sparse
+            // in the fill file (no GET). Parquet + FTS ranges still download.
+            let fetch_ranges = chunk_fetch_ranges(start, end, skip_vec);
+            if fetch_ranges.is_empty() {
+                filled[chunk_idx as usize] = true;
+                next_chunk += 1;
+                continue;
+            }
             let storage = Arc::clone(fetch_storage);
             let file = Arc::clone(&file);
             let uri = storage_uri.to_string();
+            // Tag fill ranges as background so query-window meters attribute
+            // only foreground lazy/probe GETs to the cold query cost.
             in_flight.push(async move {
-                let bytes = storage.get_range(&uri, start..end).await?;
-                spawn_blocking(move || file.write_all_at(&bytes, start))
-                    .await
-                    .map_err(|error| {
-                        DiskCacheError::SuperfileOpen(format!("write join: {error}"))
-                    })??;
+                for (range_start, range_end) in fetch_ranges {
+                    let len = range_end - range_start;
+                    let bytes =
+                        scope_background(storage.get_range(&uri, range_start..range_end)).await?;
+                    let file = Arc::clone(&file);
+                    spawn_blocking(move || file.write_all_at(&bytes, range_start))
+                        .await
+                        .map_err(|error| {
+                            DiskCacheError::SuperfileOpen(format!("write join: {error}"))
+                        })??;
+                    let _ = len;
+                }
                 Ok::<u64, DiskCacheError>(chunk_idx)
             });
             next_chunk += 1;
         }
 
+        let foreground = foreground_notify().notified();
+        tokio::pin!(foreground);
+        let _ = foreground.as_mut().enable();
         if reader.strong_count() == 0 {
             return Ok(BackgroundFillOutcome::Abandoned);
         }
-        if reader_blocks_background_fill(store, reader) {
+        if reader_blocks_background_fill(reader) {
             return Ok(BackgroundFillOutcome::Paused);
         }
         tokio::select! {
             biased;
-            _ = tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL) => {
+            _ = &mut foreground => {
+                // A query started: re-check same-URI hold. Unrelated fills
+                // (strong_count == 1) fall through and keep downloading.
                 if reader.strong_count() == 0 {
                     return Ok(BackgroundFillOutcome::Abandoned);
                 }
-                if reader_blocks_background_fill(store, reader) {
+                if reader_blocks_background_fill(reader) {
                     return Ok(BackgroundFillOutcome::Paused);
                 }
             }
@@ -2101,7 +2195,7 @@ async fn cold_fetch_to_disk_cancelable(
     if reader.strong_count() == 0 {
         return Ok(BackgroundFillOutcome::Abandoned);
     }
-    if reader_blocks_background_fill(store, reader) {
+    if reader_blocks_background_fill(reader) {
         return Ok(BackgroundFillOutcome::Paused);
     }
     spawn_blocking(move || file.sync_all())
@@ -2125,6 +2219,10 @@ pub(crate) fn skip_background_fill() -> bool {
 }
 
 /// Promote one released lazy reader to an mmap-backed cache entry.
+///
+/// When `skip_vec` is set, the fill file leaves the vector blob sparse and
+/// promotion opens a hybrid reader: mmap for parquet/FTS, the preserved
+/// block-cache source for vector ranges.
 async fn lazy_background_fill(
     store: Weak<DiskCacheStore>,
     reader: Weak<SuperfileReader>,
@@ -2133,6 +2231,7 @@ async fn lazy_background_fill(
     size: u64,
     reserved_bytes: u64,
     fetch_storage: Arc<dyn StorageProvider>,
+    skip_vec: Option<(u64, u64)>,
 ) -> Result<(), DiskCacheError> {
     let Some(store) = wait_for_lazy_foreground_release(&store, &reader).await else {
         return Ok(());
@@ -2156,8 +2255,8 @@ async fn lazy_background_fill(
         }
     };
     // Resume cursor: chunks durably written so far, preserved across
-    // pause/resume so a same-URI reader interrupting the fill costs only the
-    // unfinished chunks rather than a re-download of the whole object.
+    // pause/resume so a same-URI reader interrupting the fill costs only
+    // the unfinished chunks rather than a re-download of the whole object.
     let mut filled: Vec<bool> = Vec::new();
     loop {
         if !wait_for_reader_quiescence(&store, &reader).await {
@@ -2172,6 +2271,7 @@ async fn lazy_background_fill(
             &tmp,
             size,
             &mut filled,
+            skip_vec,
         )
         .await?
         {
@@ -2195,21 +2295,80 @@ async fn lazy_background_fill(
         let mmap = open_readonly_mmap(&final_path)?;
         let mmap_arc = Arc::new(mmap);
         let bytes = Bytes::from_owner(ArcMmapOwner(Arc::clone(&mmap_arc)));
-        let reader = SuperfileReader::open_with(
-            bytes,
-            OpenOptions {
-                verify_crc: store.config.verify_crc_on_open,
-            },
-        )?;
+
+        // Reuse the live block-cache source when excluding the vector blob so
+        // touched vector ranges from the cold query stay local after promote.
+        let prior_block = store
+            .cached
+            .get(&uri)
+            .and_then(|entry| entry.block_source.clone());
+        let (promoted_reader, block_token, block_source) = match (skip_vec, prior_block) {
+            (Some((vec_off, vec_len)), Some(block_source)) => {
+                let block_token = block_source.entry_token();
+                let local: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
+                let source: Arc<dyn LazyByteSource> = Arc::new(HoleFallbackSource {
+                    local,
+                    hole_start: vec_off,
+                    hole_len: vec_len,
+                    fallback: Arc::clone(&block_source),
+                });
+                let reader = SuperfileReader::open_lazy_with(
+                    source,
+                    OpenOptions { verify_crc: false },
+                )
+                .await?;
+                (reader, Some(block_token), Some(block_source))
+            }
+            (Some((vec_off, vec_len)), None) => {
+                // Evicted mid-fill: fresh block cache over storage for the hole.
+                let remote: Arc<dyn LazyByteSource> =
+                    Arc::new(StorageRangeSource::with_known_size(
+                        Arc::clone(&fetch_storage),
+                        storage_uri.clone(),
+                        size,
+                    ));
+                let block_source = BlockCachedSource::new_pre_reserved(
+                    remote,
+                    Arc::downgrade(&store),
+                    uri,
+                    store.blocks_path(&uri),
+                );
+                let block_token = block_source.entry_token();
+                let local: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
+                let source: Arc<dyn LazyByteSource> = Arc::new(HoleFallbackSource {
+                    local,
+                    hole_start: vec_off,
+                    hole_len: vec_len,
+                    fallback: Arc::clone(&block_source),
+                });
+                let reader = SuperfileReader::open_lazy_with(
+                    source,
+                    OpenOptions { verify_crc: false },
+                )
+                .await?;
+                (reader, Some(block_token), Some(block_source))
+            }
+            (None, _) => {
+                let reader = SuperfileReader::open_with(
+                    bytes,
+                    OpenOptions {
+                        verify_crc: store.config.verify_crc_on_open,
+                    },
+                )?;
+                (reader, None, None)
+            }
+        };
 
         match store.cached.entry(uri) {
             Entry::Occupied(mut occupied) => {
                 *occupied.get_mut() = Arc::new(CachedEntry {
-                    reader: Arc::new(reader),
+                    reader: Arc::new(promoted_reader),
                     mmap: Some(mmap_arc),
                     size_bytes: Arc::new(AtomicU64::new(size)),
                     accounting: EntryAccounting::Eager,
-                    block_token: None,
+                    block_token,
+                    block_source,
+                    fill_spawned: AtomicBool::new(true),
                     last_access_us: AtomicU64::new(store.now_us()),
                 });
             }
@@ -2228,6 +2387,125 @@ async fn lazy_background_fill(
     }
     let _ = reserved_bytes;
     result
+}
+
+/// Absolute `(offset, length)` of the vector blob from Parquet KV metadata.
+fn vector_blob_range(reader: &SuperfileReader) -> Option<(u64, u64)> {
+    let kv_map = footer::extract_kv_map(reader.parquet_metadata()).ok()?;
+    let off: u64 = kv_map.get(kv::VEC_OFFSET)?.parse().ok()?;
+    let len: u64 = kv_map.get(kv::VEC_LENGTH)?.parse().ok()?;
+    (len > 0).then_some((off, len))
+}
+
+/// Sub-ranges of `[start, end)` that are outside an optional skip hole.
+///
+/// Empty means the whole chunk lies inside the hole (no GET).
+fn chunk_fetch_ranges(start: u64, end: u64, skip: Option<(u64, u64)>) -> Vec<(u64, u64)> {
+    debug_assert!(start <= end);
+    let Some((hole_start, hole_len)) = skip else {
+        return vec![(start, end)];
+    };
+    if hole_len == 0 || start == end {
+        return vec![(start, end)];
+    }
+    let hole_end = hole_start.saturating_add(hole_len);
+    if end <= hole_start || start >= hole_end {
+        return vec![(start, end)];
+    }
+    let mut out = Vec::with_capacity(2);
+    if start < hole_start {
+        out.push((start, hole_start.min(end)));
+    }
+    if end > hole_end {
+        out.push((hole_end.max(start), end));
+    }
+    out
+}
+
+/// Local mmap/bytes source with a hole that falls through to another source.
+///
+/// Used after background fill excludes the vector blob: parquet + FTS come
+/// from the filled mmap; vector ranges keep using the block cache.
+struct HoleFallbackSource {
+    local: Arc<dyn LazyByteSource>,
+    hole_start: u64,
+    hole_len: u64,
+    fallback: Arc<BlockCachedSource>,
+}
+
+impl HoleFallbackSource {
+    fn hole_end(&self) -> u64 {
+        self.hole_start.saturating_add(self.hole_len)
+    }
+
+    fn overlaps_hole(&self, start: u64, len: u64) -> bool {
+        let end = start.saturating_add(len);
+        end > self.hole_start && start < self.hole_end()
+    }
+
+    fn fully_in_hole(&self, start: u64, len: u64) -> bool {
+        let end = start.saturating_add(len);
+        start >= self.hole_start && end <= self.hole_end()
+    }
+}
+
+#[async_trait]
+impl LazyByteSource for HoleFallbackSource {
+    fn size(&self) -> u64 {
+        self.local.size()
+    }
+
+    async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        if len == 0 {
+            return Ok(Bytes::new());
+        }
+        if !self.overlaps_hole(start, len) {
+            return self.local.range(start, len).await;
+        }
+        if self.fully_in_hole(start, len) {
+            return self.fallback.range(start, len).await;
+        }
+        // Spanning request: stitch local and fallback pieces in order.
+        let end = start + len;
+        let hole_end = self.hole_end();
+        let mut pieces = Vec::with_capacity(3);
+        let mut cursor = start;
+        if cursor < self.hole_start {
+            let piece_end = self.hole_start.min(end);
+            pieces.push(self.local.range(cursor, piece_end - cursor).await?);
+            cursor = piece_end;
+        }
+        if cursor < end && cursor < hole_end {
+            let piece_end = hole_end.min(end);
+            pieces.push(self.fallback.range(cursor, piece_end - cursor).await?);
+            cursor = piece_end;
+        }
+        if cursor < end {
+            pieces.push(self.local.range(cursor, end - cursor).await?);
+        }
+        if pieces.len() == 1 {
+            return Ok(pieces.pop().expect("one piece"));
+        }
+        let mut out = Vec::with_capacity(len as usize);
+        for piece in pieces {
+            out.extend_from_slice(&piece);
+        }
+        Ok(Bytes::from(out))
+    }
+
+    fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
+        if len == 0 {
+            return Some(Bytes::new());
+        }
+        if !self.overlaps_hole(start, len) {
+            return self.local.try_get_range_sync(start, len);
+        }
+        if self.fully_in_hole(start, len) {
+            return self.fallback.try_get_range_sync(start, len);
+        }
+        // Spanning sync reads are rare; force the async path.
+        None
+    }
 }
 
 /// Newtype around `Arc<Mmap>` that delegates `AsRef<[u8]>`
@@ -2285,7 +2563,7 @@ mod tests {
     /// Local-filesystem background promotion should finish well within this.
     const PROMOTE_TIMEOUT: Duration = Duration::from_secs(10);
     /// Long enough to cover several background quiet-interval checks.
-    const READER_HOLD_INTERVAL: Duration = Duration::from_millis(50);
+    const FOREGROUND_GUARD_HOLD: Duration = Duration::from_millis(50);
     /// Large enough that one-byte sequential range reads cannot finish before
     /// the preemption test enters its foreground guard.
     const PREEMPT_TEST_BYTES: usize = 1 << 20;
@@ -2598,7 +2876,6 @@ mod tests {
             ..Default::default()
         };
         let store2 = DiskCacheStore::new_unpinned(Arc::clone(&storage), cfg2).expect("store2");
-        store2.wait_for_restore().await;
 
         let s = store2.stats();
         assert_eq!(s.n_entries, 1, "rebuilt index has the cached superfile");
@@ -2719,7 +2996,7 @@ mod tests {
             .expect("put at hidden prefix");
 
         let reader = cache
-            .reader_with_hints(&uri, None, Some(&hidden_storage))
+            .reader_with_hints(&uri, None, Some(&hidden_storage), true)
             .await
             .expect("cold fetch via caller storage");
         assert_eq!(reader.n_docs(), 1);
@@ -2762,7 +3039,7 @@ mod tests {
             .expect("put at hidden prefix");
 
         let reader = cache
-            .reader_with_hints(&uri, None, Some(&hidden_storage))
+            .reader_with_hints(&uri, None, Some(&hidden_storage), true)
             .await
             .expect("lazy cold fetch via caller storage");
         assert_eq!(reader.n_docs(), 1);
@@ -2805,7 +3082,7 @@ mod tests {
 
         // Query path admission: lazy reader with no resident parquet bytes.
         let lazy = cache
-            .reader_with_hints(&uri, None, Some(&hidden_storage))
+            .reader_with_hints(&uri, None, Some(&hidden_storage), true)
             .await
             .expect("lazy cold fetch via caller storage");
         assert!(
@@ -2933,7 +3210,7 @@ mod tests {
             open_blob: Vec::new(),
         };
         let r = store
-            .reader_with_hints(&uri, Some(&offsets), None)
+            .reader_with_hints(&uri, Some(&offsets), None, true)
             .await
             .expect("lazy hinted cold");
         assert_eq!(r.n_docs(), 1);
@@ -2944,12 +3221,45 @@ mod tests {
             .await
             .expect("background promotion");
         let r2 = store
-            .reader_with_hints(&uri, Some(&offsets), None)
+            .reader_with_hints(&uri, Some(&offsets), None, true)
             .await
             .expect("warm hinted mmap");
         assert_eq!(store.stats().n_cold_fetches, 1);
         assert!(store.is_mmap_promoted(&uri));
         assert!(r2.parquet_bytes().is_some());
+    }
+
+    #[tokio::test]
+    async fn vector_open_skips_fill_fts_open_starts_it() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+
+        // Vector modality: block-cache only — no background fill.
+        let vector_reader = store
+            .reader_with_hints(&uri, None, None, false)
+            .await
+            .expect("vector lazy open");
+        drop(vector_reader);
+        tokio::time::sleep(FOREGROUND_GUARD_HOLD).await;
+        assert!(
+            !store.is_mmap_promoted(&uri),
+            "vector open must not spawn background fill"
+        );
+
+        // FTS/SQL modality on the same URI starts fill after the fact.
+        let fts_reader = store
+            .reader_with_hints(&uri, None, None, true)
+            .await
+            .expect("fts lazy open");
+        drop(fts_reader);
+        store
+            .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
+            .await
+            .expect("FTS open must start background fill");
+        assert!(store.is_mmap_promoted(&uri));
     }
 
     #[tokio::test]
@@ -2961,10 +3271,11 @@ mod tests {
         put_superfile(&store, &uri, tiny_superfile_bytes()).await;
 
         let reader = store.reader(&uri).await.expect("lazy cold");
-        tokio::time::sleep(READER_HOLD_INTERVAL).await;
+        let _foreground = ForegroundQueryGuard::enter();
+        tokio::time::sleep(FOREGROUND_GUARD_HOLD).await;
         assert!(
             !store.is_mmap_promoted(&uri),
-            "background promotion must yield while the URI's lazy reader is held"
+            "background promotion must yield while this URI's lazy reader is held"
         );
 
         drop(reader);
@@ -2986,17 +3297,57 @@ mod tests {
         put_superfile(&store, &fill_uri, tiny_superfile_bytes()).await;
 
         let held_reader = store.reader(&held_uri).await.expect("held lazy reader");
-        let fill_reader = store.reader(&fill_uri).await.expect("fill lazy reader");
-        drop(fill_reader);
+        let _fill_reader = store.reader(&fill_uri).await.expect("fill lazy reader");
+        drop(_fill_reader);
+        let _foreground = ForegroundQueryGuard::enter();
         store
             .wait_until_mmap_promoted(&fill_uri, PROMOTE_TIMEOUT)
             .await
-            .expect("unrelated URI must promote");
+            .expect("unrelated URI fill must proceed while another URI is held");
         assert!(
             !store.is_mmap_promoted(&held_uri),
-            "only the URI with an active reader should remain paused"
+            "held URI must still wait for its own reader release"
         );
         drop(held_reader);
+    }
+
+    #[test]
+    fn chunk_fetch_ranges_skips_vector_hole() {
+        assert_eq!(
+            chunk_fetch_ranges(0, 100, None),
+            vec![(0, 100)],
+            "no hole ⇒ full chunk"
+        );
+        assert_eq!(
+            chunk_fetch_ranges(0, 100, Some((100, 50))),
+            vec![(0, 100)],
+            "hole after chunk ⇒ full chunk"
+        );
+        assert_eq!(
+            chunk_fetch_ranges(0, 100, Some((0, 100))),
+            Vec::<(u64, u64)>::new(),
+            "chunk fully inside hole ⇒ no GET"
+        );
+        assert_eq!(
+            chunk_fetch_ranges(50, 150, Some((0, 200))),
+            Vec::<(u64, u64)>::new(),
+            "chunk fully inside larger hole ⇒ no GET"
+        );
+        assert_eq!(
+            chunk_fetch_ranges(0, 100, Some((40, 20))),
+            vec![(0, 40), (60, 100)],
+            "hole splits chunk into two fetch ranges"
+        );
+        assert_eq!(
+            chunk_fetch_ranges(0, 100, Some((80, 40))),
+            vec![(0, 80)],
+            "hole overlapping chunk end ⇒ leading fetch only"
+        );
+        assert_eq!(
+            chunk_fetch_ranges(0, 100, Some((0, 40))),
+            vec![(40, 100)],
+            "hole overlapping chunk start ⇒ trailing fetch only"
+        );
     }
 
     #[tokio::test]
@@ -3030,6 +3381,7 @@ mod tests {
                 &fill_destination,
                 PREEMPT_TEST_BYTES as u64,
                 &mut filled,
+                None,
             )
             .await;
             (outcome, filled)
@@ -3042,16 +3394,18 @@ mod tests {
         })
         .await
         .expect("background fill started");
+        // Holding the signal reader (strong_count > 1) is the per-URI pause.
         let foreground = Arc::clone(&signal_reader);
+        let _ = ForegroundQueryGuard::enter();
         let (outcome, filled) = fill.await.expect("background task joined");
         let outcome = outcome.expect("background fill returned an outcome");
         assert_eq!(outcome, BackgroundFillOutcome::Paused);
-        // The resume cursor is sized to the object's chunk count and preserved
-        // across the pause, so a later attempt resumes rather than restarting.
+        // Resume cursor is sized to the object's chunk count and preserved
+        // across the pause so a later attempt resumes rather than restarting.
         assert_eq!(filled.len(), PREEMPT_TEST_BYTES);
         assert!(
             filled.iter().any(|&done| !done),
-            "a foreground pause must leave unfinished chunks for the resume"
+            "a same-URI pause must leave unfinished chunks for the resume"
         );
         drop(foreground);
     }

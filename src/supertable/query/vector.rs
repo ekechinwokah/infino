@@ -538,7 +538,7 @@ async fn read_ids_for_locals(
     let storage = manifest.options.storage.as_ref();
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.as_ref();
-    let reader = dispatch::open_reader(&store, disk_cache, storage, entry).await?;
+    let reader = dispatch::open_reader(&store, disk_cache, storage, entry, false).await?;
     // The inline IVF region is usable as an `_id` source only when its rows
     // map 1:1 to Parquet rows. Boundary-replicated user commits break that:
     // the IVF carries stub rows beyond the Parquet count, so inline order
@@ -1276,12 +1276,12 @@ impl SupertableReader {
                 let n = fanout_width.min(units.len());
                 let wave: Vec<_> = units.drain(..n).collect();
                 collected.extend(
-                    dispatch::fanout_with(self, wave, !hidden_vector_index, body.clone()).await?,
+                    dispatch::fanout_with(self, wave, !hidden_vector_index, false, body.clone()).await?,
                 );
             }
             collected
         } else {
-            dispatch::fanout_with(self, units, !hidden_vector_index, body).await?
+            dispatch::fanout_with(self, units, !hidden_vector_index, false, body).await?
         };
 
         Ok(top_k_ascending(per_superfile, k))
@@ -1940,7 +1940,7 @@ impl SupertableReader {
             }
         };
         let pairs: Vec<(SuperfileUri, RoaringBitmap)> =
-            dispatch::fanout_with(self, units, true, body).await?;
+            dispatch::fanout_with(self, units, true, false, body).await?;
         Ok(pairs
             .into_iter()
             .filter(|(_, bm)| !bm.is_empty())
@@ -2130,6 +2130,9 @@ impl SupertableReader {
         filter: Option<VectorFilter<'_>>,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
+        // Mark a foreground query in flight so background cache-fills yield
+        // S3 bandwidth to it; released when this query returns.
+        let _fg = crate::supertable::reader_cache::disk::ForegroundQueryGuard::enter();
         self.block_on(async {
             let hits = match filter {
                 None => {
@@ -2162,6 +2165,9 @@ impl SupertableReader {
         options: VectorSearchOptions,
         filter: Option<VectorFilter<'_>>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        // Mark a foreground query in flight so background cache-fills yield
+        // S3 bandwidth to it; released when this query returns.
+        let _fg = crate::supertable::reader_cache::disk::ForegroundQueryGuard::enter();
         match filter {
             None => self.block_on(self.vector_search_global_index_async(column, query, k, options)),
             Some(f) => self.block_on(self.vector_hits_filtered_async(column, query, k, options, f)),

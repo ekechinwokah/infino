@@ -434,6 +434,7 @@ async fn resolve_columns(
             storage,
             &entry.uri,
             entry.subsection_offsets.as_ref(),
+            true,
         )
         .await
         .map(|reader| (index, reader))
