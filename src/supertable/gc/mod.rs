@@ -21,6 +21,7 @@ use crate::{
             commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
         },
         slow_vector_state::{self, STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX},
+        wal::persistence::{SUPERFILES_DIR, WalStore},
     },
 };
 
@@ -66,6 +67,9 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     // the current list and get swept once past the safety gap.
     if let Some((uri, _)) = manifest.slow_vector_state_blob() {
         live.insert(uri.to_owned());
+    for sf in manifest.get_all_superfiles() {
+        live.insert(sf.uri.storage_path());
+        live.insert(WalStore::tombstones_path(sf.superfile_id));
     }
     (live, superfiles_complete)
 }
