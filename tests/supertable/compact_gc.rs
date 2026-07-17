@@ -59,11 +59,7 @@ fn count_tombstone_sidecars(dir: &std::path::Path) -> usize {
     std::fs::read_dir(dir)
         .expect("readdir")
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "tombstones")
-        })
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "tombstones"))
         .count()
 }
 
