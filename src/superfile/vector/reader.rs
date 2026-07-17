@@ -3172,10 +3172,7 @@ impl VectorReader {
         {
             ShortlistOutcome::Done(out) => {
                 if let Some(t0) = shortlist_t0 {
-                    io_counters::phase_record(
-                        "vec.shortlist",
-                        t0.elapsed().as_micros() as u64,
-                    );
+                    io_counters::phase_record("vec.shortlist", t0.elapsed().as_micros() as u64);
                 }
                 return Ok(out);
             }
@@ -3199,10 +3196,7 @@ impl VectorReader {
             None => None,
         };
         if let Some(t0) = survivor_t0 {
-            io_counters::phase_record(
-                "vec.survivor_fetch",
-                t0.elapsed().as_micros() as u64,
-            );
+            io_counters::phase_record("vec.survivor_fetch", t0.elapsed().as_micros() as u64);
         }
 
         io_counters::phase_timed_async("vec.rerank", async {

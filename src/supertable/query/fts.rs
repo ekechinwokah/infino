@@ -324,12 +324,12 @@ impl SupertableReader {
             let shared = Arc::clone(&shared);
             let tombstones = tombstones.clone();
             async move {
-                let term_refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
                 // A cross-file floor can suppress score-tied single-term hits
                 // according to task completion order. Local BMW still prunes
                 // those queries; share the global floor only for multi-term
                 // paths.
-                let floor = if term_refs.len() == 1 {
+                let n_terms = must_arc.len() + should_arc.len();
+                let floor = if n_terms == 1 {
                     f32::NEG_INFINITY
                 } else {
                     shared.floor()

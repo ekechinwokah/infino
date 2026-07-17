@@ -354,13 +354,7 @@ fn score_fine_candidates(
                                 .get(local as usize)
                                 .copied()
                                 .unwrap_or(0) as u64;
-                            candidates.push((
-                                si,
-                                flat_base + local,
-                                score,
-                                cell.cell_id,
-                                count,
-                            ));
+                            candidates.push((si, flat_base + local, score, cell.cell_id, count));
                         });
                     flat_base = flat_base.saturating_add(cell.clusters.n_cent);
                 }
@@ -908,9 +902,9 @@ impl SupertableReader {
             .map(|g| g.user_grid())
             .filter(|grid| grid.n_cent > 0 && grid.dim as usize == query.len())
             .or_else(|| {
-                manifest.vector_cell_clusters(column).filter(|clusters| {
-                    clusters.n_cent > 0 && clusters.dim as usize == query.len()
-                })
+                manifest
+                    .vector_cell_clusters(column)
+                    .filter(|clusters| clusters.n_cent > 0 && clusters.dim as usize == query.len())
             });
         // Admit: rank the coarse grid, score every fine IVF centroid in
         // eligible summaries, then fine/grid cell selection + per-fragment
@@ -980,8 +974,7 @@ impl SupertableReader {
                 ));
             }
             let cutoff = grid_cell_cutoff(&ranked_for_beam, &cell_routing);
-            let candidates =
-                score_fine_candidates(&superfiles, column, query, metric, allow_ref)?;
+            let candidates = score_fine_candidates(&superfiles, column, query, metric, allow_ref)?;
             candidate_counts = candidates
                 .iter()
                 .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
@@ -1001,8 +994,7 @@ impl SupertableReader {
                     .map(|(cell, _)| *cell)
                     .collect();
                 let selected_cells_ordered = union_cell_selection(&grid_cells, &fine_cells);
-                let selected_cells: HashSet<u32> =
-                    selected_cells_ordered.iter().copied().collect();
+                let selected_cells: HashSet<u32> = selected_cells_ordered.iter().copied().collect();
                 gated = gate_fine_candidates_by_fragment(
                     candidates,
                     &selected_cells,
@@ -1074,8 +1066,7 @@ impl SupertableReader {
         } else {
             // No grid, or untagged summaries: score every fine centroid
             // (legacy flat path).
-            let candidates =
-                score_fine_candidates(&superfiles, column, query, metric, allow_ref)?;
+            let candidates = score_fine_candidates(&superfiles, column, query, metric, allow_ref)?;
             candidate_counts = candidates
                 .iter()
                 .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
@@ -1186,10 +1177,7 @@ impl SupertableReader {
         }
         if units.is_empty() {
             if let Some(t0) = admit_t0 {
-                io_counters::phase_record(
-                    "vec.admit",
-                    t0.elapsed().as_micros() as u64,
-                );
+                io_counters::phase_record("vec.admit", t0.elapsed().as_micros() as u64);
             }
             return Ok(Vec::new());
         }
@@ -1304,10 +1292,7 @@ impl SupertableReader {
             dispatch::fanout_with(self, units, !hidden_vector_index, false, body).await?
         };
         if let Some(t0) = fanout_t0 {
-            io_counters::phase_record(
-                "vec.fanout_wall",
-                t0.elapsed().as_micros() as u64,
-            );
+            io_counters::phase_record("vec.fanout_wall", t0.elapsed().as_micros() as u64);
         }
 
         Ok(top_k_ascending(per_superfile, k))

@@ -85,12 +85,11 @@ const SQL_LOGICAL_PLAN_CACHE_ENTRIES: usize = 64;
 fn cacheable_scalar_plan(plan: &LogicalPlan) -> bool {
     fn visit(plan: &LogicalPlan, found_scan: &mut bool) -> bool {
         if let LogicalPlan::TableScan(scan) = plan {
-            let Some(source) = scan.source.as_any().downcast_ref::<DefaultTableSource>() else {
+            let Some(source) = scan.source.downcast_ref::<DefaultTableSource>() else {
                 return false;
             };
             if source
                 .table_provider
-                .as_any()
                 .downcast_ref::<SupertableProvider>()
                 .is_none()
             {

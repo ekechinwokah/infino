@@ -301,8 +301,7 @@ pub mod io_counters {
     /// engine YAML is never overridden by env — this is a separate tracer).
     pub fn phase_enabled() -> bool {
         *PHASE_TRACE_ON.get_or_init(|| {
-            timeline_enabled()
-                || std::env::var_os("INFINO_TRACE_VECTOR_WARM_PHASES").is_some()
+            timeline_enabled() || std::env::var_os("INFINO_TRACE_VECTOR_WARM_PHASES").is_some()
         })
     }
 

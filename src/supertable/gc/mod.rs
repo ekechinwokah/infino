@@ -67,6 +67,7 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     // the current list and get swept once past the safety gap.
     if let Some((uri, _)) = manifest.slow_vector_state_blob() {
         live.insert(uri.to_owned());
+    }
     for sf in manifest.get_all_superfiles() {
         live.insert(sf.uri.storage_path());
         live.insert(WalStore::tombstones_path(sf.superfile_id));

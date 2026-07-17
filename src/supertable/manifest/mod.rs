@@ -491,9 +491,11 @@ impl ManifestSnapshot {
     /// Borrow the global vector cell-index (no clone — keeps the transposed
     /// SIMD cache warm on the query path).
     pub(crate) fn global_vector_index(&self) -> Option<&list::GlobalVectorIndex> {
-        self.stamped_global_vector_index
-            .as_ref()
-            .or_else(|| self.list.as_ref().and_then(|l| l.global_vector_index.as_ref()))
+        self.stamped_global_vector_index.as_ref().or_else(|| {
+            self.list
+                .as_ref()
+                .and_then(|l| l.global_vector_index.as_ref())
+        })
     }
 
     /// Drained user commit-versions recorded on this (hidden) manifest. Honors

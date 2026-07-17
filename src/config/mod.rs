@@ -425,6 +425,8 @@ pub struct DiagnosticsSettings {
     /// Skip the disk cache's lazy background fill so foreground-only
     /// read behavior can be measured (A/B measurement).
     pub disable_background_fill: bool,
+}
+
 /// Gc settings used by `optimize()`'s bundled gc sweep.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcSettings {
