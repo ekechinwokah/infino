@@ -67,6 +67,8 @@ pub(crate) enum HiddenDeletedError {
     BadMagic,
     #[error("deleted-id set unsupported version {0}")]
     UnsupportedVersion(u8),
+    #[error("deleted-id set not strictly ascending on the wire")]
+    NonCanonical,
 }
 
 /// Parse a deleted-`_id` set written by [`encode_deleted_ids`].
@@ -92,12 +94,12 @@ pub(crate) fn decode_deleted_ids(bytes: &[u8]) -> Result<Vec<i128>, HiddenDelete
         buf.copy_from_slice(chunk);
         ids.push(i128::from_le_bytes(buf));
     }
-    // Consumers `binary_search` this set; the encoder guarantees canonical
-    // order on the wire (see `encode_deleted_ids`).
-    debug_assert!(
-        is_canonical_deleted_id_set(&ids),
-        "deleted-id set must be strictly ascending on the wire"
-    );
+    // Consumers `binary_search` this set. Reject unsorted/duplicate wire
+    // order in release too — a corrupt blob would otherwise silently
+    // resurrect deleted rows via false-negative searches.
+    if !is_canonical_deleted_id_set(&ids) {
+        return Err(HiddenDeletedError::NonCanonical);
+    }
     Ok(ids)
 }
 
@@ -141,5 +143,16 @@ mod tests {
         assert_eq!(decoded, vec![-1, 0, 42, i128::MAX]);
         assert!(decoded.binary_search(&-1).is_ok());
         assert!(decoded.binary_search(&i128::MAX).is_ok());
+    }
+
+    #[test]
+    fn decode_rejects_unsorted_wire_bytes() {
+        let mut bytes = encode_deleted_ids(&[1, 2, 3]);
+        let (left, right) = bytes[DELETED_IDS_HEADER_LEN..].split_at_mut(DELETED_ID_LEN);
+        left.swap_with_slice(&mut right[..DELETED_ID_LEN]);
+        assert!(matches!(
+            decode_deleted_ids(&bytes),
+            Err(HiddenDeletedError::NonCanonical)
+        ));
     }
 }

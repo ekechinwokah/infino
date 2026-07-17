@@ -1075,9 +1075,9 @@ impl ManifestSnapshot {
     /// content-addressed object holding this table's superfile entries
     /// (drain-owned routing/centroid state). Bumps `manifest_id` like a
     /// normal commit without touching superfiles or parts, mirroring
-    /// [`ManifestSnapshot::with_deleted_user_ids`]. Called only from drain / hidden
-    /// compaction publication; ordinary commits instead CLEAR the ref via
-    /// [`ManifestSnapshot::update`] (membership change invalidates the blob).
+    /// [`ManifestSnapshot::with_deleted_user_ids`]. Standalone restamp path
+    /// (e.g. post-drain refresh); membership commits instead compose the
+    /// ref via [`Self::with_slow_vector_state_ref`] before the same CAS.
     pub fn with_slow_vector_state(&self, uri: String, hash: part::ContentHash) -> Self {
         let next_id = self.get_next_manifest_id();
         let new_list = self.list.as_ref().map(|list| {
@@ -1090,6 +1090,37 @@ impl ManifestSnapshot {
         Self {
             superfile_list: SuperfileList {
                 manifest_id: next_id,
+                options: Arc::clone(&self.superfile_list.options),
+                superfiles: self.superfile_list.superfiles.clone(),
+                vector_index_storage_prefix: self
+                    .superfile_list
+                    .vector_index_storage_prefix
+                    .clone(),
+            },
+            list: new_list,
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+        }
+    }
+
+    /// Stamp the slow-state ref onto an already-built successor **without**
+    /// bumping `manifest_id`. Used when composing a membership
+    /// [`crate::supertable::writer::try_commit_attempt`] so the blob PUT and
+    /// list/pointer CAS publish together — closing the window where a crash
+    /// leaves membership durable with a cleared slow-state ref.
+    pub(crate) fn with_slow_vector_state_ref(&self, uri: String, hash: part::ContentHash) -> Self {
+        let new_list = self.list.as_ref().map(|list| {
+            let mut list = list.clone();
+            list.slow_vector_state_uri = Some(uri);
+            list.slow_vector_state_content_hash = Some(hash);
+            list
+        });
+        Self {
+            superfile_list: SuperfileList {
+                manifest_id: self.superfile_list.manifest_id,
                 options: Arc::clone(&self.superfile_list.options),
                 superfiles: self.superfile_list.superfiles.clone(),
                 vector_index_storage_prefix: self
@@ -1579,9 +1610,10 @@ impl ManifestSnapshot {
             // Slow-CAS section is deliberately NOT carried into the
             // successor: `update` is the membership-change path (its only
             // production caller is the commit attempt), and a membership
-            // change invalidates the drain-published entry blob. Only
-            // drain / hidden compaction restamp it, via
-            // `with_slow_vector_state`, after the new membership settles.
+            // change invalidates the prior entry blob. The commit attempt
+            // restamps a fresh blob onto this successor via
+            // [`Self::with_slow_vector_state_ref`] before the list/pointer
+            // CAS, so membership and the slow-state ref publish together.
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             parts: out_list_entries_after_removal,

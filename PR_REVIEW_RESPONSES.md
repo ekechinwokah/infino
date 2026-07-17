@@ -317,18 +317,22 @@ working tree after `724e39d` (see below).
 
 ### Fixed (committed in `51ed0d7` unless noted)
 
-- **S2:** Multi-cell lazy open honors the caller's CRC option; `verify_crc=true`
-  performs the required full fetch.
-- **S3:** Deleted-id decode rejects noncanonical wire order in release builds.
+- **S2:** Multi-cell lazy open threads the caller's `OpenOptions`; 
+  `verify_crc=true` fetches the full blob so outer/subsection CRC checks run.
+- **S3:** Deleted-id decode rejects noncanonical wire order in release builds
+  (`HiddenDeletedError::NonCanonical`); encode still sorts+dedups.
 - **S14:** Packed cells are sorted before both Parquet ids and vector
   subsections are emitted.
 - **S16:** Open-range capture rejects unknown vector versions.
-- **S17:** Every VectorCell membership commit writes and stamps its
-  content-addressed slow-state ref before the same list/pointer CAS.
-- **S18:** A concurrent-create loser reopens the winner's durable hidden-index
-  prefix before building its handle.
-- **S19/F8:** Lazy Sq8 metadata validation is a real release error, including
-  per-cluster on-demand metadata.
+- **S17:** Hidden membership commits (`try_commit_attempt`) write the
+  content-addressed slow-state blob and stamp it via
+  `with_slow_vector_state_ref` on the same successor before the list/pointer
+  CAS (closes the post-`update` clear window).
+- **S18:** A concurrent-create loser adopts the winner's manifest and
+  reopens the hidden index at the winner's stamped prefix (drops the loser's
+  process-local UUID prefix).
+- **S19/F8:** Lazy Sq8 metadata validation is a real release error on the
+  cold parse path and on per-cluster on-demand metadata.
 - **S20:** Hidden bootstrap-create failures are recorded as Broken rather than
   silently treated as Absent.
 - **S21:** Vector directory geometry uses checked multiplication/addition on

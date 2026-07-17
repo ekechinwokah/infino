@@ -418,7 +418,14 @@ impl VectorReader {
             ))));
         }
         if version == format::vec::VERSION_MULTI_CELL {
-            return Self::open_lazy_multi_cell(source, columns_json, header_bytes, blob_size).await;
+            return Self::open_lazy_multi_cell(
+                source,
+                columns_json,
+                header_bytes,
+                blob_size,
+                opts,
+            )
+            .await;
         }
         let n_columns = read_u32_le(
             &header_bytes[outer_hdr::N_COLUMNS_OFF..outer_hdr::N_COLUMNS_OFF + U32_BYTES],
@@ -1371,11 +1378,16 @@ impl VectorReader {
 
     /// Lazy open for a v2 multi-cell blob: prefetch header + cell directory,
     /// then hand off to the sync multi-cell open over a prefetched overlay.
+    ///
+    /// Honors `opts.verify_crc`: when true, the full blob is fetched so the
+    /// outer + per-subsection CRC checks in [`Self::open_multi_cell_with_source`]
+    /// can run (same contract as v1 [`Self::open_lazy`]).
     async fn open_lazy_multi_cell(
         source: Arc<dyn LazyByteSource>,
         columns_json: &str,
         header_bytes: Bytes,
         blob_size: usize,
+        opts: OpenOptions,
     ) -> Result<Self, VectorError> {
         let n_cells =
             read_u32_le(&header_bytes[outer_hdr::N_CELLS_OFF..outer_hdr::N_CELLS_OFF + U32_BYTES])
@@ -1390,6 +1402,25 @@ impl VectorReader {
                 "lazy multi-cell: directory end {dir_end} exceeds blob size {blob_size}",
             ))));
         }
+
+        // CRC-on: one full-blob GET so sync CRC verification can
+        // `fetch_sync` contiguous ranges (PrefetchedSource does not stitch).
+        if opts.verify_crc {
+            let full = source.range(0, blob_size as u64).await.map_err(|e| {
+                VectorError::Read(ReadError::MalformedVersion(format!(
+                    "lazy multi-cell: full-blob CRC fetch: {e}"
+                )))
+            })?;
+            let mut overlay = PrefetchedSource::new(Arc::clone(&source));
+            overlay.install(0, full);
+            return Self::open_multi_cell_with_source(
+                Source::Lazy(Arc::new(overlay)),
+                columns_json,
+                opts,
+                header_bytes,
+            );
+        }
+
         let dir_prefetch = source
             .range(dir_offset as u64, (dir_end - dir_offset) as u64)
             .await
@@ -1466,7 +1497,7 @@ impl VectorReader {
         Self::open_multi_cell_with_source(
             Source::Lazy(Arc::new(overlay)),
             columns_json,
-            OpenOptions::for_object_store(),
+            opts,
             header_bytes,
         )
     }
@@ -2748,7 +2779,6 @@ impl VectorReader {
             k,
         )
         .await
-        .map_err(|e| VectorError::LazySource(e.to_string()))
     }
 
     /// Async sibling of [`Self::search`]. Byte-for-byte the same IVF
@@ -3172,7 +3202,6 @@ impl VectorReader {
             ctx.k,
         )
         .await
-        .map_err(|e| VectorError::LazySource(e.to_string()))
     }
 
     /// Look up the column by name and validate `query.len() == col.dim`
@@ -3904,8 +3933,9 @@ async fn rerank_candidates_from_blocks(
     query: &[f32],
     pool: Option<Arc<ThreadPool>>,
     k: usize,
-) -> Result<Vec<(u32, f32)>, LazyByteSourceError> {
+) -> Result<Vec<(u32, f32)>, VectorError> {
     let stride = col.rerank_codec.per_vector_bytes(col.dim);
+    let map_lazy = |e: LazyByteSourceError| VectorError::LazySource(e.to_string());
     let reranked: Vec<(u32, f32)> = match col.rerank_codec {
         RerankCodec::Fp32 => {
             // Exact fp32 rerank — every survivor is independent, so the
@@ -3989,16 +4019,22 @@ async fn rerank_candidates_from_blocks(
                     norms_abs_off,
                 } => {
                     if let Some(meta_bytes) = lazy_sq8_meta_bytes {
-                        let parsed = Arc::clone(col.lazy_sq8_parsed.get_or_init(|| {
-                            Arc::new(parse_sq8_meta_bytes(
+                        if col.lazy_sq8_parsed.get().is_none() {
+                            let parsed = parse_sq8_meta_bytes(
                                 meta_bytes,
                                 col.n_cent as usize,
                                 dim,
                                 col.n_docs as usize,
                                 norms_abs_off.is_some(),
                                 col.rerank_codec,
-                            ))
-                        }));
+                            )?;
+                            let _ = col.lazy_sq8_parsed.set(Arc::new(parsed));
+                        }
+                        let parsed = Arc::clone(
+                            col.lazy_sq8_parsed
+                                .get()
+                                .expect("lazy Sq8 meta set just above"),
+                        );
                         return Ok(finalize_reranked(
                             score_sq8_residual_candidates(
                                 candidates,
@@ -4031,12 +4067,18 @@ async fn rerank_candidates_from_blocks(
                         ranges.push(scale_start..scale_start + cluster_meta_len);
                         ranges.push(offset_start..offset_start + cluster_meta_len);
                     }
-                    let bytes = source.get_ranges_parallel(&ranges)?;
+                    let bytes = source.get_ranges_parallel(&ranges).map_err(map_lazy)?;
                     let mut scale_offset_by_cluster: HashMap<u32, (Vec<f32>, Vec<f32>)> =
                         HashMap::with_capacity(clusters.len());
                     for (idx, &cluster_id) in clusters.iter().enumerate() {
                         let scale = parse_f32_le_vec(&bytes[idx * 2]);
                         let offset = parse_f32_le_vec(&bytes[idx * 2 + 1]);
+                        validate_quantizer_meta(
+                            col.rerank_codec,
+                            &scale,
+                            &offset,
+                            "lazy per-cluster metadata",
+                        )?;
                         scale_offset_by_cluster.insert(cluster_id, (scale, offset));
                     }
 
@@ -4063,7 +4105,9 @@ async fn rerank_candidates_from_blocks(
                                 start..start + (hi - lo + 1) as usize * 4
                             })
                             .collect();
-                        let norm_bytes = source.get_ranges_parallel(&norm_ranges)?;
+                        let norm_bytes = source
+                            .get_ranges_parallel(&norm_ranges)
+                            .map_err(map_lazy)?;
                         let mut out = HashMap::new();
                         for ((_, lo, hi), bytes) in span_items.into_iter().zip(norm_bytes) {
                             let vals = parse_f32_le_vec(&bytes);
@@ -4222,22 +4266,25 @@ fn parse_sq8_meta_bytes(
     n_docs: usize,
     has_norms: bool,
     rerank_codec: RerankCodec,
-) -> Sq8ParsedMeta {
+) -> Result<Sq8ParsedMeta, VectorError> {
     let so_block_bytes = n_cent * dim * 4;
     let scale_end = so_block_bytes;
     let offset_end = scale_end + so_block_bytes;
     let scale = parse_f32_le_vec(&bytes[0..scale_end]);
     let offset = parse_f32_le_vec(&bytes[scale_end..offset_end]);
-    debug_assert!(validate_quantizer_meta(rerank_codec, &scale, &offset, "lazy metadata").is_ok());
+    // Same release-path check the eager open uses — corrupt/non-finite
+    // scale/offset on the cold lazy path must fail loud, not silently
+    // score with bad quantizer metadata.
+    validate_quantizer_meta(rerank_codec, &scale, &offset, "lazy metadata")?;
     let per_doc_norms = has_norms.then(|| {
         let norms_end = offset_end + n_docs * 4;
         Arc::from(parse_f32_le_vec(&bytes[offset_end..norms_end]))
     });
-    Sq8ParsedMeta {
+    Ok(Sq8ParsedMeta {
         scale,
         offset,
         per_doc_norms,
-    }
+    })
 }
 
 fn validate_quantizer_meta(

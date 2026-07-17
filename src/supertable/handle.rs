@@ -1315,7 +1315,7 @@ async fn create_table_async(
     // another process (`open` requires a pointer). This doesn't shift the id
     // sequence: the first append still commits `manifest_id 1`. An in-memory
     // table keeps the lighter in-process-only empty snapshot.
-    let manifest = if let Some(storage) = options.storage.clone() {
+    let (manifest, vector_index_table) = if let Some(storage) = options.storage.clone() {
         let materialized = Arc::new(
             ManifestSnapshot::materialized_empty_with_vector_index_prefix(
                 options.clone(),
@@ -1325,24 +1325,95 @@ async fn create_table_async(
         // `expected_prev_etag = None` is the initial-commit shape: no prior
         // pointer to fence on.
         match materialized.write(storage.as_ref(), None, &[]).await {
-            Ok(()) => materialized,
+            Ok(()) => (materialized, vector_index_table),
             // Lost the initial-pointer race to a concurrent creator on the
             // same storage: adopt their committed manifest rather than
             // failing — `create` is create-or-open, and a pointer that
             // appeared between the caller's probe and this write is the same
-            // as "pointer already present".
+            // as "pointer already present". Drop the loser's pre-built
+            // hidden handle (it used a freshly generated prefix the durable
+            // manifest does not track) and reopen against the winner's
+            // stamped prefix.
             Err(CommitError::WriteContentionExhausted) => {
-                ManifestSnapshot::load(None, storage, Some(options.clone())).await?
+                let adopted =
+                    ManifestSnapshot::load(None, storage, Some(options.clone())).await?;
+                let reconciled =
+                    reconcile_vector_index_table_to_manifest(options.as_ref(), &adopted).await?;
+                (adopted, reconciled)
             }
             Err(e) => return Err(e.into()),
         }
     } else {
-        Arc::new(ManifestSnapshot::empty_with_vector_index_prefix(
-            options.clone(),
-            vector_index_storage_prefix,
-        ))
+        (
+            Arc::new(ManifestSnapshot::empty_with_vector_index_prefix(
+                options.clone(),
+                vector_index_storage_prefix,
+            )),
+            vector_index_table,
+        )
     };
     build_handle(options, manifest, vector_index_table).await
+}
+
+/// After a lost create-race, open (or bootstrap) the hidden vector-index
+/// table at the prefix stamped in `adopted` — never keep the loser's
+/// process-local UUID prefix.
+async fn reconcile_vector_index_table_to_manifest(
+    user_opts: &SupertableOptions,
+    adopted: &ManifestSnapshot,
+) -> Result<Option<Arc<Supertable>>, OpenError> {
+    let Some(hidden_opts) = build_vector_index_options(user_opts, Some(adopted), None) else {
+        return Ok(None);
+    };
+    let hidden_storage = hidden_opts.storage.clone().ok_or_else(|| {
+        OpenError::Build(BuildError::Store(
+            "VectorIndexSuperTable requires options.storage".into(),
+        ))
+    })?;
+    match read_pointer(&*hidden_storage).await {
+        Ok(Some(_)) => {
+            let hidden_arc = Arc::new(hidden_opts);
+            let hidden_manifest =
+                ManifestSnapshot::load(None, hidden_storage, Some(hidden_arc.clone())).await?;
+            Ok(Some(Arc::new(
+                open_table_async(hidden_arc, hidden_manifest, None).await?,
+            )))
+        }
+        Ok(None) => {
+            // Leaf create at the winner's already-prefixed storage — do not
+            // recurse through `create_table_async` (that path reconciles
+            // again and would form an infinitely sized future).
+            let hidden_arc = Arc::new(hidden_opts);
+            let manifest = if let Some(storage) = hidden_arc.storage.clone() {
+                let materialized = Arc::new(
+                    ManifestSnapshot::materialized_empty_with_vector_index_prefix(
+                        Arc::clone(&hidden_arc),
+                        None,
+                    ),
+                );
+                match materialized.write(storage.as_ref(), None, &[]).await {
+                    Ok(()) => materialized,
+                    Err(CommitError::WriteContentionExhausted) => {
+                        ManifestSnapshot::load(None, storage, Some(Arc::clone(&hidden_arc)))
+                            .await?
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            } else {
+                Arc::new(ManifestSnapshot::empty_with_vector_index_prefix(
+                    Arc::clone(&hidden_arc),
+                    None,
+                ))
+            };
+            Ok(Some(Arc::new(
+                build_handle(hidden_arc, manifest, None).await?,
+            )))
+        }
+        Err(e) => Err(OpenError::Storage(StorageError::Permanent {
+            uri: "_supertable/current".into(),
+            source: Box::new(std::io::Error::other(format!("{e}"))),
+        })),
+    }
 }
 
 /// Open one supertable handle from a loaded manifest. Leaf — never creates a sibling.

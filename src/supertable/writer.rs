@@ -5839,7 +5839,7 @@ pub(crate) async fn try_commit_attempt(
     .await?;
 
     // 2. update the manifest for the commit.
-    let (new_manifest, parts_to_write) = match birth_versions {
+    let (mut new_manifest, parts_to_write) = match birth_versions {
         NewEntryBirthVersions::StampCommit => {
             current_manifest
                 .update(new_entries, entries_to_remove)
@@ -5851,6 +5851,24 @@ pub(crate) async fn try_commit_attempt(
                 .await?
         }
     };
+
+    // 2b. Hidden VectorCell membership lives in the slow-state blob.
+    //     `update` clears the ref; restamp it onto this same successor
+    //     before the list/pointer CAS so a crash cannot leave durable
+    //     membership with a missing slow-state ref (S17).
+    if super::handle::is_hidden_vector_index_table(&opts) {
+        let entries = new_manifest.get_all_superfiles();
+        if !entries.is_empty() {
+            let (uri, hash) = slow_vector_state::write_state(storage.as_ref(), entries)
+                .await
+                .map_err(|e| {
+                    SupertableCommitError::ManifestError(ManifestError::ManifestLoadError(
+                        ManifestLoadError::SlowStateHydration(e.to_string()),
+                    ))
+                })?;
+            new_manifest = new_manifest.with_slow_vector_state_ref(uri, hash);
+        }
+    }
 
     // 3. Read the prior pointer's etag for the CAS. Fresh
     //    supertable → no pointer yet → None etag (initial
