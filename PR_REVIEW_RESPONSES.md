@@ -280,31 +280,46 @@ Refuted. `_id` values are monotonic Snowflake ids and are not re-minted.
 - Four new v2 F3/F4 corruption tests pass.
 - Corrected hidden deleted-id wire tests pass.
 - Focused F7, F8, F9, A3, A4, and A5 cache-behavior tests pass.
-- Accepted second-review fixes landed in `51ed0d7` (*vector: finish review
-  hardening and cache fixes*).
+- Accepted second-review fixes that landed in `51ed0d7` (*vector: finish
+  review hardening and cache fixes*): S2/S3/S14/S16–S23, A3/A4, and the
+  F7–F9 / cache pieces named above.
 - A5 modality gate + fill metering landed in `9521716` (*supertable/cache:
-  modality-gate background fill; meter fill I/O*).
+  modality-gate background fill; meter fill I/O*); needless-borrow nit in
+  `724e39d`.
+- S1/S4/S9–S12 atomicity group fixed in code after `724e39d` (see disposition
+  below); `make check` / lib clippy clean on the change.
 - 1M@64 Azure vector gate after `9521716`: cold GETs 16/4/5/5, repeats 0,
   fill 0, recall unchanged vs baseline.
 
 ## Second-review disposition
 
+Earlier drafts incorrectly listed S1/S4/S9–S12 as fixed in `51ed0d7`; that
+commit's `writer.rs` work is A3/A4 (per-cell packed decode + split count
+bookkeeping) plus related hardening. The atomicity group is fixed in the
+working tree after `724e39d` (see below).
+
+### Fixed in this pass (atomicity group; was incorrectly listed under `51ed0d7`)
+
+- **S1:** Drain passes grid + drained watermark as `CommitListMetadata` into
+  `persist_commit_async`, applied on every OCC attempt with membership — no
+  pre-`store`.
+- **S4:** Cell split likewise publishes the updated grid only via
+  `CommitListMetadata` in the same OCC attempt as replacement membership.
+- **S9:** `commit_appends_internal` restores the taken append buffer and byte
+  counters on any flush failure so the writer can retry.
+- **S10:** First-commit global-grid bootstrap is local `pending_gvi` stamped
+  through `CommitListMetadata` on the membership commit — not a bare
+  `ArcSwap` store ahead of CAS.
+- **S11:** The zero-replica-budget fast path dedups by `stable_id` before
+  spilling; only re-assign is skipped.
+- **S12:** In-memory `store.insert` is deferred until after durable (or local)
+  membership publish succeeds.
+
 ### Fixed (committed in `51ed0d7` unless noted)
 
-- **S1:** Drain grid/watermark metadata is now reapplied inside every OCC
-  attempt and becomes visible only with the shard membership commit.
 - **S2:** Multi-cell lazy open honors the caller's CRC option; `verify_crc=true`
   performs the required full fetch.
 - **S3:** Deleted-id decode rejects noncanonical wire order in release builds.
-- **S4:** Split grid and replacement membership publish in one OCC attempt.
-- **S9:** Any fallible append flush after `mem::take` restores buffered batches
-  and byte accounting for retry.
-- **S10:** First-commit global-grid bootstrap is committed through OCC metadata
-  rather than a separate in-memory store.
-- **S11:** The zero-replica-budget fast path removes stable-id duplicates left
-  by earlier configuration.
-- **S12:** In-memory cache inserts roll back on partial insertion or durable
-  publish failure.
 - **S14:** Packed cells are sorted before both Parquet ids and vector
   subsections are emitted.
 - **S16:** Open-range capture rejects unknown vector versions.
@@ -322,8 +337,12 @@ Refuted. `_id` values are monotonic Snowflake ids and are not re-minted.
   length validation.
 - **S23:** A non-empty source cluster mapping to zero destination cells is an
   error.
-- **A5 (follow-up in `9521716`):** Vector opens skip background fill; FTS/SQL
-  may fill non-vector bytes; fill I/O is metered separately.
+- **A3/A4:** Split path stops cloning encoded rows; packed keep-cells decode
+  once per entry; physical counts update from the committed split delta
+  instead of a full recount (`51ed0d7`).
+- **A5 (follow-up in `9521716`, clippy nit in `724e39d`):** Vector opens skip
+  background fill; FTS/SQL may fill non-vector bytes; fill I/O is metered
+  separately.
 
 ### Deferred or ratified
 

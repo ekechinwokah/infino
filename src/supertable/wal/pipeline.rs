@@ -87,8 +87,8 @@ use crate::{
             tombstones_codec::TombstonesSidecar,
         },
         writer::{
-            build_subsection_offsets, persist_commit, read_vector_layout_from_bytes,
-            stamp_tombstone_seqs,
+            CommitListMetadata, build_subsection_offsets, persist_commit,
+            read_vector_layout_from_bytes, stamp_tombstone_seqs,
         },
     },
 };
@@ -458,6 +458,7 @@ async fn do_apply(
         &[],
         vec![(uri, bytes.clone())],
         Vec::new(),
+        CommitListMetadata::empty(),
     )
     .map_err(|e| AppendPhaseError::ManifestCommit {
         message: format!("{e}"),

@@ -157,7 +157,9 @@ use crate::{
         manifest::{
             ClusterCentroids,
             commit::get_current_manifest_etag,
-            list::{CellRoutingParams, PartitionStrategy},
+            list::{
+                CellRoutingParams, DrainedVersionRanges, GlobalVectorIndex, PartitionStrategy,
+            },
             options_hash,
             part::{self as part_mod, PartId},
         },
@@ -389,6 +391,7 @@ impl fmt::Debug for SupertableWriter {
 /// `Arc<Float32Array>` so the buffer owns its data outright;
 /// per-shard builders re-derive `&[f32]` slices via
 /// [`Float32Array::values`] without copying.
+#[derive(Clone)]
 struct BufferedBatch {
     scalar: RecordBatch,
     vectors: Vec<Arc<Float32Array>>,
@@ -1415,21 +1418,39 @@ impl SupertableWriter {
             self.buffer_fts_bytes,
         )?;
 
+        // Take the buffer so a concurrent append can't observe a half-drained
+        // state, but keep the batches for restore on any later failure (S9).
+        let saved_scalar = self.buffer_scalar_bytes;
+        let saved_vector = self.buffer_vector_bytes;
+        let saved_fts = self.buffer_fts_bytes;
         let buffer = mem::take(&mut self.buffer);
         self.buffer_scalar_bytes = 0;
         self.buffer_vector_bytes = 0;
         self.buffer_fts_bytes = 0;
 
-        // Phase A — bootstrap the global cell grid from the FIRST committed batch
-        // into THIS (the user) table's manifest, which is the source of truth for
-        // the grid. Gated on VECTORS being in the input (a vector column), not on
-        // any sibling table: the packed user build below and the query both read
-        // the grid from here, and it persists with this commit (`ManifestSnapshot::update`
-        // carries `global_vector_index` through). A hidden cell-index sibling, when
-        // present, gets the grid as a derived copy at drain time — but its absence
-        // must not change how user superfiles are laid out. Idempotent: only
-        // trains while absent.
-        if self
+        match self.commit_appends_with_taken_buffer(&buffer) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.buffer = buffer;
+                self.buffer_scalar_bytes = saved_scalar;
+                self.buffer_vector_bytes = saved_vector;
+                self.buffer_fts_bytes = saved_fts;
+                Err(e)
+            }
+        }
+    }
+
+    /// Body of [`Self::commit_appends_internal`] after the buffer has been
+    /// taken. On `Err`, the caller restores `buffer` onto the writer.
+    fn commit_appends_with_taken_buffer(
+        &self,
+        buffer: &[BufferedBatch],
+    ) -> Result<(), BuildError> {
+        // Phase A — train the global cell grid from the FIRST committed batch
+        // into pending OCC metadata (not a bare ArcSwap.store). The pack path
+        // below reads the same local `pending_gvi` / existing manifest grid;
+        // the stamp lands with the membership commit (S10).
+        let pending_gvi: Option<GlobalVectorIndex> = if self
             .inner
             .manifest
             .load()
@@ -1438,35 +1459,34 @@ impl SupertableWriter {
             && !buffer.is_empty()
             && let Some(vc) = self.inner.options.vector_columns.first()
             && let Some(grid) = bootstrap_centroids_from_batch(
-                &buffer,
+                buffer,
                 vc.dim,
                 super::handle::hidden_vector_cell_count(),
-            )
-        {
-            // `global_vector_index.grid` is the grid the drain reads to build
-            // the hidden index, so it is trained at `hidden_cell_count`. The
-            // finer `user_cell_count` grid (user-superfile packing + pre-drain
-            // routing) is trained here too, from the same batch by the same
-            // helper, but stored separately so the hidden path never sees it.
+            ) {
             let hidden_cells = super::handle::hidden_vector_cell_count();
             let user_cells = super::handle::user_vector_cell_count();
             let user_grid = (user_cells != hidden_cells)
-                .then(|| bootstrap_centroids_from_batch(&buffer, vc.dim, user_cells))
+                .then(|| bootstrap_centroids_from_batch(buffer, vc.dim, user_cells))
                 .flatten();
-            let index = super::manifest::GlobalVectorIndex {
+            Some(GlobalVectorIndex {
                 column: vc.column.clone(),
                 grid,
                 user_grid,
-            };
-            self.inner.manifest.store(Arc::new(
-                self.inner.manifest.load().with_global_vector_index(index),
-            ));
-        }
+            })
+        } else {
+            None
+        };
 
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
         if total_rows == 0 {
-            return Ok::<(), BuildError>(());
+            return Ok(());
         }
+
+        let list_metadata = CommitListMetadata {
+            partition_strategy: None,
+            global_vector_index: pending_gvi.clone(),
+            drained_ranges: None,
+        };
 
         // Vector commit: same row-shard fanout as the legacy path. Each writer
         // assigns its rows to cells, calls drain's pack
@@ -1476,11 +1496,16 @@ impl SupertableWriter {
         // this path. No slow CAS.
         if !self.inner.options.vector_columns.is_empty() {
             let commit_t0 = time::Instant::now();
-            let Some(global) = self.inner.manifest.load().get_global_vector_index() else {
-                return Err(BuildError::Store(
-                    "vector columns present but global cell grid missing after Phase A".into(),
-                ));
-            };
+            let pack_grid = pending_gvi
+                .as_ref()
+                .cloned()
+                .or_else(|| self.inner.manifest.load().get_global_vector_index())
+                .ok_or_else(|| {
+                    BuildError::Store(
+                        "vector columns present but global cell grid missing after Phase A".into(),
+                    )
+                })?
+                .into_user_grid();
             let metric = self
                 .inner
                 .options
@@ -1488,10 +1513,6 @@ impl SupertableWriter {
                 .first()
                 .map(|vc| vc.metric)
                 .unwrap_or(Metric::L2Sq);
-            // Pack against the finer user grid when trained; the drain keeps
-            // its own `grid` and re-assigns rows from scratch, so the two
-            // sides never need to agree on cell ids.
-            let pack_grid = global.into_user_grid();
             let (outputs, cell_hints) =
                 commit_shards_via_drain(buffer, &self.inner, &pack_grid, metric)?;
             let build_elapsed = commit_t0.elapsed();
@@ -1505,7 +1526,7 @@ impl SupertableWriter {
                 .sum();
             let publish_t0 = time::Instant::now();
             bridge_on_runtime(
-                persist_superfile_publish_batch_async(&self.inner, user_batch),
+                persist_superfile_publish_batch_async(&self.inner, user_batch, list_metadata),
                 &self.inner.query_runtime(),
             )?;
             if crate::storage::io_counters::timeline_enabled() {
@@ -1536,6 +1557,9 @@ impl SupertableWriter {
             .iter()
             .map(|vc| vc.dim)
             .collect();
+        // Clone into shard builders so `buffer` stays intact for S9 restore.
+        // Arrow batches are Arc-backed — this is a shallow clone of handles.
+        let owned = buffer.to_vec();
         // VectorCell strategy: pre-shard by nearest centroid instead of
         // round-robin. Each shard becomes one superfile in its cell-partition.
         let (shards, cell_hints): (Vec<Vec<BufferedBatch>>, Vec<Option<u32>>) =
@@ -1550,12 +1574,8 @@ impl SupertableWriter {
                     .map(|vc| vc.metric)
                     .unwrap_or(Metric::L2Sq);
                 if clusters.n_cent > 0 && clusters.dim > 0 {
-                    // Run on the build pool: `split_buffer_by_vector_cell` →
-                    // `assign_rows` is a CPU wave (per-row nearest-cell scoring)
-                    // and must dispatch to `writer_pool`, not the global rayon
-                    // pool, per the rayon-owns-CPU concurrency contract.
                     let cell_shards = writer_pool
-                        .install(|| split_buffer_by_vector_cell(buffer, clusters, metric, 0));
+                        .install(|| split_buffer_by_vector_cell(owned, clusters, metric, 0));
                     let hints: Vec<Option<u32>> = cell_shards
                         .iter()
                         .map(|(cell_id, _)| Some(*cell_id))
@@ -1566,32 +1586,28 @@ impl SupertableWriter {
                         .collect();
                     (shards, hints)
                 } else {
-                    let shards = split_buffer_into_row_shards(buffer, n_shards, &vector_dims);
+                    let shards = split_buffer_into_row_shards(owned, n_shards, &vector_dims);
                     let hints = vec![None; shards.len()];
                     (shards, hints)
                 }
             } else {
-                let shards = split_buffer_into_row_shards(buffer, n_shards, &vector_dims);
+                let shards = split_buffer_into_row_shards(owned, n_shards, &vector_dims);
                 let hints = vec![None; shards.len()];
                 (shards, hints)
             };
 
-        // Parallel create: user superfile build + hidden incoming build
-        // share one writer-pool install (rayon::join, no nested install).
-        // Parallel publish: user + hidden manifest/storage commits overlap.
         let user_inner = Arc::clone(&self.inner);
         let user_options = Arc::clone(&self.inner.options);
         // A/B knob (`vector.user_centroids: global`): build user superfiles
         // aligned to the GLOBAL cell grid (cluster c == cell c) instead of local
-        // k-means — so the splice/kmeans drain routes cluster c → cell c
-        // doc-correctly. The grid is read from THIS table's manifest (bootstrapped
-        // above, Phase A). Default `local` is unchanged.
+        // k-means. Prefer the pending bootstrap stamp when this is the first
+        // vector commit; otherwise read the durable/manifest grid.
         let user_global_centroids: Option<std::sync::Arc<[f32]>> =
             if config::global().vector.user_centroids == CentroidAlignment::Global {
-                self.inner
-                    .manifest
-                    .load()
-                    .get_global_vector_index()
+                pending_gvi
+                    .as_ref()
+                    .cloned()
+                    .or_else(|| self.inner.manifest.load().get_global_vector_index())
                     .filter(|g| g.grid.n_cent > 0 && g.grid.dim > 0)
                     .map(|g| g.grid.to_fp32().into())
             } else {
@@ -1612,7 +1628,7 @@ impl SupertableWriter {
         let superfiles = outputs.len();
         let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
         bridge_on_runtime(
-            persist_superfile_publish_batch_async(&user_inner, user_batch),
+            persist_superfile_publish_batch_async(&user_inner, user_batch, list_metadata),
             &self.inner.query_runtime(),
         )?;
         if self.inner.options.storage.is_some() {
@@ -1620,7 +1636,6 @@ impl SupertableWriter {
         }
         debug!(superfiles, "published appended superfiles");
 
-        // Reserved memory (if any) via _build_guard is freed now.
         Ok(())
     }
 }
@@ -2293,22 +2308,23 @@ struct SuperfilePublishBatch {
     to_remove: Vec<Arc<SuperfileEntry>>,
     pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
     pending_cache_inserts: Vec<(SuperfileUri, Bytes)>,
+    /// In-memory reader-cache inserts deferred until after durable (or
+    /// local) membership publish succeeds — inserting earlier leaves
+    /// orphaned cache entries when the CAS fails (S12).
+    pending_store_inserts: Vec<(SuperfileUri, Bytes)>,
 }
 
 fn collect_prepared_superfiles(
-    inner: &SupertableInner,
+    _inner: &SupertableInner,
     prepared: Vec<PreparedSuperfile>,
 ) -> Result<SuperfilePublishBatch, BuildError> {
     let mut new_entries: Vec<Arc<SuperfileEntry>> = Vec::with_capacity(prepared.len());
     let mut pending_storage_writes: Vec<(SuperfileUri, Bytes)> = Vec::new();
     let mut pending_cache_inserts: Vec<(SuperfileUri, Bytes)> = Vec::new();
+    let mut pending_store_inserts: Vec<(SuperfileUri, Bytes)> = Vec::new();
     for p in prepared {
-        if let Some((uri, b)) = p.bytes_for_store {
-            inner
-                .options
-                .store
-                .insert(uri, b)
-                .map_err(|e| BuildError::Store(e.to_string()))?;
+        if let Some(t) = p.bytes_for_store {
+            pending_store_inserts.push(t);
         }
         if let Some(t) = p.bytes_for_storage {
             pending_storage_writes.push(t);
@@ -2323,7 +2339,19 @@ fn collect_prepared_superfiles(
         to_remove: Vec::new(),
         pending_storage_writes,
         pending_cache_inserts,
+        pending_store_inserts,
     })
+}
+
+fn apply_pending_store_inserts(
+    inner: &SupertableInner,
+    inserts: Vec<(SuperfileUri, Bytes)>,
+) {
+    for (uri, bytes) in inserts {
+        // Non-fatal: bytes are durable (or local-appended) and a later
+        // open can refetch. Mirrors the WAL append path.
+        let _ = inner.options.store.insert(uri, bytes);
+    }
 }
 
 fn prepare_user_superfile_batch_in_scope(
@@ -2366,6 +2394,7 @@ fn prepare_user_superfile_batch(
 async fn persist_superfile_publish_batch_async(
     inner: &SupertableInner,
     batch: SuperfilePublishBatch,
+    list_metadata: CommitListMetadata,
 ) -> Result<(), BuildError> {
     if batch.new_entries.is_empty() {
         return Ok(());
@@ -2378,10 +2407,12 @@ async fn persist_superfile_publish_batch_async(
             &batch.to_remove,
             batch.pending_storage_writes,
             Vec::new(),
+            list_metadata,
         )
         .await
         .map_err(|e| BuildError::Store(e.to_string()))?;
         inner.manifest.store(Arc::new(new_manifest));
+        apply_pending_store_inserts(inner, batch.pending_store_inserts);
         // Already async — await the warm-cache fill directly. Do NOT call
         // `warm_cache_after_commit` here: its sync `block_in_place` + nested
         // `block_on` inside the `tokio::join!` commit future deadlocks the
@@ -2398,8 +2429,17 @@ async fn persist_superfile_publish_batch_async(
         return Ok(());
     }
     let old = inner.manifest.load();
-    let new = old.with_appended(batch.new_entries);
+    // Local (no-storage) path: stamp list metadata onto the OCC base, then
+    // append — `with_appended` preserves the stamped fields.
+    let new = if list_metadata.is_empty() {
+        old.with_appended(batch.new_entries)
+    } else {
+        list_metadata
+            .apply(&old)
+            .with_appended(batch.new_entries)
+    };
     inner.manifest.store(Arc::new(new));
+    apply_pending_store_inserts(inner, batch.pending_store_inserts);
     Ok(())
 }
 
@@ -3294,10 +3334,25 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     writer.begin_batch();
                 }
                 let replica_target = drain_replica_target_factor();
-                if assign_skip && drain_replica_extra_budget(n_batch_rows, replica_target) == 0 {
+                // Distinct corpus only: user superfiles already carry
+                // commit-time boundary replicas (user-space recall rides on
+                // them); without this dedup every ingest copy assigns beside
+                // its primary and lands as a same-cell duplicate that wastes
+                // top-k slots — measured at 100K/factor 1.5: 211,009 stored
+                // rows for 100,000 distinct, 88,961 same-cell duplicate
+                // pairs, post-drain recall 0.950 → 0.870. The zero-budget
+                // fast path must dedup too (S11); it only skips re-assign.
+                let mut seen_stable_ids: HashSet<i128> = HashSet::with_capacity(n_batch_rows);
+                let distinct_rows: Vec<&MaterializedIvfRow> = all_rows
+                    .iter()
+                    .filter(|row| seen_stable_ids.insert(row.stable_id))
+                    .collect();
+                if assign_skip && drain_replica_extra_budget(distinct_rows.len(), replica_target) == 0
+                {
                     // Globally-aligned superfiles with no drain-side budget:
-                    // trust ingest placement verbatim, replicas included.
-                    for row in &all_rows {
+                    // trust ingest placement on the distinct set (replicas
+                    // included as already stamped at commit).
+                    for row in &distinct_rows {
                         spill_unfinished_shard_row(
                             &mut cell_spills,
                             &mut added_per_cell,
@@ -3309,20 +3364,6 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         )?;
                     }
                 } else {
-                    // The drain re-derives placement and replication from the
-                    // DISTINCT corpus. User superfiles already carry
-                    // commit-time boundary replicas (user-space recall rides
-                    // on them); without this dedup every ingest copy assigns
-                    // beside its primary and lands as a same-cell duplicate
-                    // that wastes top-k slots — measured at 100K/factor 1.5:
-                    // 211,009 stored rows for 100,000 distinct, 88,961
-                    // same-cell duplicate pairs, post-drain recall 0.950 →
-                    // 0.870.
-                    let mut seen_stable_ids: HashSet<i128> = HashSet::with_capacity(n_batch_rows);
-                    let distinct_rows: Vec<&MaterializedIvfRow> = all_rows
-                        .iter()
-                        .filter(|row| seen_stable_ids.insert(row.stable_id))
-                        .collect();
                     let replica_extra_budget =
                         drain_replica_extra_budget(distinct_rows.len(), replica_target);
                     let clusters_ref = &running_clusters;
@@ -3550,6 +3591,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .map(|entry| (entry.uri, Arc::clone(entry)))
             .collect();
         let pending_cache_inserts = publish.pending_cache_inserts;
+        let pending_store_inserts = publish.pending_store_inserts;
         let multipart_threshold = hidden_inner.options.put_multipart_threshold_bytes;
         let put_futures = publish
             .pending_storage_writes
@@ -3647,17 +3689,19 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .unwrap_or(0);
         let lo = new_drained.prefix_end().map(|end| end + 1).unwrap_or(0);
         new_drained.insert_range(lo.min(drained_max), drained_max);
-        hidden_inner.manifest.store(Arc::new(
-            hidden_inner
-                .manifest
-                .load()
-                .with_partition_strategy(PartitionStrategy::VectorCell {
-                    column: column.clone(),
-                    clusters: running_clusters.clone(),
-                    routing,
-                })
-                .with_drained_ranges(new_drained),
-        ));
+        // Grid + drained watermark must land in the same OCC attempt as the
+        // shard membership append — never ArcSwap.store them beforehand
+        // (contention refresh would drop the stamps; readers would also see
+        // an advanced watermark without the new shards).
+        let list_metadata = CommitListMetadata {
+            partition_strategy: Some(PartitionStrategy::VectorCell {
+                column: column.clone(),
+                clusters: running_clusters.clone(),
+                routing,
+            }),
+            drained_ranges: Some(new_drained),
+            global_vector_index: None,
+        };
         let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
         let new_manifest = persist_commit_async(
             &hidden_inner,
@@ -3666,10 +3710,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             &no_removals,
             Vec::new(),
             Vec::new(),
+            list_metadata,
         )
         .await
         .map_err(|e| BuildError::Store(e.to_string()))?;
         hidden_inner.manifest.store(Arc::new(new_manifest));
+        apply_pending_store_inserts(&hidden_inner, pending_store_inserts);
         if !pending_cache_inserts.is_empty()
             && let Some(cache) = hidden_inner.options.disk_cache.as_ref()
         {
@@ -4613,7 +4659,7 @@ fn build_prepared_from_spilled_cells(
 /// never writes superfiles or touches S3 here — the writer publishes through
 /// the normal batch path.
 fn commit_shards_via_drain(
-    buffer: Vec<BufferedBatch>,
+    buffer: &[BufferedBatch],
     inner: &SupertableInner,
     clusters: &ClusterCentroids,
     metric: Metric,
@@ -4637,7 +4683,7 @@ fn commit_shards_via_drain(
     let mut stable_ids: Vec<i128> = Vec::new();
     let mut flat_vectors: Vec<Vec<f32>> = vec![Vec::new(); inner.options.vector_columns.len()];
     let mut scalar_batches: Vec<&RecordBatch> = Vec::with_capacity(buffer.len());
-    for buffered in &buffer {
+    for buffered in buffer {
         let id_col = buffered
             .scalar
             .column(0)
@@ -5117,19 +5163,20 @@ pub(in crate::supertable) async fn split_overflow_cell(
 
     let batch = collect_prepared_superfiles(&inner, all_prepared)?;
 
-    // Publish the new grid; `with_partition_strategy` clones the full list, so
-    // the drain watermark (`drained_ranges`) and every other manifest field ride
-    // through unchanged — a hidden-space reorg consumes no user commit and must
-    // not disturb coverage.
-    inner
-        .manifest
-        .store(Arc::new(manifest.with_partition_strategy(
-            PartitionStrategy::VectorCell {
-                column: column.clone(),
-                clusters: updated_clusters.clone(),
-                routing,
-            },
-        )));
+    // Publish the new grid in the same OCC attempt as the replacement
+    // membership. Pre-storing the strategy is not atomic with the CAS and
+    // is lost on contention refresh. `drained_ranges` and every other
+    // manifest field ride through `update` unchanged — a hidden-space reorg
+    // consumes no user commit and must not disturb coverage.
+    let list_metadata = CommitListMetadata {
+        partition_strategy: Some(PartitionStrategy::VectorCell {
+            column: column.clone(),
+            clusters: updated_clusters.clone(),
+            routing,
+        }),
+        drained_ranges: None,
+        global_vector_index: None,
+    };
 
     let new_manifest = persist_commit_async(
         &inner,
@@ -5138,10 +5185,12 @@ pub(in crate::supertable) async fn split_overflow_cell(
         &to_remove,
         batch.pending_storage_writes,
         Vec::new(),
+        list_metadata,
     )
     .await
     .map_err(|e| BuildError::Store(e.to_string()))?;
     inner.manifest.store(Arc::new(new_manifest));
+    apply_pending_store_inserts(&inner, batch.pending_store_inserts);
 
     schedule_background_storage_reclaim(Arc::clone(&inner));
 
@@ -5425,6 +5474,45 @@ async fn record_hidden_deleted_ids(
     ))
 }
 
+/// List-level metadata stamped onto the OCC base snapshot for one durable
+/// commit attempt. Applied inside every retry so contention refresh cannot
+/// drop grid / watermark / bootstrap stamps that must land with membership.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct CommitListMetadata {
+    pub(crate) partition_strategy: Option<PartitionStrategy>,
+    pub(crate) global_vector_index: Option<GlobalVectorIndex>,
+    pub(crate) drained_ranges: Option<DrainedVersionRanges>,
+}
+
+impl CommitListMetadata {
+    pub(crate) fn empty() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.partition_strategy.is_none()
+            && self.global_vector_index.is_none()
+            && self.drained_ranges.is_none()
+    }
+
+    /// Overlay stamped fields onto `base`. `ManifestSnapshot` is not
+    /// `Clone`; start from an identity stamp (`with_drained_ranges` of the
+    /// current ranges) then layer call-site fields.
+    pub(crate) fn apply(&self, base: &ManifestSnapshot) -> ManifestSnapshot {
+        let mut out = base.with_drained_ranges(base.get_drained_ranges());
+        if let Some(strategy) = self.partition_strategy.clone() {
+            out = out.with_partition_strategy(strategy);
+        }
+        if let Some(index) = self.global_vector_index.clone() {
+            out = out.with_global_vector_index(index);
+        }
+        if let Some(ranges) = self.drained_ranges.clone() {
+            out = out.with_drained_ranges(ranges);
+        }
+        out
+    }
+}
+
 pub(in crate::supertable) async fn persist_commit_async(
     inner: &SupertableInner,
     storage: Arc<dyn StorageProvider>,
@@ -5432,6 +5520,7 @@ pub(in crate::supertable) async fn persist_commit_async(
     entries_to_remove: &[Arc<SuperfileEntry>],
     mut pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
     mut pending_storage_replaces: Vec<(SuperfileUri, Bytes)>,
+    list_metadata: CommitListMetadata,
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
@@ -5440,12 +5529,20 @@ pub(in crate::supertable) async fn persist_commit_async(
         let mut last_err: Option<SupertableCommitError> = None;
         for attempt in 0..max_retries {
             let old = inner.manifest.load_full();
+            // Re-apply call-site stamps on every attempt. A pre-store of these
+            // fields is not OCC-safe: contention refresh reloads from storage
+            // and would drop them before a successful CAS.
+            let base = if list_metadata.is_empty() {
+                old
+            } else {
+                Arc::new(list_metadata.apply(&old))
+            };
             let pending_writes = &mut pending_storage_writes;
             let pending_replaces = &mut pending_storage_replaces;
             match try_commit_attempt(
                 Arc::clone(&storage_async),
                 Arc::clone(&opts),
-                Arc::clone(&old),
+                base,
                 &new_entries,
                 entries_to_remove,
                 NewEntryBirthVersions::StampCommit,
@@ -5482,6 +5579,7 @@ pub(in crate::supertable) fn persist_commit(
     entries_to_remove: &[Arc<SuperfileEntry>],
     pending_storage_writes: Vec<(SuperfileUri, Bytes)>,
     pending_storage_replaces: Vec<(SuperfileUri, Bytes)>,
+    list_metadata: CommitListMetadata,
 ) -> Result<(), SupertableCommitError> {
     let drive = persist_commit_async(
         inner,
@@ -5490,6 +5588,7 @@ pub(in crate::supertable) fn persist_commit(
         entries_to_remove,
         pending_storage_writes,
         pending_storage_replaces,
+        list_metadata,
     );
     let new_manifest = bridge_on_runtime(drive, &inner.query_runtime())?;
     inner.manifest.store(Arc::new(new_manifest));
