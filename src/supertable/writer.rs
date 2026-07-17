@@ -157,9 +157,7 @@ use crate::{
         manifest::{
             ClusterCentroids,
             commit::get_current_manifest_etag,
-            list::{
-                CellRoutingParams, DrainedVersionRanges, GlobalVectorIndex, PartitionStrategy,
-            },
+            list::{CellRoutingParams, DrainedVersionRanges, GlobalVectorIndex, PartitionStrategy},
             options_hash,
             part::{self as part_mod, PartId},
         },
@@ -1442,10 +1440,7 @@ impl SupertableWriter {
 
     /// Body of [`Self::commit_appends_internal`] after the buffer has been
     /// taken. On `Err`, the caller restores `buffer` onto the writer.
-    fn commit_appends_with_taken_buffer(
-        &self,
-        buffer: &[BufferedBatch],
-    ) -> Result<(), BuildError> {
+    fn commit_appends_with_taken_buffer(&self, buffer: &[BufferedBatch]) -> Result<(), BuildError> {
         // Phase A — train the global cell grid from the FIRST committed batch
         // into pending OCC metadata (not a bare ArcSwap.store). The pack path
         // below reads the same local `pending_gvi` / existing manifest grid;
@@ -2343,10 +2338,7 @@ fn collect_prepared_superfiles(
     })
 }
 
-fn apply_pending_store_inserts(
-    inner: &SupertableInner,
-    inserts: Vec<(SuperfileUri, Bytes)>,
-) {
+fn apply_pending_store_inserts(inner: &SupertableInner, inserts: Vec<(SuperfileUri, Bytes)>) {
     for (uri, bytes) in inserts {
         // Non-fatal: bytes are durable (or local-appended) and a later
         // open can refetch. Mirrors the WAL append path.
@@ -2434,9 +2426,7 @@ async fn persist_superfile_publish_batch_async(
     let new = if list_metadata.is_empty() {
         old.with_appended(batch.new_entries)
     } else {
-        list_metadata
-            .apply(&old)
-            .with_appended(batch.new_entries)
+        list_metadata.apply(&old).with_appended(batch.new_entries)
     };
     inner.manifest.store(Arc::new(new));
     apply_pending_store_inserts(inner, batch.pending_store_inserts);
@@ -3347,7 +3337,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     .iter()
                     .filter(|row| seen_stable_ids.insert(row.stable_id))
                     .collect();
-                if assign_skip && drain_replica_extra_budget(distinct_rows.len(), replica_target) == 0
+                if assign_skip
+                    && drain_replica_extra_budget(distinct_rows.len(), replica_target) == 0
                 {
                     // Globally-aligned superfiles with no drain-side budget:
                     // trust ingest placement on the distinct set (replicas

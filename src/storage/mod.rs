@@ -963,6 +963,28 @@ mod tests {
         ));
     }
 
+    /// The default `get_if_none_match` issues a plain `get` and compares etags
+    /// locally: a matching etag short-circuits to `None` ("not modified"), a
+    /// different one returns the full body + metadata.
+    #[tokio::test]
+    async fn default_get_if_none_match_reports_modified_state() {
+        let mock = InMemoryMock::with("k", b"payload");
+        assert!(
+            mock.get_if_none_match("k", MOCK_ETAG)
+                .await
+                .expect("conditional get")
+                .is_none(),
+            "a matching etag means not-modified",
+        );
+        let (bytes, meta) = mock
+            .get_if_none_match("k", "stale-etag")
+            .await
+            .expect("conditional get")
+            .expect("a mismatched etag returns the body");
+        assert_eq!(&bytes[..], b"payload");
+        assert_eq!(meta.etag.as_deref(), Some(MOCK_ETAG));
+    }
+
     #[tokio::test]
     async fn mock_put_multipart_surfaces_permanent_error() {
         let mock = InMemoryMock::default();

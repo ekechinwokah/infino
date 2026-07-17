@@ -3307,6 +3307,71 @@ mod tests {
         drop(held_reader);
     }
 
+    /// `HoleFallbackSource` serves ranges outside the vector hole from the
+    /// local (filled) bytes and ranges inside the hole from the fallback block
+    /// cache, stitching a spanning read from both halves. Covers the geometry
+    /// helpers (`overlaps_hole` / `fully_in_hole` / `hole_end`) alongside
+    /// `size`, `range`, and the `try_get_range_sync` fast path.
+    #[tokio::test]
+    async fn hole_fallback_source_routes_local_and_fallback_by_hole() {
+        use crate::superfile::lazy_source::BytesLazyByteSource;
+
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        // local = the "filled" bytes (0xAA); the fallback's inner = the block
+        // cache side (0xBB) that serves the excluded vector hole.
+        let local: Arc<dyn LazyByteSource> =
+            Arc::new(BytesLazyByteSource::new(Bytes::from(vec![0xAAu8; 100])));
+        let remote: Arc<dyn LazyByteSource> =
+            Arc::new(BytesLazyByteSource::new(Bytes::from(vec![0xBBu8; 100])));
+        let fallback = BlockCachedSource::new_pre_reserved(
+            remote,
+            Arc::downgrade(&store),
+            uri,
+            store.blocks_path(&uri),
+        );
+        let hfs = HoleFallbackSource {
+            local,
+            hole_start: 40,
+            hole_len: 20,
+            fallback,
+        };
+
+        assert_eq!(hfs.size(), 100, "size reflects the local (full) source");
+
+        // Wholly before the hole → local bytes.
+        assert_eq!(
+            &hfs.range(0, 10).await.expect("pre-hole")[..],
+            &[0xAAu8; 10]
+        );
+        // Wholly inside the hole → fallback bytes.
+        assert_eq!(
+            &hfs.range(40, 20).await.expect("in-hole")[..],
+            &[0xBBu8; 20]
+        );
+        // Spanning: local[30..40] + fallback[40..60] + local[60..70].
+        let mut want = vec![0xAAu8; 10];
+        want.extend_from_slice(&[0xBBu8; 20]);
+        want.extend_from_slice(&[0xAAu8; 10]);
+        assert_eq!(
+            &hfs.range(30, 40).await.expect("spanning")[..],
+            &want[..],
+            "spanning read stitches local + fallback + local in order",
+        );
+
+        // Sync fast path: a read outside the hole resolves locally; a spanning
+        // read returns None to force the async path.
+        assert_eq!(
+            hfs.try_get_range_sync(0, 10).as_deref(),
+            Some(&[0xAAu8; 10][..]),
+            "sync read outside the hole comes from local",
+        );
+        assert!(
+            hfs.try_get_range_sync(30, 40).is_none(),
+            "spanning sync read forces the async path",
+        );
+    }
+
     #[test]
     fn chunk_fetch_ranges_skips_vector_hole() {
         assert_eq!(

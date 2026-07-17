@@ -2429,6 +2429,101 @@ mod tests {
         );
     }
 
+    /// The default k-means drain over an Sq8Residual index materializes user
+    /// rows in doc order (the `materialized_ivf_rows_in_doc_order` path, which
+    /// only runs for a residual codec) and populates the hidden cell index.
+    #[test]
+    fn kmeans_drain_over_residual_index_materializes_and_populates_cells() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        // Sq8Residual (not Fixed) + default consolidate (k-means) is the combo
+        // that routes the drain through materialized_ivf_rows_in_doc_order.
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(Arc::clone(&storage))
+        .with_writer_pool(pool);
+
+        let st = Supertable::create(options).expect("create");
+        let titles = LargeStringArray::from(vec!["a", "b", "c", "d"]);
+        let mut flat = vec![0.0f32; 4 * dim];
+        for row in 0..4 {
+            flat[row * dim + row] = 1.0;
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field,
+            dim as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        st.drain_vectors_to_cells_sync()
+            .expect("k-means residual drain");
+
+        // The residual-materialized rows landed in the hidden cell index.
+        let (total, max_per_cell) = st
+            .hidden_vector_superfile_stats()
+            .expect("hidden stats after drain");
+        assert!(total > 0, "k-means drain must populate hidden cells");
+        assert!(
+            max_per_cell > 0 && max_per_cell <= total,
+            "max-per-cell {max_per_cell} in 1..={total}",
+        );
+    }
+
     /// After a splice drain into the hidden vector index, the reader's derived-
     /// state accessors report a live hidden index: a storage prefix is stamped,
     /// the hidden-superfile stats are non-empty, the user superfiles carry real
