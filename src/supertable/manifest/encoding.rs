@@ -788,8 +788,9 @@ mod decode_error_tests {
 
     use super::{
         DecodeError, ScalarStatsAgg, ScalarValue, ScalarValueCounts, decode_fts_summary,
-        decode_fts_summary_map, decode_length1_array, decode_scalar_stats, decode_vector_summary,
-        decode_vector_summary_map, encode_length1_array, encode_scalar_stats, read_n, read_u32,
+        decode_fts_summary_map, decode_length1_array, decode_scalar_stats, decode_value_counts,
+        decode_vector_summary, decode_vector_summary_map, encode_length1_array,
+        encode_scalar_stats, read_n, read_u32,
     };
 
     /// Hand-build a `decode_fts_summary` payload: no bloom, a given
@@ -818,6 +819,86 @@ mod decode_error_tests {
             w.finish().expect("ipc finish");
         }
         out
+    }
+
+    /// `decode_value_counts` rejects corrupt / wrong-shaped manifest bytes with
+    /// a typed `DecodeError` (never a panic): manifest bytes are read from
+    /// object storage and can be truncated or corrupted.
+    #[test]
+    fn decode_value_counts_rejects_malformed_input() {
+        use arrow_array::UInt64Array;
+
+        // Not an Arrow-IPC stream at all → reader init / collect fails.
+        assert!(matches!(
+            decode_value_counts(b"definitely-not-arrow-ipc"),
+            Err(DecodeError::ArrowIpc(_))
+        ));
+
+        // A single-column batch (the wire form is value + count = 2 columns).
+        let one_col = ipc_batch(
+            vec![Field::new("value", DataType::Int64, false)],
+            vec![Arc::new(Int64Array::from(vec![1i64])) as ArrayRef],
+        );
+        assert!(matches!(
+            decode_value_counts(&one_col),
+            Err(DecodeError::ArrowIpc(msg)) if msg.contains("2 columns")
+        ));
+
+        // Count column typed Int64 instead of UInt64 → downcast rejected.
+        let wrong_count = ipc_batch(
+            vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new("count", DataType::Int64, false),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![7i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![3i64])) as ArrayRef,
+            ],
+        );
+        assert!(matches!(
+            decode_value_counts(&wrong_count),
+            Err(DecodeError::ArrowIpc(msg)) if msg.contains("UInt64")
+        ));
+
+        // A null value entry → value counts must not carry nulls.
+        let with_null = ipc_batch(
+            vec![
+                Field::new("value", DataType::Int64, true),
+                Field::new("count", DataType::UInt64, false),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![None])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![1u64])) as ArrayRef,
+            ],
+        );
+        assert!(matches!(
+            decode_value_counts(&with_null),
+            Err(DecodeError::ArrowIpc(msg)) if msg.contains("null")
+        ));
+    }
+
+    /// `decode_length1_array` rejects corrupt / wrong-shaped bytes with a typed
+    /// error rather than panicking.
+    #[test]
+    fn decode_length1_array_rejects_malformed_input() {
+        // Garbage bytes → IPC error.
+        assert!(decode_length1_array(b"not-ipc").is_err());
+
+        // Two columns where a length-1 aggregate wire form has exactly one.
+        let two_col = ipc_batch(
+            vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Int64, false),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![2i64])) as ArrayRef,
+            ],
+        );
+        assert!(
+            decode_length1_array(&two_col).is_err(),
+            "a multi-column batch is not a valid length-1 aggregate",
+        );
     }
 
     /// An empty blob decodes to an empty table (the zero-length sentinel

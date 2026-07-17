@@ -872,6 +872,55 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_if_none_match_returns_body_on_etag_mismatch() {
+        let (p, _guard) = harness_provider().await;
+        let body = Bytes::from_static(b"conditional-v1");
+        let etag = p.put_atomic("k/cond", body.clone()).await.expect("put");
+
+        // A non-matching etag always returns the full body + metadata,
+        // regardless of whether the backend implements If-None-Match.
+        let (got, meta) = p
+            .get_if_none_match("k/cond", "\"does-not-match\"")
+            .await
+            .expect("conditional get")
+            .expect("mismatched etag returns the object");
+        assert_eq!(&got[..], &body[..]);
+        assert!(meta.etag.is_some(), "etag surfaced from the response");
+
+        // With the object's own etag: a backend honoring If-None-Match answers
+        // 304 (None); one that ignores it returns the body. Accept either, but
+        // require correctness in the returned-body case.
+        if let Some(etag) = etag {
+            match p
+                .get_if_none_match("k/cond", &etag)
+                .await
+                .expect("cond get")
+            {
+                None => {}
+                Some((b, _)) => assert_eq!(&b[..], &body[..]),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_multipart_round_trips_a_single_part() {
+        use object_store::PutPayload;
+        let (p, _guard) = harness_provider().await;
+        let body = Bytes::from(vec![0x5Au8; 4096]);
+        let mut upload = p
+            .put_multipart("k/multi.bin")
+            .await
+            .expect("start multipart upload");
+        upload
+            .put_part(PutPayload::from(body.clone()))
+            .await
+            .expect("upload part");
+        upload.complete().await.expect("complete multipart");
+        let (got, _) = p.get("k/multi.bin").await.expect("get multipart object");
+        assert_eq!(&got[..], &body[..], "multipart upload round-trips");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn put_atomic_twice_is_precondition_failed() {
         let (p, _guard) = harness_provider().await;
         let body = Bytes::from_static(b"first");
