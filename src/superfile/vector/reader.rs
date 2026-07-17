@@ -418,14 +418,8 @@ impl VectorReader {
             ))));
         }
         if version == format::vec::VERSION_MULTI_CELL {
-            return Self::open_lazy_multi_cell(
-                source,
-                columns_json,
-                header_bytes,
-                blob_size,
-                opts,
-            )
-            .await;
+            return Self::open_lazy_multi_cell(source, columns_json, header_bytes, blob_size, opts)
+                .await;
         }
         let n_columns = read_u32_le(
             &header_bytes[outer_hdr::N_COLUMNS_OFF..outer_hdr::N_COLUMNS_OFF + U32_BYTES],
@@ -4105,9 +4099,8 @@ async fn rerank_candidates_from_blocks(
                                 start..start + (hi - lo + 1) as usize * 4
                             })
                             .collect();
-                        let norm_bytes = source
-                            .get_ranges_parallel(&norm_ranges)
-                            .map_err(map_lazy)?;
+                        let norm_bytes =
+                            source.get_ranges_parallel(&norm_ranges).map_err(map_lazy)?;
                         let mut out = HashMap::new();
                         for ((_, lo, hi), bytes) in span_items.into_iter().zip(norm_bytes) {
                             let vals = parse_f32_le_vec(&bytes);

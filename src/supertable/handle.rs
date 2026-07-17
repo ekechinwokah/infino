@@ -1335,8 +1335,7 @@ async fn create_table_async(
             // manifest does not track) and reopen against the winner's
             // stamped prefix.
             Err(CommitError::WriteContentionExhausted) => {
-                let adopted =
-                    ManifestSnapshot::load(None, storage, Some(options.clone())).await?;
+                let adopted = ManifestSnapshot::load(None, storage, Some(options.clone())).await?;
                 let reconciled =
                     reconcile_vector_index_table_to_manifest(options.as_ref(), &adopted).await?;
                 (adopted, reconciled)
@@ -1394,8 +1393,7 @@ async fn reconcile_vector_index_table_to_manifest(
                 match materialized.write(storage.as_ref(), None, &[]).await {
                     Ok(()) => materialized,
                     Err(CommitError::WriteContentionExhausted) => {
-                        ManifestSnapshot::load(None, storage, Some(Arc::clone(&hidden_arc)))
-                            .await?
+                        ManifestSnapshot::load(None, storage, Some(Arc::clone(&hidden_arc))).await?
                     }
                     Err(e) => return Err(e.into()),
                 }
