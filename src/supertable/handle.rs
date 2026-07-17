@@ -336,13 +336,16 @@ impl Supertable {
                         }
                     }
                 }
-                Ok(None) => (
-                    create_table_async(hidden_opts, None, None)
-                        .await
-                        .ok()
-                        .map(Arc::new),
-                    None,
-                ),
+                Ok(None) => match create_table_async(hidden_opts, None, None).await {
+                    Ok(table) => (Some(Arc::new(table)), None),
+                    Err(e) => {
+                        // Surface a genuine bootstrap failure as Broken (carry the
+                        // error) rather than Absent, matching the sibling arms —
+                        // otherwise a storage fault silently degrades to full scan.
+                        warn!("supertable: hidden vector-index bootstrap-create failed: {e}");
+                        (None, Some(e.to_string()))
+                    }
+                },
                 Err(e) => {
                     warn!("supertable: hidden vector-index pointer unreadable: {e}");
                     (None, Some(e.to_string()))

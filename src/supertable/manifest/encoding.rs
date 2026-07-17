@@ -611,8 +611,18 @@ pub fn decode_cluster_centroids(bytes: &[u8]) -> Result<ClusterCentroids, Decode
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
 
-    let body = n_cent * cdim;
-    let centroids_b = view_n(&mut c, body * 4, "cluster_centroids")?;
+    // n_cent * cdim can't overflow usize on 64-bit (both are u32), but the
+    // *4 byte size can — check the whole chain so a crafted header errors
+    // rather than wrapping to a short read (silent truncation).
+    let body_bytes = n_cent
+        .checked_mul(cdim)
+        .and_then(|body| body.checked_mul(4))
+        .ok_or_else(|| {
+            DecodeError::InvalidVectorSummary(format!(
+                "cluster centroids byte size overflow: n_cent={n_cent} dim={cdim}"
+            ))
+        })?;
+    let centroids_b = view_n(&mut c, body_bytes, "cluster_centroids")?;
     let centroids = decode_f32_le_vec(centroids_b);
 
     Ok(ClusterCentroids::from_decoded(

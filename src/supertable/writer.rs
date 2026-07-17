@@ -1919,6 +1919,11 @@ fn vector_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64
     if version == crate::superfile::format::vec::VERSION_MULTI_CELL {
         return vector_open_ranges_multi_cell(blob, off);
     }
+    // Reject any version we don't recognize instead of falling through to the
+    // v1 layout (a future/corrupt version would otherwise be mis-parsed).
+    if version != crate::superfile::format::vec::VERSION {
+        return None;
+    }
     let n_columns =
         read_u32_le(blob.get(outer_hdr::N_COLUMNS_OFF..outer_hdr::N_COLUMNS_OFF + U32_BYTES)?)
             as usize;
@@ -4467,6 +4472,12 @@ fn build_one_shard_from_packed_cells(
     if cells.is_empty() {
         return Err(BuildError::NoDocsToBuild);
     }
+    // Sort by cell_id up front so the concatenated `_id` column order matches
+    // the subsection order the builder re-sorts into — a caller passing cells
+    // out of cell_id order would otherwise diverge parquet `_id` from the
+    // vector rows (parity with the sibling shard builder).
+    let mut cells = cells;
+    cells.sort_by_key(|(cell_id, _, _)| *cell_id);
     let mut stable_ids: Vec<i128> = Vec::new();
     let mut subsections: Vec<(u32, MergedIvfSubsection)> = Vec::with_capacity(cells.len());
     for (cell_id, sub, ids) in cells {

@@ -427,8 +427,7 @@ impl VectorReader {
         let dir_offset = read_u64_le(
             &header_bytes[outer_hdr::DIR_OFFSET_OFF..outer_hdr::DIR_OFFSET_OFF + U64_BYTES],
         ) as usize;
-        let dir_size = n_columns * DIR_ENTRY_SIZE;
-        let dir_end = dir_offset + dir_size + format::CRC_BYTES;
+        let (dir_size, dir_end) = checked_dir_bounds(dir_offset, n_columns, DIR_ENTRY_SIZE)?;
         if dir_end > blob_size {
             return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                 "lazy open: directory end {dir_end} exceeds blob size {blob_size}",
@@ -674,8 +673,8 @@ impl VectorReader {
 
         // Verify directory CRC (cheap, needed before we can parallelize
         // subsection CRCs since we walk dir entries to find them).
-        let dir_size = n_columns * DIR_ENTRY_SIZE;
-        if dir_offset + dir_size + 4 > source.len() {
+        let (dir_size, dir_end) = checked_dir_bounds(dir_offset, n_columns, DIR_ENTRY_SIZE)?;
+        if dir_end > source.len() {
             return Err(VectorError::Read(ReadError::MalformedVersion(
                 "vector directory runs past blob".into(),
             )));
@@ -1204,8 +1203,8 @@ impl VectorReader {
         let dir_offset =
             read_u64_le(&header[outer_hdr::DIR_OFFSET_OFF..outer_hdr::DIR_OFFSET_OFF + U64_BYTES])
                 as usize;
-        let dir_size = n_cells * CELL_DIR_ENTRY_SIZE;
-        if dir_offset + dir_size + format::CRC_BYTES > source.len() {
+        let (dir_size, dir_end) = checked_dir_bounds(dir_offset, n_cells, CELL_DIR_ENTRY_SIZE)?;
+        if dir_end > source.len() {
             return Err(VectorError::Read(ReadError::MalformedVersion(
                 "multi-cell directory runs past blob".into(),
             )));
@@ -1389,8 +1388,7 @@ impl VectorReader {
         let dir_offset = read_u64_le(
             &header_bytes[outer_hdr::DIR_OFFSET_OFF..outer_hdr::DIR_OFFSET_OFF + U64_BYTES],
         ) as usize;
-        let dir_size = n_cells * CELL_DIR_ENTRY_SIZE;
-        let dir_end = dir_offset + dir_size + format::CRC_BYTES;
+        let (dir_size, dir_end) = checked_dir_bounds(dir_offset, n_cells, CELL_DIR_ENTRY_SIZE)?;
         if dir_end > blob_size {
             return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                 "lazy multi-cell: directory end {dir_end} exceeds blob size {blob_size}",
@@ -4345,6 +4343,33 @@ fn read_u64_le(b: &[u8]) -> u64 {
     u64::from_le_bytes(buf)
 }
 
+/// Overflow-checked directory bounds for a vector blob's outer header.
+/// `entry_count` and `entry_size` derive from untrusted header fields, so a
+/// crafted blob could wrap `entry_count * entry_size` or the
+/// `dir_offset + dir_size + CRC` sum past a bounds guard; both are checked
+/// here. Returns `(dir_size, dir_end)` with `dir_end = dir_offset + dir_size +
+/// CRC_BYTES`; callers compare `dir_end` against the actual blob/source length.
+fn checked_dir_bounds(
+    dir_offset: usize,
+    entry_count: usize,
+    entry_size: usize,
+) -> Result<(usize, usize), VectorError> {
+    let dir_size = entry_count.checked_mul(entry_size).ok_or_else(|| {
+        VectorError::Read(ReadError::MalformedVersion(format!(
+            "vector directory size overflow (entries={entry_count})",
+        )))
+    })?;
+    let dir_end = dir_offset
+        .checked_add(dir_size)
+        .and_then(|x| x.checked_add(format::CRC_BYTES))
+        .ok_or_else(|| {
+            VectorError::Read(ReadError::MalformedVersion(format!(
+                "vector directory offset+size overflow (dir_offset={dir_offset})",
+            )))
+        })?;
+    Ok((dir_size, dir_end))
+}
+
 const CLUSTER_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
 const CLUSTER_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
 
@@ -4524,6 +4549,24 @@ mod tests {
     use tokio::time::sleep;
 
     use super::*;
+
+    /// `checked_dir_bounds` computes `dir_end = offset + count*entry_size + CRC`
+    /// and rejects untrusted-header values that would wrap `usize` (a crafted
+    /// blob must error, not silently pass a bounds guard on a wrapped value).
+    #[test]
+    fn checked_dir_bounds_computes_end_and_rejects_overflow() {
+        let (size, end) = checked_dir_bounds(100, 4, 16).expect("valid bounds");
+        assert_eq!(size, 64);
+        assert_eq!(end, 100 + 64 + format::CRC_BYTES);
+        assert!(
+            checked_dir_bounds(0, usize::MAX, 2).is_err(),
+            "count*entry_size overflow must error, not wrap",
+        );
+        assert!(
+            checked_dir_bounds(usize::MAX, 1, 8).is_err(),
+            "offset+size+CRC overflow must error, not wrap",
+        );
+    }
     use crate::superfile::vector::{
         builder::{
             VectorBuilder, VectorConfig, build_merged_subsection_from_materialized,

@@ -670,7 +670,14 @@ where
             }
             let co = inp.centroids_off + c * dim * 4;
             decode_f32_le_into(&inp.sub[co..co + dim * 4], &mut centroid_buf);
-            for cell in route_cluster(&centroid_buf) {
+            let dests = route_cluster(&centroid_buf);
+            if dests.is_empty() {
+                return Err(BuildError::VectorSchemaMismatch(format!(
+                    "route_clusters_into_cells: non-empty cluster {c} (count={count}) of \
+                     input {ii} routed to zero cells; its {count} rows would be dropped",
+                )));
+            }
+            for cell in dests {
                 cell_frags.entry(cell).or_default().push((ii, c));
             }
         }
