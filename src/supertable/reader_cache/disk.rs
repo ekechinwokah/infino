@@ -1315,7 +1315,7 @@ impl DiskCacheStore {
         match result {
             Ok(entry) => {
                 if allow_background_fill {
-                    self.maybe_spawn_background_fill(uri, &entry, storage);
+                    self.maybe_spawn_background_fill(uri, entry, storage);
                 }
                 Ok(Arc::clone(&entry.reader))
             }
