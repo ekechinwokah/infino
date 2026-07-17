@@ -776,17 +776,6 @@ impl Supertable {
         scan_and_recover(self, self.inner.handle_id, DEFAULT_LEASE_DURATION).await
     }
 
-    /// Sync-bridged version of [`run_recovery_sweep_once`]. Used
-    /// by [`Supertable::create`] to drive an open-time sweep
-    /// from a sync entry point. Same sync→async pattern the
-    /// writer's `persist_commit` uses: ride the ambient tokio
-    /// runtime when present, lazy-init the supertable's owned
-    /// runtime otherwise.
-    pub(crate) fn run_recovery_sweep_once_blocking(&self) -> Result<RecoveryReport, RecoveryError> {
-        let drive = self.run_recovery_sweep_once();
-        bridge_on_runtime(drive, &self.inner.query_runtime())
-    }
-
     /// Run one GC sweep over this supertable's `wal/mutations/` prefix.
     /// Reaps `Complete` WALs older than the wal-grace window + orphan
     /// `.arrow` sidecars older than the sidecar-grace window. Runs at

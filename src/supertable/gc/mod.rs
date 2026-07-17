@@ -126,6 +126,9 @@ pub(super) async fn gc_storage_sweep_for_inner(
         MANIFEST_DIR,
         MANIFEST_PARTS_DIR,
         SLOW_VECTOR_STATE_STORAGE_PREFIX,
+        // Tombstone sidecars under `superfiles/` (live set includes the
+        // paths for current superfiles; orphans age out past the safety gap).
+        SUPERFILES_DIR,
     ];
     if superfiles_complete {
         prefixes.push(SUPERFILE_DATA_DIR);
