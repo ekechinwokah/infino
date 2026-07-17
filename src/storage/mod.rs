@@ -108,7 +108,10 @@ pub enum StorageError {
 }
 
 pub mod io_counters {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     static FETCHES: AtomicU64 = AtomicU64::new(0);
     static BYTES: AtomicU64 = AtomicU64::new(0);
@@ -267,6 +270,18 @@ pub mod io_counters {
     /// (`false` unless the task-local flag is set).
     pub fn io_is_background() -> bool {
         IO_BACKGROUND.try_with(|b| *b).unwrap_or(false)
+    }
+
+    /// Run `fut` with [`io_is_background`] true for the current task.
+    ///
+    /// Background cache-fill GETs wrap their object-store calls in this
+    /// so meters and timelines can attribute them separately from
+    /// foreground query reads.
+    pub async fn scope_background<F>(fut: F) -> F::Output
+    where
+        F: Future,
+    {
+        IO_BACKGROUND.scope(true, fut).await
     }
 
     static TIMELINE_ON: OnceLock<bool> = OnceLock::new();
