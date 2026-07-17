@@ -1490,6 +1490,22 @@ mod tests {
         )
     }
 
+    /// User column names may not contain the FST separator byte or the
+    /// reserved `inf.` prefix.
+    #[test]
+    fn check_user_column_name_rejects_reserved_names() {
+        assert!(check_user_column_name("user_id").is_ok());
+        let with_sep = format!("a{}b", format::FST_SEPARATOR as char);
+        assert!(matches!(
+            check_user_column_name(&with_sep),
+            Err(BuildError::ReservedSeparatorInColumnName(_))
+        ));
+        assert!(matches!(
+            check_user_column_name("inf.internal"),
+            Err(BuildError::ReservedPrefixInColumnName(_))
+        ));
+    }
+
     #[test]
     fn new_rejects_missing_id_column() {
         let mut opts = opts_minimal();

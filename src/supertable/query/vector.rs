@@ -2343,9 +2343,9 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        VectorFilter, VectorSearchOptions, cells_ranked_by_fine_score,
-        gate_fine_candidates_by_fragment, is_hidden_vector_manifest, union_cell_selection,
-        vector_read_query_error,
+        SCORE_COLUMN, VectorFilter, VectorSearchOptions, cells_ranked_by_fine_score,
+        gate_fine_candidates_by_fragment, hidden_hits_user_ids, is_hidden_vector_manifest,
+        projection_is_id_score_only, union_cell_selection, vector_read_query_error,
     };
     use crate::{
         InfinoError,
@@ -2378,6 +2378,21 @@ mod tests {
     /// Fine ranking takes each cell's best (minimum) candidate score,
     /// sorts ascending with lower-id tie-break, and ignores untagged
     /// (legacy, `None`-cell) candidates.
+    /// Exactly the id + score columns (either order) or a bare `SELECT *`
+    /// (None) takes the id/score fast path; anything else does not.
+    #[test]
+    fn projection_is_id_score_only_matches_id_score_combinations() {
+        let id = "doc_id";
+        assert!(projection_is_id_score_only(None, id));
+        assert!(projection_is_id_score_only(Some(&[id, SCORE_COLUMN]), id));
+        assert!(projection_is_id_score_only(Some(&[SCORE_COLUMN, id]), id));
+        assert!(!projection_is_id_score_only(Some(&[id]), id));
+        assert!(!projection_is_id_score_only(
+            Some(&["other", SCORE_COLUMN]),
+            id
+        ));
+    }
+
     #[test]
     fn cells_ranked_by_fine_score_takes_min_per_cell_in_order() {
         let candidates: Vec<(usize, u32, f32, Option<u32>, u64)> = vec![
@@ -2403,6 +2418,33 @@ mod tests {
         assert_eq!(union_cell_selection(&[4], &[4]), vec![4]);
         assert_eq!(union_cell_selection(&[4, 9], &[9, 1]), vec![4, 9, 1]);
         assert_eq!(union_cell_selection(&[], &[2]), vec![2]);
+    }
+
+    /// The inline stable-id fast path: hits carrying `stable_id` are resolved
+    /// directly from the stamp, in hit order, without any manifest lookup or
+    /// storage read (the superfile URIs below are random and absent from the
+    /// manifest, so a fallback read would error).
+    #[test]
+    fn hidden_hits_user_ids_uses_inline_stable_id_fast_path() {
+        let dim = 16;
+        let table = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
+        let reader = table.reader();
+        let manifest = reader.manifest();
+
+        let mk = |sid: i128| SuperfileHit {
+            superfile: SuperfileUri(uuid::Uuid::new_v4()),
+            local_doc_id: 0,
+            score: 0.0,
+            stable_id: Some(sid),
+        };
+        let hits = [mk(42)];
+        let ids = block_on(hidden_hits_user_ids(manifest, &hits, "_id")).expect("resolve one id");
+        assert_eq!(ids, vec![42], "single inline stable id returned verbatim");
+
+        // Order is preserved across multiple stamped hits.
+        let hits = [mk(42), mk(7)];
+        let ids = block_on(hidden_hits_user_ids(manifest, &hits, "_id")).expect("resolve two ids");
+        assert_eq!(ids, vec![42, 7], "inline stable ids returned in hit order");
     }
 
     #[test]

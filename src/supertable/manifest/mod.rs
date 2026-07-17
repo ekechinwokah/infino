@@ -6365,4 +6365,51 @@ mod tests {
         assert_eq!(out[2], 0.0);
         assert_eq!(out[3], 1.0);
     }
+
+    /// `decode_part_off_thread` decodes valid part bytes on the blocking pool
+    /// back to a part equal to the original, and surfaces a typed error (not a
+    /// panic / task-join failure) on garbage input.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn decode_part_off_thread_roundtrips_and_rejects_garbage() {
+        let id = Uuid::new_v4();
+        let seg = Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: id,
+            uri: SuperfileUri(id),
+            n_docs: 3,
+            id_min: -5,
+            id_max: 7,
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
+            subsection_offsets: None,
+        });
+        let part = ManifestPart {
+            format_version: part::FORMAT_VERSION.into(),
+            part_id: PartId::new_v4(),
+            superfiles: vec![seg],
+        };
+        let bytes = part::encode(&part);
+
+        let decoded = decode_part_off_thread(Bytes::from(bytes))
+            .await
+            .expect("valid part decodes off-thread");
+        assert_eq!(decoded.part_id, part.part_id, "part_id round-trips");
+        assert_eq!(decoded.superfiles.len(), 1);
+        assert_eq!(decoded.superfiles[0].superfile_id, id);
+        assert_eq!(decoded.superfiles[0].id_min, -5);
+        assert_eq!(decoded.superfiles[0].id_max, 7);
+
+        // Garbage bytes surface a typed error, not a panic.
+        let err = decode_part_off_thread(Bytes::from_static(b"not-a-valid-part-blob"))
+            .await
+            .expect_err("garbage bytes must fail to decode");
+        assert!(
+            matches!(err, ManifestLoadError::Parse(_)),
+            "expected a parse error, got {err:?}"
+        );
+    }
 }

@@ -2412,6 +2412,37 @@ mod tests {
         assert!(!store.is_mmap_promoted(&SuperfileUri::new_v4()));
     }
 
+    /// `rollback_lazy_background_fill` undoes an in-flight promotion: it drops
+    /// the cache entry, forgets the coordinator, and deletes the tmp scratch
+    /// file left by the partial download.
+    #[tokio::test]
+    async fn rollback_lazy_background_fill_evicts_entry_and_tmp() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+
+        // Seed a cache entry the way a lazy fill would, plus a leftover tmp
+        // scratch file for the partial download.
+        store.install_block_entry_for_test(uri, Arc::new(AtomicU64::new(0)), Arc::new(()));
+        assert!(
+            store.is_cached(&uri),
+            "entry must be cached before rollback"
+        );
+        let tmp = store.tmp_path(&uri);
+        std::fs::write(&tmp, b"partial-download-bytes").expect("seed tmp scratch file");
+        assert!(tmp.exists(), "tmp scratch file must exist before rollback");
+
+        rollback_lazy_background_fill(&store, &uri, &tmp);
+
+        assert!(
+            !store.is_cached(&uri),
+            "cached entry must be gone after rollback"
+        );
+        assert!(
+            !tmp.exists(),
+            "tmp scratch file must be deleted after rollback"
+        );
+    }
+
     // ----- warm insert path (insert_warm + cold-free path) -----
 
     #[tokio::test]

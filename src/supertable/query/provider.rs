@@ -1574,6 +1574,41 @@ mod tests {
         got
     }
 
+    /// `flip_op` swaps a comparison to read column-on-right as column-on-left;
+    /// equality operators are unchanged.
+    #[test]
+    fn flip_op_swaps_directional_comparisons() {
+        use super::{ScalarOp, flip_op};
+        assert!(matches!(flip_op(ScalarOp::Lt), ScalarOp::Gt));
+        assert!(matches!(flip_op(ScalarOp::LtEq), ScalarOp::GtEq));
+        assert!(matches!(flip_op(ScalarOp::Gt), ScalarOp::Lt));
+        assert!(matches!(flip_op(ScalarOp::GtEq), ScalarOp::LtEq));
+        assert!(matches!(flip_op(ScalarOp::Eq), ScalarOp::Eq));
+        assert!(matches!(flip_op(ScalarOp::NotEq), ScalarOp::NotEq));
+    }
+
+    /// `collect_null_leaves` emits a leaf per `IS [NOT] NULL` on a known
+    /// column, descends `AND`, and declines unknown columns.
+    #[test]
+    fn collect_null_leaves_emits_for_known_columns_under_and() {
+        use std::sync::Arc;
+
+        use arrow_schema::{DataType, Field, Schema, SchemaRef};
+        use datafusion::prelude::col;
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let expr = col("a").is_null().and(col("b").is_not_null());
+        let mut out = Vec::new();
+        super::collect_null_leaves(&expr, &schema, &mut out);
+        assert_eq!(out.len(), 2, "one leaf per null-check on a known column");
+
+        let mut unknown = Vec::new();
+        super::collect_null_leaves(&col("missing").is_null(), &schema, &mut unknown);
+        assert!(unknown.is_empty(), "unknown column declines");
+    }
+
     #[test]
     fn tombstone_access_plan_none_when_no_deletes_in_file() {
         let bytes = parquet_with_row_groups(12, 4);

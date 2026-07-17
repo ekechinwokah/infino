@@ -825,6 +825,113 @@ mod tests {
     /// legacy `try_optimize`), and carries its registered name. Neither
     /// the `supports_rewrite` flag nor `name` is observed during a plain
     /// query, so assert them directly.
+    /// `classify` buckets a segment against an id-column range: disjoint when
+    /// the segment sits wholly outside, covered when wholly inside, boundary
+    /// when it straddles an edge or the column has no usable stats.
+    #[test]
+    fn classify_buckets_segment_against_id_range() {
+        use std::collections::HashMap;
+
+        use crate::{
+            superfile::vector::layout::VectorLayout, supertable::manifest::SuperfileEntry,
+        };
+        let entry = SuperfileEntry {
+            birth_version: 0,
+            superfile_id: uuid::Uuid::new_v4(),
+            uri: crate::supertable::manifest::SuperfileUri::new_v4(),
+            n_docs: 1,
+            id_min: 10,
+            id_max: 20,
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
+            subsection_offsets: None,
+        };
+        let dec =
+            |v: i128| ScalarValue::Decimal128(Some(v), DECIMAL128_PRECISION, DECIMAL128_SCALE);
+        let bound = |v: i128, inclusive: bool| Bound {
+            value: dec(v),
+            inclusive,
+        };
+        let rf = |lo: Option<Bound>, hi: Option<Bound>| RangeFilter {
+            column: "_id".to_string(),
+            lo,
+            hi,
+        };
+
+        assert!(matches!(
+            classify(&entry, "_id", &rf(Some(bound(25, true)), None)),
+            Class::Disjoint
+        ));
+        assert!(matches!(
+            classify(&entry, "_id", &rf(None, Some(bound(5, true)))),
+            Class::Disjoint
+        ));
+        assert!(matches!(
+            classify(
+                &entry,
+                "_id",
+                &rf(Some(bound(0, true)), Some(bound(30, true)))
+            ),
+            Class::Covered
+        ));
+        assert!(matches!(
+            classify(&entry, "_id", &rf(Some(bound(15, true)), None)),
+            Class::Boundary
+        ));
+        // Unknown column with no scalar stats → boundary (can't prune).
+        assert!(matches!(
+            classify(
+                &entry,
+                "_id",
+                &RangeFilter {
+                    column: "other".to_string(),
+                    lo: None,
+                    hi: None
+                }
+            ),
+            Class::Boundary
+        ));
+    }
+
+    /// `typed_zero` maps each supported sum type to its zero and errors on
+    /// an unsupported type.
+    #[test]
+    fn typed_zero_maps_numeric_types_and_rejects_others() {
+        assert!(matches!(
+            typed_zero(&ScalarValue::Int64(Some(5))),
+            Ok(ScalarValue::Int64(Some(0)))
+        ));
+        assert!(matches!(
+            typed_zero(&ScalarValue::UInt64(Some(5))),
+            Ok(ScalarValue::UInt64(Some(0)))
+        ));
+        assert!(matches!(
+            typed_zero(&ScalarValue::Float64(Some(5.0))),
+            Ok(ScalarValue::Float64(Some(v))) if v == 0.0
+        ));
+        assert!(typed_zero(&ScalarValue::Utf8(Some("x".into()))).is_err());
+    }
+
+    /// `avg_column` reads the column name directly and through a wrapping
+    /// cast; a non-column argument yields `None`.
+    #[test]
+    fn avg_column_reads_through_cast_and_rejects_non_column() {
+        use arrow_schema::DataType;
+        use datafusion::{
+            logical_expr::{Cast, Expr},
+            prelude::{col, lit},
+        };
+
+        assert_eq!(avg_column(&col("price")), Some("price".to_string()));
+        let casted = Expr::Cast(Cast::new(Box::new(col("price")), DataType::Float64));
+        assert_eq!(avg_column(&casted), Some("price".to_string()));
+        assert_eq!(avg_column(&lit(1.0)), None);
+    }
+
     #[test]
     #[allow(deprecated)] // `supports_rewrite` is the targeted method.
     fn rule_opts_into_rewrite_and_reports_name() {

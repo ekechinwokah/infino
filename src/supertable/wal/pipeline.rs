@@ -1321,6 +1321,40 @@ mod tests {
         assert!(!manifest_contains(&empty, Uuid::nil()));
     }
 
+    /// The storage-fallback fetch surfaces a typed "no storage" string when
+    /// the supertable has no storage attached, before any I/O is attempted.
+    #[test]
+    fn fetch_superfile_bytes_for_id_scan_errors_without_storage() {
+        let st = Supertable::create(default_supertable_options()).expect("create");
+        assert!(
+            st.inner().options.storage.is_none(),
+            "fixture-free supertable has no storage"
+        );
+        let err = fetch_superfile_bytes_for_id_scan(st.inner(), Uuid::from_u128(7))
+            .expect_err("must error without storage");
+        assert!(err.contains("no storage"), "got {err}");
+    }
+
+    /// With storage attached, the fallback fetch returns exactly the bytes
+    /// written at the superfile's storage path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetch_superfile_bytes_for_id_scan_reads_written_bytes() {
+        let (_dir, st, _ws, _wal, _etag) = fixture().await;
+        let id = Uuid::from_u128(0xFEED_FACE);
+        let payload = Bytes::from_static(b"superfile-scan-payload");
+        st.inner()
+            .options
+            .storage
+            .as_ref()
+            .expect("fixture attaches storage")
+            .put_atomic(&SuperfileUri(id).storage_path(), payload.clone())
+            .await
+            .expect("put superfile");
+
+        let got = fetch_superfile_bytes_for_id_scan(st.inner(), id).expect("fetch bytes");
+        assert_eq!(got, payload, "fetched bytes match what was written");
+    }
+
     // ---- End-to-end Applied path ----------------------------------------
 
     /// Encode a RecordBatch as Arrow IPC stream bytes — same

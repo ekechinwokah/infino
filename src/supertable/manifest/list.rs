@@ -1690,6 +1690,32 @@ mod tests {
             .value(0)
     }
 
+    /// `birth_version_range` reads the UInt64 min/max of the birth-version
+    /// aggregate; an entry lacking that aggregate has no range.
+    #[test]
+    fn birth_version_range_reads_uint64_bounds() {
+        use arrow_array::UInt64Array;
+        let mut entry = rich_entry(1);
+        let mut stats = HashMap::new();
+        stats.insert(
+            BIRTH_VERSION_AGGREGATE_COLUMN.to_string(),
+            ScalarStatsAgg {
+                min: Arc::new(UInt64Array::from(vec![10u64])) as ArrayRef,
+                max: Arc::new(UInt64Array::from(vec![20u64])) as ArrayRef,
+                null_count: None,
+                sum: None,
+                hll: None,
+                value_counts: None,
+            },
+        );
+        entry.scalar_stats_agg = stats;
+        assert_eq!(entry.birth_version_range(), Some((10, 20)));
+
+        let mut bare = rich_entry(2);
+        bare.scalar_stats_agg = HashMap::new();
+        assert_eq!(bare.birth_version_range(), None);
+    }
+
     #[test]
     fn scalar_agg_from_column_computes_min_max_sum_nullcount() {
         let arr: ArrayRef = Arc::new(Int64Array::from(vec![Some(3), None, Some(7), Some(1)]));

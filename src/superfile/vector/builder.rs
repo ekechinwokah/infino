@@ -2900,6 +2900,28 @@ mod tests {
         }
     }
 
+    /// The centroid-count cap steps up at the two document-count thresholds.
+    #[test]
+    fn n_cent_row_count_cap_steps_at_thresholds() {
+        assert_eq!(n_cent_row_count_cap(0), N_CENT_SMALL);
+        assert_eq!(
+            n_cent_row_count_cap(N_CENT_MEDIUM_DOC_THRESHOLD - 1),
+            N_CENT_SMALL
+        );
+        assert_eq!(
+            n_cent_row_count_cap(N_CENT_MEDIUM_DOC_THRESHOLD),
+            N_CENT_MEDIUM
+        );
+        assert_eq!(
+            n_cent_row_count_cap(N_CENT_LARGE_DOC_THRESHOLD - 1),
+            N_CENT_MEDIUM
+        );
+        assert_eq!(
+            n_cent_row_count_cap(N_CENT_LARGE_DOC_THRESHOLD),
+            N_CENT_LARGE
+        );
+    }
+
     #[test]
     fn register_column_returns_sequential_ids() {
         let mut b = VectorBuilder::new();

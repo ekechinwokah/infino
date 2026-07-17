@@ -7526,4 +7526,37 @@ supertable:
         assert_eq!(w.buffered_bytes(), 0, "buffer drained on commit");
         assert_eq!(w.buffered_batches(), 0);
     }
+
+    /// `put_superfile_replace` creates on first write (NotFound → put_atomic)
+    /// and overwrites on the second (head → put_if_match), leaving the object
+    /// content equal to the most recent bytes written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_superfile_replace_creates_then_overwrites() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let path = "superfiles/replace-me.sf";
+
+        // First write to a fresh path routes through the NotFound → put_atomic
+        // arm and creates the object.
+        let first = Bytes::from_static(b"first-body-contents");
+        put_superfile_replace(&storage, path, first.clone())
+            .await
+            .expect("first put creates");
+        let (read_first, _) = storage.get(path).await.expect("read after create");
+        assert_eq!(read_first, first, "created object holds the first bytes");
+
+        // Second write to the same path routes through head → put_if_match and
+        // replaces the content.
+        let second = Bytes::from_static(b"second-body-different-length");
+        put_superfile_replace(&storage, path, second.clone())
+            .await
+            .expect("second put overwrites");
+        let (read_second, _) = storage.get(path).await.expect("read after overwrite");
+        assert_eq!(read_second, second, "overwrite installs the new bytes");
+        assert_ne!(
+            read_second, read_first,
+            "object content actually changed between writes"
+        );
+    }
 }

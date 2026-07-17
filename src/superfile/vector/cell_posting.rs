@@ -931,6 +931,39 @@ mod tests {
     /// `compute_encoded_norms` returns exactly one residual norm-squared per
     /// row, and each is finite and non-negative — the recompute path taken when
     /// a decoded posting carries no stored per-doc norms.
+    /// `metric_from_id` maps the on-disk metric id byte to its `Metric` and
+    /// rejects an unknown id.
+    #[test]
+    fn metric_from_id_maps_known_ids_and_rejects_unknown() {
+        assert!(matches!(
+            metric_from_id(METRIC_ID_L2SQ as u8),
+            Ok(Metric::L2Sq)
+        ));
+        assert!(matches!(
+            metric_from_id(METRIC_ID_COSINE as u8),
+            Ok(Metric::Cosine)
+        ));
+        assert!(matches!(
+            metric_from_id(METRIC_ID_NEGDOT as u8),
+            Ok(Metric::NegDot)
+        ));
+        assert!(metric_from_id(250).is_err());
+    }
+
+    /// `residual_divisor_for_codec` resolves the Sq8 residual-family divisors
+    /// and rejects non-residual codecs with a message naming the codec.
+    #[test]
+    fn residual_divisor_resolves_sq8_family_and_rejects_others() {
+        assert_eq!(
+            residual_divisor_for_codec(RerankCodec::Sq8Residual),
+            Ok(SQ8_RESIDUAL_DIVISOR)
+        );
+        assert!(residual_divisor_for_codec(RerankCodec::Sq8FixedResidual).is_ok());
+        let err = residual_divisor_for_codec(RerankCodec::Fp32).expect_err("Fp32 rejected");
+        assert!(err.contains(RerankCodec::Fp32.name()));
+        assert!(residual_divisor_for_codec(RerankCodec::RabitqOnly).is_err());
+    }
+
     #[test]
     fn compute_encoded_norms_one_nonneg_norm_per_row() {
         let dim = 4usize;

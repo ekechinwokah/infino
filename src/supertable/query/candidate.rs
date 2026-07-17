@@ -442,6 +442,46 @@ mod tests {
         CandidatePlan::from_filters(&[expr], &fts_cols(), Some(&tok()))
     }
 
+    /// Bloom-survival flattening: an `AND` of term-alls collapses to one
+    /// conjunctive group; a top-level `OR` yields one group per branch; a plan
+    /// that isn't a pure conjunction (`Unbounded`, or an `OR` nested under an
+    /// `AND`) is inexpressible and returns `false`.
+    #[test]
+    fn candidate_plan_flattens_into_bloom_survival_groups() {
+        let terms = |c: &str, t: &str| CandidatePlan::TermsAll {
+            column: c.to_string(),
+            tokens: vec![t.to_string()],
+        };
+
+        let mut groups = Vec::new();
+        assert!(
+            CandidatePlan::And(vec![terms("a", "x"), terms("b", "y")])
+                .collect_survival_or_groups(&mut groups)
+        );
+        assert_eq!(groups.len(), 1, "AND is one conjunctive group");
+        assert_eq!(groups[0].len(), 2, "with a leaf per term-all");
+
+        let mut groups = Vec::new();
+        assert!(
+            CandidatePlan::Or(vec![terms("a", "x"), terms("b", "y")])
+                .collect_survival_or_groups(&mut groups)
+        );
+        assert_eq!(groups.len(), 2, "top-level OR is one group per branch");
+
+        let mut groups = Vec::new();
+        assert!(!CandidatePlan::Unbounded.collect_survival_or_groups(&mut groups));
+
+        let mut groups = Vec::new();
+        assert!(
+            !CandidatePlan::And(vec![
+                terms("a", "x"),
+                CandidatePlan::Or(vec![terms("b", "y"), terms("c", "z")]),
+            ])
+            .collect_survival_or_groups(&mut groups),
+            "OR nested under AND is not a single bloom conjunction"
+        );
+    }
+
     #[test]
     fn eq_on_fts_column_lowers_to_terms_all() {
         let p = plan(col("title").eq(lit("rust async")));

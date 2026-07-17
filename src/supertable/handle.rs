@@ -2321,6 +2321,236 @@ mod tests {
         );
     }
 
+    /// A Kmeans-consolidate drain re-clusters the user rows through
+    /// `materialized_ivf_rows_in_doc_order`; every doc's stable id must survive
+    /// into the hidden index. Payloads may be re-quantized under the new
+    /// centroids, so compare the id set rather than bytes.
+    #[test]
+    fn kmeans_drain_preserves_all_stable_ids() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            config::DrainConsolidate,
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(storage)
+        .with_writer_pool(pool)
+        .with_drain_consolidate(DrainConsolidate::Kmeans)
+        .with_drain_batch_superfiles(-1);
+
+        let st = Supertable::create(options).expect("create");
+        let titles = LargeStringArray::from(vec!["a", "b", "c", "d"]);
+        let mut flat_vals = vec![0.0f32; 4 * dim];
+        for (row, axis) in [0usize, 1, 2, 3].into_iter().enumerate() {
+            flat_vals[row * dim + axis] = 1.0;
+        }
+        let flat = Float32Array::from(flat_vals);
+        let fsl = FixedSizeListArray::new(item_field, dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        let user_payloads = rerank_payloads_by_stable_id(&st);
+        assert_eq!(user_payloads.len(), 4, "four user rows before drain");
+        st.drain_vectors_to_cells_sync().expect("kmeans drain");
+
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        assert!(
+            hidden.reader().n_superfiles() > 0,
+            "kmeans drain must populate hidden cells"
+        );
+        let hidden_payloads = rerank_payloads_by_stable_id(&hidden);
+        let mut user_ids: Vec<i128> = user_payloads.keys().copied().collect();
+        let mut hidden_ids: Vec<i128> = hidden_payloads.keys().copied().collect();
+        user_ids.sort_unstable();
+        hidden_ids.sort_unstable();
+        assert_eq!(
+            hidden_ids, user_ids,
+            "kmeans drain preserves every doc's stable id"
+        );
+    }
+
+    /// After a splice drain into the hidden vector index, the reader's derived-
+    /// state accessors report a live hidden index: a storage prefix is stamped,
+    /// the hidden-superfile stats are non-empty, the user superfiles carry real
+    /// index bytes, and the disk cache warms without timing out.
+    #[test]
+    fn drained_reader_reports_hidden_index_and_warms() {
+        use std::{sync::Arc, time::Duration};
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            config::DrainConsolidate,
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            test_helpers::default_disk_cache,
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+        let disk_cache = default_disk_cache(Arc::clone(&storage), cache_dir.path());
+
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8FixedResidual,
+                provided_centroids: None,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(Arc::clone(&storage))
+        .with_writer_pool(pool)
+        .with_disk_cache(Arc::clone(&disk_cache))
+        .with_drain_consolidate(DrainConsolidate::Splice)
+        .with_drain_batch_superfiles(-1);
+
+        let st = Supertable::create(options).expect("create");
+        let titles = LargeStringArray::from(vec!["a", "b", "c", "d"]);
+        let mut flat_vals = vec![0.0f32; 4 * dim];
+        for (row, axis) in [0usize, 1, 2, 3].into_iter().enumerate() {
+            flat_vals[row * dim + axis] = 1.0;
+        }
+        let flat = Float32Array::from(flat_vals);
+        let fsl = FixedSizeListArray::new(item_field, dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        st.drain_vectors_to_cells_sync().expect("splice drain");
+
+        // A hidden index now exists → a storage prefix is stamped on the
+        // user manifest.
+        let prefix = st
+            .vector_index_storage_prefix()
+            .expect("hidden vector index prefix present after drain");
+        assert!(!prefix.is_empty(), "storage prefix must be non-empty");
+
+        // The hidden table carries at least one cell superfile, and the
+        // busiest cell holds at least one.
+        let (total, max_per_cell) = st
+            .hidden_vector_superfile_stats()
+            .expect("hidden vector stats present after drain");
+        assert!(
+            total > 0,
+            "drain must populate hidden superfiles, got {total}"
+        );
+        assert!(
+            max_per_cell > 0 && max_per_cell <= total,
+            "max-per-cell {max_per_cell} must be in 1..={total}"
+        );
+
+        // The user superfiles load and report real per-superfile index bytes.
+        let (n_superfiles, index_bytes) = st
+            .reader()
+            .load_superfile_storage_stats()
+            .expect("load superfile storage stats");
+        assert!(n_superfiles > 0, "user table has committed superfiles");
+        assert!(
+            index_bytes > 0,
+            "committed vector superfiles carry index bytes"
+        );
+
+        // The disk cache warms within the timeout.
+        st.wait_until_warm(Duration::from_secs(5))
+            .expect("disk cache warms without timing out");
+    }
+
     /// An engine-managed (auto-sized) cache budget must be raised at open
     /// to the table's real on-storage footprint — user superfiles plus the
     /// hidden vector index — while an explicit budget is never changed.

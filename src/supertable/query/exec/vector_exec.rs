@@ -716,6 +716,22 @@ mod tests {
 
     // ---- arg parsing (unit) ----
 
+    /// `array_to_f32` casts numeric elements to f32 and rejects null elements
+    /// (a query vector cannot carry missing components).
+    #[test]
+    fn array_to_f32_casts_ints_and_rejects_nulls() {
+        use std::sync::Arc;
+
+        use arrow_array::ArrayRef;
+        let ints: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        assert_eq!(
+            super::array_to_f32(&ints).expect("cast ints"),
+            vec![1.0f32, 2.0, 3.0]
+        );
+        let with_null: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None]));
+        assert!(super::array_to_f32(&with_null).is_err());
+    }
+
     #[test]
     fn arg_to_query_vector_parses_csv_string() {
         let v = arg_to_query_vector(&lit("0.5, 1, -2.25")).expect("csv vector");

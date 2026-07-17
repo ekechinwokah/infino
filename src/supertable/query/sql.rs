@@ -524,6 +524,41 @@ mod tests {
         n.value(0)
     }
 
+    /// `extract_id_column` collects non-null Decimal128 `_id`s from single-column
+    /// batches and rejects a batch that isn't exactly one column.
+    #[test]
+    fn extract_id_column_reads_decimal128_and_rejects_multi_column() {
+        use arrow_array::ArrayRef;
+        let ids: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(1i128), Some(2), None, Some(3)])
+                .with_precision_and_scale(38, 0)
+                .expect("decimal"),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "_id",
+            DataType::Decimal128(38, 0),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![ids]).expect("batch");
+        assert_eq!(
+            super::extract_id_column(&[batch]).expect("ids"),
+            vec![1i128, 2, 3]
+        );
+
+        let two = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![2])) as ArrayRef,
+            ],
+        )
+        .expect("two-col batch");
+        assert!(super::extract_id_column(&[two]).is_err());
+    }
+
     #[test]
     fn query_sql_count_star_returns_zero_on_empty_supertable() {
         let st = Supertable::create(options_id_cat_title()).expect("create");
