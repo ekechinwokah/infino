@@ -1003,6 +1003,7 @@ pub mod vector {
     use std::{collections::HashMap, hint::black_box};
 
     use infino::{
+        storage::io_counters,
         superfile::{SuperfileReader, reader::VectorSearchOptions},
         supertable::{
             manifest::list::PartitionStrategy, query::vector::USER_FINE_RUNS_PER_FRAGMENT,
@@ -1462,11 +1463,51 @@ pub mod vector {
         for _ in 0..WARMUP_ITERS {
             black_box(reader.topk_global(column, query, k, nprobe, rerank));
         }
+        let dump_phases = io_counters::phase_enabled();
+        let mut phase_sums: HashMap<&'static str, u64> = HashMap::new();
         let sampler = PeakSampler::start_default();
-        let (mut samples, cpu_s) = sample_batched_cpu(WARM_SAMPLE_ITERS, || {
-            reader.topk_global(column, query, k, nprobe, rerank)
-        });
+        let (mut samples, cpu_s) = if dump_phases {
+            // Sample one query at a time so phase spans attribute to a single
+            // warm iteration (batched sampling would merge concurrent queries).
+            let mut walls = Vec::with_capacity(WARM_SAMPLE_ITERS);
+            let mut cpu_acc = 0.0f64;
+            for _ in 0..WARM_SAMPLE_ITERS {
+                io_counters::phase_reset();
+                let ((), wall, cpu) = cpu::timed(|| {
+                    black_box(reader.topk_global(column, query, k, nprobe, rerank));
+                });
+                walls.push(wall);
+                if let Some(c) = cpu {
+                    cpu_acc += c;
+                }
+                for (name, us) in io_counters::phase_take_summed() {
+                    *phase_sums.entry(name).or_default() += us;
+                }
+            }
+            let cpu_s = Some(cpu_acc / WARM_SAMPLE_ITERS as f64);
+            (walls, cpu_s)
+        } else {
+            sample_batched_cpu(WARM_SAMPLE_ITERS, || {
+                reader.topk_global(column, query, k, nprobe, rerank)
+            })
+        };
         let rss = sampler.stop_stats();
+        if dump_phases && !phase_sums.is_empty() {
+            let n = WARM_SAMPLE_ITERS as f64;
+            let mut names: Vec<_> = phase_sums.keys().copied().collect();
+            names.sort_unstable();
+            let parts: Vec<String> = names
+                .into_iter()
+                .map(|name| {
+                    let avg_us = *phase_sums.get(name).unwrap_or(&0) as f64 / n;
+                    format!("{name}={avg_us:.0}µs")
+                })
+                .collect();
+            eprintln!(
+                "[vector warm phases] avg over {WARM_SAMPLE_ITERS} queries (Σ across concurrent fan-out units): {}",
+                parts.join("  ")
+            );
+        }
         VecTiming {
             warm: summarize(&mut samples),
             cpu_s,

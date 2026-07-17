@@ -191,6 +191,17 @@ impl GlobalVectorIndex {
     pub fn into_user_grid(self) -> super::ClusterCentroids {
         self.user_grid.unwrap_or(self.grid)
     }
+
+    /// Borrowing form of [`Self::into_user_grid`] for the query path.
+    ///
+    /// Callers that only need to score/rank must use this (or
+    /// [`crate::supertable::manifest::ManifestSnapshot::global_vector_index`])
+    /// instead of cloning the index: [`super::ClusterCentroids`]'s transposed
+    /// SIMD cache is per-instance, and a clone that drops it forces a full
+    /// scalar transpose rebuild on the next scan.
+    pub fn user_grid(&self) -> &super::ClusterCentroids {
+        self.user_grid.as_ref().unwrap_or(&self.grid)
+    }
 }
 
 /// Normalized set of drained user commit-versions, stored **only on the hidden
@@ -2438,10 +2449,11 @@ mod tests {
         let decoded = decode(&bytes).expect("decode with user grid");
         assert_eq!(decoded.global_vector_index, list.global_vector_index);
         assert_eq!(
-            decoded
+            *decoded
                 .global_vector_index
+                .as_ref()
                 .expect("index present")
-                .into_user_grid(),
+                .user_grid(),
             user_grid
         );
         // Absent by default (back-compat: old manifests without the field).

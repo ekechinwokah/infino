@@ -285,18 +285,40 @@ pub mod io_counters {
     }
 
     static TIMELINE_ON: OnceLock<bool> = OnceLock::new();
+    static PHASE_TRACE_ON: OnceLock<bool> = OnceLock::new();
     static EPOCH: Mutex<Option<Instant>> = Mutex::new(None);
     static SPANS: Mutex<Vec<FetchSpan>> = Mutex::new(Vec::new());
 
-    /// Whether timeline capture is active (`diagnostics.io_timeline`).
+    /// Whether timeline capture is active (`diagnostics.io_timeline` in YAML).
     pub fn timeline_enabled() -> bool {
         *TIMELINE_ON.get_or_init(|| crate::config::global().diagnostics.io_timeline)
+    }
+
+    /// Whether CPU phase spans are recorded.
+    ///
+    /// True when the YAML `diagnostics.io_timeline` flag is on, or when the
+    /// process sets `INFINO_TRACE_VECTOR_WARM_PHASES` (bench/diag opt-in;
+    /// engine YAML is never overridden by env — this is a separate tracer).
+    pub fn phase_enabled() -> bool {
+        *PHASE_TRACE_ON.get_or_init(|| {
+            timeline_enabled()
+                || std::env::var_os("INFINO_TRACE_VECTOR_WARM_PHASES").is_some()
+        })
     }
 
     /// Capture an op-start `Instant` *iff* the timeline is active; `None`
     /// disables recording for this op with zero overhead when off.
     pub fn timeline_start() -> Option<Instant> {
         if timeline_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        }
+    }
+
+    /// Capture a phase-start `Instant` when [`phase_enabled`]; `None` otherwise.
+    pub fn phase_start() -> Option<Instant> {
+        if phase_enabled() {
             Some(Instant::now())
         } else {
             None
@@ -363,9 +385,9 @@ pub mod io_counters {
     /// Same gate (`INFINO_IO_TIMELINE`); ordered by insertion (caller-sequenced).
     static PHASES: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
 
-    /// Record `name` took `micros` µs. No-op unless the timeline is enabled.
+    /// Record `name` took `micros` µs. No-op unless [`phase_enabled`].
     pub fn phase_record(name: &'static str, micros: u64) {
-        if !timeline_enabled() {
+        if !phase_enabled() {
             return;
         }
         if let Ok(mut p) = PHASES.lock() {
@@ -375,11 +397,22 @@ pub mod io_counters {
 
     /// Time `f` and record it under `name` (returns `f`'s value).
     pub fn phase_timed<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
-        if !timeline_enabled() {
+        if !phase_enabled() {
             return f();
         }
         let t = Instant::now();
         let out = f();
+        phase_record(name, t.elapsed().as_micros() as u64);
+        out
+    }
+
+    /// Async counterpart of [`phase_timed`]: await `fut` and record wall µs.
+    pub async fn phase_timed_async<T>(name: &'static str, fut: impl Future<Output = T>) -> T {
+        if !phase_enabled() {
+            return fut.await;
+        }
+        let t = Instant::now();
+        let out = fut.await;
         phase_record(name, t.elapsed().as_micros() as u64);
         out
     }
@@ -397,6 +430,18 @@ pub mod io_counters {
             .lock()
             .map(|mut p| std::mem::take(&mut *p))
             .unwrap_or_default()
+    }
+
+    /// Sum recorded phases by name (concurrent fan-out units may emit the
+    /// same name more than once; callers usually want the sum).
+    pub fn phase_take_summed() -> Vec<(&'static str, u64)> {
+        let phases = phase_take();
+        let mut by_name: std::collections::BTreeMap<&'static str, u64> =
+            std::collections::BTreeMap::new();
+        for (name, us) in phases {
+            *by_name.entry(name).or_default() += us;
+        }
+        by_name.into_iter().collect()
     }
 }
 

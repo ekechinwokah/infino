@@ -439,26 +439,61 @@ impl ManifestSnapshot {
     }
 
     pub fn get_partition_strategy(&self) -> list::PartitionStrategy {
-        if let Some(s) = &self.stamped_partition_strategy {
-            return s.clone();
-        }
-        self.list
+        self.partition_strategy()
+            .cloned()
+            .unwrap_or_else(|| self.superfile_list.options.effective_partition_strategy())
+    }
+
+    /// Borrow the resident partition strategy when one is stamped or listed.
+    ///
+    /// Prefer this on the query path over [`Self::get_partition_strategy`]: a
+    /// `VectorCell` strategy owns [`ClusterCentroids`], and cloning it drops
+    /// (or re-copies) the transposed SIMD cache used by cell ranking.
+    pub(crate) fn partition_strategy(&self) -> Option<&list::PartitionStrategy> {
+        self.stamped_partition_strategy
             .as_ref()
-            .map(|l| l.partition_strategy.clone())
-            .unwrap_or(self.superfile_list.options.effective_partition_strategy())
+            .or_else(|| self.list.as_ref().map(|l| &l.partition_strategy))
+    }
+
+    /// [`CellRoutingParams`] from a `VectorCell` strategy, without cloning
+    /// the cell-centroid grid.
+    pub(crate) fn vector_cell_routing(&self) -> Option<list::CellRoutingParams> {
+        match self.partition_strategy() {
+            Some(list::PartitionStrategy::VectorCell { routing, .. }) => Some(*routing),
+            _ => None,
+        }
+    }
+
+    /// Borrow the `VectorCell` centroid grid when it matches `column`.
+    pub(crate) fn vector_cell_clusters(&self, column: &str) -> Option<&ClusterCentroids> {
+        match self.partition_strategy() {
+            Some(list::PartitionStrategy::VectorCell {
+                column: cell_column,
+                clusters,
+                ..
+            }) if cell_column == column => Some(clusters),
+            _ => None,
+        }
     }
 
     /// The global vector cell-index grid this (user) table owns, or `None`
     /// before the first commit-with-vectors. Honors the in-memory stamp set by
     /// [`ManifestSnapshot::with_global_vector_index`] before the first list lands, then
     /// the persisted list.
+    ///
+    /// Cloning cost: this returns an owned [`list::GlobalVectorIndex`]. The
+    /// query path must use [`Self::global_vector_index`] instead so the
+    /// transposed centroid cache stays resident across warm queries.
     pub fn get_global_vector_index(&self) -> Option<list::GlobalVectorIndex> {
-        if let Some(g) = &self.stamped_global_vector_index {
-            return Some(g.clone());
-        }
-        self.list
+        self.global_vector_index().cloned()
+    }
+
+    /// Borrow the global vector cell-index (no clone — keeps the transposed
+    /// SIMD cache warm on the query path).
+    pub(crate) fn global_vector_index(&self) -> Option<&list::GlobalVectorIndex> {
+        self.stamped_global_vector_index
             .as_ref()
-            .and_then(|l| l.global_vector_index.clone())
+            .or_else(|| self.list.as_ref().and_then(|l| l.global_vector_index.as_ref()))
     }
 
     /// Drained user commit-versions recorded on this (hidden) manifest. Honors
@@ -2485,16 +2520,22 @@ pub struct ClusterCentroids {
 
 impl Clone for ClusterCentroids {
     fn clone(&self) -> Self {
+        // Preserve a warm transposed cache when present. Dropping it on every
+        // clone forced the query path (which historically cloned the global
+        // grid / VectorCell strategy each search) to rebuild the scalar
+        // block-transpose — milliseconds at dim=1024 — before the SIMD scan
+        // could run. Callers that mutate `centroids` after cloning must
+        // [`Self::invalidate_transposed`].
+        let transposed = OnceLock::new();
+        if let Some(cache) = self.transposed.get() {
+            let _ = transposed.set(cache.clone());
+        }
         Self {
             n_cent: self.n_cent,
             dim: self.dim,
             centroids: self.centroids.clone(),
             counts: self.counts.clone(),
-            // Not carried over: `centroids` is a public field a clone may
-            // mutate (e.g. split-centroid insertion), which would silently
-            // stale a copied cache. Rebuilding on first scan is cheap and
-            // always correct.
-            transposed: OnceLock::new(),
+            transposed,
         }
     }
 }
@@ -2594,6 +2635,17 @@ impl ClusterCentroids {
                 self.dim as usize,
             )
         })
+    }
+
+    /// Drop the transposed SIMD cache after mutating [`Self::centroids`]
+    /// (or `counts` / `n_cent` / `dim`) on a value that may already have
+    /// been scanned. The next [`Self::transposed`] call rebuilds it.
+    ///
+    /// Not called on the read path today (centroids are immutable after
+    /// decode); kept for write/maintenance sites that mutate in place.
+    #[allow(dead_code)]
+    pub(crate) fn invalidate_transposed(&mut self) {
+        self.transposed = OnceLock::new();
     }
 
     /// Score cluster `c` against `query`: [`distance`] on the fp32 centroid
@@ -2958,6 +3010,33 @@ mod tests {
             ScalarValue::TimestampNanosecond(Some(100), None),
             "ts-nano min"
         );
+    }
+
+    /// Cloning a warm [`ClusterCentroids`] must keep the transposed cache so a
+    /// subsequent scan does not pay the scalar transpose rebuild.
+    #[test]
+    fn clone_preserves_warm_transposed_cache() {
+        let (cc, _) = synth_clusters(32, 128, 3);
+        let warm = cc.transposed().as_ptr();
+        assert!(cc.transposed.get().is_some());
+        let cloned = cc.clone();
+        assert!(
+            cloned.transposed.get().is_some(),
+            "clone must carry a warm transposed cache"
+        );
+        // Same bytes, distinct allocation (Vec clone) — pointer differs, length matches.
+        assert_eq!(cloned.transposed().len(), cc.transposed().len());
+        assert_ne!(
+            cloned.transposed().as_ptr(),
+            warm,
+            "clone owns its own cache buffer"
+        );
+        let mut mutated = cc.clone();
+        mutated.centroids[0] += 1.0;
+        mutated.invalidate_transposed();
+        assert!(mutated.transposed.get().is_none());
+        let _ = mutated.transposed(); // rebuild
+        assert!(mutated.transposed.get().is_some());
     }
 
     /// `score_clusters_into` must match [`distance`] on the fp32 centroid slice.

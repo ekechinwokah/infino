@@ -29,6 +29,7 @@ use tokio::sync::oneshot;
 pub(crate) use crate::superfile::lazy_source::Source;
 use crate::{
     memory::{ConnectionMemoryBudget, Reservation},
+    storage::io_counters,
     superfile::{
         BuildError, ReadError,
         error::VectorError,
@@ -3155,6 +3156,10 @@ impl VectorReader {
         // Shared pure-CPU shortlist + candidate-build stage (see
         // [`build_shortlist`]); only the survivor-row fetch below
         // diverges from the sync path.
+        // Phase names (INFINO_TRACE_VECTOR_WARM_PHASES): shortlist = 1-bit
+        // RaBitQ heap; survivor_fetch = warm/cold full-row gather; rerank =
+        // Sq8/fp32 refine. Concurrent fan-out units each emit their own spans.
+        let shortlist_t0 = io_counters::phase_start();
         let (candidates, survivor_full_ranges) = match build_shortlist(
             col,
             cb,
@@ -3165,14 +3170,26 @@ impl VectorReader {
         )
         .await
         {
-            ShortlistOutcome::Done(out) => return Ok(out),
+            ShortlistOutcome::Done(out) => {
+                if let Some(t0) = shortlist_t0 {
+                    io_counters::phase_record(
+                        "vec.shortlist",
+                        t0.elapsed().as_micros() as u64,
+                    );
+                }
+                return Ok(out);
+            }
             ShortlistOutcome::Rerank {
                 candidates,
                 survivor_full_ranges,
             } => (candidates, survivor_full_ranges),
         };
+        if let Some(t0) = shortlist_t0 {
+            io_counters::phase_record("vec.shortlist", t0.elapsed().as_micros() as u64);
+        }
         // Survivor rerank rows in one concurrent batch on the caller's
         // runtime; warm ranges resolve sync/zero-copy with no await.
+        let survivor_t0 = io_counters::phase_start();
         let survivor_full_rows = match survivor_full_ranges {
             Some(ranges) => Some(
                 get_cluster_ranges_coalesced_async(&self.source, &ranges)
@@ -3181,18 +3198,27 @@ impl VectorReader {
             ),
             None => None,
         };
+        if let Some(t0) = survivor_t0 {
+            io_counters::phase_record(
+                "vec.survivor_fetch",
+                t0.elapsed().as_micros() as u64,
+            );
+        }
 
-        rerank_candidates_from_blocks(
-            &self.source,
-            lazy_sq8_meta_bytes.as_ref(),
-            &cluster_blocks,
-            survivor_full_rows.as_deref(),
-            &candidates,
-            col,
-            query,
-            ctx.pool.clone(),
-            ctx.k,
-        )
+        io_counters::phase_timed_async("vec.rerank", async {
+            rerank_candidates_from_blocks(
+                &self.source,
+                lazy_sq8_meta_bytes.as_ref(),
+                &cluster_blocks,
+                survivor_full_rows.as_deref(),
+                &candidates,
+                col,
+                query,
+                ctx.pool.clone(),
+                ctx.k,
+            )
+            .await
+        })
         .await
     }
 

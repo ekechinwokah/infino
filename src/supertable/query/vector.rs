@@ -88,11 +88,15 @@ use super::{
 pub use crate::superfile::reader::VectorSearchOptions;
 use crate::{
     config,
+    storage::io_counters,
     superfile::{
         SuperfileReader,
         error::ReadError,
         fts::reader::BoolMode,
-        vector::{distance::relative_score_window, layout::VectorLayout},
+        vector::{
+            distance::{Metric, relative_score_window},
+            layout::VectorLayout,
+        },
     },
     supertable::{
         error::QueryError,
@@ -285,6 +289,102 @@ fn cells_ranked_by_fine_score(
             .then_with(|| a.0.cmp(&b.0))
     });
     ranked
+}
+
+/// Sum indexed row counts per cell from manifest vector summaries — no
+/// distance work. Drives posting-widen and "does this cell exist?" checks
+/// before fine centroid scoring.
+fn postings_by_cell_from_summaries(
+    superfiles: &[Arc<SuperfileEntry>],
+    column: &str,
+    allow: Option<&HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
+) -> (HashMap<u32, u64>, bool) {
+    let mut postings: HashMap<u32, u64> = HashMap::new();
+    let mut any_tagged = false;
+    for entry in superfiles {
+        if allow.is_some_and(|m| !m.contains_key(&entry.uri)) {
+            continue;
+        }
+        let Some(vs) = entry.vector_summary.get(column) else {
+            continue;
+        };
+        for cell in &vs.cells {
+            let Some(cell_id) = cell.cell_id else {
+                continue;
+            };
+            any_tagged = true;
+            let n: u64 = cell.clusters.counts.iter().map(|&c| u64::from(c)).sum();
+            *postings.entry(cell_id).or_default() += n;
+        }
+    }
+    (postings, any_tagged)
+}
+
+/// Score every fine IVF centroid in the eligible superfile summaries.
+fn score_fine_candidates(
+    superfiles: &[Arc<SuperfileEntry>],
+    column: &str,
+    query: &[f32],
+    metric: Metric,
+    allow: Option<&HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
+) -> Result<Vec<(usize, u32, f32, Option<u32>, u64)>, QueryError> {
+    let mut candidates: Vec<(usize, u32, f32, Option<u32>, u64)> = Vec::new();
+    for (si, entry) in superfiles.iter().enumerate() {
+        if allow.is_some_and(|m| !m.contains_key(&entry.uri)) {
+            continue;
+        }
+        match entry.vector_summary.get(column) {
+            Some(vs) if !vs.cells.is_empty() => {
+                let mut flat_base = 0u32;
+                for cell in &vs.cells {
+                    if cell.clusters.dim as usize != query.len() {
+                        return Err(QueryError::Execute(format!(
+                            "vector summary dimension {} for column `{column}` on superfile {} \
+                             does not match query dimension {}",
+                            cell.clusters.dim,
+                            entry.superfile_id,
+                            query.len()
+                        )));
+                    }
+                    cell.clusters
+                        .score_clusters_into(metric, query, |local, score| {
+                            let count = cell
+                                .clusters
+                                .counts
+                                .get(local as usize)
+                                .copied()
+                                .unwrap_or(0) as u64;
+                            candidates.push((
+                                si,
+                                flat_base + local,
+                                score,
+                                cell.cell_id,
+                                count,
+                            ));
+                        });
+                    flat_base = flat_base.saturating_add(cell.clusters.n_cent);
+                }
+            }
+            Some(vs) if vs.cells.is_empty() => {
+                return Err(QueryError::Execute(format!(
+                    "superfile {} has no cluster centroids in its vector summary for \
+                     column `{column}` — malformed build; refusing to degrade to a \
+                     blind per-superfile probe",
+                    entry.superfile_id
+                )));
+            }
+            Some(_) => unreachable!("non-empty cell summaries handled above"),
+            None => {
+                return Err(QueryError::Execute(format!(
+                    "superfile {} has no vector summary for column `{column}` — \
+                     malformed build; refusing to degrade to a blind per-superfile \
+                     probe",
+                    entry.superfile_id
+                )));
+            }
+        }
+    }
+    Ok(candidates)
 }
 
 /// Minimum fine-ranked picks in the union cell selection, shared by the
@@ -640,8 +740,8 @@ fn projection_is_id_score_only(projection: Option<&[&str]>, id_column: &str) -> 
 
 fn is_hidden_vector_manifest(manifest: &ManifestSnapshot) -> bool {
     matches!(
-        manifest.get_partition_strategy(),
-        PartitionStrategy::VectorCell { .. }
+        manifest.partition_strategy(),
+        Some(PartitionStrategy::VectorCell { .. })
     )
 }
 
@@ -763,10 +863,10 @@ impl SupertableReader {
         let (resolved_nprobe, _) = options.resolve(filtered);
         let manifest = self.manifest();
         let hidden_vector_index = is_hidden_vector_manifest(manifest);
-        let hidden_routing = match manifest.get_partition_strategy() {
-            PartitionStrategy::VectorCell { routing, .. } => Some(routing),
-            _ => None,
-        };
+        // Borrow routing — do not clone the VectorCell centroid grid just to
+        // read Copy `CellRoutingParams` (that clone used to drop the transposed
+        // SIMD cache and force a per-query scalar transpose rebuild).
+        let hidden_routing = manifest.vector_cell_routing();
         // The user-table path owns its coarse default (16 cells). Explicit
         // caller overrides and the filtered path keep the resolved value;
         // hidden routing ignores `nprobe` entirely (persisted
@@ -794,101 +894,35 @@ impl SupertableReader {
             .map(|vc| vc.metric)
             .ok_or_else(|| QueryError::Execute(format!("unknown vector column `{column}`")))?;
 
+        // Borrow grids only. Cloning `GlobalVectorIndex` / `ClusterCentroids`
+        // on this path cleared the lazily-built transposed cache every query
+        // and rebuilt it with the scalar `transpose_centroids_cluster_major`
+        // loop (~ms at dim=1024) before any SIMD scoring ran.
         let grid = manifest
-            .get_global_vector_index()
+            .global_vector_index()
             .filter(|g| g.column == column)
             // Route on the same grid commit packing stamped cell tags from:
             // the finer user grid when trained, else the drain grid. (Hidden
             // manifests carry no `global_vector_index` and take the
             // `VectorCell` branch below.)
-            .map(|g| g.into_user_grid())
+            .map(|g| g.user_grid())
             .filter(|grid| grid.n_cent > 0 && grid.dim as usize == query.len())
-            .or_else(|| match manifest.get_partition_strategy() {
-                PartitionStrategy::VectorCell {
-                    column: cell_column,
-                    clusters,
-                    ..
-                } if cell_column == column
-                    && clusters.n_cent > 0
-                    && clusters.dim as usize == query.len() =>
-                {
-                    Some(clusters)
-                }
-                _ => None,
+            .or_else(|| {
+                manifest.vector_cell_clusters(column).filter(|clusters| {
+                    clusters.n_cent > 0 && clusters.dim as usize == query.len()
+                })
             });
-        // Full grid ranking through the blocked SIMD kernel over the manifest
-        // grid's cached transposed centroids ([`ClusterCentroids::rank_cells`])
-        // — the single centroid-scan owner; no per-cell `score_one` loop here.
+        // Admit: rank the coarse grid, score every fine IVF centroid in
+        // eligible summaries, then fine/grid cell selection + per-fragment
+        // gate. Phase timers (INFINO_TRACE_VECTOR_WARM_PHASES): admit covers
+        // that work; fanout_wall is probe+rerank+remap wall.
+        let admit_t0 = io_counters::phase_start();
         let ranked_cells_scored: Option<Vec<(u32, f32)>> =
-            grid.as_ref().map(|grid| grid.rank_cells(metric, query));
+            grid.map(|grid| grid.rank_cells(metric, query));
         let ranked_cells: Option<Vec<u32>> = ranked_cells_scored
             .as_ref()
             .map(|cells| cells.iter().map(|(cell, _)| *cell).collect());
 
-        let mut candidates: Vec<(usize, u32, f32, Option<u32>, u64)> = Vec::new();
-        for (si, entry) in superfiles.iter().enumerate() {
-            // Filtered search: a superfile whose predicate matched no row
-            // (absent from `allow`) is dropped here — it never scores a
-            // cluster, never enters the fan-out, and issues zero GETs.
-            if allow.as_ref().is_some_and(|m| !m.contains_key(&entry.uri)) {
-                continue;
-            }
-            // No fallback: an entry that can't be cluster-ranked is a hard
-            // error naming the superfile. The old silent per-superfile
-            // `nprobe` probe absorbed 100% of traffic when a build path
-            // shipped empty summaries, hiding both the defect and a large
-            // per-query metadata re-read behind normal-looking results.
-            match entry.vector_summary.get(column) {
-                Some(vs) if !vs.cells.is_empty() => {
-                    let mut flat_base = 0u32;
-                    for cell in &vs.cells {
-                        if cell.clusters.dim as usize != query.len() {
-                            return Err(QueryError::Execute(format!(
-                                "vector summary dimension {} for column `{column}` on superfile {} \
-                                 does not match query dimension {}",
-                                cell.clusters.dim,
-                                entry.superfile_id,
-                                query.len()
-                            )));
-                        }
-                        cell.clusters
-                            .score_clusters_into(metric, query, |local, score| {
-                                let count =
-                                    cell.clusters
-                                        .counts
-                                        .get(local as usize)
-                                        .copied()
-                                        .unwrap_or(0) as u64;
-                                candidates.push((
-                                    si,
-                                    flat_base + local,
-                                    score,
-                                    cell.cell_id,
-                                    count,
-                                ));
-                            });
-                        flat_base = flat_base.saturating_add(cell.clusters.n_cent);
-                    }
-                }
-                Some(vs) if vs.cells.is_empty() => {
-                    return Err(QueryError::Execute(format!(
-                        "superfile {} has no cluster centroids in its vector summary for \
-                         column `{column}` — malformed build; refusing to degrade to a \
-                         blind per-superfile probe",
-                        entry.superfile_id
-                    )));
-                }
-                Some(_) => unreachable!("non-empty cell summaries handled above"),
-                None => {
-                    return Err(QueryError::Execute(format!(
-                        "superfile {} has no vector summary for column `{column}` — \
-                         malformed build; refusing to degrade to a blind per-superfile \
-                         probe",
-                        entry.superfile_id
-                    )));
-                }
-            }
-        }
         // Cell cutoff shared by the hidden and user branches: probe the
         // `nprobe_min` nearest cells under GRID ranking, widening toward
         // `nprobe_max` while a cell's score stays within the slack threshold
@@ -908,176 +942,148 @@ impl SupertableReader {
             }
             cutoff
         };
-        let candidate_counts: HashMap<(usize, u32), u64> = candidates
-            .iter()
-            .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
-            .collect();
-        // Drain-generation of each superfile (by fan-out index), so the hidden
-        // path can bound its fine-run budget per drain wave rather than per
-        // (cell, superfile). All superfiles a single drain commit wrote share a
-        // `birth_version`.
         let birth_versions: Vec<u64> = superfiles.iter().map(|e| e.birth_version).collect();
         let gated_target = (k as f64
             * f64::from(config::global().vector.drain_replica_target_factor.max(1.0)))
         .ceil() as u64;
+        let allow_ref = allow.as_ref();
+        let (postings_by_cell, any_tagged) =
+            postings_by_cell_from_summaries(&superfiles, column, allow_ref);
+
         let mut gated = Vec::new();
         let mut scored = Vec::new();
-        match ranked_cells {
-            Some(ranked) if candidates.iter().any(|candidate| candidate.3.is_some()) => {
-                let mut postings_by_cell: HashMap<u32, u64> = HashMap::new();
-                for candidate in &candidates {
-                    if let Some(cell) = candidate.3 {
-                        *postings_by_cell.entry(cell).or_default() += candidate.4;
-                    }
+        // Assigned in both admit arms; used below for the posting-aware
+        // budget expand (keep scoring until we cover ≥ k postings).
+        let candidate_counts: HashMap<(usize, u32), u64>;
+        if let (Some(ranked_scored), true) = (&ranked_cells_scored, any_tagged) {
+            let cell_routing = if hidden_vector_index {
+                hidden_routing.expect("hidden manifest carries routing")
+            } else if filtered || options.nprobe.is_some() {
+                CellRoutingParams {
+                    nprobe_min: nprobe.max(1),
+                    nprobe_max: nprobe.max(1),
+                    ..CellRoutingParams::default()
                 }
-                if hidden_vector_index {
-                    let routing = hidden_routing.expect("hidden manifest carries routing");
-                    // Dual cell ranking, probed as a union (see
-                    // [`union_cell_selection`] for the measured scale
-                    // inversion): the grid ranking scores the SAME centroids
-                    // the drain assigns rows against; the fine ranking scores
-                    // each cell's best fine centroid from the candidate set.
-                    // Cells absent from the candidate set (no committed
-                    // superfiles) are skipped. No fallback ranking: a hidden
-                    // manifest without its cell grid is malformed and errors
-                    // loudly.
-                    let ranked_hidden: Vec<(u32, f32)> = ranked_cells_scored
-                        .as_ref()
-                        .ok_or_else(|| {
-                            QueryError::Execute(
-                                "hidden vector-index manifest carries no cell grid — \
-                                 malformed manifest; refusing to rank cells by fine \
-                                 centroids"
-                                    .into(),
-                            )
-                        })?
-                        .iter()
-                        .filter(|(cell, _)| postings_by_cell.contains_key(cell))
-                        .copied()
-                        .collect();
-                    if ranked_hidden.is_empty() {
-                        return Err(QueryError::Execute(
-                            "hidden vector-index candidates name no cell present in the \
-                             grid — malformed cell tags"
-                                .into(),
-                        ));
+            } else {
+                CellRoutingParams::default()
+            };
+            let ranked_for_beam: Vec<(u32, f32)> = ranked_scored
+                .iter()
+                .filter(|(cell, _)| postings_by_cell.contains_key(cell))
+                .copied()
+                .collect();
+            if ranked_for_beam.is_empty() {
+                return Err(QueryError::Execute(
+                    "vector candidates name no cell present in the grid — \
+                     malformed cell tags"
+                        .into(),
+                ));
+            }
+            let cutoff = grid_cell_cutoff(&ranked_for_beam, &cell_routing);
+            let candidates =
+                score_fine_candidates(&superfiles, column, query, metric, allow_ref)?;
+            candidate_counts = candidates
+                .iter()
+                .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
+                .collect();
+            let ranked = ranked_cells
+                .as_ref()
+                .expect("ranked cell ids exist with scored ranking");
+            if hidden_vector_index {
+                let grid_cells: Vec<u32> = ranked_for_beam[..cutoff]
+                    .iter()
+                    .map(|(cell, _)| *cell)
+                    .collect();
+                let fine_ranked = cells_ranked_by_fine_score(&candidates);
+                let fine_cells: Vec<u32> = fine_ranked
+                    .iter()
+                    .take(cutoff.max(UNION_FINE_PICKS_MIN))
+                    .map(|(cell, _)| *cell)
+                    .collect();
+                let selected_cells_ordered = union_cell_selection(&grid_cells, &fine_cells);
+                let selected_cells: HashSet<u32> =
+                    selected_cells_ordered.iter().copied().collect();
+                gated = gate_fine_candidates_by_fragment(
+                    candidates,
+                    &selected_cells,
+                    &selected_cells_ordered,
+                    cell_routing.fine_nprobe,
+                    gated_target,
+                    &candidate_counts,
+                    &mut scored,
+                    Some(&birth_versions),
+                );
+            } else {
+                // Fine-first p=1 over all scored fines. Explicit nprobe /
+                // filtered search keep the grid/fine union.
+                let fine_ranked = cells_ranked_by_fine_score(&candidates);
+                let default_p1 = !filtered && options.nprobe.is_none() && cutoff == 1;
+                let mut selected_cells: Vec<u32> = if default_p1 && !fine_ranked.is_empty() {
+                    let (fine_top, fine_top_score) = fine_ranked[0];
+                    let mut cells = vec![fine_top];
+                    let grid_top = ranked[0];
+                    if grid_top != fine_top {
+                        let tie_threshold = relative_score_window(
+                            fine_top_score,
+                            REPLICA_CLOSURE_DISTANCE_RATIO - 1.0,
+                        );
+                        let grid_top_fine_score = fine_ranked
+                            .iter()
+                            .find(|(cell, _)| *cell == grid_top)
+                            .map(|(_, score)| *score);
+                        if grid_top_fine_score.is_some_and(|score| score <= tie_threshold) {
+                            cells.push(grid_top);
+                        }
                     }
-                    let cutoff = grid_cell_cutoff(&ranked_hidden, &routing);
-                    let grid_cells: Vec<u32> = ranked_hidden[..cutoff]
-                        .iter()
-                        .map(|(cell, _)| *cell)
-                        .collect();
-                    let fine_ranked = cells_ranked_by_fine_score(&candidates);
+                    cells
+                } else {
+                    let grid_cells: Vec<u32> = ranked[..cutoff].to_vec();
                     let fine_cells: Vec<u32> = fine_ranked
                         .iter()
-                        .take(cutoff.max(UNION_FINE_PICKS_MIN))
+                        .take(cutoff)
                         .map(|(cell, _)| *cell)
                         .collect();
-                    let selected_cells_ordered = union_cell_selection(&grid_cells, &fine_cells);
-                    let selected_cells: HashSet<u32> =
-                        selected_cells_ordered.iter().copied().collect();
-                    // Bound the fine-run budget per drain wave, pooled across
-                    // the cells that wave wrote: a freshly drained delta wave
-                    // keeps its share of the shortlist beside the large base
-                    // wave, while read volume stays a function of the number of
-                    // drain waves rather than the probed-cell count.
-                    gated = gate_fine_candidates_by_fragment(
-                        candidates,
-                        &selected_cells,
-                        &selected_cells_ordered,
-                        routing.fine_nprobe,
-                        gated_target,
-                        &candidate_counts,
-                        &mut scored,
-                        Some(&birth_versions),
-                    );
-                } else {
-                    // Default user routing is fine-first p=1 with a grid
-                    // near-tie fallback. Explicit nprobe and filtered search
-                    // retain the existing grid/fine union. Within each
-                    // selected cell, every commit fragment holding that cell
-                    // is probed, keeping its closest
-                    // `USER_FINE_RUNS_PER_FRAGMENT` fine runs.
-                    let user_routing = if filtered || options.nprobe.is_some() {
-                        CellRoutingParams {
-                            nprobe_min: nprobe.max(1),
-                            nprobe_max: nprobe.max(1),
-                            ..CellRoutingParams::default()
-                        }
-                    } else {
-                        CellRoutingParams::default()
-                    };
-                    let ranked_scored = ranked_cells_scored
-                        .as_ref()
-                        .expect("scored cell ranking exists whenever ranked_cells does");
-                    let cutoff = grid_cell_cutoff(ranked_scored, &user_routing);
-                    let fine_ranked = cells_ranked_by_fine_score(&candidates);
-                    let default_p1 = !filtered && options.nprobe.is_none() && cutoff == 1;
-                    let mut selected_cells: Vec<u32> = if default_p1 && !fine_ranked.is_empty() {
-                        let (fine_top, fine_top_score) = fine_ranked[0];
-                        let mut cells = vec![fine_top];
-                        let grid_top = ranked[0];
-                        if grid_top != fine_top {
-                            let tie_threshold = relative_score_window(
-                                fine_top_score,
-                                REPLICA_CLOSURE_DISTANCE_RATIO - 1.0,
-                            );
-                            let grid_top_fine_score = fine_ranked
-                                .iter()
-                                .find(|(cell, _)| *cell == grid_top)
-                                .map(|(_, score)| *score);
-                            if grid_top_fine_score.is_some_and(|score| score <= tie_threshold) {
-                                cells.push(grid_top);
-                            }
-                        }
-                        cells
-                    } else {
-                        // Explicit nprobe and filtered searches retain the
-                        // existing grid/fine union policy.
-                        let grid_cells: Vec<u32> = ranked[..cutoff].to_vec();
-                        let fine_cells: Vec<u32> = fine_ranked
-                            .iter()
-                            .take(cutoff)
-                            .map(|(cell, _)| *cell)
-                            .collect();
-                        union_cell_selection(&grid_cells, &fine_cells)
-                    };
-                    // Widen past the routed cells only if they cannot fill
-                    // top-k (tiny tables, heavily deleted cells): append
-                    // grid-ranked cells not already selected by the union.
-                    let mut covered: u64 = selected_cells
-                        .iter()
-                        .map(|cell| postings_by_cell.get(cell).copied().unwrap_or(0))
-                        .sum();
-                    for cell in ranked.iter().copied() {
-                        if covered >= gated_target {
-                            break;
-                        }
-                        if selected_cells.contains(&cell) {
-                            continue;
-                        }
-                        covered += postings_by_cell.get(&cell).copied().unwrap_or(0);
-                        selected_cells.push(cell);
+                    union_cell_selection(&grid_cells, &fine_cells)
+                };
+                let mut covered: u64 = selected_cells
+                    .iter()
+                    .map(|cell| postings_by_cell.get(cell).copied().unwrap_or(0))
+                    .sum();
+                for cell in ranked.iter().copied() {
+                    if covered >= gated_target {
+                        break;
                     }
-                    let selected: HashSet<u32> = selected_cells.iter().copied().collect();
-                    gated = gate_fine_candidates_by_fragment(
-                        candidates,
-                        &selected,
-                        &selected_cells,
-                        USER_FINE_RUNS_PER_FRAGMENT,
-                        gated_target,
-                        &candidate_counts,
-                        &mut scored,
-                        None,
-                    );
+                    if selected_cells.contains(&cell) {
+                        continue;
+                    }
+                    covered += postings_by_cell.get(&cell).copied().unwrap_or(0);
+                    selected_cells.push(cell);
                 }
+                let selected: HashSet<u32> = selected_cells.iter().copied().collect();
+                gated = gate_fine_candidates_by_fragment(
+                    candidates,
+                    &selected,
+                    &selected_cells,
+                    USER_FINE_RUNS_PER_FRAGMENT,
+                    gated_target,
+                    &candidate_counts,
+                    &mut scored,
+                    None,
+                );
             }
-            _ => {
-                scored = candidates
-                    .into_iter()
-                    .map(|(si, cluster, score, _, _)| (si, cluster, score))
-                    .collect();
-            }
+        } else {
+            // No grid, or untagged summaries: score every fine centroid
+            // (legacy flat path).
+            let candidates =
+                score_fine_candidates(&superfiles, column, query, metric, allow_ref)?;
+            candidate_counts = candidates
+                .iter()
+                .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
+                .collect();
+            scored = candidates
+                .into_iter()
+                .map(|(si, cluster, score, _, _)| (si, cluster, score))
+                .collect();
         }
 
         // Every hidden-index search globally ranks fine centroids within the
@@ -1179,7 +1185,16 @@ impl SupertableReader {
             units.push((Arc::clone(entry), (ids, bitmap)));
         }
         if units.is_empty() {
+            if let Some(t0) = admit_t0 {
+                io_counters::phase_record(
+                    "vec.admit",
+                    t0.elapsed().as_micros() as u64,
+                );
+            }
             return Ok(Vec::new());
+        }
+        if let Some(t0) = admit_t0 {
+            io_counters::phase_record("vec.admit", t0.elapsed().as_micros() as u64);
         }
 
         // Fan out through the shared [`query::dispatch::fanout`] (also
@@ -1247,7 +1262,10 @@ impl SupertableReader {
                 let mut tagged = dispatch::tag_hits(&entry, hits);
                 // Prefer manifest span arithmetic; only touch `_id` pages /
                 // inline IVF regions when the layout is cell-packed or gapped.
-                dispatch::attach_stable_ids(&reader_for_ids, &entry, &mut tagged, false).await?;
+                io_counters::phase_timed_async("vec.stable_id", async {
+                    dispatch::attach_stable_ids(&reader_for_ids, &entry, &mut tagged, false).await
+                })
+                .await?;
                 if !hidden_vector_index && !deny_pushdown {
                     // MultiCell user files (and any path that skipped the
                     // push-down): drop deleted rows by identity post-rank.
@@ -1269,6 +1287,7 @@ impl SupertableReader {
         // width so transient memory stays bounded. The unfiltered path
         // carries no bitmaps and fans out all units at once (matching
         // main's concurrency — every superfile GET overlaps on tokio).
+        let fanout_t0 = io_counters::phase_start();
         let per_superfile = if allow.is_some() {
             let fanout_width = manifest.options.reader_pool.current_num_threads().max(1);
             let mut collected = Vec::new();
@@ -1284,6 +1303,12 @@ impl SupertableReader {
         } else {
             dispatch::fanout_with(self, units, !hidden_vector_index, false, body).await?
         };
+        if let Some(t0) = fanout_t0 {
+            io_counters::phase_record(
+                "vec.fanout_wall",
+                t0.elapsed().as_micros() as u64,
+            );
+        }
 
         Ok(top_k_ascending(per_superfile, k))
     }
