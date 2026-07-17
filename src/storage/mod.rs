@@ -263,15 +263,10 @@ pub mod io_counters {
         static IO_BACKGROUND: bool;
     }
 
-    /// Whether the current task is a background cache-fill (default
-    /// `false` outside a [`scope_background`]).
+    /// Whether the current task is a background cache-fill
+    /// (`false` unless the task-local flag is set).
     pub fn io_is_background() -> bool {
         IO_BACKGROUND.try_with(|b| *b).unwrap_or(false)
-    }
-
-    /// Run `fut` with its object-store reads tagged as background.
-    pub async fn scope_background<F: std::future::Future>(fut: F) -> F::Output {
-        IO_BACKGROUND.scope(true, fut).await
     }
 
     static TIMELINE_ON: OnceLock<bool> = OnceLock::new();

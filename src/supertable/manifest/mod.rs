@@ -2788,6 +2788,146 @@ mod tests {
         );
     }
 
+    /// Every supported column type must fold through `merge_min_max_arrays`
+    /// keeping the smaller `min` and the larger `max`, and the merged bound
+    /// must reconstruct to the column's own scalar type. A missing arm (or a
+    /// type drift on reconstruction) fails the downcast and silently drops the
+    /// stat, regressing the range prune for that type — so assert both the
+    /// value fold and the reconstructed `ScalarValue` for each.
+    #[test]
+    fn merge_min_max_folds_every_supported_column_type() {
+        let scalar = |a: &ArrayRef| ScalarValue::try_from_array(a, 0).expect("decode");
+        // min-pair = (hi, lo) ⇒ lo survives; max-pair = (lo, hi) ⇒ hi survives.
+        let fold =
+            |lo: ArrayRef, hi: ArrayRef| merge_min_max_arrays(&hi, &lo, &lo, &hi).expect("merge");
+
+        macro_rules! prim_case {
+            ($arr:ty, $sv:path, $lo:expr, $hi:expr) => {{
+                let lo: ArrayRef = Arc::new(<$arr>::from(vec![Some($lo)]));
+                let hi: ArrayRef = Arc::new(<$arr>::from(vec![Some($hi)]));
+                let (mn, mx) = fold(lo, hi);
+                assert_eq!(
+                    scalar(&mn),
+                    $sv(Some($lo)),
+                    concat!(stringify!($arr), " min")
+                );
+                assert_eq!(
+                    scalar(&mx),
+                    $sv(Some($hi)),
+                    concat!(stringify!($arr), " max")
+                );
+            }};
+        }
+
+        prim_case!(UInt8Array, ScalarValue::UInt8, 1u8, 9u8);
+        prim_case!(UInt16Array, ScalarValue::UInt16, 1u16, 9u16);
+        prim_case!(UInt32Array, ScalarValue::UInt32, 1u32, 9u32);
+        prim_case!(UInt64Array, ScalarValue::UInt64, 1u64, 9u64);
+        prim_case!(Int8Array, ScalarValue::Int8, -3i8, 4i8);
+        prim_case!(Int16Array, ScalarValue::Int16, -3i16, 4i16);
+        prim_case!(Int32Array, ScalarValue::Int32, -3i32, 4i32);
+        prim_case!(Float32Array, ScalarValue::Float32, -1.5f32, 2.5f32);
+        prim_case!(Float64Array, ScalarValue::Float64, -1.5f64, 2.5f64);
+        prim_case!(Date64Array, ScalarValue::Date64, 2i64, 9i64);
+        prim_case!(Time32SecondArray, ScalarValue::Time32Second, 2i32, 9i32);
+        prim_case!(
+            Time32MillisecondArray,
+            ScalarValue::Time32Millisecond,
+            2i32,
+            9i32
+        );
+        prim_case!(
+            Time64NanosecondArray,
+            ScalarValue::Time64Nanosecond,
+            2i64,
+            9i64
+        );
+
+        // `false < true`: min folds like AND, max like OR.
+        let (mn, mx) = fold(
+            Arc::new(BooleanArray::from(vec![Some(false)])),
+            Arc::new(BooleanArray::from(vec![Some(true)])),
+        );
+        assert_eq!(scalar(&mn), ScalarValue::Boolean(Some(false)), "bool min");
+        assert_eq!(scalar(&mx), ScalarValue::Boolean(Some(true)), "bool max");
+
+        // Utf8 / LargeUtf8 fold lexicographically.
+        let (mn, mx) = fold(
+            Arc::new(StringArray::from(vec![Some("apple")])),
+            Arc::new(StringArray::from(vec![Some("pear")])),
+        );
+        assert_eq!(
+            scalar(&mn),
+            ScalarValue::Utf8(Some("apple".into())),
+            "utf8 min"
+        );
+        assert_eq!(
+            scalar(&mx),
+            ScalarValue::Utf8(Some("pear".into())),
+            "utf8 max"
+        );
+        let (mn, mx) = fold(
+            Arc::new(LargeStringArray::from(vec![Some("apple")])),
+            Arc::new(LargeStringArray::from(vec![Some("pear")])),
+        );
+        assert_eq!(
+            scalar(&mn),
+            ScalarValue::LargeUtf8(Some("apple".into())),
+            "largeutf8 min"
+        );
+        assert_eq!(
+            scalar(&mx),
+            ScalarValue::LargeUtf8(Some("pear".into())),
+            "largeutf8 max"
+        );
+
+        // Decimal128 keeps precision/scale through the fold.
+        let dec = |v: i128| -> ArrayRef {
+            Arc::new(
+                Decimal128Array::from(vec![Some(v)])
+                    .with_precision_and_scale(10, 2)
+                    .expect("decimal"),
+            )
+        };
+        let (mn, mx) = fold(dec(125), dec(999));
+        assert_eq!(
+            scalar(&mn),
+            ScalarValue::Decimal128(Some(125), 10, 2),
+            "dec min"
+        );
+        assert_eq!(
+            scalar(&mx),
+            ScalarValue::Decimal128(Some(999), 10, 2),
+            "dec max"
+        );
+
+        // Timestamp arms other than the Microsecond one covered above; a
+        // naive (tz-less) timestamp must fold and reconstruct with `None` tz.
+        let (mn, mx) = fold(
+            Arc::new(TimestampSecondArray::from(vec![Some(100i64)])),
+            Arc::new(TimestampSecondArray::from(vec![Some(200i64)])),
+        );
+        assert_eq!(
+            scalar(&mn),
+            ScalarValue::TimestampSecond(Some(100), None),
+            "ts-sec min"
+        );
+        assert_eq!(
+            scalar(&mx),
+            ScalarValue::TimestampSecond(Some(200), None),
+            "ts-sec max"
+        );
+        let (mn, _mx) = fold(
+            Arc::new(TimestampNanosecondArray::from(vec![Some(100i64)])),
+            Arc::new(TimestampNanosecondArray::from(vec![Some(200i64)])),
+        );
+        assert_eq!(
+            scalar(&mn),
+            ScalarValue::TimestampNanosecond(Some(100), None),
+            "ts-nano min"
+        );
+    }
+
     /// `score_clusters_into` must match [`distance`] on the fp32 centroid slice.
     #[test]
     fn score_clusters_into_matches_centroid_distance() {
@@ -2808,7 +2948,14 @@ mod tests {
                 if cc.counts[c] == 0 {
                     continue;
                 }
-                reference.push((c as u32, distance(metric, &query, cc.centroid(c))));
+                let d = distance(metric, &query, cc.centroid(c));
+                // Single-cluster probe must equal the direct distance.
+                assert_eq!(
+                    cc.score_one(metric, c, &query),
+                    d,
+                    "{metric:?}: score_one c{c}"
+                );
+                reference.push((c as u32, d));
             }
 
             assert_eq!(
