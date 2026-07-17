@@ -2312,11 +2312,9 @@ async fn lazy_background_fill(
                     hole_len: vec_len,
                     fallback: Arc::clone(&block_source),
                 });
-                let reader = SuperfileReader::open_lazy_with(
-                    source,
-                    OpenOptions { verify_crc: false },
-                )
-                .await?;
+                let reader =
+                    SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false })
+                        .await?;
                 (reader, Some(block_token), Some(block_source))
             }
             (Some((vec_off, vec_len)), None) => {
@@ -2341,11 +2339,9 @@ async fn lazy_background_fill(
                     hole_len: vec_len,
                     fallback: Arc::clone(&block_source),
                 });
-                let reader = SuperfileReader::open_lazy_with(
-                    source,
-                    OpenOptions { verify_crc: false },
-                )
-                .await?;
+                let reader =
+                    SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false })
+                        .await?;
                 (reader, Some(block_token), Some(block_source))
             }
             (None, _) => {

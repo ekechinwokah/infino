@@ -1276,7 +1276,8 @@ impl SupertableReader {
                 let n = fanout_width.min(units.len());
                 let wave: Vec<_> = units.drain(..n).collect();
                 collected.extend(
-                    dispatch::fanout_with(self, wave, !hidden_vector_index, false, body.clone()).await?,
+                    dispatch::fanout_with(self, wave, !hidden_vector_index, false, body.clone())
+                        .await?,
                 );
             }
             collected
