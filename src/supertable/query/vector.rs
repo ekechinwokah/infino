@@ -381,12 +381,42 @@ fn score_fine_candidates(
     Ok(candidates)
 }
 
-/// Minimum fine-ranked picks in the union cell selection, shared by the
-/// hidden and user branches. The fine ranking's second pick is what closes
-/// the last coverage gap at scale — measured at 10M/64c: fine p1 coverage
-/// 0.919 (union recall landed exactly on it at 0.921) vs fine p2 coverage
-/// 0.997. An explicit caller probe width larger than this takes precedence.
+/// Minimum fine-ranked picks in the union cell selection used by the
+/// non-default paths (filtered search, explicit caller nprobe). The fine
+/// ranking's second pick closes the last coverage gap when the grid is
+/// very coarse — measured at 10M/64c: fine p1 coverage 0.919 (union recall
+/// landed exactly on it at 0.921) vs fine p2 coverage 0.997. An explicit
+/// caller probe width larger than this takes precedence.
 const UNION_FINE_PICKS_MIN: usize = 2;
+
+/// Default-path cell selection, shared by the hidden (post-drain) and user
+/// (pre-drain) branches: probe the fine-ranked top cell, adding the grid's
+/// top cell only when its own fine score is a genuine near-tie of the fine
+/// winner (same relative window replica closure uses at drain time, so
+/// probing and replication agree on what counts as a boundary). At the
+/// shipped grid shapes (256/1024 cells) fine p1 coverage measures 1.000
+/// (drain-diag, 1M–100M), so a second unconditional pick only multiplies
+/// the probed-cell fan without recall to show for it.
+fn fine_first_cell_selection(fine_ranked: &[(u32, f32)], grid_top: Option<u32>) -> Vec<u32> {
+    let Some(&(fine_top, fine_top_score)) = fine_ranked.first() else {
+        return grid_top.into_iter().collect();
+    };
+    let mut cells = vec![fine_top];
+    if let Some(grid_top) = grid_top
+        && grid_top != fine_top
+    {
+        let tie_threshold =
+            relative_score_window(fine_top_score, REPLICA_CLOSURE_DISTANCE_RATIO - 1.0);
+        let grid_top_fine_score = fine_ranked
+            .iter()
+            .find(|(cell, _)| *cell == grid_top)
+            .map(|(_, score)| *score);
+        if grid_top_fine_score.is_some_and(|score| score <= tie_threshold) {
+            cells.push(grid_top);
+        }
+    }
+    cells
+}
 
 /// Union of the grid-ranked and fine-ranked cell selections, in probe
 /// priority order: grid picks first, then fine picks not already selected.
@@ -983,17 +1013,28 @@ impl SupertableReader {
                 .as_ref()
                 .expect("ranked cell ids exist with scored ranking");
             if hidden_vector_index {
-                let grid_cells: Vec<u32> = ranked_for_beam[..cutoff]
-                    .iter()
-                    .map(|(cell, _)| *cell)
-                    .collect();
                 let fine_ranked = cells_ranked_by_fine_score(&candidates);
-                let fine_cells: Vec<u32> = fine_ranked
-                    .iter()
-                    .take(cutoff.max(UNION_FINE_PICKS_MIN))
-                    .map(|(cell, _)| *cell)
-                    .collect();
-                let selected_cells_ordered = union_cell_selection(&grid_cells, &fine_cells);
+                // Default path: fine-first p=1, the same selection the user
+                // (pre-drain) branch ships. Filtered search and explicit
+                // caller nprobe keep the wider grid/fine union.
+                let default_p1 = !filtered && options.nprobe.is_none() && cutoff == 1;
+                let selected_cells_ordered: Vec<u32> = if default_p1 {
+                    fine_first_cell_selection(
+                        &fine_ranked,
+                        ranked_for_beam.first().map(|(cell, _)| *cell),
+                    )
+                } else {
+                    let grid_cells: Vec<u32> = ranked_for_beam[..cutoff]
+                        .iter()
+                        .map(|(cell, _)| *cell)
+                        .collect();
+                    let fine_cells: Vec<u32> = fine_ranked
+                        .iter()
+                        .take(cutoff.max(UNION_FINE_PICKS_MIN))
+                        .map(|(cell, _)| *cell)
+                        .collect();
+                    union_cell_selection(&grid_cells, &fine_cells)
+                };
                 let selected_cells: HashSet<u32> = selected_cells_ordered.iter().copied().collect();
                 gated = gate_fine_candidates_by_fragment(
                     candidates,
@@ -1011,23 +1052,7 @@ impl SupertableReader {
                 let fine_ranked = cells_ranked_by_fine_score(&candidates);
                 let default_p1 = !filtered && options.nprobe.is_none() && cutoff == 1;
                 let mut selected_cells: Vec<u32> = if default_p1 && !fine_ranked.is_empty() {
-                    let (fine_top, fine_top_score) = fine_ranked[0];
-                    let mut cells = vec![fine_top];
-                    let grid_top = ranked[0];
-                    if grid_top != fine_top {
-                        let tie_threshold = relative_score_window(
-                            fine_top_score,
-                            REPLICA_CLOSURE_DISTANCE_RATIO - 1.0,
-                        );
-                        let grid_top_fine_score = fine_ranked
-                            .iter()
-                            .find(|(cell, _)| *cell == grid_top)
-                            .map(|(_, score)| *score);
-                        if grid_top_fine_score.is_some_and(|score| score <= tie_threshold) {
-                            cells.push(grid_top);
-                        }
-                    }
-                    cells
+                    fine_first_cell_selection(&fine_ranked, ranked.first().copied())
                 } else {
                     let grid_cells: Vec<u32> = ranked[..cutoff].to_vec();
                     let fine_cells: Vec<u32> = fine_ranked
