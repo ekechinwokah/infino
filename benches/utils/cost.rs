@@ -222,6 +222,15 @@ pub struct QueryStateCost {
     pub warm_p50_s: Option<f64>,
     pub warm_cpu_s: Option<f64>,
     pub ram_bytes: Option<u64>,
+    /// Engine-only settled anon after the state's warm battery: what a
+    /// serving process actually pins (consumer handle + state the engine
+    /// retains across queries), with freed query scratch purged and bench
+    /// harness heap subtracted out.
+    pub ram_anon_bytes: Option<u64>,
+    /// Settled file-backed resident bytes at the same sample: the mmap
+    /// page-cache working set — reclaimable, NVMe-backed, held only while
+    /// actively serving warm.
+    pub ram_file_settled_bytes: Option<u64>,
     pub cold_open_s: Option<f64>,
     pub cold_open_cpu_s: Option<f64>,
     pub cold_query_s: Option<f64>,
@@ -1344,16 +1353,31 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
 
     // ---- Block 5: monthly cost summary ----
     // The standing bill for one table at an assumed steady load: capacity,
-    // reads, writes, and the RAM residency an open table pins. Reads/writes
-    // price the measured steady-state per-unit costs at 1M units/month;
-    // residency prices the resident set's share of the instance for a full
-    // month. All inputs are measured — a line without a measurement is
-    // omitted, never guessed.
-    let steady_ram_bytes = query_states
-        .last()
-        .and_then(|state| state.ram_bytes)
+    // reads, writes, and RAM. Reads/writes price the measured steady-state
+    // per-unit costs at 1M units/month. RAM is split by what it actually
+    // is: an open table PINS only anonymous heap (routing state — grids,
+    // 1-bit admit slabs, counts, manifest metadata); the rest of measured
+    // RSS is file-backed mmap page cache over the local NVMe copy —
+    // reclaimable under pressure and only needed while actively serving
+    // the warm blend, so it is priced as a serving reservation, not as an
+    // open-table cost. All inputs are measured — a line without a
+    // measurement is omitted, never guessed.
+    let last_state = query_states.last();
+    let steady_pinned_bytes = last_state
+        .and_then(|state| state.ram_anon_bytes)
         .unwrap_or(c.resident_anon_bytes);
-    let residency_month = inst.ram_share(steady_ram_bytes) * inst.usd_per_hour * HOURS_PER_MONTH;
+    let steady_working_set_bytes = last_state
+        .and_then(|state| state.ram_file_settled_bytes)
+        .or_else(|| {
+            last_state
+                .and_then(|state| state.ram_bytes)
+                .map(|total| total.saturating_sub(steady_pinned_bytes))
+        })
+        .unwrap_or(0);
+    let pinned_month = inst.ram_share(steady_pinned_bytes) * inst.usd_per_hour * HOURS_PER_MONTH;
+    let working_set_month =
+        inst.ram_share(steady_working_set_bytes) * inst.usd_per_hour * HOURS_PER_MONTH;
+    let residency_month = pinned_month + working_set_month;
     let mut summary_rows: Vec<Vec<Cell>> = vec![vec![
         text("Storage"),
         text(format!(
@@ -1498,15 +1522,36 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         ]);
         month
     });
+    // Residency is priced per ACTIVE hour — "pinned" means unreclaimable
+    // only while the serving process is alive. The $/month column assumes
+    // an always-on process (the upper bound, and the exact number for the
+    // summary's uniform 1M-queries/mo load, whose 2.6 s inter-arrival gap
+    // never trips an idle reaper). On-demand serving (process reaped after
+    // an idle window) multiplies the hourly rate by its duty cycle and
+    // pays the measured cold-open line once per process start instead.
+    let pinned_hour = inst.ram_share(steady_pinned_bytes) * inst.usd_per_hour;
+    let working_set_hour = inst.ram_share(steady_working_set_bytes) * inst.usd_per_hour;
     summary_rows.push(vec![
-        text("Open table — RAM residency"),
+        text("Serving memory — pinned while process alive (anon heap)"),
         text(format!(
-            "{} resident ({:.0}% of {})",
-            fmt_bytes(steady_ram_bytes),
-            inst.ram_share(steady_ram_bytes) * 100.0,
+            "{} ({:.0}% of {}) · {}/active-hour · 24/7 shown",
+            fmt_bytes(steady_pinned_bytes),
+            inst.ram_share(steady_pinned_bytes) * 100.0,
             inst.name,
+            usd(pinned_hour),
         )),
-        metric(residency_month, usd(residency_month), Better::Lower),
+        metric(pinned_month, usd(pinned_month), Better::Lower),
+    ]);
+    summary_rows.push(vec![
+        text("Serving memory — mmap page cache (evictable)"),
+        text(format!(
+            "{} ({:.0}% of {}) · {}/active-hour · sustains the warm blend",
+            fmt_bytes(steady_working_set_bytes),
+            inst.ram_share(steady_working_set_bytes) * 100.0,
+            inst.name,
+            usd(working_set_hour),
+        )),
+        metric(working_set_month, usd(working_set_month), Better::Lower),
     ]);
     let monthly_total = storage_month
         + blended_read_q

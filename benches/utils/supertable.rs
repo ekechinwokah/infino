@@ -1117,6 +1117,7 @@ pub mod vector {
         cmp::Ordering,
         collections::{HashMap, HashSet},
         hint::black_box,
+        sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
     };
 
     use super::*;
@@ -1161,6 +1162,16 @@ pub mod vector {
     /// Explicitly discard only the derived hidden vector-index sibling before
     /// a retained-prefix lifecycle run; the durable user table is untouched.
     const RESET_HIDDEN_INDEX_ENV: &str = "INFINO_BENCH_RESET_HIDDEN_VECTOR_INDEX";
+
+    /// Settled-anon accounting for the cost model's pinned-residency line.
+    /// The bench process carries harness state a real serving process never
+    /// allocates (the ground-truth id map, corpus bookkeeping, report
+    /// buffers), so pricing whole-process anon overstates the engine.
+    /// `run()` stamps the consumer handle's own settled-anon open delta
+    /// here; each routing state adds what its own battery retained
+    /// (settled-after minus settled-before, allocator purged at both
+    /// samples). Zero means "not captured".
+    static CONSUMER_ENGINE_ANON_BYTES: AtomicU64 = AtomicU64::new(0);
     /// Skip the normal undrained-delta commit while retaining pre-drain,
     /// drain, post-drain, and optimize/compact measurements.
     const SKIP_VECTOR_DELTA_ENV: &str = "INFINO_BENCH_SKIP_VECTOR_DELTA";
@@ -1238,6 +1249,14 @@ pub mod vector {
         warm_p50_ns: Option<f64>,
         warm_cpu_s: Option<f64>,
         ram_bytes: Option<u64>,
+        /// Engine-only settled anon after this state's battery: the consumer
+        /// handle's open delta plus retained serving growth, with freed query
+        /// scratch purged and harness heap subtracted (see
+        /// [`CONSUMER_ENGINE_ANON_BYTES`]).
+        ram_anon_bytes: Option<u64>,
+        /// Settled file-backed resident bytes at the same sample — the mmap
+        /// page-cache working set actually held after serving this state.
+        ram_file_settled_bytes: Option<u64>,
         warm_io: Option<storage_meter::ObjectStoreMeter>,
         cold: Option<RoutingColdStat>,
     }
@@ -2217,6 +2236,12 @@ pub mod vector {
         include_warm: bool,
         include_cold: bool,
     ) -> RoutingStateStat {
+        // Settled-anon bracket for the cost model's pinned line: sample
+        // before this state's measurements and again after, so only what
+        // the engine retains ACROSS the battery counts — harness heap
+        // allocated between states (recall machinery, report rows) drops
+        // out, and freed query scratch is purged before both samples.
+        let settled_before = rss::settled_rss_breakdown().map(|(_, anon, _, _)| anon);
         let hits = hit_tier_counts(consumer, query, nprobe, rerank);
         let user_hits = hits.user_hits;
         let hidden_hits = hits.hidden_hits;
@@ -2261,9 +2286,22 @@ pub mod vector {
             }
             samples.sort_unstable();
             let p50_ns = samples[samples.len() / 2].as_secs_f64() * 1e9;
-            let ram_bytes = sampler.stop_stats().peak_rss_bytes;
-            (p50_ns, warm_cpu_s, warm_io, ram_bytes)
+            (p50_ns, warm_cpu_s, warm_io, sampler.stop_stats().peak_rss_bytes)
         });
+        // Engine-pinned estimate, sampled after the warm battery but BEFORE
+        // the cold-store measurement: the cold guard opens a second consumer
+        // purely to time cold opens — harness, not serving state. Pinned =
+        // the shared consumer's open delta plus what this state's warm
+        // serving retained (settled-after minus settled-before, allocator
+        // purged at both samples so freed query scratch never counts).
+        let settled = rss::settled_rss_breakdown();
+        let engine_anon_bytes = settled.map(|(_, anon, _, _)| {
+            let retained = settled_before
+                .map(|before| anon.saturating_sub(before))
+                .unwrap_or(0);
+            CONSUMER_ENGINE_ANON_BYTES.load(AtomicOrdering::Relaxed) + retained
+        });
+        let settled_file_bytes = settled.map(|(_, _, file, _)| file);
         let cold = include_cold
             .then(|| measure_cold_store(label, built, query, nprobe, rerank, cache_budget_bytes))
             .flatten();
@@ -2285,6 +2323,8 @@ pub mod vector {
             warm_p50_ns: warm.map(|(p50, _, _, _)| p50),
             warm_cpu_s: warm.and_then(|(_, cpu_s, _, _)| cpu_s),
             ram_bytes: warm.map(|(_, _, _, ram_bytes)| ram_bytes),
+            ram_anon_bytes: engine_anon_bytes,
+            ram_file_settled_bytes: settled_file_bytes,
             warm_io: warm.map(|(_, _, io, _)| io),
             cold,
         }
@@ -2452,6 +2492,8 @@ pub mod vector {
                 warm_p50_s: state.warm_p50_ns.map(|ns| ns / 1e9),
                 warm_cpu_s: state.warm_cpu_s,
                 ram_bytes: state.ram_bytes,
+                ram_anon_bytes: state.ram_anon_bytes,
+                ram_file_settled_bytes: state.ram_file_settled_bytes,
                 cold_open_s: cold.map(|value| value.open_wall_s),
                 cold_open_cpu_s: cold.and_then(|value| value.open_cpu_s),
                 cold_query_s: cold.map(|value| value.query_wall_s),
@@ -2482,10 +2524,14 @@ pub mod vector {
 
         // Always prepare the corpus for vector benches so recall is always
         // measurable (including existing-prefix runs).
+        crate::rss::log_rss_breakdown("supertable_vector before corpus prepare");
         let mut corpus = Some(supertable::prepare_corpus(Modality::Vector));
+        crate::rss::log_rss_breakdown("supertable_vector after corpus prepare");
 
         let (built, ingest_metrics) = if let Some(fixture) = existing {
-            (supertable::open_existing(Modality::Vector, fixture), None)
+            let opened = (supertable::open_existing(Modality::Vector, fixture), None);
+            crate::rss::log_rss_breakdown("supertable_vector after open_existing (producer handle)");
+            opened
         } else if crate::dataset::dataset_mode() && !phases.build {
             (supertable::open_dataset(Modality::Vector), None)
         } else {
@@ -2633,12 +2679,25 @@ pub mod vector {
                         .saturating_mul(SHARED_CONSUMER_CACHE_INDEX_FACTOR),
                 ),
             );
+            // Bracket the consumer open with settled-anon samples: the delta
+            // is the engine handle's own pinned memory, free of the harness
+            // heap that precedes it (corpus bookkeeping, producer handle).
+            let anon_before_consumer =
+                rss::settled_rss_breakdown().map(|(_, anon, _, _)| anon);
             let consumer = tiers::open_consumer(tiers::consumer_options(
                 supertable::options_for(Modality::Vector, None),
                 consumer_meter.provider(),
                 cache,
             ));
+            crate::rss::log_rss_breakdown("supertable_vector after consumer open");
+            if let (Some(before), Some((_, after, _, _))) =
+                (anon_before_consumer, rss::settled_rss_breakdown())
+            {
+                CONSUMER_ENGINE_ANON_BYTES
+                    .store(after.saturating_sub(before), AtomicOrdering::Relaxed);
+            }
             let id_to_dense = Arc::new(corpus::engine_id_to_dense(&consumer, n_docs));
+            crate::rss::log_rss_breakdown("supertable_vector after id_to_dense map");
             let warm_reader = SupertableVectorRead {
                 table: &consumer,
                 id_to_dense: Arc::clone(&id_to_dense),
