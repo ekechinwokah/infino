@@ -1711,6 +1711,61 @@ impl VectorReader {
         !self.cell_ids.is_empty()
     }
 
+    /// Exact fp32 centroid scores for one cell, read from the on-disk
+    /// centroid region (`centroids_off .. cluster_idx_off` inside the
+    /// cell's subsection) — resident/mmap zero-copy when warm, one range
+    /// fetch when cold. Returns every centroid's `(local_cluster, score)`
+    /// sorted ascending. Serves the admit rescore for manifest summaries
+    /// whose resident fp32 was dropped
+    /// (`summary_centroids_from_superfiles`); count-0 clusters are the
+    /// caller's job to skip (the summary keeps `counts`).
+    ///
+    /// `cell_id: Some(_)` addresses one packed cell of a multi-cell blob;
+    /// `None` addresses the single subsection of a v1 blob.
+    pub(crate) async fn score_cell_centroids_async(
+        &self,
+        column: &str,
+        cell_id: Option<u32>,
+        query: &[f32],
+    ) -> Result<Vec<(u32, f32)>, VectorError> {
+        let cid = *self
+            .column_id_by_name
+            .get(column)
+            .ok_or_else(|| VectorError::UnknownColumn(column.to_string()))?;
+        let col_index = match cell_id {
+            Some(cell) if self.is_multi_cell() => {
+                self.cell_ids.iter().position(|&c| c == cell).ok_or_else(|| {
+                    VectorError::Read(ReadError::MalformedVersion(format!(
+                        "cell {cell} not present in multi-cell blob"
+                    )))
+                })?
+            }
+            _ => cid as usize,
+        };
+        let col = &self.columns[col_index];
+        if query.len() != col.dim {
+            return Err(VectorError::DimensionMismatch {
+                expected: col.dim,
+                got: query.len(),
+            });
+        }
+        let start = col.subsection_range.start + col.centroids_off;
+        let end = col.subsection_range.start + col.cluster_idx_off;
+        let centroids_bytes = self
+            .source
+            .range_async(start..end)
+            .await
+            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        Ok(nearest_k_centroids_bytes(
+            col.metric,
+            query,
+            &centroids_bytes,
+            col.n_cent as usize,
+            col.dim,
+            col.n_cent as usize,
+        ))
+    }
+
     /// Map a flat cluster id (manifest / query fan-out) to
     /// `(cell_column_index, local_cluster)` for multi-cell blobs.
     pub(crate) fn resolve_flat_cluster(&self, flat: u32) -> Option<(usize, u32)> {

@@ -62,14 +62,17 @@ use xxhash_rust::xxh3::xxh3_64;
 use super::options::SupertableOptions;
 use crate::{
     storage::{StorageError, StorageProvider},
-    superfile::vector::{
-        distance::{
-            COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, Metric, all_centroid_scores_transposed,
-            distance, dot, nearest_k_centroids_transposed, transpose_centroids_cluster_major,
+    superfile::{
+        builder::VectorConfig,
+        vector::{
+            distance::{
+                COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, Metric, all_centroid_scores_transposed,
+                distance, dot, nearest_k_centroids_transposed, transpose_centroids_cluster_major,
+            },
+            layout::VectorLayout,
+            quant::BitQuantizer,
+            rotation::RandomRotation,
         },
-        layout::VectorLayout,
-        quant::BitQuantizer,
-        rotation::RandomRotation,
     },
     supertable::{
         CommitError,
@@ -825,6 +828,17 @@ impl ManifestSnapshot {
                     parts.insert(entry.part_id, Arc::new(OnceCell::new()));
                 }
             }
+        }
+
+        // Read-only-consumer memory mode: derive the 1-bit admit slab and
+        // drop each summary's fp32 fine centroids. Best-effort per entry —
+        // `Arc::get_mut` succeeds for freshly decoded entries (the slow-blob
+        // hydration path, where the bulk of the centroid bytes live) and
+        // skips entries shared with a previous snapshot or a loaded part
+        // (already stripped, or referenced by maintenance state that needs
+        // fp32). Grid centroids in the list are untouched.
+        if options.summary_centroids_from_superfiles {
+            strip_summary_centroids(&mut all_superfiles, &options.vector_columns);
         }
 
         let mut new_superfile_list = SuperfileList::empty(options.clone());
@@ -2562,6 +2576,52 @@ impl RabitqAdmitQuery {
     }
 }
 
+/// Read-only-consumer memory mode: for every uniquely-owned entry, build
+/// each summary cell's 1-bit admit slab from its resident fp32 centroids
+/// and then drop the fp32 vectors. One rotation + quantizer pair per
+/// column, shared across all entries. Entries whose `Arc` is shared (a
+/// previous snapshot or a loaded manifest part also references them) are
+/// skipped — they were either stripped by the earlier load or belong to
+/// maintenance state that needs fp32.
+fn strip_summary_centroids(
+    superfiles: &mut [Arc<SuperfileEntry>],
+    vector_columns: &[VectorConfig],
+) {
+    let encoders: HashMap<&str, (RandomRotation, BitQuantizer, u64)> = vector_columns
+        .iter()
+        .map(|vc| {
+            (
+                vc.column.as_str(),
+                (
+                    RandomRotation::new(vc.dim, vc.rot_seed),
+                    BitQuantizer::new(vc.dim),
+                    vc.rot_seed,
+                ),
+            )
+        })
+        .collect();
+    if encoders.is_empty() {
+        return;
+    }
+    for entry in superfiles.iter_mut() {
+        let Some(entry) = Arc::get_mut(entry) else {
+            continue;
+        };
+        for (column, summary) in entry.vector_summary.iter_mut() {
+            let Some((rotation, quant, rot_seed)) = encoders.get(column.as_str()) else {
+                continue;
+            };
+            for cell in &mut summary.cells {
+                if cell.clusters.dim as usize != quant.dim {
+                    continue;
+                }
+                cell.clusters
+                    .strip_centroids_after_slab(rotation, quant, *rot_seed);
+            }
+        }
+    }
+}
+
 /// Pack a byte sign code into little-endian u64 words, zero-padding the
 /// tail. Zero pad bits match on both sides of an XOR, so they never
 /// contribute to the Hamming distance.
@@ -2752,6 +2812,11 @@ impl ClusterCentroids {
     /// sanctioned way to scan these centroids; do not hand-roll
     /// `(0..n_cent).map(distance)` loops against [`Self::centroid`].
     pub(crate) fn transposed(&self) -> &[f32] {
+        assert!(
+            self.vectors_resident(),
+            "fp32 centroids were dropped (summary_centroids_from_superfiles); \
+             exact scans must read the superfile centroid regions"
+        );
         self.transposed.get_or_init(|| {
             transpose_centroids_cluster_major(
                 &self.centroids,
@@ -2773,33 +2838,78 @@ impl ClusterCentroids {
         self.admit_codes = OnceLock::new();
     }
 
+    /// Whether the fp32 centroid vectors are resident. `false` only after
+    /// [`Self::strip_centroids_after_slab`] (read-only consumer memory
+    /// mode) — exact scans must then read the superfile centroid regions
+    /// instead of this struct.
+    pub(crate) fn vectors_resident(&self) -> bool {
+        self.n_cent == 0 || !self.centroids.is_empty()
+    }
+
+    /// Build the packed 1-bit admit codes + norms from the resident fp32
+    /// centroids. Shared by the lazy per-query cache fill and the eager
+    /// hydration-time build that precedes a centroid strip.
+    fn build_admit_codes(
+        &self,
+        rotation: &RandomRotation,
+        quant: &BitQuantizer,
+        rot_seed: u64,
+    ) -> RabitqAdmitCodes {
+        assert!(
+            self.vectors_resident(),
+            "admit codes need resident fp32 centroids; this summary was stripped"
+        );
+        let dim = self.dim as usize;
+        let n_cent = self.n_cent as usize;
+        let words_per_code = dim.div_ceil(ADMIT_CODE_WORD_BITS);
+        let mut codes = vec![0u64; n_cent.saturating_mul(words_per_code)];
+        let mut norms = vec![0.0f32; n_cent];
+        let mut rotated = vec![0.0f32; dim];
+        let mut byte_code = vec![0u8; quant.code_bytes()];
+        for c in 0..n_cent {
+            let centroid = self.centroid(c);
+            norms[c] = dot(centroid, centroid).sqrt();
+            rotation.apply(centroid, &mut rotated);
+            quant.encode_rotated_into(&rotated, &mut byte_code);
+            codes[c * words_per_code..(c + 1) * words_per_code]
+                .copy_from_slice(&pack_code_bytes_to_words(&byte_code));
+        }
+        RabitqAdmitCodes {
+            rot_seed,
+            words_per_code,
+            codes,
+            norms,
+        }
+    }
+
+    /// Read-only-consumer memory mode: eagerly build the 1-bit admit slab,
+    /// then drop the fp32 centroid vectors (and the transposed cache) from
+    /// memory. `counts`, `n_cent`, and `dim` stay resident — the flat
+    /// cluster id math and posting budgets depend on them. Idempotent.
+    pub(crate) fn strip_centroids_after_slab(
+        &mut self,
+        rotation: &RandomRotation,
+        quant: &BitQuantizer,
+        rot_seed: u64,
+    ) {
+        if self.n_cent == 0 || self.centroids.is_empty() {
+            return;
+        }
+        let codes = self.build_admit_codes(rotation, quant, rot_seed);
+        self.admit_codes = OnceLock::new();
+        let _ = self.admit_codes.set(codes);
+        self.centroids = Vec::new();
+        self.transposed = OnceLock::new();
+    }
+
     /// Packed sign codes for the 1-bit admit prefilter — built once per
     /// instance from the resident fp32 centroids with the query's shared
-    /// rotation/quantizer (no per-instance rotation state).
+    /// rotation/quantizer (no per-instance rotation state). Pre-populated
+    /// by [`Self::strip_centroids_after_slab`] on stripped summaries.
     fn admit_codes(&self, admit: &RabitqAdmitQuery) -> &RabitqAdmitCodes {
-        let cache = self.admit_codes.get_or_init(|| {
-            let dim = self.dim as usize;
-            let n_cent = self.n_cent as usize;
-            let words_per_code = dim.div_ceil(ADMIT_CODE_WORD_BITS);
-            let mut codes = vec![0u64; n_cent.saturating_mul(words_per_code)];
-            let mut norms = vec![0.0f32; n_cent];
-            let mut rotated = vec![0.0f32; dim];
-            let mut byte_code = vec![0u8; admit.quant.code_bytes()];
-            for c in 0..n_cent {
-                let centroid = self.centroid(c);
-                norms[c] = dot(centroid, centroid).sqrt();
-                admit.rotation.apply(centroid, &mut rotated);
-                admit.quant.encode_rotated_into(&rotated, &mut byte_code);
-                codes[c * words_per_code..(c + 1) * words_per_code]
-                    .copy_from_slice(&pack_code_bytes_to_words(&byte_code));
-            }
-            RabitqAdmitCodes {
-                rot_seed: admit.rot_seed,
-                words_per_code,
-                codes,
-                norms,
-            }
-        });
+        let cache = self
+            .admit_codes
+            .get_or_init(|| self.build_admit_codes(&admit.rotation, &admit.quant, admit.rot_seed));
         debug_assert_eq!(
             cache.rot_seed, admit.rot_seed,
             "admit codes built with a different rot_seed"
@@ -3273,6 +3383,58 @@ mod tests {
         // Clone carries the warm admit-code slab.
         let cloned = a.clone();
         assert!(cloned.admit_codes.get().is_some());
+    }
+
+    /// Stripping keeps `counts`/`n_cent`/`dim` and the pre-built admit
+    /// slab, drops the fp32 vectors, and stays idempotent; estimates keep
+    /// serving from the slab afterward.
+    #[test]
+    fn strip_centroids_keeps_slab_and_counts() {
+        const DIM: usize = 64;
+        const ROT_SEED: u64 = 7;
+        let mut flat = vec![0.0f32; 2 * DIM];
+        flat[0] = 1.0;
+        flat[DIM + 5] = 1.0;
+        let mut cc = ClusterCentroids::from_fp32(2, DIM as u32, &flat, vec![3, 4]);
+        let rotation = RandomRotation::new(DIM, ROT_SEED);
+        let quant = BitQuantizer::new(DIM);
+        cc.strip_centroids_after_slab(&rotation, &quant, ROT_SEED);
+        assert!(!cc.vectors_resident());
+        assert_eq!(cc.n_cent, 2);
+        assert_eq!(cc.counts, vec![3, 4]);
+        assert!(cc.centroids.is_empty());
+        let mut query = vec![0.0f32; DIM];
+        query[0] = 1.0;
+        let admit = RabitqAdmitQuery::new(DIM, ROT_SEED, &query);
+        assert!(
+            cc.estimate_min_admit_score(Metric::Cosine, &admit).is_some(),
+            "estimates must keep serving from the pre-built slab"
+        );
+        // Idempotent (a reload may strip already-stripped clones).
+        cc.strip_centroids_after_slab(&rotation, &quant, ROT_SEED);
+        assert!(!cc.vectors_resident());
+        // Clone carries the stripped state + slab.
+        let cloned = cc.clone();
+        assert!(!cloned.vectors_resident());
+        assert!(cloned.admit_codes.get().is_some());
+    }
+
+    /// Exact scans on a stripped summary must fail loudly — the caller is
+    /// required to route through the superfile centroid regions instead.
+    #[test]
+    #[should_panic(expected = "fp32 centroids were dropped")]
+    fn transposed_on_stripped_summary_panics() {
+        const DIM: usize = 64;
+        const ROT_SEED: u64 = 7;
+        let mut flat = vec![0.0f32; DIM];
+        flat[0] = 1.0;
+        let mut cc = ClusterCentroids::from_fp32(1, DIM as u32, &flat, vec![1]);
+        cc.strip_centroids_after_slab(
+            &RandomRotation::new(DIM, ROT_SEED),
+            &BitQuantizer::new(DIM),
+            ROT_SEED,
+        );
+        let _ = cc.transposed();
     }
 
     /// `score_clusters_into` must match [`distance`] on the fp32 centroid slice.

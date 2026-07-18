@@ -464,6 +464,20 @@ pub struct SupertableOptions {
     /// the application never refreshes by hand. Default:
     /// [`Consistency::BoundedStaleness`] with a 1s window.
     pub read_consistency: Consistency,
+    /// Read-only-consumer memory mode for per-superfile vector summaries:
+    /// when `true`, manifest hydration derives the 1-bit admit slab +
+    /// norms from each summary's fp32 fine centroids and then drops the
+    /// fp32 vectors from memory. The exact admit rescore reads centroid
+    /// regions from the superfiles through the attached disk cache
+    /// instead (mmap-served warm, range-GET on first touch).
+    ///
+    /// **Read-only handles only.** Writer paths re-encode resident
+    /// summaries back to storage (slow-state blob republish on hidden
+    /// commits / drain checkpoints, latest-part rewrites) — a handle
+    /// that commits with this set would persist empty centroids; the
+    /// encode path asserts against that. Grid (routing) centroids and
+    /// summary `counts` stay resident regardless. Default `false`.
+    pub summary_centroids_from_superfiles: bool,
 }
 
 impl SupertableOptions {
@@ -610,6 +624,7 @@ impl SupertableOptions {
             put_multipart_threshold_bytes: DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES,
             verify_crc_on_open: true,
             read_consistency: Consistency::default(),
+            summary_centroids_from_superfiles: false,
         })
     }
 
@@ -849,6 +864,16 @@ impl SupertableOptions {
     /// `true`. See [`Self::verify_crc_on_open`].
     pub fn with_verify_crc_on_open(mut self, v: bool) -> Self {
         self.verify_crc_on_open = v;
+        self
+    }
+
+    /// Read-only-consumer memory mode: derive the 1-bit admit slab at
+    /// hydration and drop summary fp32 fine centroids from memory; the
+    /// exact admit rescore reads superfile centroid regions through the
+    /// disk cache instead. See
+    /// [`Self::summary_centroids_from_superfiles`].
+    pub fn with_summary_centroids_from_superfiles(mut self, v: bool) -> Self {
+        self.summary_centroids_from_superfiles = v;
         self
     }
 

@@ -331,6 +331,20 @@ fn postings_by_cell_from_summaries(
 /// degenerates to scoring everything — identical to the exact path.
 const RABITQ_ADMIT_CELL_SHORTLIST: usize = 48;
 
+/// One admit fine-centroid candidate:
+/// `(superfile index, flat cluster id, score, cell id, indexed doc count)`.
+type FineCandidate = (usize, u32, f32, Option<u32>, u64);
+
+/// A summary cell selected for exact scoring whose fp32 centroids were
+/// dropped at hydration (`summary_centroids_from_superfiles`): its exact
+/// scores are read from the superfile's on-disk centroid region through
+/// the reader cache instead.
+struct DeferredCellRescore {
+    si: usize,
+    cell_id: Option<u32>,
+    flat_base: u32,
+}
+
 /// Validate one superfile's vector summary for `column` (present,
 /// non-empty, dims matching the query) and hand it back. Shared by the
 /// prefilter and exact passes of [`score_fine_candidates`].
@@ -384,7 +398,7 @@ fn score_fine_candidates(
     metric: Metric,
     admit: Option<(&RabitqAdmitQuery, &[u32])>,
     allow: Option<&HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
-) -> Result<Vec<(usize, u32, f32, Option<u32>, u64)>, QueryError> {
+) -> Result<(Vec<FineCandidate>, Vec<DeferredCellRescore>), QueryError> {
     let eligible =
         |entry: &Arc<SuperfileEntry>| allow.is_none_or(|m| m.contains_key(&entry.uri));
 
@@ -426,7 +440,8 @@ fn score_fine_candidates(
         None
     };
 
-    let mut candidates: Vec<(usize, u32, f32, Option<u32>, u64)> = Vec::new();
+    let mut candidates: Vec<FineCandidate> = Vec::new();
+    let mut deferred: Vec<DeferredCellRescore> = Vec::new();
     for (si, entry) in superfiles.iter().enumerate() {
         if !eligible(entry) {
             continue;
@@ -440,21 +455,32 @@ fn score_fine_candidates(
                 .as_ref()
                 .is_some_and(|keep| cell.cell_id.is_some_and(|cid| !keep.contains(&cid)));
             if !skipped {
-                cell.clusters
-                    .score_clusters_into(metric, query, |local, score| {
-                        let count = cell
-                            .clusters
-                            .counts
-                            .get(local as usize)
-                            .copied()
-                            .unwrap_or(0) as u64;
-                        candidates.push((si, flat_base + local, score, cell.cell_id, count));
+                if cell.clusters.vectors_resident() {
+                    cell.clusters
+                        .score_clusters_into(metric, query, |local, score| {
+                            let count = cell
+                                .clusters
+                                .counts
+                                .get(local as usize)
+                                .copied()
+                                .unwrap_or(0) as u64;
+                            candidates.push((si, flat_base + local, score, cell.cell_id, count));
+                        });
+                } else {
+                    // Stripped summary (read-only consumer memory mode):
+                    // exact scores come from the superfile's centroid
+                    // region, fetched in one wave after this scan.
+                    deferred.push(DeferredCellRescore {
+                        si,
+                        cell_id: cell.cell_id,
+                        flat_base,
                     });
+                }
             }
             flat_base = flat_base.saturating_add(cell.clusters.n_cent);
         }
     }
-    Ok(candidates)
+    Ok((candidates, deferred))
 }
 
 /// Minimum fine-ranked picks in the union cell selection used by the
@@ -942,6 +968,91 @@ pub(crate) async fn user_placement_for_scalar_resolve(
 }
 
 impl SupertableReader {
+    /// Exact admit scores for summary cells whose fp32 was dropped at
+    /// hydration (`summary_centroids_from_superfiles`): open each involved
+    /// superfile through the tiered reader cache and score its on-disk
+    /// centroid region (mmap-served warm; bounded range fetches cold).
+    /// One concurrent wave across superfiles, cells within a superfile
+    /// fetched concurrently too. Background fills stay off — an admit
+    /// touch of a cell's centroid bytes must not trigger whole-file pulls
+    /// for files the fan-out may never probe.
+    async fn rescore_deferred_cells(
+        &self,
+        superfiles: &[Arc<SuperfileEntry>],
+        column: &str,
+        query: &[f32],
+        candidates: &mut Vec<FineCandidate>,
+        deferred: Vec<DeferredCellRescore>,
+    ) -> Result<(), QueryError> {
+        let manifest = self.manifest();
+        let store = Arc::clone(&manifest.options.store);
+        let disk_cache = manifest.options.disk_cache.as_ref().map(Arc::clone);
+        let storage = manifest.options.storage.as_ref().map(Arc::clone);
+        let mut by_si: HashMap<usize, Vec<DeferredCellRescore>> = HashMap::new();
+        for d in deferred {
+            by_si.entry(d.si).or_default().push(d);
+        }
+        let waves = by_si.into_iter().map(|(si, cells)| {
+            let entry = Arc::clone(&superfiles[si]);
+            let store = Arc::clone(&store);
+            let disk_cache = disk_cache.clone();
+            let storage = storage.clone();
+            async move {
+                let reader = dispatch::open_reader(
+                    &store,
+                    disk_cache.as_ref(),
+                    storage.as_ref(),
+                    &entry,
+                    false,
+                )
+                .await?;
+                let vec_reader = reader.vec().ok_or_else(|| {
+                    QueryError::Execute(format!(
+                        "superfile {} has no vector section for the deferred admit rescore",
+                        entry.superfile_id
+                    ))
+                })?;
+                let cell_scores = try_join_all(cells.iter().map(|d| async {
+                    vec_reader
+                        .score_cell_centroids_async(column, d.cell_id, query)
+                        .await
+                        .map_err(|e| {
+                            QueryError::Execute(format!("deferred admit rescore: {e}"))
+                        })
+                }))
+                .await?;
+                Ok::<_, QueryError>((si, cells, cell_scores))
+            }
+        });
+        for (si, cells, cell_scores) in try_join_all(waves).await? {
+            let entry = &superfiles[si];
+            let vs = entry
+                .vector_summary
+                .get(column)
+                .expect("summary presence validated by score_fine_candidates");
+            for (d, scores) in cells.iter().zip(cell_scores) {
+                // Counts stay resident on the stripped summary — only the
+                // fp32 vectors were dropped.
+                let Some(counts) = vs
+                    .cells
+                    .iter()
+                    .find(|cell| cell.cell_id == d.cell_id)
+                    .map(|cell| &cell.clusters.counts)
+                else {
+                    continue;
+                };
+                for (local, score) in scores {
+                    let count = counts.get(local as usize).copied().unwrap_or(0) as u64;
+                    if count == 0 {
+                        continue;
+                    }
+                    candidates.push((si, d.flat_base + local, score, d.cell_id, count));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Global cross-superfile cluster selection + waved fan-out. Shared
     /// by the user-table path and the hidden vector-index path.
     async fn fanout_vector_clusters(
@@ -1114,7 +1225,7 @@ impl SupertableReader {
                 .iter()
                 .map(|(cell, _)| *cell)
                 .collect();
-            let candidates = score_fine_candidates(
+            let (mut candidates, deferred) = score_fine_candidates(
                 &superfiles,
                 column,
                 query,
@@ -1122,6 +1233,10 @@ impl SupertableReader {
                 admit_q.as_ref().map(|aq| (aq, must_include.as_slice())),
                 allow_ref,
             )?;
+            if !deferred.is_empty() {
+                self.rescore_deferred_cells(&superfiles, column, query, &mut candidates, deferred)
+                    .await?;
+            }
             candidate_counts = candidates
                 .iter()
                 .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
@@ -1208,8 +1323,12 @@ impl SupertableReader {
         } else {
             // No grid, or untagged summaries: score every fine centroid
             // (legacy flat path, no prefilter).
-            let candidates =
+            let (mut candidates, deferred) =
                 score_fine_candidates(&superfiles, column, query, metric, None, allow_ref)?;
+            if !deferred.is_empty() {
+                self.rescore_deferred_cells(&superfiles, column, query, &mut candidates, deferred)
+                    .await?;
+            }
             candidate_counts = candidates
                 .iter()
                 .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))

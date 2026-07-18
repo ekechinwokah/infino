@@ -575,6 +575,19 @@ pub fn decode_fts_summary(bytes: &[u8]) -> Result<FtsSummaryAgg, DecodeError> {
 pub fn encode_cluster_centroids(cl: &ClusterCentroids) -> Vec<u8> {
     let nc = cl.n_cent as usize;
     let cd = cl.dim as usize;
+    // A summary whose fp32 was dropped (`summary_centroids_from_superfiles`,
+    // read-only consumer memory mode) must never reach the wire: the
+    // slow-state blob and manifest parts are re-encoded from these resident
+    // structs, so persisting empty centroids would corrupt routing state
+    // for every future open. Fail loudly instead — only writer handles
+    // (which must keep the mode off) encode summaries.
+    assert!(
+        cl.centroids.len() == nc * cd,
+        "encode_cluster_centroids on a stripped summary ({} of {} fp32 values); \
+         writer handles must not enable summary_centroids_from_superfiles",
+        cl.centroids.len(),
+        nc * cd,
+    );
     let body = nc * cd;
     let mut out = Vec::with_capacity(12 + nc * 4 + body * 4);
     out.extend_from_slice(&cl.n_cent.to_le_bytes());
@@ -1337,5 +1350,26 @@ mod vector_summary_tests {
         let got = decode_vector_summary(&encode_vector_summary(&s)).expect("decode");
         assert_eq!(got.centroid, s.centroid);
         assert!(got.cells.is_empty());
+    }
+
+    /// A stripped summary (read-only consumer memory mode) must never be
+    /// re-serialized — silently persisting empty centroids would corrupt
+    /// the slow-state blob / manifest part for every future open.
+    #[test]
+    #[should_panic(expected = "stripped summary")]
+    fn encode_stripped_summary_panics() {
+        use crate::superfile::vector::{quant::BitQuantizer, rotation::RandomRotation};
+
+        const DIM: usize = 16;
+        const ROT_SEED: u64 = 7;
+        let mut flat = vec![0.0f32; DIM];
+        flat[0] = 1.0;
+        let mut clusters = ClusterCentroids::from_fp32(1, DIM as u32, &flat, vec![1]);
+        clusters.strip_centroids_after_slab(
+            &RandomRotation::new(DIM, ROT_SEED),
+            &BitQuantizer::new(DIM),
+            ROT_SEED,
+        );
+        let _ = super::encode_cluster_centroids(&clusters);
     }
 }

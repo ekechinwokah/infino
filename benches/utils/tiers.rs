@@ -701,6 +701,13 @@ fn fresh_disk_cache_with_mode(
     (dir, cache)
 }
 
+/// Opt-in for the read-only-consumer summary-centroid memory mode
+/// (`SupertableOptions::summary_centroids_from_superfiles`): hydration
+/// derives the 1-bit admit slab and drops summary fp32 fine centroids;
+/// the exact admit rescore reads superfile centroid regions through the
+/// disk cache. Bench-harness A/B switch; the engine default stays off.
+const SUMMARY_CENTROIDS_FROM_SUPERFILES_ENV: &str = "INFINO_BENCH_SUMMARY_CENTROIDS_FROM_SUPERFILES";
+
 pub fn consumer_options(
     base: SupertableOptions,
     storage: Arc<dyn StorageProvider>,
@@ -710,9 +717,14 @@ pub fn consumer_options(
     // concurrent writers. Snapshot consistency keeps the read path free of
     // pointer-GET refreshes so the measured latency is pure query cost; the
     // one-time cold-open manifest read is timed separately.
+    let summary_centroids_from_superfiles = std::env::var(SUMMARY_CENTROIDS_FROM_SUPERFILES_ENV)
+        .ok()
+        .as_deref()
+        == Some("1");
     base.with_storage(storage)
         .with_disk_cache(cache)
         .with_read_consistency(infino::supertable::options::Consistency::Snapshot)
+        .with_summary_centroids_from_superfiles(summary_centroids_from_superfiles)
 }
 
 pub fn open_consumer(opts: SupertableOptions) -> Supertable {
