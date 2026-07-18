@@ -2286,7 +2286,12 @@ pub mod vector {
             }
             samples.sort_unstable();
             let p50_ns = samples[samples.len() / 2].as_secs_f64() * 1e9;
-            (p50_ns, warm_cpu_s, warm_io, sampler.stop_stats().peak_rss_bytes)
+            (
+                p50_ns,
+                warm_cpu_s,
+                warm_io,
+                sampler.stop_stats().peak_rss_bytes,
+            )
         });
         // Engine-pinned estimate, sampled after the warm battery but BEFORE
         // the cold-store measurement: the cold guard opens a second consumer
@@ -2530,7 +2535,9 @@ pub mod vector {
 
         let (built, ingest_metrics) = if let Some(fixture) = existing {
             let opened = (supertable::open_existing(Modality::Vector, fixture), None);
-            crate::rss::log_rss_breakdown("supertable_vector after open_existing (producer handle)");
+            crate::rss::log_rss_breakdown(
+                "supertable_vector after open_existing (producer handle)",
+            );
             opened
         } else if crate::dataset::dataset_mode() && !phases.build {
             (supertable::open_dataset(Modality::Vector), None)
@@ -2682,8 +2689,7 @@ pub mod vector {
             // Bracket the consumer open with settled-anon samples: the delta
             // is the engine handle's own pinned memory, free of the harness
             // heap that precedes it (corpus bookkeeping, producer handle).
-            let anon_before_consumer =
-                rss::settled_rss_breakdown().map(|(_, anon, _, _)| anon);
+            let anon_before_consumer = rss::settled_rss_breakdown().map(|(_, anon, _, _)| anon);
             let consumer = tiers::open_consumer(tiers::consumer_options(
                 supertable::options_for(Modality::Vector, None),
                 consumer_meter.provider(),

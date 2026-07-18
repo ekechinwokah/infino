@@ -1733,13 +1733,15 @@ impl VectorReader {
             .get(column)
             .ok_or_else(|| VectorError::UnknownColumn(column.to_string()))?;
         let col_index = match cell_id {
-            Some(cell) if self.is_multi_cell() => {
-                self.cell_ids.iter().position(|&c| c == cell).ok_or_else(|| {
+            Some(cell) if self.is_multi_cell() => self
+                .cell_ids
+                .iter()
+                .position(|&c| c == cell)
+                .ok_or_else(|| {
                     VectorError::Read(ReadError::MalformedVersion(format!(
                         "cell {cell} not present in multi-cell blob"
                     )))
-                })?
-            }
+                })?,
             _ => cid as usize,
         };
         let col = &self.columns[col_index];

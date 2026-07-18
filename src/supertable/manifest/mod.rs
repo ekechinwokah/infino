@@ -3407,7 +3407,8 @@ mod tests {
         query[0] = 1.0;
         let admit = RabitqAdmitQuery::new(DIM, ROT_SEED, &query);
         assert!(
-            cc.estimate_min_admit_score(Metric::Cosine, &admit).is_some(),
+            cc.estimate_min_admit_score(Metric::Cosine, &admit)
+                .is_some(),
             "estimates must keep serving from the pre-built slab"
         );
         // Idempotent (a reload may strip already-stripped clones).

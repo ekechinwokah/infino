@@ -706,7 +706,8 @@ fn fresh_disk_cache_with_mode(
 /// derives the 1-bit admit slab and drops summary fp32 fine centroids;
 /// the exact admit rescore reads superfile centroid regions through the
 /// disk cache. Bench-harness A/B switch; the engine default stays off.
-const SUMMARY_CENTROIDS_FROM_SUPERFILES_ENV: &str = "INFINO_BENCH_SUMMARY_CENTROIDS_FROM_SUPERFILES";
+const SUMMARY_CENTROIDS_FROM_SUPERFILES_ENV: &str =
+    "INFINO_BENCH_SUMMARY_CENTROIDS_FROM_SUPERFILES";
 
 pub fn consumer_options(
     base: SupertableOptions,

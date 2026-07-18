@@ -399,8 +399,7 @@ fn score_fine_candidates(
     admit: Option<(&RabitqAdmitQuery, &[u32])>,
     allow: Option<&HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
 ) -> Result<(Vec<FineCandidate>, Vec<DeferredCellRescore>), QueryError> {
-    let eligible =
-        |entry: &Arc<SuperfileEntry>| allow.is_none_or(|m| m.contains_key(&entry.uri));
+    let eligible = |entry: &Arc<SuperfileEntry>| allow.is_none_or(|m| m.contains_key(&entry.uri));
 
     let shortlist: Option<HashSet<u32>> = if let Some((admit_q, must_include)) = admit {
         let mut cell_best: HashMap<u32, f32> = HashMap::new();
@@ -1016,9 +1015,7 @@ impl SupertableReader {
                     vec_reader
                         .score_cell_centroids_async(column, d.cell_id, query)
                         .await
-                        .map_err(|e| {
-                            QueryError::Execute(format!("deferred admit rescore: {e}"))
-                        })
+                        .map_err(|e| QueryError::Execute(format!("deferred admit rescore: {e}")))
                 }))
                 .await?;
                 Ok::<_, QueryError>((si, cells, cell_scores))
