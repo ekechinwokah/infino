@@ -317,17 +317,25 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
     });
     let vectors = modality.has_vector().then(|| {
         if let Some(path) = explicit_vector_path.as_deref() {
+            // A persisted corpus is either base-only (`n_docs` rows) or —
+            // for the vector modality — carries the undrained delta tail
+            // (`vector_docs` rows, the shape `generate` writes). Accept
+            // both; `vector_delta_batch` regenerates the tail when only
+            // the base rows are present.
             eprintln!(
                 "[supertable_ingest] opening persisted {} ×{DIM} vector corpus from {}...",
                 fmt_count(n_docs),
                 path.display()
             );
-            MmapVectorCorpus::open(path, n_docs).unwrap_or_else(|error| {
-                panic!(
-                    "failed to open {VECTOR_CORPUS_PATH_ENV}={}: {error}",
-                    path.display()
-                )
-            })
+            MmapVectorCorpus::open(path, vector_docs)
+                .or_else(|_| MmapVectorCorpus::open(path, n_docs))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "failed to open {VECTOR_CORPUS_PATH_ENV}={} with either \
+                         {vector_docs} (base + delta) or {n_docs} (base-only) rows: {error}",
+                        path.display()
+                    )
+                })
         } else {
             eprintln!(
                 "[supertable_ingest] generating {} ×{DIM} vector corpus (mmap-backed)...",
