@@ -389,6 +389,15 @@ fn score_fine_candidates(
 /// caller probe width larger than this takes precedence.
 const UNION_FINE_PICKS_MIN: usize = 2;
 
+/// Cell-probe floor for filtered (allow-set) queries over the hidden cell
+/// index. The manifest's default routing (fine-first p=1) is calibrated
+/// for unfiltered search, where fine p1 cell coverage measures 1.000; an
+/// allow-set thins each cell's matching postings (~10% selectivity in the
+/// bench), so the nearest *matching* neighbors spread past the top cell
+/// and p=1 caps filtered recall well below the unfiltered number
+/// (measured 0.756 vs 0.997 at 10M). Probe 4 cells instead.
+const FILTERED_HIDDEN_CELL_NPROBE: usize = 4;
+
 /// Default-path cell selection, shared by the hidden (post-drain) and user
 /// (pre-drain) branches: probe the fine-ranked top cell, adding the grid's
 /// top cell only when its own fine score is a genuine near-tie of the fine
@@ -981,7 +990,18 @@ impl SupertableReader {
         let candidate_counts: HashMap<(usize, u32), u64>;
         if let (Some(ranked_scored), true) = (&ranked_cells_scored, any_tagged) {
             let cell_routing = if hidden_vector_index {
-                hidden_routing.expect("hidden manifest carries routing")
+                let base = hidden_routing.expect("hidden manifest carries routing");
+                if filtered {
+                    // Allow-set queries widen to the filtered floor; the
+                    // manifest's persisted routing still wins if broader.
+                    CellRoutingParams {
+                        nprobe_min: base.nprobe_min.max(FILTERED_HIDDEN_CELL_NPROBE),
+                        nprobe_max: base.nprobe_max.max(FILTERED_HIDDEN_CELL_NPROBE),
+                        ..base
+                    }
+                } else {
+                    base
+                }
             } else if filtered || options.nprobe.is_some() {
                 CellRoutingParams {
                     nprobe_min: nprobe.max(1),
