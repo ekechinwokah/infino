@@ -23,9 +23,11 @@
 //! decoded entries live in the hydrated `ManifestSnapshot` (there is deliberately no
 //! separate cache).
 
-use std::{mem::size_of, sync::Arc};
+use std::{mem::size_of, ops::Range, sync::Arc};
 
 use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt, stream};
+use tokio::task::spawn_blocking;
 use uuid::Uuid;
 
 use crate::{
@@ -49,6 +51,19 @@ const CHECKPOINT_PENDING_LEN_OFF: usize = CHECKPOINT_METADATA_LEN_OFF + size_of:
 /// provider is prefixed, so blobs land under the hidden subtree and request
 /// metering attributes them to the hidden index automatically).
 pub(crate) const STORAGE_PREFIX: &str = "slow-vector-state/";
+
+/// Bytes per striped range-GET when fetching a large slow-state blob. One
+/// HTTP stream tops out well under NIC line rate (~200–400 MB/s measured on
+/// Azure), and at 100M docs the blob is multi-GiB — a single `get` put ~10 s
+/// of pure transfer into every cold open. 64 MiB per range keeps the
+/// request count negligible against GET pricing while letting the streams
+/// aggregate toward line rate.
+const STRIPED_FETCH_CHUNK_BYTES: u64 = 64 << 20;
+
+/// Concurrent range-GETs per striped blob fetch. Matches the connection
+/// count one host can productively drive against Azure/S3 before the
+/// per-stream gain flattens.
+const STRIPED_FETCH_MAX_IN_FLIGHT: usize = 16;
 
 /// Object-storage path for a content-addressed slow vector-state blob.
 pub(crate) fn storage_path(hash: &ContentHash) -> String {
@@ -220,14 +235,62 @@ pub(crate) async fn load_full_state(
     uri: &str,
     expected: &ContentHash,
 ) -> Result<SlowVectorState, SlowVectorStateError> {
-    let (bytes, _) = storage
-        .get(uri)
-        .await
-        .map_err(|e| SlowVectorStateError::Storage(e.to_string()))?;
-    if ContentHash::of(bytes.as_ref()) != *expected {
-        return Err(SlowVectorStateError::HashMismatch);
+    let bytes = fetch_blob_striped(storage, uri, STRIPED_FETCH_CHUNK_BYTES).await?;
+    let expected = *expected;
+    // blake3 over the whole blob plus the Avro parse is a CPU wave
+    // (multi-GiB at 100M docs); run it on the blocking pool so the
+    // runtime keeps driving I/O instead of stalling behind the decode.
+    match spawn_blocking(move || {
+        if ContentHash::of(bytes.as_ref()) != expected {
+            return Err(SlowVectorStateError::HashMismatch);
+        }
+        decode_state(bytes.as_ref())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(join_error) => Err(SlowVectorStateError::Parse(format!(
+            "slow-state decode task failed: {join_error}"
+        ))),
     }
-    decode_state(bytes.as_ref())
+}
+
+/// Fetch one object as bytes, striping objects larger than `chunk_bytes`
+/// across parallel range-GETs ([`STRIPED_FETCH_MAX_IN_FLIGHT`] in flight).
+/// Objects at or under one chunk keep the single-request `get` — requests
+/// are the priced dimension, so small blobs must not fan out.
+async fn fetch_blob_striped(
+    storage: &dyn StorageProvider,
+    uri: &str,
+    chunk_bytes: u64,
+) -> Result<Bytes, SlowVectorStateError> {
+    let store_err = |e: StorageError| SlowVectorStateError::Storage(e.to_string());
+    let meta = storage.head(uri).await.map_err(store_err)?;
+    if meta.size <= chunk_bytes {
+        let (bytes, _) = storage.get(uri).await.map_err(store_err)?;
+        return Ok(bytes);
+    }
+    let ranges: Vec<Range<u64>> = (0..meta.size)
+        .step_by(chunk_bytes.max(1) as usize)
+        .map(|start| start..(start + chunk_bytes).min(meta.size))
+        .collect();
+    // `buffered` preserves range order, so the concatenation below
+    // reassembles the object byte-exactly; the content hash check in
+    // the caller is the end-to-end integrity gate.
+    let chunks: Vec<Bytes> = stream::iter(
+        ranges
+            .into_iter()
+            .map(|range| async move { storage.get_range(uri, range).await }),
+    )
+    .buffered(STRIPED_FETCH_MAX_IN_FLIGHT)
+    .try_collect()
+    .await
+    .map_err(store_err)?;
+    let mut out = Vec::with_capacity(meta.size as usize);
+    for chunk in &chunks {
+        out.extend_from_slice(chunk);
+    }
+    Ok(Bytes::from(out))
 }
 
 #[cfg(test)]
@@ -319,6 +382,26 @@ mod tests {
         assert_eq!(decoded_pending.metadata, pending.metadata);
         assert_eq!(decoded_pending.entries.len(), 1);
         assert_entries_match(&decoded_pending.entries[0], &pending_entries[0]);
+    }
+
+    /// Chunk size that forces the striped path on a tiny fixture blob.
+    const TINY_STRIPE_CHUNK_BYTES: u64 = 64;
+
+    #[tokio::test]
+    async fn striped_fetch_reassembles_byte_exact() {
+        let dir = tempdir().expect("tempdir");
+        let storage = LocalFsStorageProvider::new(dir.path()).expect("localfs");
+        let entries = vec![entry(FIRST_N_DOCS, 0), entry(SECOND_N_DOCS, 1)];
+        let (uri, _) = write_state(&storage, &entries).await.expect("write");
+        let whole = storage.get(&uri).await.expect("whole get").0;
+        assert!(
+            whole.len() as u64 > TINY_STRIPE_CHUNK_BYTES,
+            "fixture must exceed one stripe chunk"
+        );
+        let striped = fetch_blob_striped(&storage, &uri, TINY_STRIPE_CHUNK_BYTES)
+            .await
+            .expect("striped fetch");
+        assert_eq!(striped, whole, "striped reassembly must be byte-exact");
     }
 
     #[tokio::test]

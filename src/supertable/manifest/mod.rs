@@ -1825,19 +1825,16 @@ impl ManifestPartLoader {
             .get(uri)
             .await
             .map_err(ManifestLoadError::Storage)?;
-        let actual_hash = ContentHash::of(&bytes);
-        if actual_hash != *expected_hash {
-            return Err(ManifestLoadError::ContentHashMismatch {
-                expected: expected_hash.to_hex(),
-                actual: actual_hash.to_hex(),
-            });
-        }
-        // Populate the cache for next time (best-effort; the hash is
-        // already verified, satisfying `put`'s contract).
+        // Hash verify runs inside the same blocking task as the decode:
+        // blake3 over a multi-hundred-MiB part is CPU the polling task
+        // must not absorb (it serializes the nominally-concurrent part
+        // fan exactly like the inline decode used to).
+        let parsed = verify_and_decode_part_off_thread(bytes.clone(), *expected_hash).await?;
+        // Populate the cache for next time (best-effort; the hash was
+        // verified above, satisfying `put`'s contract).
         if let Some(cache) = &self.manifest_disk_cache {
-            cache.put(actual_hash, &bytes).await;
+            cache.put(*expected_hash, &bytes).await;
         }
-        let parsed = decode_part_off_thread(bytes).await?;
         Ok(Arc::new(parsed))
     }
 }
@@ -1853,6 +1850,31 @@ async fn decode_part_off_thread(bytes: Bytes) -> Result<ManifestPart, ManifestLo
         Ok(result) => Ok(result?),
         Err(join_error) => Err(ManifestLoadError::Parse(part::PartParseError::Avro(
             format!("part decode task failed: {join_error}"),
+        ))),
+    }
+}
+
+/// [`decode_part_off_thread`] preceded by a blake3 content-hash check on
+/// the same blocking task, for the storage-GET path where the bytes are
+/// not yet verified.
+async fn verify_and_decode_part_off_thread(
+    bytes: Bytes,
+    expected_hash: ContentHash,
+) -> Result<ManifestPart, ManifestLoadError> {
+    let verify_then_decode = move || {
+        let actual_hash = ContentHash::of(&bytes);
+        if actual_hash != expected_hash {
+            return Err(ManifestLoadError::ContentHashMismatch {
+                expected: expected_hash.to_hex(),
+                actual: actual_hash.to_hex(),
+            });
+        }
+        part::decode(&bytes).map_err(ManifestLoadError::from)
+    };
+    match spawn_blocking(verify_then_decode).await {
+        Ok(result) => result,
+        Err(join_error) => Err(ManifestLoadError::Parse(part::PartParseError::Avro(
+            format!("part verify/decode task failed: {join_error}"),
         ))),
     }
 }
