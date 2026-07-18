@@ -38,6 +38,7 @@ pub mod term_range;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
+    f32::consts::PI,
     fmt,
     ops::Deref,
     sync::{Arc, OnceLock},
@@ -63,10 +64,12 @@ use crate::{
     storage::{StorageError, StorageProvider},
     superfile::vector::{
         distance::{
-            Metric, all_centroid_scores_transposed, distance, nearest_k_centroids_transposed,
-            transpose_centroids_cluster_major,
+            COSINE_DISTANCE_BASE, L2_CROSS_TERM_COEFF, Metric, all_centroid_scores_transposed,
+            distance, dot, nearest_k_centroids_transposed, transpose_centroids_cluster_major,
         },
         layout::VectorLayout,
+        quant::BitQuantizer,
+        rotation::RandomRotation,
     },
     supertable::{
         CommitError,
@@ -2511,6 +2514,90 @@ pub struct CellVectorSummary {
     pub clusters: ClusterCentroids,
 }
 
+/// Bits per `u64` word in a packed centroid sign code.
+const ADMIT_CODE_WORD_BITS: usize = 64;
+
+/// Per-query state for the 1-bit admit prefilter: the column's rotation and
+/// sign quantizer, the query's packed sign code, and a cosine lookup table
+/// indexed by Hamming distance (`cos(π·h/dim)` — the standard sign-sketch
+/// angle estimator). Built **once per query** and shared across every
+/// [`ClusterCentroids`] instance; the failed first cut of this idea built
+/// rotation state per instance and re-rotated the query thousands of times.
+#[derive(Debug)]
+pub(crate) struct RabitqAdmitQuery {
+    rot_seed: u64,
+    rotation: RandomRotation,
+    quant: BitQuantizer,
+    /// Query sign code packed into u64 words (zero-padded past `dim`).
+    q_words: Vec<u64>,
+    /// `‖q‖` and `‖q‖²` for the metric transforms.
+    q_norm: f32,
+    q_l2sq: f32,
+    /// `cos(π·h/dim)` for h in `0..=dim`.
+    cos_table: Vec<f32>,
+}
+
+impl RabitqAdmitQuery {
+    pub(crate) fn new(dim: usize, rot_seed: u64, query: &[f32]) -> Self {
+        debug_assert_eq!(query.len(), dim);
+        let rotation = RandomRotation::new(dim, rot_seed);
+        let quant = BitQuantizer::new(dim);
+        let mut rotated = vec![0.0f32; dim];
+        rotation.apply(query, &mut rotated);
+        let mut code = vec![0u8; quant.code_bytes()];
+        quant.encode_rotated_into(&rotated, &mut code);
+        let q_l2sq = dot(query, query);
+        let cos_table = (0..=dim)
+            .map(|h| (PI * h as f32 / dim as f32).cos())
+            .collect();
+        Self {
+            rot_seed,
+            rotation,
+            quant,
+            q_words: pack_code_bytes_to_words(&code),
+            q_norm: q_l2sq.sqrt(),
+            q_l2sq,
+            cos_table,
+        }
+    }
+}
+
+/// Pack a byte sign code into little-endian u64 words, zero-padding the
+/// tail. Zero pad bits match on both sides of an XOR, so they never
+/// contribute to the Hamming distance.
+fn pack_code_bytes_to_words(code: &[u8]) -> Vec<u64> {
+    let bytes_per_word = ADMIT_CODE_WORD_BITS / 8;
+    code.chunks(bytes_per_word)
+        .map(|chunk| {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            u64::from_le_bytes(word)
+        })
+        .collect()
+}
+
+/// XOR + popcount Hamming distance over packed sign codes. Safe Rust —
+/// `count_ones` lowers to the POPCNT instruction on x86-64.
+#[inline]
+fn hamming_words(a: &[u64], b: &[u64]) -> u32 {
+    debug_assert_eq!(a.len(), b.len());
+    a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
+}
+
+/// Packed 1-bit sign codes for every centroid in a [`ClusterCentroids`],
+/// plus per-centroid norms for the metric transforms. Derived lazily from
+/// the resident fp32 centroids with the column rotation; wire format is
+/// untouched (fp32 stays canonical).
+#[derive(Debug, Clone)]
+struct RabitqAdmitCodes {
+    rot_seed: u64,
+    words_per_code: usize,
+    /// `n_cent * words_per_code`, cluster-major.
+    codes: Vec<u64>,
+    /// `‖centroid[c]‖` per cluster.
+    norms: Vec<f32>,
+}
+
 /// Per-cluster IVF centroids for one vector column, stored canonically as fp32
 /// cluster-major (`n_cent * dim`) plus a derived block-transposed cache for hot
 /// routing. Carried in the manifest so a query can rank every superfile's
@@ -2526,6 +2613,11 @@ pub struct CellVectorSummary {
 /// SIMD kernels in `superfile::vector::distance` over [`Self::transposed`],
 /// the lazily-built block-transposed cache. [`Self::score_one`] stays a
 /// zero-copy single-centroid [`distance`] probe.
+///
+/// The 1-bit admit prefilter ([`Self::estimate_min_admit_score`]) ranks
+/// whole instances cheaply from packed sign codes; exact fp32 scoring then
+/// runs only on the shortlisted cells, so final routing scores are always
+/// exact.
 #[derive(Debug, Default)]
 pub struct ClusterCentroids {
     pub n_cent: u32,
@@ -2540,19 +2632,25 @@ pub struct ClusterCentroids {
     /// instance on first scan; reset by `Clone` (a clone may mutate
     /// `centroids`, so it re-derives its own cache on first use).
     transposed: OnceLock<Vec<f32>>,
+    /// Lazily-built packed sign codes for the 1-bit admit prefilter.
+    admit_codes: OnceLock<RabitqAdmitCodes>,
 }
 
 impl Clone for ClusterCentroids {
     fn clone(&self) -> Self {
-        // Preserve a warm transposed cache when present. Dropping it on every
-        // clone forced the query path (which historically cloned the global
-        // grid / VectorCell strategy each search) to rebuild the scalar
-        // block-transpose — milliseconds at dim=1024 — before the SIMD scan
-        // could run. Callers that mutate `centroids` after cloning must
-        // [`Self::invalidate_transposed`].
+        // Preserve warm scan caches when present. Dropping the transposed
+        // cache on every clone forced the query path (which historically
+        // cloned the global grid / VectorCell strategy each search) to
+        // rebuild the scalar block-transpose — milliseconds at dim=1024 —
+        // before the SIMD scan could run. Callers that mutate `centroids`
+        // after cloning must [`Self::invalidate_transposed`].
         let transposed = OnceLock::new();
         if let Some(cache) = self.transposed.get() {
             let _ = transposed.set(cache.clone());
+        }
+        let admit_codes = OnceLock::new();
+        if let Some(cache) = self.admit_codes.get() {
+            let _ = admit_codes.set(cache.clone());
         }
         Self {
             n_cent: self.n_cent,
@@ -2560,6 +2658,7 @@ impl Clone for ClusterCentroids {
             centroids: self.centroids.clone(),
             counts: self.counts.clone(),
             transposed,
+            admit_codes,
         }
     }
 }
@@ -2643,6 +2742,7 @@ impl ClusterCentroids {
             centroids,
             counts,
             transposed: OnceLock::new(),
+            admit_codes: OnceLock::new(),
         }
     }
 
@@ -2661,15 +2761,84 @@ impl ClusterCentroids {
         })
     }
 
-    /// Drop the transposed SIMD cache after mutating [`Self::centroids`]
-    /// (or `counts` / `n_cent` / `dim`) on a value that may already have
-    /// been scanned. The next [`Self::transposed`] call rebuilds it.
+    /// Drop the transposed / admit-code scan caches after mutating
+    /// [`Self::centroids`] (or `counts` / `n_cent` / `dim`) on a value that
+    /// may already have been scanned. The next scan rebuilds them.
     ///
     /// Not called on the read path today (centroids are immutable after
     /// decode); kept for write/maintenance sites that mutate in place.
     #[allow(dead_code)]
     pub(crate) fn invalidate_transposed(&mut self) {
         self.transposed = OnceLock::new();
+        self.admit_codes = OnceLock::new();
+    }
+
+    /// Packed sign codes for the 1-bit admit prefilter — built once per
+    /// instance from the resident fp32 centroids with the query's shared
+    /// rotation/quantizer (no per-instance rotation state).
+    fn admit_codes(&self, admit: &RabitqAdmitQuery) -> &RabitqAdmitCodes {
+        let cache = self.admit_codes.get_or_init(|| {
+            let dim = self.dim as usize;
+            let n_cent = self.n_cent as usize;
+            let words_per_code = dim.div_ceil(ADMIT_CODE_WORD_BITS);
+            let mut codes = vec![0u64; n_cent.saturating_mul(words_per_code)];
+            let mut norms = vec![0.0f32; n_cent];
+            let mut rotated = vec![0.0f32; dim];
+            let mut byte_code = vec![0u8; admit.quant.code_bytes()];
+            for c in 0..n_cent {
+                let centroid = self.centroid(c);
+                norms[c] = dot(centroid, centroid).sqrt();
+                admit.rotation.apply(centroid, &mut rotated);
+                admit.quant.encode_rotated_into(&rotated, &mut byte_code);
+                codes[c * words_per_code..(c + 1) * words_per_code]
+                    .copy_from_slice(&pack_code_bytes_to_words(&byte_code));
+            }
+            RabitqAdmitCodes {
+                rot_seed: admit.rot_seed,
+                words_per_code,
+                codes,
+                norms,
+            }
+        });
+        debug_assert_eq!(
+            cache.rot_seed, admit.rot_seed,
+            "admit codes built with a different rot_seed"
+        );
+        cache
+    }
+
+    /// 1-bit prefilter: the best (smallest) estimated admit score across
+    /// this instance's populated clusters, from XOR+popcount over packed
+    /// sign codes. `None` when no cluster is populated. Estimates rank
+    /// cells for the exact-rescore shortlist only — they never feed
+    /// routing or near-tie logic directly.
+    pub(crate) fn estimate_min_admit_score(
+        &self,
+        metric: Metric,
+        admit: &RabitqAdmitQuery,
+    ) -> Option<f32> {
+        debug_assert_eq!(admit.cos_table.len(), self.dim as usize + 1);
+        let cache = self.admit_codes(admit);
+        let w = cache.words_per_code;
+        let mut best: Option<f32> = None;
+        for c in 0..self.n_cent as usize {
+            if self.counts[c] == 0 {
+                continue;
+            }
+            let code = &cache.codes[c * w..(c + 1) * w];
+            let h = hamming_words(&admit.q_words, code) as usize;
+            let est_dot = admit.cos_table[h] * admit.q_norm * cache.norms[c];
+            let score = match metric {
+                Metric::Cosine => COSINE_DISTANCE_BASE - est_dot,
+                Metric::NegDot => -est_dot,
+                Metric::L2Sq => {
+                    let c_norm = cache.norms[c];
+                    admit.q_l2sq + c_norm * c_norm - L2_CROSS_TERM_COEFF * est_dot
+                }
+            };
+            best = Some(best.map_or(score, |b: f32| b.min(score)));
+        }
+        best
     }
 
     /// Score cluster `c` against `query`: [`distance`] on the fp32 centroid
@@ -3061,6 +3230,49 @@ mod tests {
         assert!(mutated.transposed.get().is_none());
         let _ = mutated.transposed(); // rebuild
         assert!(mutated.transposed.get().is_some());
+    }
+
+    /// The 1-bit admit estimate must prefer the instance holding the
+    /// query's true nearest centroid on separated fixtures, for every
+    /// metric — the property the exact-rescore cell shortlist rides on.
+    #[test]
+    fn admit_estimate_prefers_matching_centroid_instance() {
+        const DIM: usize = 128;
+        const ROT_SEED: u64 = 7;
+        // Two single-centroid instances on different axes.
+        let mut near = vec![0.0f32; DIM];
+        near[0] = 1.0;
+        let mut far = vec![0.0f32; DIM];
+        far[5] = 1.0;
+        let a = ClusterCentroids::from_fp32(1, DIM as u32, &near, vec![1]);
+        let b = ClusterCentroids::from_fp32(1, DIM as u32, &far, vec![1]);
+        // Query beside `near`, small off-axis noise.
+        let mut query = near.clone();
+        query[1] = 0.05;
+        let admit = RabitqAdmitQuery::new(DIM, ROT_SEED, &query);
+        for metric in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
+            let ea = a
+                .estimate_min_admit_score(metric, &admit)
+                .expect("a populated");
+            let eb = b
+                .estimate_min_admit_score(metric, &admit)
+                .expect("b populated");
+            assert!(
+                ea < eb,
+                "{metric:?}: matching instance must rank first ({ea} vs {eb})"
+            );
+        }
+        // Count-0 clusters are skipped: an unpopulated instance has no
+        // estimate to contribute.
+        let unpopulated = ClusterCentroids::from_fp32(1, DIM as u32, &near, vec![0]);
+        assert!(
+            unpopulated
+                .estimate_min_admit_score(Metric::Cosine, &admit)
+                .is_none()
+        );
+        // Clone carries the warm admit-code slab.
+        let cloned = a.clone();
+        assert!(cloned.admit_codes.get().is_some());
     }
 
     /// `score_clusters_into` must match [`distance`] on the fp32 centroid slice.

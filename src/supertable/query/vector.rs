@@ -102,7 +102,7 @@ use crate::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
         manifest::{
-            ManifestSnapshot, SuperfileEntry, SuperfileUri,
+            ManifestSnapshot, RabitqAdmitQuery, SuperfileEntry, SuperfileUri, VectorSummary,
             list::{CellRoutingParams, PartitionStrategy},
         },
         opann::REPLICA_CLOSURE_DISTANCE_RATIO,
@@ -320,62 +320,138 @@ fn postings_by_cell_from_summaries(
     (postings, any_tagged)
 }
 
-/// Score every fine IVF centroid in the eligible superfile summaries.
+/// Cells kept by the 1-bit admit prefilter before exact fp32 rescoring.
+/// The prefilter only has to land the exact-best cell (plus its near-tie
+/// companions) *somewhere* in this window — final selection reruns on
+/// exact scores, so estimate noise can only cost recall if the true best
+/// cell falls outside the window entirely. Measured at 1M/256c with this
+/// window: post-drain recall matches the exact-everything scan (0.995)
+/// while exact-scanning under a fifth of the cells. When a table has
+/// fewer cells than the window plus the grid picks, the prefilter
+/// degenerates to scoring everything — identical to the exact path.
+const RABITQ_ADMIT_CELL_SHORTLIST: usize = 48;
+
+/// Validate one superfile's vector summary for `column` (present,
+/// non-empty, dims matching the query) and hand it back. Shared by the
+/// prefilter and exact passes of [`score_fine_candidates`].
+fn eligible_summary<'e>(
+    entry: &'e SuperfileEntry,
+    column: &str,
+    query_dim: usize,
+) -> Result<&'e VectorSummary, QueryError> {
+    match entry.vector_summary.get(column) {
+        Some(vs) if !vs.cells.is_empty() => {
+            for cell in &vs.cells {
+                if cell.clusters.dim as usize != query_dim {
+                    return Err(QueryError::Execute(format!(
+                        "vector summary dimension {} for column `{column}` on superfile {} \
+                         does not match query dimension {query_dim}",
+                        cell.clusters.dim, entry.superfile_id,
+                    )));
+                }
+            }
+            Ok(vs)
+        }
+        Some(_) => Err(QueryError::Execute(format!(
+            "superfile {} has no cluster centroids in its vector summary for \
+             column `{column}` — malformed build; refusing to degrade to a \
+             blind per-superfile probe",
+            entry.superfile_id
+        ))),
+        None => Err(QueryError::Execute(format!(
+            "superfile {} has no vector summary for column `{column}` — \
+             malformed build; refusing to degrade to a blind per-superfile \
+             probe",
+            entry.superfile_id
+        ))),
+    }
+}
+
+/// Score fine IVF centroids in the eligible superfile summaries.
+///
+/// With `admit` set (`(prefilter query, must-include cells)`), a 1-bit
+/// XOR+popcount pass first ranks tagged cells by their best estimated
+/// score and keeps the top [`RABITQ_ADMIT_CELL_SHORTLIST`] plus the
+/// caller's grid picks; the exact fp32 scan below then skips instances
+/// outside that set. Every *emitted* score is exact fp32, so routing and
+/// near-tie logic never see 1-bit noise — the estimates only bound which
+/// cells get exact-scored. Untagged (`cell_id: None`) summaries are
+/// always exact-scored.
 fn score_fine_candidates(
     superfiles: &[Arc<SuperfileEntry>],
     column: &str,
     query: &[f32],
     metric: Metric,
+    admit: Option<(&RabitqAdmitQuery, &[u32])>,
     allow: Option<&HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
 ) -> Result<Vec<(usize, u32, f32, Option<u32>, u64)>, QueryError> {
+    let eligible =
+        |entry: &Arc<SuperfileEntry>| allow.is_none_or(|m| m.contains_key(&entry.uri));
+
+    let shortlist: Option<HashSet<u32>> = if let Some((admit_q, must_include)) = admit {
+        let mut cell_best: HashMap<u32, f32> = HashMap::new();
+        for entry in superfiles.iter().filter(|e| eligible(e)) {
+            let vs = eligible_summary(entry, column, query.len())?;
+            for cell in &vs.cells {
+                let Some(cell_id) = cell.cell_id else {
+                    continue;
+                };
+                let Some(est) = cell.clusters.estimate_min_admit_score(metric, admit_q) else {
+                    continue;
+                };
+                cell_best
+                    .entry(cell_id)
+                    .and_modify(|best| {
+                        if est < *best {
+                            *best = est;
+                        }
+                    })
+                    .or_insert(est);
+            }
+        }
+        let mut ranked: Vec<(u32, f32)> = cell_best.into_iter().collect();
+        ranked.sort_unstable_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let mut keep: HashSet<u32> = ranked
+            .iter()
+            .take(RABITQ_ADMIT_CELL_SHORTLIST)
+            .map(|(cell, _)| *cell)
+            .collect();
+        keep.extend(must_include.iter().copied());
+        Some(keep)
+    } else {
+        None
+    };
+
     let mut candidates: Vec<(usize, u32, f32, Option<u32>, u64)> = Vec::new();
     for (si, entry) in superfiles.iter().enumerate() {
-        if allow.is_some_and(|m| !m.contains_key(&entry.uri)) {
+        if !eligible(entry) {
             continue;
         }
-        match entry.vector_summary.get(column) {
-            Some(vs) if !vs.cells.is_empty() => {
-                let mut flat_base = 0u32;
-                for cell in &vs.cells {
-                    if cell.clusters.dim as usize != query.len() {
-                        return Err(QueryError::Execute(format!(
-                            "vector summary dimension {} for column `{column}` on superfile {} \
-                             does not match query dimension {}",
-                            cell.clusters.dim,
-                            entry.superfile_id,
-                            query.len()
-                        )));
-                    }
-                    cell.clusters
-                        .score_clusters_into(metric, query, |local, score| {
-                            let count = cell
-                                .clusters
-                                .counts
-                                .get(local as usize)
-                                .copied()
-                                .unwrap_or(0) as u64;
-                            candidates.push((si, flat_base + local, score, cell.cell_id, count));
-                        });
-                    flat_base = flat_base.saturating_add(cell.clusters.n_cent);
-                }
+        let vs = eligible_summary(entry, column, query.len())?;
+        let mut flat_base = 0u32;
+        for cell in &vs.cells {
+            // Flat cluster ids must stay identical whether or not a cell is
+            // skipped, so flat_base always advances.
+            let skipped = shortlist
+                .as_ref()
+                .is_some_and(|keep| cell.cell_id.is_some_and(|cid| !keep.contains(&cid)));
+            if !skipped {
+                cell.clusters
+                    .score_clusters_into(metric, query, |local, score| {
+                        let count = cell
+                            .clusters
+                            .counts
+                            .get(local as usize)
+                            .copied()
+                            .unwrap_or(0) as u64;
+                        candidates.push((si, flat_base + local, score, cell.cell_id, count));
+                    });
             }
-            Some(vs) if vs.cells.is_empty() => {
-                return Err(QueryError::Execute(format!(
-                    "superfile {} has no cluster centroids in its vector summary for \
-                     column `{column}` — malformed build; refusing to degrade to a \
-                     blind per-superfile probe",
-                    entry.superfile_id
-                )));
-            }
-            Some(_) => unreachable!("non-empty cell summaries handled above"),
-            None => {
-                return Err(QueryError::Execute(format!(
-                    "superfile {} has no vector summary for column `{column}` — \
-                     malformed build; refusing to degrade to a blind per-superfile \
-                     probe",
-                    entry.superfile_id
-                )));
-            }
+            flat_base = flat_base.saturating_add(cell.clusters.n_cent);
         }
     }
     Ok(candidates)
@@ -919,12 +995,14 @@ impl SupertableReader {
         // probe only the globally-closest clusters.
         // Undeclared column = caller error, rejected here — not a silent
         // L2Sq default that fails later with a per-superfile decode error.
-        let metric = manifest
+        // `rot_seed` feeds the 1-bit admit prefilter (same rotation as the
+        // column's row codes).
+        let (metric, rot_seed) = manifest
             .options
             .vector_columns
             .iter()
             .find(|vc| vc.column == column)
-            .map(|vc| vc.metric)
+            .map(|vc| (vc.metric, vc.rot_seed))
             .ok_or_else(|| QueryError::Execute(format!("unknown vector column `{column}`")))?;
 
         // Borrow grids only. Cloning `GlobalVectorIndex` / `ClusterCentroids`
@@ -1024,7 +1102,26 @@ impl SupertableReader {
                 ));
             }
             let cutoff = grid_cell_cutoff(&ranked_for_beam, &cell_routing);
-            let candidates = score_fine_candidates(&superfiles, column, query, metric, allow_ref)?;
+            // 1-bit prefilter for the exact fine scan: the grid's cutoff
+            // picks are must-include so every cell the beam can select has
+            // exact candidate scores (near-tie checks included). Filtered
+            // queries bypass the prefilter — an allow-set thins each cell's
+            // matching postings, so the nearest *matching* neighbors spread
+            // across far more cells than the unfiltered estimate window is
+            // sized for; the filtered path keeps the exact-everything scan.
+            let admit_q = (!filtered).then(|| RabitqAdmitQuery::new(query.len(), rot_seed, query));
+            let must_include: Vec<u32> = ranked_for_beam[..cutoff]
+                .iter()
+                .map(|(cell, _)| *cell)
+                .collect();
+            let candidates = score_fine_candidates(
+                &superfiles,
+                column,
+                query,
+                metric,
+                admit_q.as_ref().map(|aq| (aq, must_include.as_slice())),
+                allow_ref,
+            )?;
             candidate_counts = candidates
                 .iter()
                 .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
@@ -1110,8 +1207,9 @@ impl SupertableReader {
             }
         } else {
             // No grid, or untagged summaries: score every fine centroid
-            // (legacy flat path).
-            let candidates = score_fine_candidates(&superfiles, column, query, metric, allow_ref)?;
+            // (legacy flat path, no prefilter).
+            let candidates =
+                score_fine_candidates(&superfiles, column, query, metric, None, allow_ref)?;
             candidate_counts = candidates
                 .iter()
                 .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
