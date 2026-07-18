@@ -1164,6 +1164,11 @@ pub mod vector {
     /// Skip the normal undrained-delta commit while retaining pre-drain,
     /// drain, post-drain, and optimize/compact measurements.
     const SKIP_VECTOR_DELTA_ENV: &str = "INFINO_BENCH_SKIP_VECTOR_DELTA";
+    /// Skip the post-drain assignment audit entirely. The audit is
+    /// diagnostic-only; at 100M+ its full-corpus pass reads ~0.4 TB of
+    /// mmap even in streaming order, so runs that only need the lifecycle
+    /// recall numbers can opt out.
+    const SKIP_DRAIN_DIAG_ENV: &str = "INFINO_BENCH_SKIP_DRAIN_DIAG";
     /// Numerator/denominator for compact p90 drain diagnostics.
     const DRAIN_P90_NUMERATOR: usize = 9;
     const DRAIN_P90_DENOMINATOR: usize = 10;
@@ -1171,6 +1176,13 @@ pub mod vector {
     const DRAIN_DIAG_PROBE_DEPTHS: [usize; 6] = [1, 2, 4, 8, 16, 64];
     /// Stored rows self-queried by the post-drain assignment audit.
     const DRAIN_DIAG_SELF_QUERY_SAMPLE: usize = 500;
+    /// Contiguous dense-id span per rayon task in the audit's agreement
+    /// scan: 65 536 rows × 1024 dims × 4 B ≈ 256 MiB of corpus bytes per
+    /// task, so each worker streams the corpus mmap sequentially. The
+    /// previous per-row scatter in HashMap iteration order random-faulted
+    /// a corpus far larger than RAM (394 GiB vs 63 GiB at 100M) and never
+    /// finished.
+    const DRAIN_DIAG_AGREEMENT_CHUNK_ROWS: usize = 65_536;
 
     /// Recall-target calibration grid — off by default. The shipped search
     /// process routes p=1 over the cell grid and buys recall with write-side
@@ -1508,6 +1520,11 @@ pub mod vector {
     ) {
         use rayon::prelude::*;
 
+        if env::var(SKIP_DRAIN_DIAG_ENV).ok().as_deref() == Some("1") {
+            eprintln!("[drain-diag] skipped ({SKIP_DRAIN_DIAG_ENV}=1)");
+            return;
+        }
+
         let Some(cells) = consumer.hidden_cell_stable_id_sets() else {
             eprintln!("[drain-diag] no packed hidden cells to audit");
             return;
@@ -1558,22 +1575,33 @@ pub mod vector {
                 .unwrap_or(0)
         };
 
-        let audited: Vec<(u32, &Vec<u32>)> = stored_by_dense
-            .iter()
-            .filter(|(dense, _)| ((**dense as usize + 1) * DIM) <= vectors.len())
-            .map(|(dense, stored)| (*dense, stored))
-            .collect();
-        let agree = audited
-            .par_iter()
-            .filter(|(dense, stored)| {
-                let start = *dense as usize * DIM;
-                stored.contains(&nearest_cell(&vectors[start..start + DIM]))
+        // Agreement scan in dense (corpus) order: chunk contiguous dense ids
+        // so every rayon task streams its 256 MiB corpus span sequentially
+        // instead of random-faulting the mmap per HashMap-ordered row.
+        let n_chunks = n_rows.div_ceil(DRAIN_DIAG_AGREEMENT_CHUNK_ROWS);
+        let (agree, audited_len) = (0..n_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start_row = chunk_idx * DRAIN_DIAG_AGREEMENT_CHUNK_ROWS;
+                let end_row = (start_row + DRAIN_DIAG_AGREEMENT_CHUNK_ROWS).min(n_rows);
+                let mut local_agree = 0usize;
+                let mut local_audited = 0usize;
+                for dense in start_row..end_row {
+                    let Some(stored) = stored_by_dense.get(&(dense as u32)) else {
+                        continue;
+                    };
+                    local_audited += 1;
+                    let start = dense * DIM;
+                    if stored.contains(&nearest_cell(&vectors[start..start + DIM])) {
+                        local_agree += 1;
+                    }
+                }
+                (local_agree, local_audited)
             })
-            .count();
+            .reduce(|| (0usize, 0usize), |a, b| (a.0 + b.0, a.1 + b.1));
         eprintln!(
-            "[drain-diag] assignment agreement: {agree}/{} stored rows sit in their exact nearest grid cell ({:.3})",
-            audited.len(),
-            agree as f64 / audited.len().max(1) as f64,
+            "[drain-diag] assignment agreement: {agree}/{audited_len} stored rows sit in their exact nearest grid cell ({:.3})",
+            agree as f64 / audited_len.max(1) as f64,
         );
 
         // Fine-centroid routing replica: the hidden query path ranks cells by
@@ -2730,18 +2758,6 @@ pub mod vector {
                 if phases.warm {
                     log_hidden_stats(&consumer, "at warm open (post-drain)");
                 }
-                if let Some(vectors) = corpus
-                    .as_ref()
-                    .and_then(supertable::PreparedCorpus::vectors)
-                {
-                    report_post_drain_assignment_audit(
-                        &consumer,
-                        &vectors.as_slice()[..n_docs * DIM],
-                        &q_correct,
-                        &gt_correct,
-                        &id_to_dense,
-                    );
-                }
                 eprintln!("[supertable_vector] === post-drain search (routed cells) ===");
                 let post_drain_rows = exec_vec::run_search(
                     &mut report,
@@ -2782,6 +2798,22 @@ pub mod vector {
                     phases.warm,
                     phases.cold,
                 ));
+                // Audit AFTER the measured post-drain phases: its full-corpus
+                // mmap pass and 500 extra self-queries must not perturb the
+                // page cache, disk cache, or memory state the recall and
+                // latency rows above are measured under.
+                if let Some(vectors) = corpus
+                    .as_ref()
+                    .and_then(supertable::PreparedCorpus::vectors)
+                {
+                    report_post_drain_assignment_audit(
+                        &consumer,
+                        &vectors.as_slice()[..n_docs * DIM],
+                        &q_correct,
+                        &gt_correct,
+                        &id_to_dense,
+                    );
+                }
                 post_drain_rows
             } else {
                 // Read-only path (existing-prefix / dataset): no transitions
