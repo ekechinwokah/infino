@@ -360,12 +360,20 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
     } else {
         n_docs
     };
+    // FTS/SQL carry a one-commit delta tail (same shape as the vector
+    // modality's undrained follow-up) so the post-drain → delta →
+    // post-delta → compact lifecycle can append without regenerating.
+    let text_docs = if matches!(modality, Modality::Fts | Modality::Sql) {
+        n_docs + docs_per_commit()
+    } else {
+        n_docs
+    };
     let text = modality.has_text().then(|| {
         eprintln!(
             "[supertable_ingest] generating {} -doc text corpus (mmap-backed)...",
-            fmt_count(n_docs)
+            fmt_count(text_docs)
         );
-        MmapTextCorpus::generate(n_docs, CORPUS_TEXT_SEED)
+        MmapTextCorpus::generate(text_docs, CORPUS_TEXT_SEED)
     });
     let vectors = modality.has_vector().then(|| {
         if let Some(path) = explicit_vector_path.as_deref() {
@@ -420,6 +428,41 @@ pub fn vector_delta_batch(corpus: &PreparedCorpus) -> RecordBatch {
         MmapVectorCorpus::generate_range(start, len, corpus::n_cent(start), CORPUS_VEC_SEED, true);
     RecordBatch::try_new(schema, vec![vector_array(tail.as_slice())])
         .expect("vector delta RecordBatch")
+}
+
+/// The next normal FTS commit after the measured base ingest.
+pub fn fts_delta_batch(corpus: &PreparedCorpus) -> RecordBatch {
+    text_delta_batch(Modality::Fts, corpus)
+}
+
+/// The next normal SQL commit after the measured base ingest.
+pub fn sql_delta_batch(corpus: &PreparedCorpus) -> RecordBatch {
+    text_delta_batch(Modality::Sql, corpus)
+}
+
+fn text_delta_batch(modality: Modality, corpus: &PreparedCorpus) -> RecordBatch {
+    assert!(
+        matches!(modality, Modality::Fts | Modality::Sql),
+        "text delta is FTS/SQL only"
+    );
+    let start = n_docs();
+    let len = docs_per_commit();
+    let end = start + len;
+    let text = corpus
+        .text
+        .as_ref()
+        .expect("FTS/SQL delta requires a prepared text corpus");
+    assert!(
+        text.n_docs() >= end,
+        "text corpus must include the delta tail ({} docs, need {end})",
+        text.n_docs()
+    );
+    let schema = if modality.has_sql() {
+        sql_schema()
+    } else {
+        schema_for(modality)
+    };
+    chunk_batch(modality, corpus, &schema, start, end, len)
 }
 
 /// Stream the prepared on-disk corpus → append → commit → object
