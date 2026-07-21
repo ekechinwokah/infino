@@ -24,9 +24,11 @@ use object_store::{
     path::Path as ObjPath,
 };
 
+use crate::runtime_metrics::io::UsageMeter;
+
 use super::{
     ObjectMeta, StorageError, StorageOptions, StorageProvider, counting, io_counters,
-    logical_list_key, options::apply, retry, usage::UsageMeter,
+    logical_list_key, options::apply, retry,
 };
 
 /// Warm idle connections per host, so a wide range-GET fan-out reuses TLS

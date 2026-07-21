@@ -34,9 +34,11 @@ use object_store::{
     path::Path as ObjPath,
 };
 
+use crate::runtime_metrics::io::UsageMeter;
+
 use super::{
     ObjectMeta, StorageError, StorageOptions, StorageProvider, counting, io_counters,
-    logical_list_key, options::apply, retry, usage::UsageMeter,
+    logical_list_key, options::apply, retry,
 };
 
 /// Config key written by [`S3StorageProvider::new_with_endpoint`] to point

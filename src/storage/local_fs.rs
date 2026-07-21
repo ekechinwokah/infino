@@ -28,7 +28,9 @@ use object_store::{
     PutPayload, local::LocalFileSystem, path::Path as ObjPath,
 };
 
-use super::{ObjectMeta, StorageError, StorageProvider, counting, usage::UsageMeter};
+use crate::runtime_metrics::io::UsageMeter;
+
+use super::{ObjectMeta, StorageError, StorageProvider, counting};
 
 #[derive(Debug)]
 pub struct LocalFsStorageProvider {
