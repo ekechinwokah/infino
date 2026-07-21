@@ -19,6 +19,17 @@ use crate::supertable::{
     manifest::{SuperfileEntry, list::PartitionStrategy},
 };
 
+/// First byte of an encoded [`PartitionKey::TermShard`] key. Term-shard
+/// keys are 5 bytes (this tag + LE u32 shard id) so they never collide
+/// with the strategy-typed widths (8-byte TimeRange, 4-byte Hash /
+/// VectorCell, 2-byte ColumnRange) and can coexist with VectorCell keys
+/// inside the one hidden-index table's key space.
+const TERM_SHARD_KEY_TAG: u8 = b'T';
+
+/// Encoded byte length of a [`PartitionKey::TermShard`] key: 1 tag byte
+/// + 4-byte LE u32 shard id.
+const TERM_SHARD_KEY_LEN: usize = 5;
+
 /// Opaque partition identifier. Encoded into
 /// `SuperfileEntry.partition_key` + `ManifestPartEntry.partition_key`
 /// for the manifest layer; the writer uses this typed shape
@@ -40,6 +51,11 @@ pub enum PartitionKey {
     /// Cell id (legacy one-file-per-cell) or packed-shard id
     /// (`cell_id % writer_pool`) for VectorCell strategy.
     VectorCell(u32),
+    /// Lex term-range shard id for the hidden index's text
+    /// superfiles (merged inverted-index slices). Lives in the
+    /// same hidden table as VectorCell entries; the tagged
+    /// 5-byte encoding keeps the two key families disjoint.
+    TermShard(u32),
 }
 
 /// Encode a `PartitionKey` to its on-disk bytes — the shape
@@ -52,6 +68,12 @@ pub fn encode_partition_key(key: &PartitionKey) -> Vec<u8> {
         PartitionKey::Hash(b) => b.to_le_bytes().to_vec(),
         PartitionKey::ColumnRange(b) => b.to_le_bytes().to_vec(),
         PartitionKey::VectorCell(b) => b.to_le_bytes().to_vec(),
+        PartitionKey::TermShard(b) => {
+            let mut bytes = Vec::with_capacity(TERM_SHARD_KEY_LEN);
+            bytes.push(TERM_SHARD_KEY_TAG);
+            bytes.extend_from_slice(&b.to_le_bytes());
+            bytes
+        }
     }
 }
 
@@ -63,6 +85,16 @@ pub fn decode_partition_key(
     bytes: &[u8],
     strategy: &PartitionStrategy,
 ) -> Result<PartitionKey, CommitError> {
+    // Term-shard keys are strategy-independent: the 5-byte tagged
+    // encoding collides with no strategy-typed width, and text
+    // superfiles share the hidden table with VectorCell entries, so
+    // the tag — not the table strategy — identifies them.
+    if bytes.len() == TERM_SHARD_KEY_LEN && bytes[0] == TERM_SHARD_KEY_TAG {
+        let arr: [u8; 4] = bytes[1..].try_into().map_err(|_| {
+            CommitError::PointerParse("TermShard partition_key shard id must be 4 bytes".into())
+        })?;
+        return Ok(PartitionKey::TermShard(u32::from_le_bytes(arr)));
+    }
     match strategy {
         PartitionStrategy::TimeRange { .. } => {
             let arr: [u8; 8] = bytes.try_into().map_err(|_| {
@@ -219,6 +251,13 @@ pub fn assign_partition(
                             seg.uri.0
                         ),
                     })?;
+            // Text superfiles (merged inverted-index slices: FTS summary,
+            // no vector summary) share the hidden table with VectorCell
+            // entries but partition by lex term-range shard, so the cell
+            // bounds checks below don't apply to them.
+            if !seg.fts_summary.is_empty() && seg.vector_summary.is_empty() {
+                return Ok(PartitionKey::TermShard(hint));
+            }
             // `INCOMING_VECTOR_CELL` (u32::MAX) is the reserved "incoming"
             // append partition — deliberately outside `0..n_cells`.
             //
@@ -437,6 +476,14 @@ mod tests {
         assert_eq!(bytes, 0xDEADu16.to_le_bytes().to_vec());
     }
 
+    #[test]
+    fn encode_partition_key_term_shard_emits_tagged_5_bytes() {
+        let bytes = encode_partition_key(&PartitionKey::TermShard(0xCAFEBABE));
+        assert_eq!(bytes.len(), TERM_SHARD_KEY_LEN);
+        assert_eq!(bytes[0], TERM_SHARD_KEY_TAG);
+        assert_eq!(bytes[1..], 0xCAFEBABEu32.to_le_bytes());
+    }
+
     // ---- decode_partition_key — success roundtrip ----------------------
 
     #[test]
@@ -473,6 +520,41 @@ mod tests {
         };
         let decoded = decode_partition_key(&bytes, &strategy).expect("decode");
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn decode_partition_key_round_trips_term_shard_under_vector_cell_strategy() {
+        use crate::supertable::manifest::ClusterCentroids;
+
+        // Text superfiles share the hidden table with VectorCell entries;
+        // the tag, not the strategy, identifies their keys.
+        let original = PartitionKey::TermShard(7);
+        let bytes = encode_partition_key(&original);
+        let clusters = ClusterCentroids::from_fp32(2, 4, &[0.0; 8], vec![1, 1]);
+        let strategy = PartitionStrategy::VectorCell {
+            column: "emb".into(),
+            clusters,
+            routing: Default::default(),
+        };
+        let decoded = decode_partition_key(&bytes, &strategy).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn decode_partition_key_rejects_untagged_5_bytes() {
+        // 5 bytes without the TermShard tag is not a valid key under any
+        // strategy — it must fall through to the strategy width check.
+        let strategy = PartitionStrategy::Hash {
+            column: "_id".into(),
+            n_buckets: 4,
+        };
+        let bytes = [0xFFu8, 1, 2, 3, 4];
+        assert_ne!(bytes[0], TERM_SHARD_KEY_TAG);
+        let err = decode_partition_key(&bytes, &strategy).expect_err("must error");
+        match err {
+            CommitError::PointerParse(msg) => assert!(msg.contains("4 bytes"), "{msg}"),
+            other => panic!("got {other:?}"),
+        }
     }
 
     // ---- decode_partition_key — size mismatch errors -------------------
@@ -769,6 +851,46 @@ mod tests {
         seg.partition_hint = Some(3); // >= n_cells=2
         let err = assign_partition(&seg, &strategy).expect_err("legacy cell id out of range");
         assert_spans_partition(err, "out of range");
+    }
+
+    // ---- assign_partition: TermShard (text superfiles) ------------------
+
+    #[test]
+    fn assign_partition_text_entry_routes_to_term_shard() {
+        use crate::supertable::manifest::{ClusterCentroids, FtsSummaryAgg};
+
+        // FTS summary present + vector summary absent = text superfile:
+        // the hint is the lex term-range shard id, exempt from the
+        // VectorCell cell-bounds checks.
+        let clusters = ClusterCentroids::from_fp32(2, 4, &[0.0; 8], vec![1, 1]);
+        let strategy = PartitionStrategy::VectorCell {
+            column: "emb".into(),
+            clusters,
+            routing: Default::default(),
+        };
+        let mut seg = empty_seg();
+        seg.fts_summary
+            .insert("body".into(), FtsSummaryAgg::default());
+        seg.partition_hint = Some(9); // >= n_cells=2: fine for a text shard
+        let key = assign_partition(&seg, &strategy).expect("assign text shard");
+        assert_eq!(key, PartitionKey::TermShard(9));
+    }
+
+    #[test]
+    fn assign_partition_text_entry_still_requires_hint() {
+        use crate::supertable::manifest::{ClusterCentroids, FtsSummaryAgg};
+
+        let clusters = ClusterCentroids::from_fp32(2, 4, &[0.0; 8], vec![1, 1]);
+        let strategy = PartitionStrategy::VectorCell {
+            column: "emb".into(),
+            clusters,
+            routing: Default::default(),
+        };
+        let mut seg = empty_seg();
+        seg.fts_summary
+            .insert("body".into(), FtsSummaryAgg::default());
+        let err = assign_partition(&seg, &strategy).expect_err("hint required");
+        assert_spans_partition(err, "requires pre-sharded");
     }
 
     // ---- assign_partition: ColumnRange (currently unimplemented) -------
