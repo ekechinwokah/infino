@@ -407,11 +407,15 @@ impl Supertable {
                 }
             }
         }
-        let vector_index_storage_prefix = if options.vector_columns.is_empty() {
-            None
-        } else {
-            Some(generate_vector_index_storage_prefix())
-        };
+        // The hidden sibling serves BOTH modalities (cell-organized
+        // vector superfiles and term-organized text superfiles), so
+        // either kind of indexed column warrants one at create time.
+        let vector_index_storage_prefix =
+            if options.vector_columns.is_empty() && options.fts_columns.is_empty() {
+                None
+            } else {
+                Some(generate_vector_index_storage_prefix())
+            };
         let vector_index_table = if let Some(ref prefix) = vector_index_storage_prefix {
             if let Some(hidden_opts) =
                 build_vector_index_options(&options, None, Some(prefix.as_str()))
@@ -1214,7 +1218,10 @@ fn resolve_vector_index_storage_prefix(
     user_manifest: Option<&super::manifest::ManifestSnapshot>,
     create_prefix: Option<&str>,
 ) -> Option<String> {
-    if user_opts.vector_columns.is_empty() {
+    // The hidden sibling serves BOTH modalities: cell-organized vector
+    // superfiles and term-organized text superfiles. Either kind of
+    // indexed column warrants one.
+    if user_opts.vector_columns.is_empty() && user_opts.fts_columns.is_empty() {
         return None;
     }
     if let Some(prefix) = create_prefix {
@@ -2113,6 +2120,157 @@ mod tests {
         // options the handle exposes.
         assert_eq!(r.options().id_column, st.options().id_column);
         assert_eq!(r.options().fts_columns.len(), 1);
+    }
+
+    /// FTS-only tables (no vector columns) get the hidden sibling too:
+    /// the text-only drain merges their inverted indexes into text
+    /// shards, queries route through them, and — with no VectorCell
+    /// strategy — membership persists through normal manifest parts.
+    #[test]
+    fn fts_only_table_drains_and_queries_text_shards() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::prelude::{col, lit};
+
+        use crate::superfile::{builder::FtsConfig, fts::reader::BoolMode};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let make_options = || {
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                    positions: false,
+                }],
+                vec![],
+                Some(crate::test_helpers::default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(Arc::clone(&storage))
+            .with_writer_pool(Arc::clone(&pool))
+        };
+        let st = Supertable::create(make_options()).expect("create");
+        assert!(
+            st.reader().vector_index_table().is_some(),
+            "FTS columns alone must create the hidden sibling"
+        );
+
+        // Two commits ⇒ two user superfiles ⇒ a real cross-file merge.
+        for texts in [vec!["rust engine", "tokio runtime"], vec!["parquet files"]] {
+            let titles = LargeStringArray::from(texts);
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(titles) as Arc<dyn Array>],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+            drop(w);
+        }
+        let stats = st
+            .delete(col("title").eq(lit("tokio runtime")))
+            .expect("delete");
+        assert_eq!(stats.n_tombstoned(), 1);
+
+        st.drain_vectors_to_cells_sync().expect("text-only drain");
+
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden sibling")
+            .clone();
+        let text_entries: Vec<_> = hidden
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .filter(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty())
+            .cloned()
+            .collect();
+        assert_eq!(text_entries.len(), 1, "tiny corpus fits one text shard");
+        assert_eq!(
+            text_entries[0].n_docs, 2,
+            "merged across both commits, minus the delete"
+        );
+
+        // Queries route through the shard.
+        let rows = st
+            .reader()
+            .bm25_search(
+                "title",
+                "rust",
+                10,
+                BoolMode::Or,
+                Some(&["_id", "title", "score"]),
+            )
+            .expect("bm25 via hidden route");
+        assert_eq!(rows[0].num_rows(), 1);
+        let n = st
+            .reader()
+            .count("title", "parquet", BoolMode::Or)
+            .expect("count via hidden route");
+        assert_eq!(n, 1);
+        assert_eq!(
+            st.reader()
+                .count("title", "tokio", BoolMode::Or)
+                .expect("count of tombstoned vocab"),
+            0
+        );
+
+        // Re-drain with nothing new is the idle no-op.
+        let before: Vec<_> = text_entries.iter().map(|e| e.uri).collect();
+        st.drain_vectors_to_cells_sync().expect("idle re-drain");
+        let after: Vec<_> = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden sibling")
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .filter(|e| !e.fts_summary.is_empty())
+            .map(|e| e.uri)
+            .collect();
+        assert_eq!(after, before, "idle re-drain must not rewrite the epoch");
+
+        // Reopen: membership persists through normal manifest parts.
+        drop(hidden);
+        drop(st);
+        let reopened = Supertable::open(make_options()).expect("reopen");
+        let hidden = reopened
+            .reader()
+            .vector_index_table()
+            .expect("hidden sibling after reopen")
+            .clone();
+        // Parts-backed manifests hydrate lazily; load before counting.
+        let hidden_reader = hidden.reader();
+        let n_text = bridge_sync_to_async(hidden_reader.manifest().get_all_superfiles_loaded())
+            .expect("load hidden entries")
+            .iter()
+            .filter(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty())
+            .count();
+        assert_eq!(n_text, 1, "text shard survives reopen via parts");
+        let rows = reopened
+            .reader()
+            .bm25_search("title", "engine", 10, BoolMode::Or, None)
+            .expect("bm25 after reopen");
+        assert_eq!(rows[0].num_rows(), 1);
     }
 
     /// The drain also builds TEXT superfiles — term-range shards of the

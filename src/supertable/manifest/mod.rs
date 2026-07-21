@@ -90,7 +90,9 @@ use crate::{
                 PartitionStrategy,
             },
             part::{ContentHash, ManifestPart, PartId},
-            partition::{assign_partition, encode_partition_key},
+            partition::{
+                PartitionKey, assign_partition, decode_partition_key, encode_partition_key,
+            },
         },
         query::{hierarchical_iter, prune::PruneLeaf},
         slow_vector_state,
@@ -564,8 +566,14 @@ impl ManifestSnapshot {
     fn stamp_vector_index_storage_prefix(
         &self,
         vector_columns: &[list::VectorColumnInfo],
+        fts_columns: &[list::FtsColumnInfo],
     ) -> Option<String> {
-        if vector_columns.is_empty() {
+        // Either indexed-column kind warrants the hidden sibling (cell
+        // superfiles for vectors, text superfiles for FTS), so either
+        // carries its prefix forward. A manifest with neither is a
+        // hidden sibling itself (its options declare no columns) and
+        // must never claim its own hidden subtree.
+        if vector_columns.is_empty() && fts_columns.is_empty() {
             return None;
         }
         if let Some(prefix) = self.vector_index_storage_prefix() {
@@ -1571,7 +1579,29 @@ impl ManifestSnapshot {
         let stamped_new_entries: Vec<Arc<SuperfileEntry>> = new_entries
             .iter()
             .map(|e| {
+                let entry_birth_version = if preserve_birth_versions {
+                    e.birth_version
+                } else {
+                    birth_version
+                };
                 if !e.partition_key.is_empty() {
+                    // One pre-stamped shape is legitimate: the hidden
+                    // index's TEXT superfiles arrive with their tagged
+                    // TermShard key. The drain assigns term-range shards
+                    // itself, and the tag makes the encoding
+                    // strategy-independent, so re-derivation here has
+                    // nothing to add. Everything else must arrive
+                    // unstamped (an earlier stage's stamp would be
+                    // silently re-derived and overwritten otherwise).
+                    if matches!(
+                        decode_partition_key(&e.partition_key, &strategy),
+                        Ok(PartitionKey::TermShard(_))
+                    ) {
+                        return Ok(Arc::new(SuperfileEntry {
+                            birth_version: entry_birth_version,
+                            ..(**e).clone()
+                        }));
+                    }
                     return Err(ManifestError::EntryAlreadyPartitioned {
                         detail: format!(
                             "superfile {} arrived with a partition_key already set",
@@ -1580,11 +1610,6 @@ impl ManifestSnapshot {
                     });
                 }
                 let pk = assign_partition(e, &strategy)?;
-                let entry_birth_version = if preserve_birth_versions {
-                    e.birth_version
-                } else {
-                    birth_version
-                };
                 Ok(Arc::new(SuperfileEntry {
                     partition_key: encode_partition_key(&pk),
                     birth_version: entry_birth_version,
@@ -1750,6 +1775,13 @@ impl ManifestSnapshot {
                 metric: format!("{:?}", v.metric).to_lowercase(),
             })
             .collect();
+        let fts_columns: Vec<list::FtsColumnInfo> = opts
+            .fts_columns
+            .iter()
+            .map(|f| list::FtsColumnInfo {
+                column: f.column.clone(),
+            })
+            .collect();
         let new_list = Manifest {
             // Carry/advance the hidden drain watermark via the stamp (the drain
             // sets it with `with_drained_ranges` in the same commit). Empty on
@@ -1761,13 +1793,7 @@ impl ManifestSnapshot {
             options_hash: opts_hash,
             schema: Vec::new(),
             id_column: opts.id_column.clone(),
-            fts_columns: opts
-                .fts_columns
-                .iter()
-                .map(|f| list::FtsColumnInfo {
-                    column: f.column.clone(),
-                })
-                .collect(),
+            fts_columns: fts_columns.clone(),
             vector_columns: opts
                 .vector_columns
                 .iter()
@@ -1790,7 +1816,7 @@ impl ManifestSnapshot {
             ) {
                 None
             } else {
-                self.stamp_vector_index_storage_prefix(&vector_columns)
+                self.stamp_vector_index_storage_prefix(&vector_columns, &fts_columns)
             },
             global_vector_index: self.get_global_vector_index(),
             deleted_user_ids_inline: self

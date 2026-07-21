@@ -91,7 +91,9 @@ use super::{
     handle::{GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, Supertable, SupertableInner},
     manifest::{
         CellVectorSummary, FtsSummaryAgg, ManifestSnapshot, ScalarStatsAgg, SubsectionOffsets,
-        SuperfileEntry, SuperfileUri, VectorSummary, bloom::BloomBuilder,
+        SuperfileEntry, SuperfileUri, VectorSummary,
+        bloom::BloomBuilder,
+        partition::{PartitionKey, encode_partition_key},
     },
     mutations::{
         CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
@@ -3429,6 +3431,13 @@ async fn drain_fts_text_shards(
         let p = prepare_superfile(hidden_inner, shard)?
             .ok_or_else(|| BuildError::Store("text shard prepared with zero docs".into()))?;
         let entry = finish_superfile_entry(p.entry, Some(shard_id as u32))?;
+        // Pre-stamp the tagged TermShard key: the drain owns term-range
+        // shard assignment, and the tag makes the key legible under any
+        // table strategy (the commit path accepts exactly this shape).
+        let entry = Arc::new(SuperfileEntry {
+            partition_key: encode_partition_key(&PartitionKey::TermShard(shard_id as u32)),
+            ..(*entry).clone()
+        });
         prepared.push(PreparedSuperfile {
             entry,
             bytes_for_store: p.bytes_for_store,
@@ -3482,6 +3491,108 @@ async fn drain_fts_text_shards(
     }))
 }
 
+/// Text-only drain for FTS-only tables (no vector grid): build this
+/// epoch's text shards over the whole live corpus and publish them —
+/// with the previous epoch's replaced and the residency watermark
+/// extended — in one OCC commit. Membership persists through normal
+/// manifest parts (the hidden table has no VectorCell strategy, so the
+/// slow-CAS-only membership carve-out never applies to it).
+///
+/// Runs inside the caller's single-flight slot.
+async fn drain_fts_only(
+    user_inner: &Arc<SupertableInner>,
+    hidden_inner: &Arc<SupertableInner>,
+) -> Result<(), BuildError> {
+    let user_manifest = user_inner.manifest.load_full();
+    let sources = user_manifest
+        .get_all_superfiles_loaded()
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+    if sources.is_empty() {
+        return Ok(());
+    }
+    let batch_cfg = drain_batch_superfiles(&user_inner.options);
+    if batch_cfg == 0 {
+        eprintln!("[supertable drain] skipped (drain_batch_superfiles = 0)");
+        return Ok(());
+    }
+    let budget = if batch_cfg < 0 {
+        usize::MAX
+    } else {
+        (batch_cfg as usize).max(1)
+    };
+    // Idle guard: every source already inside the watermark and an
+    // epoch's shards published ⇒ nothing new to merge. (Post-epoch
+    // deletes stay identity-filtered by the fast delete set until new
+    // data triggers the next real epoch — the vector drain's policy.)
+    let hidden_manifest = hidden_inner.manifest.load_full();
+    let drained = hidden_manifest.get_drained_ranges();
+    let epoch_has_text = hidden_manifest
+        .get_all_superfiles()
+        .iter()
+        .any(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty());
+    if epoch_has_text
+        && sources
+            .iter()
+            .all(|entry| drained.contains(entry.birth_version))
+    {
+        return Ok(());
+    }
+    let storage = hidden_inner
+        .options
+        .storage
+        .clone()
+        .ok_or_else(|| BuildError::Store("hidden drain requires storage".into()))?;
+
+    let scratch = tempfile::tempdir()
+        .map_err(|error| BuildError::Store(format!("fts drain scratch: {error}")))?;
+    let outcome = drain_fts_text_shards(
+        user_inner,
+        hidden_inner,
+        &user_manifest,
+        &sources,
+        &storage,
+        scratch.path(),
+        budget,
+    )
+    .await?
+    .expect("fts columns checked by the caller");
+
+    let mut new_drained = drained;
+    let drained_max = sources
+        .iter()
+        .map(|entry| entry.birth_version)
+        .max()
+        .unwrap_or(0);
+    let lo = new_drained.prefix_end().map(|end| end + 1).unwrap_or(0);
+    new_drained.insert_range(lo.min(drained_max), drained_max);
+    let list_metadata = CommitListMetadata {
+        partition_strategy: None,
+        drained_ranges: Some(new_drained),
+        global_vector_index: None,
+    };
+    let new_manifest = persist_commit_async(
+        hidden_inner,
+        Arc::clone(&storage),
+        outcome.new_entries,
+        &outcome.removed_entries,
+        Vec::new(),
+        Vec::new(),
+        list_metadata,
+    )
+    .await
+    .map_err(|e| BuildError::Store(e.to_string()))?;
+    hidden_inner.manifest.store(Arc::new(new_manifest));
+    apply_pending_store_inserts(hidden_inner, outcome.pending_store_inserts);
+    if !outcome.pending_cache_inserts.is_empty()
+        && let Some(cache) = hidden_inner.options.disk_cache.as_ref()
+    {
+        warm_cache_after_commit(hidden_inner, cache, outcome.pending_cache_inserts);
+    }
+    schedule_background_storage_reclaim(Arc::clone(hidden_inner));
+    Ok(())
+}
+
 pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     user_inner: Arc<SupertableInner>,
     hidden_inner: Arc<SupertableInner>,
@@ -3505,7 +3616,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // The global cell grid is owned by the USER manifest (bootstrapped at the
     // first commit). The hidden cell index is the derived copy this drain writes.
     let Some(gvi) = user_inner.manifest.load_full().get_global_vector_index() else {
-        return Ok(());
+        // FTS-only tables never train a grid; their hidden sibling holds
+        // text superfiles alone, drained by the text half by itself.
+        if user_inner.options.fts_columns.is_empty() {
+            return Ok(());
+        }
+        return drain_fts_only(&user_inner, &hidden_inner).await;
     };
     let clusters = gvi.grid;
     let column = gvi.column;

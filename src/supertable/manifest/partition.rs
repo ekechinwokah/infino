@@ -251,13 +251,6 @@ pub fn assign_partition(
                             seg.uri.0
                         ),
                     })?;
-            // Text superfiles (merged inverted-index slices: FTS summary,
-            // no vector summary) share the hidden table with VectorCell
-            // entries but partition by lex term-range shard, so the cell
-            // bounds checks below don't apply to them.
-            if !seg.fts_summary.is_empty() && seg.vector_summary.is_empty() {
-                return Ok(PartitionKey::TermShard(hint));
-            }
             // `INCOMING_VECTOR_CELL` (u32::MAX) is the reserved "incoming"
             // append partition — deliberately outside `0..n_cells`.
             //
@@ -851,46 +844,6 @@ mod tests {
         seg.partition_hint = Some(3); // >= n_cells=2
         let err = assign_partition(&seg, &strategy).expect_err("legacy cell id out of range");
         assert_spans_partition(err, "out of range");
-    }
-
-    // ---- assign_partition: TermShard (text superfiles) ------------------
-
-    #[test]
-    fn assign_partition_text_entry_routes_to_term_shard() {
-        use crate::supertable::manifest::{ClusterCentroids, FtsSummaryAgg};
-
-        // FTS summary present + vector summary absent = text superfile:
-        // the hint is the lex term-range shard id, exempt from the
-        // VectorCell cell-bounds checks.
-        let clusters = ClusterCentroids::from_fp32(2, 4, &[0.0; 8], vec![1, 1]);
-        let strategy = PartitionStrategy::VectorCell {
-            column: "emb".into(),
-            clusters,
-            routing: Default::default(),
-        };
-        let mut seg = empty_seg();
-        seg.fts_summary
-            .insert("body".into(), FtsSummaryAgg::default());
-        seg.partition_hint = Some(9); // >= n_cells=2: fine for a text shard
-        let key = assign_partition(&seg, &strategy).expect("assign text shard");
-        assert_eq!(key, PartitionKey::TermShard(9));
-    }
-
-    #[test]
-    fn assign_partition_text_entry_still_requires_hint() {
-        use crate::supertable::manifest::{ClusterCentroids, FtsSummaryAgg};
-
-        let clusters = ClusterCentroids::from_fp32(2, 4, &[0.0; 8], vec![1, 1]);
-        let strategy = PartitionStrategy::VectorCell {
-            column: "emb".into(),
-            clusters,
-            routing: Default::default(),
-        };
-        let mut seg = empty_seg();
-        seg.fts_summary
-            .insert("body".into(), FtsSummaryAgg::default());
-        let err = assign_partition(&seg, &strategy).expect_err("hint required");
-        assert_spans_partition(err, "requires pre-sharded");
     }
 
     // ---- assign_partition: ColumnRange (currently unimplemented) -------

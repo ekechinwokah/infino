@@ -645,6 +645,21 @@ async fn bm25_prefix_wave(
 }
 
 impl SupertableReader {
+    /// Whether the hidden sibling's current epoch holds text shards
+    /// (flat-view probe, zero I/O). Gates both the hidden-text route
+    /// and the row wrappers' placement pass: the two must agree, so a
+    /// lazy consumer whose hidden flat view hasn't hydrated falls back
+    /// to the (always-correct) user path on both sides consistently.
+    fn hidden_epoch_has_text(&self) -> bool {
+        self.vector_index_table().is_some_and(|vit| {
+            vit.pinned_reader()
+                .manifest()
+                .get_all_superfiles()
+                .iter()
+                .any(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty())
+        })
+    }
+
     /// The hidden-text route, when this table's hidden sibling holds
     /// text shards: `Some` ⇒ callers run two waves (text shards +
     /// undrained user tail); `None` ⇒ single-wave user path (never
@@ -662,11 +677,7 @@ impl SupertableReader {
         };
         let hidden_reader = vit.pinned_reader();
         let hidden_manifest = Arc::clone(hidden_reader.manifest());
-        let epoch_has_text = hidden_manifest
-            .get_all_superfiles()
-            .iter()
-            .any(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty());
-        if !epoch_has_text {
+        if !self.hidden_epoch_has_text() {
             return Ok(None);
         }
         // Fast delete set: stable ids deleted since the text epoch.
@@ -1350,12 +1361,13 @@ impl SupertableReader {
             let hits = self.bm25_search_async(column, query, k, mode).await?;
             // Hidden text-shard hits carry no scalar data; relocate them
             // to their user-table placement by stable `_id` before the
-            // decode (user-table hits pass through unchanged). Tables
-            // without a hidden sibling skip the pass — its per-hit
+            // decode (user-table hits pass through unchanged). Gated on
+            // the same probe the route uses: when no text shards can
+            // have produced hits, the pass is skipped — its per-hit
             // manifest lookups would force lazy parts to load.
-            let hits = match self.vector_index_table() {
-                Some(_) => user_placement_for_scalar_resolve(self, &hits).await?,
-                None => hits,
+            let hits = match self.hidden_epoch_has_text() {
+                true => user_placement_for_scalar_resolve(self, &hits).await?,
+                false => hits,
             };
             // `projection` selects columns by name (any of `_id`, the
             // visible scalar columns, or the trailing `score`); `None`
@@ -1721,12 +1733,13 @@ impl Supertable {
             .block_on_query(async {
                 // Hidden text-shard hits carry no scalar data; relocate
                 // them to their user-table placement by stable `_id`
-                // before the decode. Tables without a hidden sibling
-                // skip the pass — its per-hit manifest lookups would
+                // before the decode. Gated on the same probe the route
+                // uses: when no text shards can have produced hits, the
+                // pass is skipped — its per-hit manifest lookups would
                 // force lazy parts to load.
-                let hits = match reader.vector_index_table() {
-                    Some(_) => user_placement_for_scalar_resolve(&reader, &hits).await?,
-                    None => hits,
+                let hits = match reader.hidden_epoch_has_text() {
+                    true => user_placement_for_scalar_resolve(&reader, &hits).await?,
+                    false => hits,
                 };
                 resolve_hits_named(&reader, &hits, projection, "token_match")
                     .await
