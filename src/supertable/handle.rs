@@ -2290,6 +2290,50 @@ mod tests {
         );
         assert_eq!(after.len(), 1, "re-drain must not accumulate text shards");
 
+        // The public BM25 path now routes wave 1 through the text
+        // shards, with scalar rows relocated to their user-table
+        // placement by stable `_id`.
+        let rows = st
+            .reader()
+            .bm25_search(
+                "title",
+                "rust",
+                10,
+                BoolMode::Or,
+                Some(&["_id", "title", "score"]),
+            )
+            .expect("bm25 via hidden text route");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].num_rows(), 1, "'rust' lives in one live doc");
+        let titles_out = rows[0]
+            .column_by_name("title")
+            .expect("projected title")
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("title column");
+        assert_eq!(titles_out.value(0), "rust engine");
+        let gone = st
+            .reader()
+            .bm25_search("title", "tokio", 10, BoolMode::Or, None)
+            .expect("bm25 for pre-drain tombstoned vocab");
+        assert_eq!(gone[0].num_rows(), 0, "tombstoned vocab stays gone");
+
+        // A post-drain delete is identity-filtered by the fast delete
+        // set without waiting for the next drain.
+        let post_stats = st
+            .delete(col("title").eq(lit("parquet files")))
+            .expect("post-drain delete");
+        assert_eq!(post_stats.n_tombstoned(), 1);
+        let filtered = st
+            .reader()
+            .bm25_search("title", "parquet", 10, BoolMode::Or, None)
+            .expect("bm25 after post-drain delete");
+        assert_eq!(
+            filtered[0].num_rows(),
+            0,
+            "post-drain delete filtered via the fast delete set"
+        );
+
         // A fresh open hydrates text entries (with their FTS summaries)
         // from the slow-CAS entry blob — the hidden table has no parts.
         drop(hidden);

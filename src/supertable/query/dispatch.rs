@@ -90,11 +90,20 @@ pub(crate) async fn open_reader(
 }
 
 /// Verify that parsed on-disk vector codecs match this table's write options.
+///
+/// Text superfiles — the hidden table's merged inverted-index shards
+/// (FTS summary, no vector summary) — carry no vector blob by design
+/// and are exempt: the guard exists to catch vector-bearing files
+/// whose codecs drifted from the table options.
 pub(crate) fn verify_superfile_vector_codecs(
+    entry: &SuperfileEntry,
     reader: &SuperfileReader,
     expected: &[VectorConfig],
 ) -> Result<(), QueryError> {
     if expected.is_empty() {
+        return Ok(());
+    }
+    if entry.vector_summary.is_empty() && !entry.fts_summary.is_empty() {
         return Ok(());
     }
     let vector = reader.vec().ok_or_else(|| {
@@ -569,7 +578,7 @@ where
             allow_background_fill,
         )
         .await?;
-        verify_superfile_vector_codecs(&r, &vector_columns)?;
+        verify_superfile_vector_codecs(&entry, &r, &vector_columns)?;
         let out = body(r, entry, tombstone_cache, now, params).await?;
         return Ok(vec![out]);
     }
@@ -590,7 +599,7 @@ where
                 allow_background_fill,
             )
             .await?;
-            verify_superfile_vector_codecs(&r, &vector_columns)?;
+            verify_superfile_vector_codecs(&entry, &r, &vector_columns)?;
             body(r, entry, tombstone_cache, now, params).await
         });
         // Flatten the join error into a QueryError so `try_join_all`

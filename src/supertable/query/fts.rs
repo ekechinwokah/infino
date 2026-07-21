@@ -82,6 +82,7 @@ use std::{
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, LargeStringArray};
 use roaring::RoaringBitmap;
+use tokio::join;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -104,6 +105,8 @@ use crate::{
             SuperfileHit, dispatch,
             exec::common::{resolve_hits_named, take_rows_byte_source},
             prune::{PruneLeaf, select_superfiles},
+            skip::fts_bloom_skip,
+            vector::user_placement_for_scalar_resolve,
         },
         reader_cache::disk::ForegroundQueryGuard,
         tombstones::SidecarCache,
@@ -239,6 +242,160 @@ impl SharedTopK {
     }
 }
 
+/// One parsed BM25 query's six owned clause lists, shared across
+/// fan-out units (and across the two hidden-text waves).
+#[derive(Clone)]
+struct BmClauses {
+    musts: Arc<Vec<String>>,
+    shoulds: Arc<Vec<String>>,
+    negatives: Arc<Vec<String>>,
+    must_phrases: Arc<Vec<Vec<String>>>,
+    should_phrases: Arc<Vec<Vec<String>>>,
+    negative_phrases: Arc<Vec<Vec<String>>>,
+}
+
+/// One BM25 fan-out wave over `kept` superfiles, opened through
+/// `ctx`'s store/options. The single-wave path runs one wave over the
+/// user table; the hidden-text path runs two — text shards through the
+/// hidden sibling's reader, the undrained user tail through the user
+/// reader — sharing `shared` so the kth-best floor crosses waves.
+/// Returns the wave's top `k` hits with stable ids attached.
+async fn bm25_fanout_wave(
+    ctx: &SupertableReader,
+    kept: Vec<Arc<SuperfileEntry>>,
+    column_arc: Arc<String>,
+    clauses: BmClauses,
+    k: usize,
+    has_phrases: bool,
+    shared: Arc<SharedTopK>,
+) -> Result<Vec<SuperfileHit>, QueryError> {
+    if kept.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pool_threads = ctx.manifest().options.reader_pool.current_num_threads();
+    let BmClauses {
+        musts: must_arc,
+        shoulds: should_arc,
+        negatives: neg_arc,
+        must_phrases: must_ph_arc,
+        should_phrases: should_ph_arc,
+        negative_phrases: neg_ph_arc,
+    } = clauses;
+
+    // Build the work-unit list. When the reader pool has more
+    // threads than there are kept superfiles AND we're on the
+    // multi-term OR hot path, slice each superfile into doc_id
+    // sub-ranges so the fan-out can saturate every pool thread.
+    // Single-term OR, AND, and any query with a must or negated
+    // clause stay on the un-ranged call.
+    let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
+    // Phrase-bearing queries stay per-superfile: the ranged
+    // kernel is the pure term-union fast path.
+    let fanout = match has_phrases {
+        true => FanOut::PerSuperfile,
+        false => fanout_for(must_arc.len(), should_arc.len(), !neg_arc.is_empty()),
+    };
+    let work_units = build_work_units(&kept_refs, fanout, pool_threads);
+    let units: Vec<(Arc<SuperfileEntry>, (Option<(u32, u32)>, Uuid))> = work_units
+        .into_iter()
+        .map(|u| {
+            let suid = u.entry.superfile_id;
+            (u.entry, (u.range, suid))
+        })
+        .collect();
+
+    let tombstones = ctx.tombstone_cache.clone();
+    let now = Instant::now();
+
+    // One shared fan-out (`query::dispatch::fanout`) — the same
+    // orchestrator the vector path uses. It warms the tombstone
+    // sidecars in one batch, opens each superfile reader and runs the
+    // kernel under `tokio::spawn` so cold GETs overlap, then tags +
+    // tombstone-filters each unit's hits. The per-unit `params` is
+    // the optional doc-id sub-range (`None` searches the whole
+    // superfile) plus the superfile id for the tombstone-aware merge.
+    let kernel = move |r: Arc<SuperfileReader>, (range, suid): (Option<(u32, u32)>, Uuid)| {
+        let column_arc = Arc::clone(&column_arc);
+        let must_arc = Arc::clone(&must_arc);
+        let should_arc = Arc::clone(&should_arc);
+        let neg_arc = Arc::clone(&neg_arc);
+        let must_ph_arc = Arc::clone(&must_ph_arc);
+        let should_ph_arc = Arc::clone(&should_ph_arc);
+        let neg_ph_arc = Arc::clone(&neg_ph_arc);
+        let shared = Arc::clone(&shared);
+        let tombstones = tombstones.clone();
+        async move {
+            // A cross-file floor can suppress score-tied single-term hits
+            // according to task completion order. Local BMW still prunes
+            // those queries; share the global floor only for multi-term
+            // paths.
+            let n_terms = must_arc.len() + should_arc.len();
+            let floor = if n_terms == 1 {
+                f32::NEG_INFINITY
+            } else {
+                shared.floor()
+            };
+            let hits = match range {
+                // Ranged units exist only for pure multi-should
+                // queries (`fanout_for` never slices when a must
+                // or negated clause exists).
+                Some((start, end)) => {
+                    let should_refs: Vec<&str> = should_arc.iter().map(|s| s.as_str()).collect();
+                    r.bm25_search_or_range_pretokenized_with_floor(
+                        &column_arc,
+                        &should_refs,
+                        k,
+                        start,
+                        end,
+                        floor,
+                    )
+                    .await
+                    .map_err(fts_read_error)?
+                }
+                None => {
+                    let must_refs: Vec<&str> = must_arc.iter().map(|s| s.as_str()).collect();
+                    let should_refs: Vec<&str> = should_arc.iter().map(|s| s.as_str()).collect();
+                    let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
+                    r.bm25_search_clauses(
+                        &column_arc,
+                        ClauseLists {
+                            musts: &must_refs,
+                            shoulds: &should_refs,
+                            negatives: &neg_refs,
+                            must_phrases: &must_ph_arc,
+                            should_phrases: &should_ph_arc,
+                            negative_phrases: &neg_ph_arc,
+                        },
+                        k,
+                        floor,
+                    )
+                    .await
+                    .map_err(fts_read_error)?
+                }
+            };
+            // Raise the global floor with this unit's surviving
+            // scores. Sidecars were prefetched by the dispatcher,
+            // so the bitmap lookup is an in-memory hit; on a cache
+            // miss/error we simply don't merge (a lower floor is
+            // always safe).
+            match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
+                Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
+                    hits.iter()
+                        .filter(|(d, _)| !bitmap.contains(*d))
+                        .map(|(_, s)| *s),
+                ),
+                Some(Err(_)) => {}
+                _ => shared.merge(hits.iter().map(|(_, s)| *s)),
+            }
+            Ok(hits)
+        }
+    };
+    let per_unit = dispatch::fanout_local_hits(ctx, units, kernel).await?;
+    let mut hits = top_k_descending(per_unit, k);
+    dispatch::attach_stable_ids_to_hits(ctx, &mut hits).await?;
+    Ok(hits)
+}
+
 impl SupertableReader {
     /// Single-column BM25 search across the pinned manifest's
     /// superfiles. Returns up to `k` highest-scoring hits, sorted
@@ -273,7 +430,6 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
-        let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
 
         // Parse the query once here, not per superfile, resolving the
@@ -343,139 +499,121 @@ impl SupertableReader {
             terms: prune_terms,
             mode: prune_mode,
         };
+        let clauses = BmClauses {
+            musts: Arc::new(musts),
+            shoulds: Arc::new(shoulds),
+            negatives: Arc::new(negatives),
+            must_phrases: Arc::new(must_phrases),
+            should_phrases: Arc::new(should_phrases),
+            negative_phrases: Arc::new(negative_phrases),
+        };
+        let column_arc = Arc::new(column_owned);
+        // ---- Hidden-text route: two waves over (text shards, undrained
+        // user tail), mirroring `vector_search_global_index_async`. A
+        // configured+materialized hidden index that failed to open is
+        // present-but-broken: fail loud (the vector path's policy).
+        // Absent (never configured / pre-first-drain / no text shards
+        // yet) falls through to the single-wave user path.
+        if let Some(vit) = self.vector_index_table() {
+            let hidden_reader = vit.pinned_reader();
+            let hidden_manifest = Arc::clone(hidden_reader.manifest());
+            let text_entries: Vec<Arc<SuperfileEntry>> =
+                select_superfiles(hidden_manifest.as_ref(), slice::from_ref(&prune_leaf))
+                    .await?
+                    .into_iter()
+                    // The prune keeps entries with no FTS info at all
+                    // (always-keep); the vector family is filtered out
+                    // here, not there.
+                    .filter(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty())
+                    .collect();
+            let epoch_has_text = hidden_manifest
+                .get_all_superfiles()
+                .iter()
+                .any(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty());
+            if epoch_has_text {
+                // Fast delete set: ids deleted since the text epoch.
+                // Fetching k + |deleted| in one pass guarantees k live
+                // survivors when they exist (at most |deleted| hits can
+                // be identity-filtered), so no refill loop is needed —
+                // FTS fetch cost grows only with heap sizes, unlike the
+                // vector path's per-candidate rerank.
+                vit.ensure_fresh_async().await;
+                let deleted = vit
+                    .pinned_reader()
+                    .hidden_deleted_ids()
+                    .map_err(|error| QueryError::Execute(error.to_string()))?;
+                let k_fetch = k.saturating_add(deleted.len());
+                let drained = hidden_manifest.get_drained_ranges();
+                let tail: Vec<Arc<SuperfileEntry>> = self
+                    .manifest()
+                    .get_undrained_superfiles_loaded(&drained)
+                    .await
+                    .map_err(QueryError::ManifestLoad)?;
+                // The tail wave reuses the same term-presence prune,
+                // applied as a per-entry mask (the two-tier
+                // `select_superfiles` walk already ran for wave 1).
+                let (leaf_terms, leaf_mode) = match &prune_leaf {
+                    PruneLeaf::TermPresence { terms, mode, .. } => (terms.clone(), *mode),
+                    _ => unreachable!("bm25 builds a TermPresence leaf above"),
+                };
+                let term_refs: Vec<&str> = leaf_terms.iter().map(|t| t.as_str()).collect();
+                let mask = fts_bloom_skip(&tail, &column_arc, &term_refs, leaf_mode);
+                let tail: Vec<Arc<SuperfileEntry>> = tail
+                    .into_iter()
+                    .zip(mask)
+                    .filter_map(|(e, keep)| keep.then_some(e))
+                    .collect();
+
+                // Cross-segment threshold sharing spans BOTH waves: the
+                // shared kth-best floor a text shard establishes prunes
+                // tail blocks and vice versa.
+                let shared = SharedTopK::new(k_fetch);
+                let text_wave = bm25_fanout_wave(
+                    &hidden_reader,
+                    text_entries,
+                    Arc::clone(&column_arc),
+                    clauses.clone(),
+                    k_fetch,
+                    has_phrases,
+                    Arc::clone(&shared),
+                );
+                let tail_wave = bm25_fanout_wave(
+                    self,
+                    tail,
+                    Arc::clone(&column_arc),
+                    clauses.clone(),
+                    k_fetch,
+                    has_phrases,
+                    Arc::clone(&shared),
+                );
+                let (text_hits, tail_hits) = join!(text_wave, tail_wave);
+                let mut combined = top_k_descending(vec![text_hits?, tail_hits?], k_fetch);
+                combined.retain(|hit| {
+                    hit.stable_id
+                        .is_some_and(|id| deleted.binary_search(&id).is_err())
+                });
+                combined.truncate(k);
+                return Ok(combined);
+            }
+            if let Some(reason) = self.hidden_index_open_error() {
+                return Err(QueryError::Execute(format!(
+                    "hidden index present but failed to open: {reason}"
+                )));
+            }
+        } else if let Some(reason) = self.hidden_index_open_error() {
+            return Err(QueryError::Execute(format!(
+                "hidden index present but failed to open: {reason}"
+            )));
+        }
+
+        // ---- Single-wave user path (no hidden text index).
         let kept = select_superfiles(manifest.as_ref(), slice::from_ref(&prune_leaf)).await?;
         if kept.is_empty() {
             return Ok(Vec::new());
         }
-
-        // Build the work-unit list. When the reader pool has more
-        // threads than there are kept superfiles AND we're on the
-        // multi-term OR hot path, slice each superfile into doc_id
-        // sub-ranges so the fan-out can saturate every pool thread.
-        // Single-term OR, AND, and any query with a must or negated
-        // clause stay on the un-ranged call.
-        let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
-        // Phrase-bearing queries stay per-superfile: the ranged
-        // kernel is the pure term-union fast path.
-        let fanout = match has_phrases {
-            true => FanOut::PerSuperfile,
-            false => fanout_for(musts.len(), shoulds.len(), !negatives.is_empty()),
-        };
-        let work_units = build_work_units(&kept_refs, fanout, pool_threads);
-        let units: Vec<(Arc<SuperfileEntry>, (Option<(u32, u32)>, Uuid))> = work_units
-            .into_iter()
-            .map(|u| {
-                let suid = u.entry.superfile_id;
-                (u.entry, (u.range, suid))
-            })
-            .collect();
-
-        let must_arc: Arc<Vec<String>> = Arc::new(musts);
-        let should_arc: Arc<Vec<String>> = Arc::new(shoulds);
-        let neg_arc: Arc<Vec<String>> = Arc::new(negatives);
-        let must_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(must_phrases);
-        let should_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(should_phrases);
-        let neg_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(negative_phrases);
-        let column_arc = Arc::new(column_owned);
-
-        // Cross-segment threshold sharing: each unit reads the global
-        // kth-best floor before searching and merges its surviving
-        // scores back after — late units skip every block that can't
-        // beat what earlier units already found. Tombstoned hits are
-        // excluded from the merge so deleted rows never raise the bar.
         let shared = SharedTopK::new(k);
-        let tombstones = self.tombstone_cache.clone();
-        let now = Instant::now();
 
-        // One shared fan-out (`query::dispatch::fanout`) — the same
-        // orchestrator the vector path uses. It warms the tombstone
-        // sidecars in one batch, opens each superfile reader and runs the
-        // kernel under `tokio::spawn` so cold GETs overlap, then tags +
-        // tombstone-filters each unit's hits. The per-unit `params` is
-        // the optional doc-id sub-range (`None` searches the whole
-        // superfile) plus the superfile id for the tombstone-aware merge.
-        let kernel = move |r: Arc<SuperfileReader>, (range, suid): (Option<(u32, u32)>, Uuid)| {
-            let column_arc = Arc::clone(&column_arc);
-            let must_arc = Arc::clone(&must_arc);
-            let should_arc = Arc::clone(&should_arc);
-            let neg_arc = Arc::clone(&neg_arc);
-            let must_ph_arc = Arc::clone(&must_ph_arc);
-            let should_ph_arc = Arc::clone(&should_ph_arc);
-            let neg_ph_arc = Arc::clone(&neg_ph_arc);
-            let shared = Arc::clone(&shared);
-            let tombstones = tombstones.clone();
-            async move {
-                // A cross-file floor can suppress score-tied single-term hits
-                // according to task completion order. Local BMW still prunes
-                // those queries; share the global floor only for multi-term
-                // paths.
-                let n_terms = must_arc.len() + should_arc.len();
-                let floor = if n_terms == 1 {
-                    f32::NEG_INFINITY
-                } else {
-                    shared.floor()
-                };
-                let hits = match range {
-                    // Ranged units exist only for pure multi-should
-                    // queries (`fanout_for` never slices when a must
-                    // or negated clause exists).
-                    Some((start, end)) => {
-                        let should_refs: Vec<&str> =
-                            should_arc.iter().map(|s| s.as_str()).collect();
-                        r.bm25_search_or_range_pretokenized_with_floor(
-                            &column_arc,
-                            &should_refs,
-                            k,
-                            start,
-                            end,
-                            floor,
-                        )
-                        .await
-                        .map_err(fts_read_error)?
-                    }
-                    None => {
-                        let must_refs: Vec<&str> = must_arc.iter().map(|s| s.as_str()).collect();
-                        let should_refs: Vec<&str> =
-                            should_arc.iter().map(|s| s.as_str()).collect();
-                        let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                        r.bm25_search_clauses(
-                            &column_arc,
-                            ClauseLists {
-                                musts: &must_refs,
-                                shoulds: &should_refs,
-                                negatives: &neg_refs,
-                                must_phrases: &must_ph_arc,
-                                should_phrases: &should_ph_arc,
-                                negative_phrases: &neg_ph_arc,
-                            },
-                            k,
-                            floor,
-                        )
-                        .await
-                        .map_err(fts_read_error)?
-                    }
-                };
-                // Raise the global floor with this unit's surviving
-                // scores. Sidecars were prefetched by the dispatcher,
-                // so the bitmap lookup is an in-memory hit; on a cache
-                // miss/error we simply don't merge (a lower floor is
-                // always safe).
-                match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
-                    Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
-                        hits.iter()
-                            .filter(|(d, _)| !bitmap.contains(*d))
-                            .map(|(_, s)| *s),
-                    ),
-                    Some(Err(_)) => {}
-                    _ => shared.merge(hits.iter().map(|(_, s)| *s)),
-                }
-                Ok(hits)
-            }
-        };
-        let per_unit = dispatch::fanout_local_hits(self, units, kernel).await?;
-        let mut hits = top_k_descending(per_unit, k);
-        dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
-        Ok(hits)
+        bm25_fanout_wave(self, kept, column_arc, clauses, k, has_phrases, shared).await
     }
 
     /// Prefix-expanded BM25 search across the pinned manifest's
@@ -1007,6 +1145,15 @@ impl SupertableReader {
         let _foreground = ForegroundQueryGuard::enter();
         self.block_on(async {
             let hits = self.bm25_search_async(column, query, k, mode).await?;
+            // Hidden text-shard hits carry no scalar data; relocate them
+            // to their user-table placement by stable `_id` before the
+            // decode (user-table hits pass through unchanged). Tables
+            // without a hidden sibling skip the pass — its per-hit
+            // manifest lookups would force lazy parts to load.
+            let hits = match self.vector_index_table() {
+                Some(_) => user_placement_for_scalar_resolve(self, &hits).await?,
+                None => hits,
+            };
             // `projection` selects columns by name (any of `_id`, the
             // visible scalar columns, or the trailing `score`); `None`
             // returns `_id` + `score` only. The shared resolver decodes
