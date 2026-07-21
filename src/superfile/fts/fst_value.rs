@@ -35,6 +35,13 @@ const PFOR_OFFSET_BITS: u32 = 42;
 const PFOR_LENGTH_SHIFT: u32 = PFOR_OFFSET_SHIFT + PFOR_OFFSET_BITS;
 const PFOR_LENGTH_BITS: u32 = 21;
 const PFOR_OFFSET_MAX: u64 = (1u64 << PFOR_OFFSET_BITS) - 1;
+/// All-ones in the 21-bit length slot: the **long-term sentinel**. A
+/// posting region at or above this size (a merged mega-term in a
+/// hidden text superfile; per-file postings never get close) stores
+/// the sentinel, and the reader resolves the true `u32` length from
+/// the term metadata header — which has always carried it
+/// authoritatively (the FST copy exists only to make the common case
+/// a single ranged GET).
 pub(crate) const PFOR_LENGTH_MAX: u32 = (1u32 << PFOR_LENGTH_BITS) - 1;
 /// Maximum `tf` representable in the inline form's 30-bit slot.
 /// Real-world per-doc tf is bounded by document length (in tokens),
@@ -71,18 +78,17 @@ impl FstValue {
     }
 
     /// Pack `(metadata_offset, postings_length)` into the PFOR-form
-    /// FST value. The low bit is always 0.
+    /// FST value. The low bit is always 0. Lengths at or above
+    /// [`PFOR_LENGTH_MAX`] store the long-term sentinel (see its
+    /// docs); everything below is exact.
     #[inline]
     pub(crate) fn pack_pfor(metadata_offset: u64, postings_length: u32) -> u64 {
         assert!(
             metadata_offset <= PFOR_OFFSET_MAX,
             "metadata_offset {metadata_offset} overflows the {PFOR_OFFSET_BITS}-bit PFOR slot"
         );
-        assert!(
-            postings_length <= PFOR_LENGTH_MAX,
-            "postings_length {postings_length} overflows the {PFOR_LENGTH_BITS}-bit PFOR slot"
-        );
-        (metadata_offset << PFOR_OFFSET_SHIFT) | ((postings_length as u64) << PFOR_LENGTH_SHIFT)
+        let stored = postings_length.min(PFOR_LENGTH_MAX);
+        (metadata_offset << PFOR_OFFSET_SHIFT) | ((stored as u64) << PFOR_LENGTH_SHIFT)
     }
 
     /// Pack a `(doc_id, tf)` pair into the inline-form FST value. The
@@ -142,6 +148,23 @@ mod tests {
     #[should_panic(expected = "overflows the inline 30-bit slot")]
     fn inline_tf_overflow_panics() {
         let _ = FstValue::pack_inline(0, INLINE_TF_MAX + 1);
+    }
+
+    #[test]
+    fn pfor_length_at_or_above_ceiling_stores_the_sentinel() {
+        // A merged mega-term's postings exceed the 21-bit slot; the
+        // packed value carries the sentinel and the reader resolves
+        // the true length from the term metadata header.
+        for &len in &[PFOR_LENGTH_MAX, PFOR_LENGTH_MAX + 1, u32::MAX] {
+            let packed = FstValue::pack_pfor(7, len);
+            assert_eq!(
+                FstValue::unpack(packed),
+                FstValue::Pfor {
+                    metadata_offset: 7,
+                    postings_length: PFOR_LENGTH_MAX
+                }
+            );
+        }
     }
 
     #[test]

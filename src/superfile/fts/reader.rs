@@ -42,7 +42,7 @@ use crate::superfile::{
             DOC_LENGTHS_ENTRY_SIZE, SKIP_ENTRY_SIZE, TERM_META_POSITIONAL_SIZE, TERM_META_SIZE,
         },
         dict::{DictReader, make_key},
-        fst_value::FstValue,
+        fst_value::{FstValue, PFOR_LENGTH_MAX},
         positions::{decode_run, push_varint, skip_run},
         posting::{BLOCK_LEN, decode_block},
         tokenize::{AsciiLowerTokenizer, Tokenizer as _},
@@ -916,6 +916,32 @@ impl FtsReader {
             })
     }
 
+    /// True postings byte length for a PFOR term. Lengths below the
+    /// long-term sentinel are exact in the FST value; the sentinel (a
+    /// merged mega-term whose region exceeds the 21-bit slot — see
+    /// [`PFOR_LENGTH_MAX`]) resolves from the term metadata header's
+    /// `u32` length, which has always been authoritative.
+    async fn resolve_pfor_length(
+        &self,
+        metadata_offset: u64,
+        packed_length: u32,
+        positional: bool,
+    ) -> Result<u32, FtsError> {
+        if packed_length < PFOR_LENGTH_MAX {
+            return Ok(packed_length);
+        }
+        let meta_size = match positional {
+            true => TERM_META_POSITIONAL_SIZE,
+            false => TERM_META_SIZE,
+        };
+        let fetched = self
+            .fetch_term_postings(&[(metadata_offset as usize, meta_size)])
+            .await?;
+        Ok(read_u32_le(
+            &fetched[0][term_meta::POSTINGS_LENGTH_OFF..term_meta::POSTINGS_LENGTH_OFF + U32_BYTES],
+        ))
+    }
+
     /// Build one [`AnyCursor`] per requested atom, preserving input
     /// order: first the `terms`, then the `phrases`. An atom whose
     /// term (or any phrase member) is absent from the column yields
@@ -1404,6 +1430,9 @@ impl FtsReader {
                 metadata_offset,
                 postings_length,
             } => {
+                let postings_length = self
+                    .resolve_pfor_length(metadata_offset, postings_length, positional)
+                    .await?;
                 let fetched = self
                     .fetch_term_postings(&[(metadata_offset as usize, postings_length as usize)])
                     .await?;
@@ -1922,7 +1951,11 @@ impl FtsReader {
             FstValue::Pfor {
                 metadata_offset,
                 postings_length,
-            } => (metadata_offset as usize, postings_length as usize),
+            } => (
+                metadata_offset as usize,
+                self.resolve_pfor_length(metadata_offset, postings_length, col_meta.positions)
+                    .await? as usize,
+            ),
         };
         // Fetch only this term's byte range (metadata header + skip
         // table + blocks). The returned buffer starts at the metadata
@@ -2047,7 +2080,10 @@ impl FtsReader {
                     metadata_offset,
                     postings_length,
                 } => {
-                    pfor_offsets.push((metadata_offset as usize, postings_length as usize));
+                    let postings_length = self
+                        .resolve_pfor_length(metadata_offset, postings_length, col_meta.positions)
+                        .await? as usize;
+                    pfor_offsets.push((metadata_offset as usize, postings_length));
                     resolved.push(Resolved::Pfor);
                 }
             }
@@ -5080,6 +5116,45 @@ mod tests {
             .collect();
         assert_eq!(at, runs.len(), "runs must cover exactly the pairs");
         out
+    }
+
+    /// The long-term sentinel path: a mega-term's FST value carries
+    /// `PFOR_LENGTH_MAX` instead of its true region length, and the
+    /// resolver recovers the exact length from the term metadata
+    /// header. Driven against a small term by handing the resolver the
+    /// sentinel directly — the meta-read path is identical regardless
+    /// of the region's actual size.
+    #[tokio::test]
+    async fn resolve_pfor_length_recovers_true_length_from_term_meta() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+        let (_, packed) = r
+            .column_term_entries("body")
+            .expect("entries")
+            .into_iter()
+            .find(|(t, _)| t == b"rust")
+            .expect("'rust' has df=2 -> PFOR form");
+        let FstValue::Pfor {
+            metadata_offset,
+            postings_length,
+        } = FstValue::unpack(packed)
+        else {
+            panic!("df=2 term must be PFOR")
+        };
+        assert!(postings_length < PFOR_LENGTH_MAX, "small term is exact");
+        let exact = r
+            .resolve_pfor_length(metadata_offset, postings_length, false)
+            .await
+            .expect("exact passthrough");
+        assert_eq!(exact, postings_length);
+        let via_meta = r
+            .resolve_pfor_length(metadata_offset, PFOR_LENGTH_MAX, false)
+            .await
+            .expect("sentinel resolves via term meta");
+        assert_eq!(
+            via_meta, postings_length,
+            "meta header length is authoritative"
+        );
     }
 
     #[tokio::test]
