@@ -2318,6 +2318,23 @@ mod tests {
             .expect("bm25 for pre-drain tombstoned vocab");
         assert_eq!(gone[0].num_rows(), 0, "tombstoned vocab stays gone");
 
+        // token_match and count route through the text shards too.
+        let matches = st
+            .reader()
+            .token_match("title", "engine", BoolMode::Or)
+            .expect("token_match via hidden route");
+        assert_eq!(matches.len(), 1, "'engine' lives in one live doc");
+        let n = st
+            .reader()
+            .count("title", "files", BoolMode::Or)
+            .expect("count via hidden route");
+        assert_eq!(n, 1, "'files' counted once");
+        let n_gone = st
+            .reader()
+            .count("title", "tokio", BoolMode::Or)
+            .expect("count for tombstoned vocab");
+        assert_eq!(n_gone, 0, "tombstoned vocab counts zero");
+
         // A post-drain delete is identity-filtered by the fast delete
         // set without waiting for the next drain.
         let post_stats = st
@@ -2333,6 +2350,22 @@ mod tests {
             0,
             "post-drain delete filtered via the fast delete set"
         );
+        let tm_filtered = st
+            .reader()
+            .token_match("title", "parquet", BoolMode::Or)
+            .expect("token_match after post-drain delete");
+        assert!(
+            tm_filtered.is_empty(),
+            "token_match filters post-drain deletes too"
+        );
+        // Counts can't identity-filter, so a non-empty delete set
+        // falls back to the always-correct user path (which sees the
+        // sidecar tombstone).
+        let n_after_delete = st
+            .reader()
+            .count("title", "parquet", BoolMode::Or)
+            .expect("count after post-drain delete");
+        assert_eq!(n_after_delete, 0, "count stays correct under deletes");
 
         // A fresh open hydrates text entries (with their FTS summaries)
         // from the slow-CAS entry blob — the hidden table has no parts.

@@ -100,12 +100,12 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{Supertable, SupertableReader},
-        manifest::SuperfileEntry,
+        manifest::{ManifestSnapshot, SuperfileEntry, list::DrainedVersionRanges},
         query::{
             SuperfileHit, dispatch,
             exec::common::{resolve_hits_named, take_rows_byte_source},
             prune::{PruneLeaf, select_superfiles},
-            skip::fts_bloom_skip,
+            skip::{fts_bloom_skip, fts_prefix_skip},
             vector::user_placement_for_scalar_resolve,
         },
         reader_cache::disk::ForegroundQueryGuard,
@@ -134,24 +134,12 @@ impl Default for UnrankedMatchSet {
     }
 }
 
-impl UnrankedMatchSet {
-    fn has_phrases(&self) -> bool {
-        !self.phrases.is_empty()
-    }
-}
-
 /// An unranked query's negated atoms (docs containing any are
 /// excluded).
 #[derive(Default)]
 struct UnrankedNegatives {
     terms: Vec<String>,
     phrases: Vec<Vec<String>>,
-}
-
-impl UnrankedNegatives {
-    fn is_empty(&self) -> bool {
-        self.terms.is_empty() && self.phrases.is_empty()
-    }
 }
 
 /// Rejection message for a query with negated terms but no positive
@@ -240,6 +228,21 @@ impl SharedTopK {
                 .store(min.to_bits(), atomic::Ordering::Release);
         }
     }
+}
+
+/// Ingredients of the hidden-text query route, present when the
+/// hidden sibling's current epoch holds text shards (term-range
+/// slices of the merged inverted index).
+struct HiddenTextRoute {
+    /// Reader whose store/options open the hidden table's superfiles.
+    hidden_reader: SupertableReader,
+    hidden_manifest: Arc<ManifestSnapshot>,
+    /// Stable ids deleted since the text epoch (sorted); hits are
+    /// identity-filtered against it after the waves merge.
+    deleted: Arc<Vec<i128>>,
+    /// The epoch's residency watermark: user superfiles NOT covered
+    /// by it form the tail wave.
+    drained: DrainedVersionRanges,
 }
 
 /// One parsed BM25 query's six owned clause lists, shared across
@@ -396,7 +399,333 @@ async fn bm25_fanout_wave(
     Ok(hits)
 }
 
+/// One unranked token-match fan-out wave over `kept` superfiles
+/// opened through `ctx`'s store/options — the `token_match` sibling of
+/// [`bm25_fanout_wave`]. Returns every matching row (no scoring, no
+/// ordering) with stable ids attached.
+#[allow(clippy::too_many_arguments)]
+async fn token_match_wave(
+    ctx: &SupertableReader,
+    kept: Vec<Arc<SuperfileEntry>>,
+    column_arc: Arc<String>,
+    term_arc: Arc<Vec<String>>,
+    phrase_arc: Arc<Vec<Vec<String>>>,
+    neg_arc: Arc<Vec<String>>,
+    neg_ph_arc: Arc<Vec<Vec<String>>>,
+    match_mode: BoolMode,
+) -> Result<Vec<SuperfileHit>, QueryError> {
+    if kept.is_empty() {
+        return Ok(Vec::new());
+    }
+    let has_negatives = !neg_arc.is_empty() || !neg_ph_arc.is_empty();
+    let phrase_involved = !phrase_arc.is_empty() || !neg_ph_arc.is_empty();
+    let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
+    let kernel = move |r: Arc<SuperfileReader>, _: ()| {
+        let column_arc = Arc::clone(&column_arc);
+        let term_arc = Arc::clone(&term_arc);
+        let phrase_arc = Arc::clone(&phrase_arc);
+        let neg_arc = Arc::clone(&neg_arc);
+        let neg_ph_arc = Arc::clone(&neg_ph_arc);
+        async move {
+            let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
+            // Any phrase atom (match or negated) takes the
+            // phrase-aware walk; plain-token queries keep the
+            // optimized token_match path unchanged.
+            let docs = match phrase_involved {
+                true => r
+                    .atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
+                    .await
+                    .map_err(fts_read_error)?,
+                false => r
+                    .token_match(&column_arc, &refs, match_mode)
+                    .await
+                    .map_err(fts_read_error)?,
+            };
+            // Drop any positive match that also carries a negated
+            // atom (union of the negatives). The df / count fast
+            // paths can't express exclusion, so negation forces a
+            // materialized walk over both sets.
+            let docs = if has_negatives {
+                let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
+                let excluded: RoaringBitmap = match neg_ph_arc.is_empty() {
+                    true => r
+                        .token_match(&column_arc, &neg_refs, BoolMode::Or)
+                        .await
+                        .map_err(fts_read_error)?,
+                    false => r
+                        .atoms_match_ids(&column_arc, &neg_refs, &neg_ph_arc, BoolMode::Or)
+                        .await
+                        .map_err(fts_read_error)?,
+                }
+                .into_iter()
+                .collect();
+                docs.into_iter()
+                    .filter(|d| !excluded.contains(*d))
+                    .collect::<Vec<_>>()
+            } else {
+                docs
+            };
+            Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
+        }
+    };
+    let per_unit = dispatch::fanout_local_hits(ctx, units, kernel).await?;
+    // Exact pre-size: `Flatten`'s size_hint is opaque, and growth
+    // reallocations copy the whole hit vec repeatedly at 1M hits.
+    let total: usize = per_unit.iter().map(Vec::len).sum();
+    let mut hits: Vec<SuperfileHit> = Vec::with_capacity(total);
+    for unit in per_unit {
+        hits.extend(unit);
+    }
+    dispatch::attach_stable_ids_to_hits(ctx, &mut hits).await?;
+    Ok(hits)
+}
+
+/// One unranked match-count fan-out wave over `kept` superfiles
+/// opened through `ctx`'s store/options — the counting sibling of
+/// [`token_match_wave`]. Returns the wave's total match count,
+/// tombstone-filtered per superfile.
+#[allow(clippy::too_many_arguments)]
+async fn token_match_count_wave(
+    ctx: &SupertableReader,
+    kept: Vec<Arc<SuperfileEntry>>,
+    column_arc: Arc<String>,
+    term_arc: Arc<Vec<String>>,
+    phrase_arc: Arc<Vec<Vec<String>>>,
+    neg_arc: Arc<Vec<String>>,
+    neg_ph_arc: Arc<Vec<Vec<String>>>,
+    match_mode: BoolMode,
+) -> Result<u64, QueryError> {
+    if kept.is_empty() {
+        return Ok(0);
+    }
+    let single_term = term_arc.len() == 1 && phrase_arc.is_empty();
+    let has_negatives = !neg_arc.is_empty() || !neg_ph_arc.is_empty();
+    let phrase_involved = !phrase_arc.is_empty() || !neg_ph_arc.is_empty();
+    let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
+
+    // Shared fan-out (`dispatch::fanout_with`): warms tombstones,
+    // spawns + opens each superfile concurrently, and short-circuits
+    // on the first error. The per-superfile body returns this
+    // superfile's match count; the totals are summed.
+    let per_superfile = dispatch::fanout_with(
+        ctx,
+        units,
+        true,
+        true,
+        move |r, entry, tombstone_cache, now, _params: ()| {
+            let column_arc = Arc::clone(&column_arc);
+            let term_arc = Arc::clone(&term_arc);
+            let phrase_arc = Arc::clone(&phrase_arc);
+            let neg_arc = Arc::clone(&neg_arc);
+            let neg_ph_arc = Arc::clone(&neg_ph_arc);
+            async move {
+                // Tombstone bitmap for this superfile (None = no deletes).
+                let tomb = match tombstone_cache.as_ref() {
+                    Some(c) => {
+                        let b = c
+                            .bitmap_for(entry.superfile_id, now)
+                            .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+                        if b.is_empty() { None } else { Some(b) }
+                    }
+                    None => None,
+                };
+                let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
+                // Negated terms or deletes both force materialization:
+                // the df read and the bare match count can't subtract
+                // excluded or tombstoned docs. Materialize the positive
+                // matches, then drop any doc carrying a negated term
+                // (union of the negatives) or a tombstone.
+                if has_negatives || tomb.is_some() {
+                    let docs = match phrase_involved {
+                        true => r
+                            .atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
+                            .await
+                            .map_err(fts_read_error)?,
+                        false => r
+                            .token_match(&column_arc, &refs, match_mode)
+                            .await
+                            .map_err(fts_read_error)?,
+                    };
+                    let excluded: RoaringBitmap = if has_negatives {
+                        let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
+                        match neg_ph_arc.is_empty() {
+                            true => r
+                                .token_match(&column_arc, &neg_refs, BoolMode::Or)
+                                .await
+                                .map_err(fts_read_error)?,
+                            false => r
+                                .atoms_match_ids(&column_arc, &neg_refs, &neg_ph_arc, BoolMode::Or)
+                                .await
+                                .map_err(fts_read_error)?,
+                        }
+                        .into_iter()
+                        .collect()
+                    } else {
+                        RoaringBitmap::new()
+                    };
+                    let n = docs
+                        .iter()
+                        .filter(|d| {
+                            !excluded.contains(**d)
+                                && tomb.as_ref().is_none_or(|b| !b.contains(**d))
+                        })
+                        .count() as u64;
+                    return Ok::<u64, QueryError>(n);
+                }
+                // No negatives and no deletes (the common case): count
+                // without materializing ids — a single token resolves
+                // O(1) from the stored df, multi-token tallies the
+                // match walk through the counting sink.
+                let n = if single_term {
+                    r.term_df(&column_arc, &term_arc[0])
+                        .await
+                        .map_err(fts_read_error)?
+                } else if phrase_involved {
+                    r.atoms_match_count(&column_arc, &refs, &phrase_arc, match_mode)
+                        .await
+                        .map_err(fts_read_error)?
+                } else {
+                    r.token_match_count(&column_arc, &refs, match_mode)
+                        .await
+                        .map_err(fts_read_error)?
+                };
+                Ok(n)
+            }
+        },
+    )
+    .await?;
+    Ok(per_superfile.into_iter().sum())
+}
+
+/// One prefix-expanded BM25 fan-out wave over `kept` superfiles
+/// opened through `ctx`'s store/options — the prefix sibling of
+/// [`bm25_fanout_wave`] (no cross-unit floor: the per-superfile
+/// prefix kernels never shared one). Returns the wave's top `k` hits
+/// with stable ids attached.
+async fn bm25_prefix_wave(
+    ctx: &SupertableReader,
+    kept: Vec<Arc<SuperfileEntry>>,
+    column_arc: Arc<String>,
+    prefix_arc: Arc<String>,
+    k: usize,
+) -> Result<Vec<SuperfileHit>, QueryError> {
+    if kept.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pool_threads = ctx.manifest().options.reader_pool.current_num_threads();
+    let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
+    // Prefix expansion is always multi-term OR with no negation, so
+    // it is directly sub-range eligible.
+    let work_units = build_work_units(&kept_refs, FanOut::SubRanges, pool_threads);
+    let units: Vec<(Arc<SuperfileEntry>, Option<(u32, u32)>)> =
+        work_units.into_iter().map(|u| (u.entry, u.range)).collect();
+
+    // Shared fan-out — see `bm25_search` for the rationale; the
+    // kernel differs only in calling the prefix search variants.
+    let kernel = move |r: Arc<SuperfileReader>, range: Option<(u32, u32)>| {
+        let column_arc = Arc::clone(&column_arc);
+        let prefix_arc = Arc::clone(&prefix_arc);
+        async move {
+            match range {
+                Some((start, end)) => r
+                    .bm25_search_prefix_range(&column_arc, &prefix_arc, k, start, end)
+                    .await
+                    .map_err(fts_read_error),
+                None => r
+                    .bm25_search_prefix(&column_arc, &prefix_arc, k)
+                    .await
+                    .map_err(fts_read_error),
+            }
+        }
+    };
+    let per_unit = dispatch::fanout_local_hits(ctx, units, kernel).await?;
+    let mut hits = top_k_descending(per_unit, k);
+    dispatch::attach_stable_ids_to_hits(ctx, &mut hits).await?;
+    Ok(hits)
+}
+
 impl SupertableReader {
+    /// The hidden-text route, when this table's hidden sibling holds
+    /// text shards: `Some` ⇒ callers run two waves (text shards +
+    /// undrained user tail); `None` ⇒ single-wave user path (never
+    /// configured, pre-first-drain, or no text shards yet). A
+    /// present-but-broken hidden index fails loud — the vector path's
+    /// policy (see `vector_search_global_index_async`).
+    async fn hidden_text_route(&self) -> Result<Option<HiddenTextRoute>, QueryError> {
+        let Some(vit) = self.vector_index_table() else {
+            if let Some(reason) = self.hidden_index_open_error() {
+                return Err(QueryError::Execute(format!(
+                    "hidden index present but failed to open: {reason}"
+                )));
+            }
+            return Ok(None);
+        };
+        let hidden_reader = vit.pinned_reader();
+        let hidden_manifest = Arc::clone(hidden_reader.manifest());
+        let epoch_has_text = hidden_manifest
+            .get_all_superfiles()
+            .iter()
+            .any(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty());
+        if !epoch_has_text {
+            return Ok(None);
+        }
+        // Fast delete set: stable ids deleted since the text epoch.
+        vit.ensure_fresh_async().await;
+        let deleted = vit
+            .pinned_reader()
+            .hidden_deleted_ids()
+            .map_err(|error| QueryError::Execute(error.to_string()))?;
+        let drained = hidden_manifest.get_drained_ranges();
+        Ok(Some(HiddenTextRoute {
+            hidden_reader,
+            hidden_manifest,
+            deleted,
+            drained,
+        }))
+    }
+
+    /// Wave-1 superfiles: the hidden epoch's text shards surviving
+    /// `prune_leaf`. The prune keeps entries with no FTS info at all
+    /// (always-keep), so the vector family is filtered out here, not
+    /// there.
+    async fn text_shards_pruned(
+        route: &HiddenTextRoute,
+        prune_leaf: &PruneLeaf,
+    ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
+        Ok(
+            select_superfiles(route.hidden_manifest.as_ref(), slice::from_ref(prune_leaf))
+                .await?
+                .into_iter()
+                .filter(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty())
+                .collect(),
+        )
+    }
+
+    /// Wave-2 superfiles: user files newer than the text epoch's
+    /// watermark, masked by the same term-presence prune the text wave
+    /// used (the two-tier `select_superfiles` walk already ran for
+    /// wave 1; the tail only needs the per-entry mask).
+    async fn undrained_tail_pruned(
+        &self,
+        route: &HiddenTextRoute,
+        column: &str,
+        terms: &[String],
+        mode: BoolMode,
+    ) -> Result<Vec<Arc<SuperfileEntry>>, QueryError> {
+        let tail = self
+            .manifest()
+            .get_undrained_superfiles_loaded(&route.drained)
+            .await
+            .map_err(QueryError::ManifestLoad)?;
+        let term_refs: Vec<&str> = terms.iter().map(|t| t.as_str()).collect();
+        let mask = fts_bloom_skip(&tail, column, &term_refs, mode);
+        Ok(tail
+            .into_iter()
+            .zip(mask)
+            .filter_map(|(e, keep)| keep.then_some(e))
+            .collect())
+    }
+
     /// Single-column BM25 search across the pinned manifest's
     /// superfiles. Returns up to `k` highest-scoring hits, sorted
     /// descending by score.
@@ -509,101 +838,52 @@ impl SupertableReader {
         };
         let column_arc = Arc::new(column_owned);
         // ---- Hidden-text route: two waves over (text shards, undrained
-        // user tail), mirroring `vector_search_global_index_async`. A
-        // configured+materialized hidden index that failed to open is
-        // present-but-broken: fail loud (the vector path's policy).
-        // Absent (never configured / pre-first-drain / no text shards
-        // yet) falls through to the single-wave user path.
-        if let Some(vit) = self.vector_index_table() {
-            let hidden_reader = vit.pinned_reader();
-            let hidden_manifest = Arc::clone(hidden_reader.manifest());
-            let text_entries: Vec<Arc<SuperfileEntry>> =
-                select_superfiles(hidden_manifest.as_ref(), slice::from_ref(&prune_leaf))
-                    .await?
-                    .into_iter()
-                    // The prune keeps entries with no FTS info at all
-                    // (always-keep); the vector family is filtered out
-                    // here, not there.
-                    .filter(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty())
-                    .collect();
-            let epoch_has_text = hidden_manifest
-                .get_all_superfiles()
-                .iter()
-                .any(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty());
-            if epoch_has_text {
-                // Fast delete set: ids deleted since the text epoch.
-                // Fetching k + |deleted| in one pass guarantees k live
-                // survivors when they exist (at most |deleted| hits can
-                // be identity-filtered), so no refill loop is needed —
-                // FTS fetch cost grows only with heap sizes, unlike the
-                // vector path's per-candidate rerank.
-                vit.ensure_fresh_async().await;
-                let deleted = vit
-                    .pinned_reader()
-                    .hidden_deleted_ids()
-                    .map_err(|error| QueryError::Execute(error.to_string()))?;
-                let k_fetch = k.saturating_add(deleted.len());
-                let drained = hidden_manifest.get_drained_ranges();
-                let tail: Vec<Arc<SuperfileEntry>> = self
-                    .manifest()
-                    .get_undrained_superfiles_loaded(&drained)
-                    .await
-                    .map_err(QueryError::ManifestLoad)?;
-                // The tail wave reuses the same term-presence prune,
-                // applied as a per-entry mask (the two-tier
-                // `select_superfiles` walk already ran for wave 1).
-                let (leaf_terms, leaf_mode) = match &prune_leaf {
-                    PruneLeaf::TermPresence { terms, mode, .. } => (terms.clone(), *mode),
-                    _ => unreachable!("bm25 builds a TermPresence leaf above"),
-                };
-                let term_refs: Vec<&str> = leaf_terms.iter().map(|t| t.as_str()).collect();
-                let mask = fts_bloom_skip(&tail, &column_arc, &term_refs, leaf_mode);
-                let tail: Vec<Arc<SuperfileEntry>> = tail
-                    .into_iter()
-                    .zip(mask)
-                    .filter_map(|(e, keep)| keep.then_some(e))
-                    .collect();
-
-                // Cross-segment threshold sharing spans BOTH waves: the
-                // shared kth-best floor a text shard establishes prunes
-                // tail blocks and vice versa.
-                let shared = SharedTopK::new(k_fetch);
-                let text_wave = bm25_fanout_wave(
-                    &hidden_reader,
-                    text_entries,
-                    Arc::clone(&column_arc),
-                    clauses.clone(),
-                    k_fetch,
-                    has_phrases,
-                    Arc::clone(&shared),
-                );
-                let tail_wave = bm25_fanout_wave(
-                    self,
-                    tail,
-                    Arc::clone(&column_arc),
-                    clauses.clone(),
-                    k_fetch,
-                    has_phrases,
-                    Arc::clone(&shared),
-                );
-                let (text_hits, tail_hits) = join!(text_wave, tail_wave);
-                let mut combined = top_k_descending(vec![text_hits?, tail_hits?], k_fetch);
-                combined.retain(|hit| {
-                    hit.stable_id
-                        .is_some_and(|id| deleted.binary_search(&id).is_err())
-                });
-                combined.truncate(k);
-                return Ok(combined);
-            }
-            if let Some(reason) = self.hidden_index_open_error() {
-                return Err(QueryError::Execute(format!(
-                    "hidden index present but failed to open: {reason}"
-                )));
-            }
-        } else if let Some(reason) = self.hidden_index_open_error() {
-            return Err(QueryError::Execute(format!(
-                "hidden index present but failed to open: {reason}"
-            )));
+        // user tail), mirroring `vector_search_global_index_async`.
+        // Fetching k + |deleted| in one pass guarantees k live
+        // survivors when they exist (at most |deleted| hits can be
+        // identity-filtered), so no refill loop is needed — FTS fetch
+        // cost grows only with heap sizes, unlike the vector path's
+        // per-candidate rerank.
+        if let Some(route) = self.hidden_text_route().await? {
+            let text_entries = Self::text_shards_pruned(&route, &prune_leaf).await?;
+            let (leaf_terms, leaf_mode) = match &prune_leaf {
+                PruneLeaf::TermPresence { terms, mode, .. } => (terms.clone(), *mode),
+                _ => unreachable!("bm25 builds a TermPresence leaf above"),
+            };
+            let tail = self
+                .undrained_tail_pruned(&route, &column_arc, &leaf_terms, leaf_mode)
+                .await?;
+            let k_fetch = k.saturating_add(route.deleted.len());
+            // Cross-segment threshold sharing spans BOTH waves: the
+            // shared kth-best floor a text shard establishes prunes
+            // tail blocks and vice versa.
+            let shared = SharedTopK::new(k_fetch);
+            let text_wave = bm25_fanout_wave(
+                &route.hidden_reader,
+                text_entries,
+                Arc::clone(&column_arc),
+                clauses.clone(),
+                k_fetch,
+                has_phrases,
+                Arc::clone(&shared),
+            );
+            let tail_wave = bm25_fanout_wave(
+                self,
+                tail,
+                Arc::clone(&column_arc),
+                clauses.clone(),
+                k_fetch,
+                has_phrases,
+                Arc::clone(&shared),
+            );
+            let (text_hits, tail_hits) = join!(text_wave, tail_wave);
+            let mut combined = top_k_descending(vec![text_hits?, tail_hits?], k_fetch);
+            combined.retain(|hit| {
+                hit.stable_id
+                    .is_some_and(|id| route.deleted.binary_search(&id).is_err())
+            });
+            combined.truncate(k);
+            return Ok(combined);
         }
 
         // ---- Single-wave user path (no hidden text index).
@@ -639,7 +919,6 @@ impl SupertableReader {
             return Ok(Vec::new());
         }
         let manifest = self.manifest();
-        let pool_threads = manifest.options.reader_pool.current_num_threads();
         let column_owned = column.to_owned();
         let prefix_owned = prefix.to_owned();
 
@@ -650,94 +929,83 @@ impl SupertableReader {
         // tokenizer's interpretation of the prefix.
         let prefix_lower = prefix_owned.to_ascii_lowercase();
 
-        // Superfile selection via the shared two-tier prune — the
-        // single-`Prefix`-leaf case (part-level term-range skip →
-        // lazy-load surviving parts → per-superfile term-range skip).
-        let kept = select_superfiles(
-            manifest.as_ref(),
-            &[PruneLeaf::Prefix {
-                column: column_owned.clone(),
-                prefix: prefix_lower.as_bytes().to_vec(),
-            }],
-        )
-        .await?;
-        if kept.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
-        // Prefix expansion is always multi-term OR with no negation, so
-        // it is directly sub-range eligible.
-        let work_units = build_work_units(&kept_refs, FanOut::SubRanges, pool_threads);
-        let units: Vec<(Arc<SuperfileEntry>, Option<(u32, u32)>)> =
-            work_units.into_iter().map(|u| (u.entry, u.range)).collect();
-
+        let prune_leaf = PruneLeaf::Prefix {
+            column: column_owned.clone(),
+            prefix: prefix_lower.as_bytes().to_vec(),
+        };
         let column_arc = Arc::new(column_owned);
         let prefix_arc = Arc::new(prefix_owned);
 
-        // Shared fan-out — see `bm25_search` for the rationale; the
-        // kernel differs only in calling the prefix search variants.
-        let kernel = move |r: Arc<SuperfileReader>, range: Option<(u32, u32)>| {
-            let column_arc = Arc::clone(&column_arc);
-            let prefix_arc = Arc::clone(&prefix_arc);
-            async move {
-                match range {
-                    Some((start, end)) => r
-                        .bm25_search_prefix_range(&column_arc, &prefix_arc, k, start, end)
-                        .await
-                        .map_err(fts_read_error),
-                    None => r
-                        .bm25_search_prefix(&column_arc, &prefix_arc, k)
-                        .await
-                        .map_err(fts_read_error),
-                }
-            }
-        };
-        let per_unit = dispatch::fanout_local_hits(self, units, kernel).await?;
-        let mut hits = top_k_descending(per_unit, k);
-        dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
-        Ok(hits)
+        // Hidden-text route: two waves, prefix-routed by the text
+        // shards' lex term ranges (wave 1) and the tail's per-entry
+        // range mask (wave 2); post-epoch deletes identity-filtered
+        // out of the k + |deleted| combined fetch.
+        if let Some(route) = self.hidden_text_route().await? {
+            let text_entries = Self::text_shards_pruned(&route, &prune_leaf).await?;
+            let tail = self
+                .manifest()
+                .get_undrained_superfiles_loaded(&route.drained)
+                .await
+                .map_err(QueryError::ManifestLoad)?;
+            let mask = fts_prefix_skip(&tail, &column_arc, prefix_lower.as_bytes());
+            let tail: Vec<Arc<SuperfileEntry>> = tail
+                .into_iter()
+                .zip(mask)
+                .filter_map(|(e, keep)| keep.then_some(e))
+                .collect();
+            let k_fetch = k.saturating_add(route.deleted.len());
+            let text_wave = bm25_prefix_wave(
+                &route.hidden_reader,
+                text_entries,
+                Arc::clone(&column_arc),
+                Arc::clone(&prefix_arc),
+                k_fetch,
+            );
+            let tail_wave = bm25_prefix_wave(
+                self,
+                tail,
+                Arc::clone(&column_arc),
+                Arc::clone(&prefix_arc),
+                k_fetch,
+            );
+            let (text_hits, tail_hits) = join!(text_wave, tail_wave);
+            let mut combined = top_k_descending(vec![text_hits?, tail_hits?], k_fetch);
+            combined.retain(|hit| {
+                hit.stable_id
+                    .is_some_and(|id| route.deleted.binary_search(&id).is_err())
+            });
+            combined.truncate(k);
+            return Ok(combined);
+        }
+
+        // Superfile selection via the shared two-tier prune — the
+        // single-`Prefix`-leaf case (part-level term-range skip →
+        // lazy-load surviving parts → per-superfile term-range skip).
+        let kept = select_superfiles(manifest.as_ref(), slice::from_ref(&prune_leaf)).await?;
+        bm25_prefix_wave(self, kept, column_arc, prefix_arc, k).await
     }
 
-    /// Parse `query` into positive and negated tokens, then select the
-    /// superfiles to scan. Pruning keys on the **positives only** — a
-    /// negated term must never drop a superfile: a superfile lacking it
-    /// excludes nothing, and under `And` keying on it would wrongly prune
-    /// every superfile that doesn't carry it. This mirrors the BM25
-    /// search path so the unranked `token_match` / `count` surfaces honor
-    /// negation the same way scored search does.
+    /// Parse `query` into the unranked **match set**, negatives, and
+    /// the term-presence prune leaf — with no manifest walk, so each
+    /// route prunes its own wave(s) against the right manifest.
+    /// `None` = empty/whitespace query (matches nothing, not an
+    /// error); negation-only (e.g. `-foo`) is rejected like the
+    /// scored path.
     ///
-    /// Returns `(positives, negatives, kept)`. A query with no tokens at
-    /// all yields an empty `kept`, so the caller returns the empty result
-    /// (`[]` / count `0`). A negation-only query (negated terms but no
-    /// positive, e.g. `-foo`) is rejected with [`QueryError::InvalidQuery`],
-    /// the same as the scored search path — there is no positive anchor to
-    /// match against.
-    /// Parse `query` into clauses, resolve the unranked **match set**
-    /// terms, and bloom-prune the superfile list.
-    ///
-    /// Unranked matching has no scores for a should clause to raise,
-    /// so the match set is the musts' intersection whenever any must
-    /// exists (`+a b` matches exactly the docs containing `a`; the
-    /// bare `b` is scoring-only and contributes nothing here) —
-    /// keeping `token_match` / `count` consistent with which docs the
-    /// scored search returns. With no musts, the bare terms match
-    /// under `mode` exactly as before.
-    ///
-    /// Returns `(match_set, negatives, kept)`.
-    async fn parse_and_prune(
-        &self,
+    /// The leaf keys on the **positives only** — a negated term must
+    /// never drop a superfile: a superfile lacking it excludes
+    /// nothing, and under `And` keying on it would wrongly prune
+    /// every superfile that doesn't carry it. Unranked matching has
+    /// no scores for a should clause to raise, so the match set is
+    /// the musts' intersection whenever any must exists, keeping
+    /// `token_match` / `count` consistent with which docs the scored
+    /// search returns.
+    #[allow(clippy::type_complexity)]
+    fn parse_unranked(
         column: &str,
         query: &str,
         mode: BoolMode,
-    ) -> Result<
-        (
-            UnrankedMatchSet,
-            UnrankedNegatives,
-            Vec<Arc<SuperfileEntry>>,
-        ),
-        QueryError,
-    > {
+    ) -> Result<Option<(UnrankedMatchSet, UnrankedNegatives, PruneLeaf)>, QueryError> {
         let clauses = AsciiLowerTokenizer.parse(query).into_clauses(mode);
         let musts: Vec<String> = clauses.musts.into_iter().map(Cow::into_owned).collect();
         let shoulds: Vec<String> = clauses.shoulds.into_iter().map(Cow::into_owned).collect();
@@ -760,7 +1028,7 @@ impl SupertableReader {
             if negs.terms.is_empty() && negs.phrases.is_empty() {
                 // No tokens at all (empty/whitespace query) — nothing to
                 // match, not an error.
-                return Ok((UnrankedMatchSet::default(), negs, Vec::new()));
+                return Ok(None);
             }
             // Negation-only (e.g. `-foo`): reject, matching the scored
             // search path, which has no positive anchor to rank or match.
@@ -791,9 +1059,7 @@ impl SupertableReader {
             terms: prune_terms,
             mode: match_set.mode,
         };
-        let kept =
-            select_superfiles(self.manifest().as_ref(), slice::from_ref(&prune_leaf)).await?;
-        Ok((match_set, negs, kept))
+        Ok(Some((match_set, negs, prune_leaf)))
     }
 
     /// Unranked token match across the pinned snapshot. Returns
@@ -818,77 +1084,66 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        let (match_set, negatives, kept) = self.parse_and_prune(column, query, mode).await?;
-        if kept.is_empty() {
+        let Some((match_set, negatives, prune_leaf)) = Self::parse_unranked(column, query, mode)?
+        else {
             return Ok(Vec::new());
-        }
+        };
         let match_mode = match_set.mode;
-        let has_negatives = !negatives.is_empty();
-        let phrase_involved = match_set.has_phrases() || !negatives.phrases.is_empty();
-        let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
         let column_arc = Arc::new(column.to_owned());
         let term_arc: Arc<Vec<String>> = Arc::new(match_set.terms);
         let phrase_arc: Arc<Vec<Vec<String>>> = Arc::new(match_set.phrases);
         let neg_arc: Arc<Vec<String>> = Arc::new(negatives.terms);
         let neg_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(negatives.phrases);
-        let kernel = move |r: Arc<SuperfileReader>, _: ()| {
-            let column_arc = Arc::clone(&column_arc);
-            let term_arc = Arc::clone(&term_arc);
-            let phrase_arc = Arc::clone(&phrase_arc);
-            let neg_arc = Arc::clone(&neg_arc);
-            let neg_ph_arc = Arc::clone(&neg_ph_arc);
-            async move {
-                let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
-                // Any phrase atom (match or negated) takes the
-                // phrase-aware walk; plain-token queries keep the
-                // optimized token_match path unchanged.
-                let docs = match phrase_involved {
-                    true => r
-                        .atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
-                        .await
-                        .map_err(fts_read_error)?,
-                    false => r
-                        .token_match(&column_arc, &refs, match_mode)
-                        .await
-                        .map_err(fts_read_error)?,
-                };
-                // Drop any positive match that also carries a negated
-                // atom (union of the negatives). The df / count fast
-                // paths can't express exclusion, so negation forces a
-                // materialized walk over both sets.
-                let docs = if has_negatives {
-                    let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                    let excluded: RoaringBitmap = match neg_ph_arc.is_empty() {
-                        true => r
-                            .token_match(&column_arc, &neg_refs, BoolMode::Or)
-                            .await
-                            .map_err(fts_read_error)?,
-                        false => r
-                            .atoms_match_ids(&column_arc, &neg_refs, &neg_ph_arc, BoolMode::Or)
-                            .await
-                            .map_err(fts_read_error)?,
-                    }
-                    .into_iter()
-                    .collect();
-                    docs.into_iter()
-                        .filter(|d| !excluded.contains(*d))
-                        .collect::<Vec<_>>()
-                } else {
-                    docs
-                };
-                Ok(docs.into_iter().map(|d| (d, 0.0f32)).collect::<Vec<_>>())
-            }
-        };
-        let per_unit = dispatch::fanout_local_hits(self, units, kernel).await?;
-        // Exact pre-size: `Flatten`'s size_hint is opaque, and growth
-        // reallocations copy the whole hit vec repeatedly at 1M hits.
-        let total: usize = per_unit.iter().map(Vec::len).sum();
-        let mut hits: Vec<SuperfileHit> = Vec::with_capacity(total);
-        for unit in per_unit {
-            hits.extend(unit);
+
+        // Hidden-text route: unranked matching needs no floor sharing
+        // (no scores) — the waves just union, then post-epoch deletes
+        // are identity-filtered (every match is returned, so no
+        // fetch-size padding is needed either).
+        if let Some(route) = self.hidden_text_route().await? {
+            let text_entries = Self::text_shards_pruned(&route, &prune_leaf).await?;
+            let (leaf_terms, leaf_mode) = match &prune_leaf {
+                PruneLeaf::TermPresence { terms, mode, .. } => (terms.clone(), *mode),
+                _ => unreachable!("parse_unranked builds a TermPresence leaf"),
+            };
+            let tail = self
+                .undrained_tail_pruned(&route, &column_arc, &leaf_terms, leaf_mode)
+                .await?;
+            let text_wave = token_match_wave(
+                &route.hidden_reader,
+                text_entries,
+                Arc::clone(&column_arc),
+                Arc::clone(&term_arc),
+                Arc::clone(&phrase_arc),
+                Arc::clone(&neg_arc),
+                Arc::clone(&neg_ph_arc),
+                match_mode,
+            );
+            let tail_wave = token_match_wave(
+                self,
+                tail,
+                Arc::clone(&column_arc),
+                Arc::clone(&term_arc),
+                Arc::clone(&phrase_arc),
+                Arc::clone(&neg_arc),
+                Arc::clone(&neg_ph_arc),
+                match_mode,
+            );
+            let (text_hits, tail_hits) = join!(text_wave, tail_wave);
+            let mut hits = text_hits?;
+            hits.extend(tail_hits?);
+            hits.retain(|hit| {
+                hit.stable_id
+                    .is_some_and(|id| route.deleted.binary_search(&id).is_err())
+            });
+            return Ok(hits);
         }
-        dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
-        Ok(hits)
+
+        let kept =
+            select_superfiles(self.manifest().as_ref(), slice::from_ref(&prune_leaf)).await?;
+        token_match_wave(
+            self, kept, column_arc, term_arc, phrase_arc, neg_arc, neg_ph_arc, match_mode,
+        )
+        .await
     }
 
     /// Count documents whose `column` matches `query`'s tokens under
@@ -915,119 +1170,62 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
     ) -> Result<u64, QueryError> {
-        let (match_set, negatives, kept) = self.parse_and_prune(column, query, mode).await?;
-        if kept.is_empty() {
+        let Some((match_set, negatives, prune_leaf)) = Self::parse_unranked(column, query, mode)?
+        else {
             return Ok(0);
-        }
-
+        };
         let match_mode = match_set.mode;
-        let single_term = match_set.terms.len() == 1 && !match_set.has_phrases();
-        let has_negatives = !negatives.is_empty();
-        let phrase_involved = match_set.has_phrases() || !negatives.phrases.is_empty();
         let column_arc = Arc::new(column.to_owned());
         let term_arc: Arc<Vec<String>> = Arc::new(match_set.terms);
         let phrase_arc: Arc<Vec<Vec<String>>> = Arc::new(match_set.phrases);
         let neg_arc: Arc<Vec<String>> = Arc::new(negatives.terms);
         let neg_ph_arc: Arc<Vec<Vec<String>>> = Arc::new(negatives.phrases);
-        let units: Vec<(Arc<SuperfileEntry>, ())> = kept.into_iter().map(|e| (e, ())).collect();
 
-        // Shared fan-out (`dispatch::fanout_with`): warms tombstones,
-        // spawns + opens each superfile concurrently, and short-circuits
-        // on the first error. The per-superfile body returns this
-        // superfile's match count; the totals are summed.
-        let per_superfile = dispatch::fanout_with(
-            self,
-            units,
-            true,
-            true,
-            move |r, entry, tombstone_cache, now, _params: ()| {
-                let column_arc = Arc::clone(&column_arc);
-                let term_arc = Arc::clone(&term_arc);
-                let phrase_arc = Arc::clone(&phrase_arc);
-                let neg_arc = Arc::clone(&neg_arc);
-                let neg_ph_arc = Arc::clone(&neg_ph_arc);
-                async move {
-                    // Tombstone bitmap for this superfile (None = no deletes).
-                    let tomb = match tombstone_cache.as_ref() {
-                        Some(c) => {
-                            let b = c
-                                .bitmap_for(entry.superfile_id, now)
-                                .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
-                            if b.is_empty() { None } else { Some(b) }
-                        }
-                        None => None,
-                    };
-                    let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
-                    // Negated terms or deletes both force materialization:
-                    // the df read and the bare match count can't subtract
-                    // excluded or tombstoned docs. Materialize the positive
-                    // matches, then drop any doc carrying a negated term
-                    // (union of the negatives) or a tombstone.
-                    if has_negatives || tomb.is_some() {
-                        let docs = match phrase_involved {
-                            true => r
-                                .atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
-                                .await
-                                .map_err(fts_read_error)?,
-                            false => r
-                                .token_match(&column_arc, &refs, match_mode)
-                                .await
-                                .map_err(fts_read_error)?,
-                        };
-                        let excluded: RoaringBitmap = if has_negatives {
-                            let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                            match neg_ph_arc.is_empty() {
-                                true => r
-                                    .token_match(&column_arc, &neg_refs, BoolMode::Or)
-                                    .await
-                                    .map_err(fts_read_error)?,
-                                false => r
-                                    .atoms_match_ids(
-                                        &column_arc,
-                                        &neg_refs,
-                                        &neg_ph_arc,
-                                        BoolMode::Or,
-                                    )
-                                    .await
-                                    .map_err(fts_read_error)?,
-                            }
-                            .into_iter()
-                            .collect()
-                        } else {
-                            RoaringBitmap::new()
-                        };
-                        let n = docs
-                            .iter()
-                            .filter(|d| {
-                                !excluded.contains(**d)
-                                    && tomb.as_ref().is_none_or(|b| !b.contains(**d))
-                            })
-                            .count() as u64;
-                        return Ok::<u64, QueryError>(n);
-                    }
-                    // No negatives and no deletes (the common case): count
-                    // without materializing ids — a single token resolves
-                    // O(1) from the stored df, multi-token tallies the
-                    // match walk through the counting sink.
-                    let n = if single_term {
-                        r.term_df(&column_arc, &term_arc[0])
-                            .await
-                            .map_err(fts_read_error)?
-                    } else if phrase_involved {
-                        r.atoms_match_count(&column_arc, &refs, &phrase_arc, match_mode)
-                            .await
-                            .map_err(fts_read_error)?
-                    } else {
-                        r.token_match_count(&column_arc, &refs, match_mode)
-                            .await
-                            .map_err(fts_read_error)?
-                    };
-                    Ok(n)
-                }
-            },
+        // Hidden-text route — only when the fast delete set is empty:
+        // a count can't be identity-filtered (there are no ids to
+        // subtract), so any post-epoch delete falls back to the
+        // always-correct user path until the next drain purges it.
+        if let Some(route) = self.hidden_text_route().await?
+            && route.deleted.is_empty()
+        {
+            let text_entries = Self::text_shards_pruned(&route, &prune_leaf).await?;
+            let (leaf_terms, leaf_mode) = match &prune_leaf {
+                PruneLeaf::TermPresence { terms, mode, .. } => (terms.clone(), *mode),
+                _ => unreachable!("parse_unranked builds a TermPresence leaf"),
+            };
+            let tail = self
+                .undrained_tail_pruned(&route, &column_arc, &leaf_terms, leaf_mode)
+                .await?;
+            let text_wave = token_match_count_wave(
+                &route.hidden_reader,
+                text_entries,
+                Arc::clone(&column_arc),
+                Arc::clone(&term_arc),
+                Arc::clone(&phrase_arc),
+                Arc::clone(&neg_arc),
+                Arc::clone(&neg_ph_arc),
+                match_mode,
+            );
+            let tail_wave = token_match_count_wave(
+                self,
+                tail,
+                Arc::clone(&column_arc),
+                Arc::clone(&term_arc),
+                Arc::clone(&phrase_arc),
+                Arc::clone(&neg_arc),
+                Arc::clone(&neg_ph_arc),
+                match_mode,
+            );
+            let (text_n, tail_n) = join!(text_wave, tail_wave);
+            return Ok(text_n? + tail_n?);
+        }
+
+        let kept =
+            select_superfiles(self.manifest().as_ref(), slice::from_ref(&prune_leaf)).await?;
+        token_match_count_wave(
+            self, kept, column_arc, term_arc, phrase_arc, neg_arc, neg_ph_arc, match_mode,
         )
-        .await?;
-        Ok(per_superfile.into_iter().sum())
+        .await
     }
 
     /// Unranked two-pass exact match of the **raw string** `value`
@@ -1035,6 +1233,11 @@ impl SupertableReader {
     /// whose stored value equals `value` exactly as [`SuperfileHit`]s —
     /// **no scoring**. See [`crate::superfile::SuperfileReader::exact_match`]
     /// for the per-superfile two-pass (token-AND prune + raw verify).
+    ///
+    /// Deliberately NOT routed through the hidden text shards: the
+    /// verify pass reads the stored column text, which text superfiles
+    /// don't carry (their Parquet body is an `_id` stub) — the user
+    /// path is the one that can compare raw strings.
     ///
     /// `pub(crate)` async kernel; the public surface is the sync
     /// [`SupertableReader::exact_match`].
@@ -1515,12 +1718,20 @@ impl Supertable {
             .token_match(column, query, mode)
             .map_err(|e| InfinoError::from(e).with_context("token_match", None))?;
         let batch = self
-            .block_on_query(resolve_hits_named(
-                &reader,
-                &hits,
-                projection,
-                "token_match",
-            ))
+            .block_on_query(async {
+                // Hidden text-shard hits carry no scalar data; relocate
+                // them to their user-table placement by stable `_id`
+                // before the decode. Tables without a hidden sibling
+                // skip the pass — its per-hit manifest lookups would
+                // force lazy parts to load.
+                let hits = match reader.vector_index_table() {
+                    Some(_) => user_placement_for_scalar_resolve(&reader, &hits).await?,
+                    None => hits,
+                };
+                resolve_hits_named(&reader, &hits, projection, "token_match")
+                    .await
+                    .map_err(|e| QueryError::Execute(e.to_string()))
+            })
             .map_err(|e| InfinoError::Query(e.to_string()).with_context("token_match", None))?;
         Ok(vec![batch])
     }
