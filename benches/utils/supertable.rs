@@ -968,12 +968,102 @@ pub mod fts {
             }
         }
 
+        // ---- Post-drain: build the hidden text index and re-measure.
+        // The tables above are the PRE-drain (user-path) numbers, kept
+        // on their existing anchors so A/B against baselines stays
+        // apples-to-apples; the post-drain sections are the hidden
+        // two-wave route (text shards + empty tail). Skipped in
+        // dataset mode: the drain would permanently mutate the shared
+        // pre-uploaded artifact every later run measures.
+        if (phases.warm || phases.cold) && !crate::dataset::dataset_mode() {
+            drain_text_index(&built);
+            {
+                // Same planted-corpus gate as pre-drain, now answered
+                // through the text shards.
+                let (cache_dir, consumer) = open_consumer(Modality::Fts, &built);
+                let reader = consumer.reader();
+                exec_fts::assert_correct(
+                    &reader,
+                    supertable::TEXT_COLUMN,
+                    n_docs,
+                    "supertable_fts post-drain",
+                );
+                drop(consumer);
+                drop(cache_dir);
+            }
+            let (warm_post, counts_post, _large_k_post) =
+                match phases.warm.then(|| measure_warm(&built)) {
+                    Some((w, c, l)) => (Some(w), Some(c), Some(l)),
+                    None => (None, None, None),
+                };
+            let cold_post = phases.cold.then(|| measure_cold(&built));
+            exec_fts::emit_search(
+                &mut report,
+                "bench/fts/supertable/search-post-drain",
+                format!(
+                    "Supertable FTS — search POST-DRAIN (hidden text index), multi-superfile / object-store ({} docs)",
+                    fmt_count(n_docs)
+                ),
+                "Same batteries as the search table above, after the drain built the hidden                  text index: queries route over the merged term-range shards (wave 1) plus the                  empty undrained tail. Δ is vs the previous run.",
+                warm_post.as_deref(),
+                cold_post.as_ref(),
+                None,
+            );
+            if let Some(counts_post) = &counts_post {
+                exec_fts::emit_count(
+                    &mut report,
+                    "bench/fts/supertable/count-post-drain",
+                    format!(
+                        "Supertable FTS — count POST-DRAIN (hidden text index), multi-superfile / object-store ({} docs)",
+                        fmt_count(n_docs)
+                    ),
+                    "The count battery after the drain: single-term counts resolve from the merged                      shards' dictionary headers. Δ is vs the previous run.",
+                    counts_post,
+                );
+            }
+        }
+
         report.save();
 
         if let Some(cleanup) = &built.cleanup {
             eprintln!("[supertable_fts] cleaning up object-store prefix...");
             tiers::cleanup_prefix(cleanup);
         }
+    }
+
+    /// Build the hidden text index (term-range shards of the merged
+    /// inverted index) via the drain, timing wall clock and metering
+    /// object-store I/O. The FTS counterpart of the vector bench's
+    /// `drain_hidden_incoming` phase.
+    fn drain_text_index(built: &supertable::IngestResult) {
+        let consumer_meter = storage_meter::wrap(Arc::clone(&built.storage));
+        let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
+            consumer_meter.provider(),
+            Some(built.total_index_bytes),
+        );
+        let opts = tiers::consumer_options(
+            supertable::options_for(Modality::Fts, None),
+            consumer_meter.provider(),
+            cache,
+        );
+        let consumer = tiers::open_consumer(opts);
+        let before = consumer_meter.snapshot();
+        let ((), wall, _cpu) = cpu::timed(|| {
+            consumer
+                .drain_vectors_to_cells_sync()
+                .expect("text-index drain")
+        });
+        let io = consumer_meter.snapshot().since(&before);
+        eprintln!(
+            "[supertable_fts] text-index drain: {} PUT ({} up), {} GET ({} down) in {:.1}s",
+            io.put_count,
+            rss::fmt_bytes(io.put_bytes),
+            io.get_count,
+            rss::fmt_bytes(io.get_bytes),
+            wall.as_secs_f64(),
+        );
+        drop(consumer);
+        drop(cache_dir);
     }
 
     fn emit_ingest(report: &mut Report, n_docs: usize, metrics: &ShapeMetrics) {
