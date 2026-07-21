@@ -82,7 +82,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    io::{BufReader, BufWriter, Cursor, Error, Seek, SeekFrom, Write},
+    io::{BufReader, BufWriter, Cursor, Error, Read, Seek, SeekFrom, Write},
     sync::Arc,
 };
 
@@ -226,6 +226,16 @@ pub struct BuilderOptions {
     pub id_page_size_limit: usize,
     /// Embedded vector blob layout. Default IVF.
     pub(crate) vector_layout: VectorLayout,
+    /// The FTS blob is supplied pre-built at finish time
+    /// ([`SuperfileBuilder::finish_with_prebuilt_fts_to`]) instead of
+    /// being tokenized from batch text — the hidden index's text
+    /// superfiles, whose blobs come from the drain's posting merge.
+    /// Flips the FTS-column contract to the vector-column one:
+    /// `fts_columns` become **logical names only** (they must NOT
+    /// collide with a `schema` column; they name the blob's columns
+    /// via `inf.fts.columns`), no tokenizer is required, and no
+    /// streaming `FtsBuilder` is created. Default off.
+    pub(crate) prebuilt_fts: bool,
 }
 
 /// Default per-column data-page size limit for the id column
@@ -269,11 +279,22 @@ impl BuilderOptions {
             ),
             id_page_size_limit: DEFAULT_ID_PAGE_SIZE_LIMIT,
             vector_layout: VectorLayout::Ivf,
+            prebuilt_fts: false,
         }
     }
 
     pub(crate) fn with_vector_layout(mut self, layout: VectorLayout) -> Self {
         self.vector_layout = layout;
+        self
+    }
+
+    /// See [`BuilderOptions::prebuilt_fts`].
+    // TODO(hidden-fts drain): `allow` is staging-only — the drain's
+    // fts-merge consolidation (next commit in this series) is the
+    // non-test consumer; remove the attribute when it lands.
+    #[allow(dead_code)]
+    pub(crate) fn with_prebuilt_fts(mut self) -> Self {
+        self.prebuilt_fts = true;
         self
     }
 
@@ -487,9 +508,19 @@ impl SuperfileBuilder {
             ));
         }
 
-        // 2. Each FTS column must exist and be LargeUtf8.
+        // 2. Each FTS column must exist and be LargeUtf8 — unless the
+        //    FTS blob arrives pre-built, in which case FTS columns
+        //    follow the vector-column contract: logical names only,
+        //    absent from the Parquet schema (see
+        //    [`BuilderOptions::prebuilt_fts`]).
         let mut fts_col_idxs = Vec::with_capacity(opts.fts_columns.len());
         for fc in &opts.fts_columns {
+            if opts.prebuilt_fts {
+                if opts.schema.index_of(&fc.column).is_ok() {
+                    return Err(BuildError::DuplicateLogicalName(fc.column.clone()));
+                }
+                continue;
+            }
             let idx = opts
                 .schema
                 .index_of(&fc.column)
@@ -525,16 +556,19 @@ impl SuperfileBuilder {
             }
         }
 
-        // 4. FTS requires a tokenizer.
-        if !opts.fts_columns.is_empty() && opts.tokenizer.is_none() {
+        // 4. FTS requires a tokenizer — except pre-built blobs, which
+        //    were tokenized when their sources were built.
+        if !opts.fts_columns.is_empty() && opts.tokenizer.is_none() && !opts.prebuilt_fts {
             return Err(BuildError::FtsColumnTypeInvalid {
                 column: opts.fts_columns[0].column.clone(),
                 actual: "missing tokenizer in BuilderOptions".to_string(),
             });
         }
 
-        // 5. Wire up the unified FTS + vector sub-builders.
-        let fts_builder = if opts.fts_columns.is_empty() {
+        // 5. Wire up the unified FTS + vector sub-builders. A
+        //    pre-built FTS blob needs no streaming builder — it is
+        //    spliced whole at finish time.
+        let fts_builder = if opts.fts_columns.is_empty() || opts.prebuilt_fts {
             None
         } else {
             let tk = opts
@@ -1255,6 +1289,82 @@ impl SuperfileBuilder {
             0,
             BufReader::new(vector_file),
             vector_length,
+            &kvs,
+            &mut output,
+        )?;
+        output.flush().map_err(BuildError::Io)?;
+        Ok(())
+    }
+
+    /// Consume an ids-only builder and stream one **text superfile** —
+    /// the hidden index's merged inverted-index shard — to `output`:
+    /// the `_id`-stub Parquet body spliced with a pre-built
+    /// (merge-produced) FTS blob and no vector blob. FTS sibling of
+    /// [`finish_multi_cell_sources_to`](Self::finish_multi_cell_sources_to);
+    /// Parquet footer surgery stays on the shared splice path.
+    ///
+    /// The builder's options must declare the FTS columns (they become
+    /// the `inf.fts.columns` KV the reader opens the blob with, so
+    /// they must match the merge's column declaration order) and no
+    /// vector columns.
+    // TODO(hidden-fts drain): `allow` is staging-only — the drain's
+    // fts-merge consolidation (next commit in this series) is the
+    // non-test consumer; remove the attribute when it lands.
+    #[allow(dead_code)]
+    pub(crate) fn finish_with_prebuilt_fts_to<R, W>(
+        self,
+        fts_blob: R,
+        fts_blob_len: u64,
+        mut output: W,
+    ) -> Result<(), BuildError>
+    where
+        R: Read,
+        W: Write,
+    {
+        if self.next_local_doc_id == 0 {
+            return Err(BuildError::FTSSchemaMismatch(
+                "prebuilt-FTS finish requires at least one row".into(),
+            ));
+        }
+        if self.vec_builder.is_some()
+            || self.cell_posting_builder.is_some()
+            || self.prebuilt_multi_cell.is_some()
+        {
+            return Err(BuildError::VectorSchemaMismatch(
+                "prebuilt-FTS finish takes no vector columns".into(),
+            ));
+        }
+        if fts_blob_len == 0 {
+            return Err(BuildError::FTSSchemaMismatch(
+                "prebuilt-FTS finish requires a non-empty FTS blob".into(),
+            ));
+        }
+        if !self.opts.prebuilt_fts {
+            return Err(BuildError::FTSSchemaMismatch(
+                "prebuilt-FTS finish requires BuilderOptions::with_prebuilt_fts".into(),
+            ));
+        }
+        debug_assert!(
+            self.fts_builder.is_none(),
+            "prebuilt_fts options never create a streaming FtsBuilder"
+        );
+
+        let n_docs = self.next_local_doc_id as u64;
+        let kvs = superfile_kvs(&self.opts, n_docs, None)?;
+        let id_page_limit = [(self.opts.id_column.as_str(), self.opts.id_page_size_limit)];
+        let body = encode_parquet_body(
+            &self.opts.schema,
+            &self.batches,
+            self.opts.compression,
+            self.opts.row_group_size,
+            &id_page_limit,
+        )?;
+        splice_index_streams_to(
+            body,
+            BufReader::new(fts_blob),
+            fts_blob_len,
+            BufReader::new(Cursor::new(Vec::<u8>::new())),
+            0,
             &kvs,
             &mut output,
         )?;

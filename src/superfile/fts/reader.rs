@@ -43,7 +43,7 @@ use crate::superfile::{
         },
         dict::{DictReader, make_key},
         fst_value::FstValue,
-        positions::{decode_run, skip_run},
+        positions::{decode_run, push_varint, skip_run},
         posting::{BLOCK_LEN, decode_block},
         tokenize::{AsciiLowerTokenizer, Tokenizer as _},
     },
@@ -1338,6 +1338,140 @@ impl FtsReader {
         Ok(pairs
             .into_iter()
             .map(|(key, _)| key[column_prefix_len..].to_vec())
+            .collect())
+    }
+
+    /// Every `(term, packed FST value)` of `column` in lex order, the
+    /// term bytes with the column prefix stripped. The source side of
+    /// the hidden-index text-superfile merge walks these entries and
+    /// decodes each via [`Self::decode_term_postings`]; not a
+    /// query-path API. Empty if `column` is not FTS-indexed here.
+    // TODO(hidden-fts drain): `allow` is staging-only — the drain's
+    // fts-merge consolidation (next commit in this series) is the
+    // non-test consumer; remove the attribute when it lands.
+    #[allow(dead_code)]
+    pub(crate) fn column_term_entries(
+        &self,
+        column: &str,
+    ) -> Result<Vec<(Vec<u8>, u64)>, FtsError> {
+        if !self.column_id_by_name.contains_key(column) {
+            return Ok(Vec::new());
+        }
+        let mut full_prefix = column.as_bytes().to_vec();
+        full_prefix.push(FST_SEPARATOR);
+        let column_prefix_len = full_prefix.len();
+        let fst_bytes = self.dict_bytes()?;
+        let dict = DictReader::open(&fst_bytes).map_err(|e| {
+            FtsError::Read(ReadError::MalformedVersion(format!(
+                "FST parse failed: {e}"
+            )))
+        })?;
+        Ok(dict
+            .iter_prefix(&full_prefix)
+            .into_iter()
+            .map(|(key, packed)| (key[column_prefix_len..].to_vec(), packed))
+            .collect())
+    }
+
+    /// Fully decode one term's postings from its packed FST value:
+    /// appends the sorted `(doc_id, tf)` pairs to `pairs` (cleared
+    /// first) and returns the term's position-run bytes (one run per
+    /// pair, in pair order — see [`super::positions`]) for a
+    /// positional column, `None` otherwise.
+    ///
+    /// Merge-path sibling of the query kernels' cursor construction;
+    /// callers run it over fully-resident readers (the drain opens
+    /// sources resident), where every fetch resolves synchronously.
+    // TODO(hidden-fts drain): `allow` is staging-only — the drain's
+    // fts-merge consolidation (next commit in this series) is the
+    // non-test consumer; remove the attribute when it lands.
+    #[allow(dead_code)]
+    pub(crate) async fn decode_term_postings(
+        &self,
+        positional: bool,
+        packed: u64,
+        pairs: &mut Vec<(u32, u32)>,
+    ) -> Result<Option<Bytes>, FtsError> {
+        pairs.clear();
+        match FstValue::unpack(packed) {
+            FstValue::Inline { doc_id, tf } => {
+                // Positional inline packs the single position where
+                // tf normally lives (tf implied 1) — see the
+                // builder's df=1 inline policy.
+                if positional {
+                    pairs.push((doc_id, 1));
+                    let mut run = Vec::new();
+                    push_varint(&mut run, tf);
+                    Ok(Some(Bytes::from(run)))
+                } else {
+                    pairs.push((doc_id, tf));
+                    Ok(None)
+                }
+            }
+            FstValue::Pfor {
+                metadata_offset,
+                postings_length,
+            } => {
+                let fetched = self
+                    .fetch_term_postings(&[(metadata_offset as usize, postings_length as usize)])
+                    .await?;
+                let region = &fetched[0];
+                let meta = TermMeta::parse(region, 0, positional)?;
+                let mut doc_ids = [0u32; BLOCK_LEN];
+                let mut tfs = [0u32; BLOCK_LEN];
+                for i in 0..meta.num_blocks {
+                    let (_, block_offset, _) = meta.skip_entry(region, i);
+                    let block_end = meta.block_end_in_term(region, i);
+                    let n = decode_block(&region[block_offset..block_end], &mut doc_ids, &mut tfs);
+                    pairs.extend(doc_ids[..n].iter().copied().zip(tfs[..n].iter().copied()));
+                }
+                if positional {
+                    let runs = self
+                        .fetch_term_positions(&[(meta.positions_offset, meta.positions_length)])
+                        .await?;
+                    Ok(Some(runs.into_iter().next().expect("one range requested")))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Whether `column` records token positions. Merge-path helper;
+    /// `FtsError::UnknownColumn` if the column isn't FTS-indexed here.
+    // TODO(hidden-fts drain): `allow` is staging-only — the drain's
+    // fts-merge consolidation (next commit in this series) is the
+    // non-test consumer; remove the attribute when it lands.
+    #[allow(dead_code)]
+    pub(crate) fn column_positional(&self, column: &str) -> Result<bool, FtsError> {
+        let id = self.resolve_column_id(column)?;
+        Ok(self.columns[id as usize].positions)
+    }
+
+    /// This column's raw `u32` doc-lengths array (one entry per doc,
+    /// indexed by local doc id), decoded from the blob's doc-lengths
+    /// region. Merge-path helper for rebuilding merged doc-lengths;
+    /// the query path never calls this (it scores through the
+    /// byte-quantized [`NormTable`] instead).
+    // TODO(hidden-fts drain): `allow` is staging-only — the drain's
+    // fts-merge consolidation (next commit in this series) is the
+    // non-test consumer; remove the attribute when it lands.
+    #[allow(dead_code)]
+    pub(crate) async fn column_doc_lengths_raw(&self, column: &str) -> Result<Vec<u32>, FtsError> {
+        let id = self.resolve_column_id(column)?;
+        let range = self.columns[id as usize].doc_lengths_range.clone();
+        let fetched = self
+            .source
+            .get_ranges_parallel_async(&[range])
+            .await
+            .map_err(|e| {
+                FtsError::Read(ReadError::MalformedVersion(format!(
+                    "fts/doc-lengths array range fetch failed: {e}"
+                )))
+            })?;
+        Ok(fetched[0]
+            .chunks_exact(U32_BYTES)
+            .map(read_u32_le)
             .collect())
     }
 
@@ -4944,6 +5078,107 @@ mod tests {
             err,
             FtsError::Read(ReadError::MalformedVersion(_))
         ));
+    }
+
+    /// Decode a term's runs (one per pair) into absolute positions.
+    #[cfg(test)]
+    fn decode_all_runs(runs: &[u8], pairs: &[(u32, u32)]) -> Vec<Vec<u32>> {
+        let mut at = 0;
+        let out = pairs
+            .iter()
+            .map(|&(_, tf)| {
+                let mut positions = Vec::new();
+                decode_run(runs, &mut at, tf, &mut positions).expect("well-formed run");
+                positions
+            })
+            .collect();
+        assert_eq!(at, runs.len(), "runs must cover exactly the pairs");
+        out
+    }
+
+    #[tokio::test]
+    async fn term_entries_decode_round_trips_positionless_blob() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+        let positional = r.column_positional("body").expect("column exists");
+        assert!(!positional);
+        let mut got: Vec<(String, Vec<(u32, u32)>)> = Vec::new();
+        let mut pairs = Vec::new();
+        for (term, packed) in r.column_term_entries("body").expect("entries") {
+            let runs = r
+                .decode_term_postings(positional, packed, &mut pairs)
+                .await
+                .expect("decode");
+            assert!(runs.is_none(), "positionless column must yield no runs");
+            got.push((String::from_utf8(term).expect("utf8 term"), pairs.clone()));
+        }
+        // Corpus: doc0 "rust async runtime", doc1 "tokio is a rust
+        // runtime", doc2 "java spring boot" — every (term, postings)
+        // in lex order, covering both df=1 inline and df≥2 PFOR terms.
+        let expect: Vec<(&str, Vec<(u32, u32)>)> = vec![
+            ("a", vec![(1, 1)]),
+            ("async", vec![(0, 1)]),
+            ("boot", vec![(2, 1)]),
+            ("is", vec![(1, 1)]),
+            ("java", vec![(2, 1)]),
+            ("runtime", vec![(0, 1), (1, 1)]),
+            ("rust", vec![(0, 1), (1, 1)]),
+            ("spring", vec![(2, 1)]),
+            ("tokio", vec![(1, 1)]),
+        ];
+        assert_eq!(
+            got,
+            expect
+                .into_iter()
+                .map(|(t, p)| (t.to_string(), p))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn term_entries_decode_round_trips_positional_blob() {
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), true).expect("register");
+        b.add_doc(0, 0, "alpha beta alpha").expect("add doc");
+        b.add_doc(0, 1, "beta alpha").expect("add doc");
+        b.add_doc(0, 2, "gamma").expect("add doc");
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower","positions":true}]"#;
+        let r = FtsReader::open(blob, json).expect("open FtsReader");
+        let positional = r.column_positional("body").expect("column exists");
+        assert!(positional);
+        let mut got: Vec<(String, Vec<(u32, u32)>, Vec<Vec<u32>>)> = Vec::new();
+        let mut pairs = Vec::new();
+        for (term, packed) in r.column_term_entries("body").expect("entries") {
+            let runs = r
+                .decode_term_postings(positional, packed, &mut pairs)
+                .await
+                .expect("decode")
+                .expect("positional column must yield runs");
+            got.push((
+                String::from_utf8(term).expect("utf8 term"),
+                pairs.clone(),
+                decode_all_runs(&runs, &pairs),
+            ));
+        }
+        // "alpha": doc0 tf2 @[0,2], doc1 tf1 @[1] (PFOR positional);
+        // "beta": doc0 tf1 @[1], doc1 tf1 @[0];
+        // "gamma": doc2 tf1 @[0] (df=1 positional inline).
+        let expect = vec![
+            (
+                "alpha".to_string(),
+                vec![(0u32, 2u32), (1, 1)],
+                vec![vec![0u32, 2], vec![1]],
+            ),
+            (
+                "beta".to_string(),
+                vec![(0, 1), (1, 1)],
+                vec![vec![1], vec![0]],
+            ),
+            ("gamma".to_string(), vec![(2, 1)], vec![vec![0]]),
+        ];
+        assert_eq!(got, expect);
     }
 
     #[tokio::test]

@@ -161,7 +161,7 @@ type DocPosHeadMap = HbHashMap<&'static str, u32, FxBuildHasher>;
 const CHAIN_END: u32 = u32::MAX;
 
 #[derive(Default)]
-struct FinishProfile {
+pub(super) struct FinishProfile {
     enabled: bool,
     encode_calls: u64,
     encode_df1: u64,
@@ -187,7 +187,7 @@ struct FinishProfile {
 }
 
 impl FinishProfile {
-    fn from_config() -> Self {
+    pub(super) fn from_config() -> Self {
         Self {
             enabled: crate::config::global().diagnostics.fts_profile,
             ..Self::default()
@@ -2738,7 +2738,7 @@ impl FtsBuilder {
 /// Created by a finish path iff any registered column is positional;
 /// its running `len` doubles as the next term's `positions_offset`
 /// (offsets in term metadata are relative to the region start).
-struct PositionsSink {
+pub(super) struct PositionsSink {
     writer: BufWriter<File>,
     path: PathBuf,
     crc_acc: u32,
@@ -2746,7 +2746,7 @@ struct PositionsSink {
 }
 
 impl PositionsSink {
-    fn create(scratch_path: &Path) -> Result<Self, BuildError> {
+    pub(super) fn create(scratch_path: &Path) -> Result<Self, BuildError> {
         let path = scratch_path.join("infino_fts_positions.bin");
         Ok(Self {
             writer: BufWriter::new(File::create(&path)?),
@@ -2761,47 +2761,47 @@ impl PositionsSink {
     }
 }
 
-struct BlobAssemblyInputs {
+pub(super) struct BlobAssemblyInputs {
     /// Open scratch writer holding every encoded posting block in
     /// lex order. Assembly closes it (CRC trailer + flush) before
     /// streaming the file's contents into the output.
-    postings_writer: BufWriter<File>,
+    pub(super) postings_writer: BufWriter<File>,
     /// On-disk path of the posting body. Reopened for the streaming
     /// copy into the output writer.
-    postings_path: PathBuf,
+    pub(super) postings_path: PathBuf,
     /// Running CRC32C over every byte written to `postings_writer`.
     /// Assembly appends the little-endian trailer.
-    postings_crc_acc: u32,
+    pub(super) postings_crc_acc: u32,
     /// Bytes written so far to `postings_writer` (excluding trailer).
     /// Assembly grows this by 4 when it appends the CRC.
-    postings_len: u64,
+    pub(super) postings_len: u64,
     /// Positions region sink. Always present: new code always writes
     /// the v2 layout, with the region (possibly just its CRC-of-empty
     /// trailer) between the postings and the doc-lengths directory.
     /// v1 remains a read-only legacy format.
-    positions_sink: PositionsSink,
+    pub(super) positions_sink: PositionsSink,
     /// Whichever FST sink was used during the per-column emit loop
     /// (exactly one of the two variants).
-    fst_sink: FstSinkFinish,
-    n_columns: u32,
-    n_docs: u32,
+    pub(super) fst_sink: FstSinkFinish,
+    pub(super) n_columns: u32,
+    pub(super) n_docs: u32,
     /// Pre-cast checked downstream against `u32::MAX`.
-    n_terms_total_usize: usize,
+    pub(super) n_terms_total_usize: usize,
     /// Per-original-column avgdl (declaration order, not lex order).
-    avgdl_per_col: Vec<f32>,
+    pub(super) avgdl_per_col: Vec<f32>,
     /// Per-original-column doc-lengths, moved out of `work` by each
     /// emit-loop iteration.
-    doc_lengths_by_orig_col: Vec<Option<Vec<u32>>>,
+    pub(super) doc_lengths_by_orig_col: Vec<Option<Vec<u32>>>,
     /// Scratch dir owning every spill file. Dropped after the
     /// streamed regions (FST + postings) have been copied into `w`.
-    scratch_dir: tempfile::TempDir,
+    pub(super) scratch_dir: tempfile::TempDir,
     /// Profile accumulator — final block of `[fts-finish]` timings
     /// is emitted at the bottom of assembly.
-    finish_profile: FinishProfile,
+    pub(super) finish_profile: FinishProfile,
 }
 
 /// FST emission sink picked by the active finish path.
-enum FstSinkFinish {
+pub(super) enum FstSinkFinish {
     /// In-RAM build: hand the populated `DictBuilder` to assembly,
     /// which calls `finish()` to produce the FST bytes in one shot.
     InRam(DictBuilder),
@@ -2821,7 +2821,7 @@ enum FstSinkFinish {
 /// `FtsBuilder::finish_to` so the in-RAM and spilled paths share one
 /// regression target instead of two — every byte the reader observes
 /// passes through here.
-fn assemble_and_write_blob<W: Write>(
+pub(super) fn assemble_and_write_blob<W: Write>(
     inputs: BlobAssemblyInputs,
     w: &mut W,
 ) -> Result<(), BuildError> {
@@ -3055,7 +3055,7 @@ fn assemble_and_write_blob<W: Write>(
 }
 
 #[inline]
-fn map_fst_err(e: fst::Error) -> BuildError {
+pub(super) fn map_fst_err(e: fst::Error) -> BuildError {
     BuildError::Io(Error::new(ErrorKind::InvalidData, e))
 }
 
@@ -3069,7 +3069,7 @@ fn map_fst_err(e: fst::Error) -> BuildError {
 /// `mem::take` so the underlying buffer is reused for the next
 /// chunk (same allocation, just `Vec::clear` between iterations).
 #[derive(Default)]
-struct TermScratch {
+pub(super) struct TermScratch {
     /// Per-block doc_id column passed to `encode_block`. Re-used by
     /// taking it into a Block, encoding, and taking it back. Capacity
     /// stabilises at `BLOCK_LEN` after the first dense term.
@@ -3256,7 +3256,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
 /// Owns the per-term encoding policy (df=1 inline value, df≥2 PFOR
 /// blocks via `encode_posting_group`).
 #[allow(clippy::too_many_arguments)]
-fn encode_and_emit_term<W: Write>(
+pub(super) fn encode_and_emit_term<W: Write>(
     term: &str,
     pairs: &[(u32, u32)],
     col_name_bytes: &[u8],
