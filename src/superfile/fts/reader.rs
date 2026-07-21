@@ -1346,10 +1346,6 @@ impl FtsReader {
     /// the hidden-index text-superfile merge walks these entries and
     /// decodes each via [`Self::decode_term_postings`]; not a
     /// query-path API. Empty if `column` is not FTS-indexed here.
-    // TODO(hidden-fts drain): `allow` is staging-only — the drain's
-    // fts-merge consolidation (next commit in this series) is the
-    // non-test consumer; remove the attribute when it lands.
-    #[allow(dead_code)]
     pub(crate) fn column_term_entries(
         &self,
         column: &str,
@@ -1382,10 +1378,6 @@ impl FtsReader {
     /// Merge-path sibling of the query kernels' cursor construction;
     /// callers run it over fully-resident readers (the drain opens
     /// sources resident), where every fetch resolves synchronously.
-    // TODO(hidden-fts drain): `allow` is staging-only — the drain's
-    // fts-merge consolidation (next commit in this series) is the
-    // non-test consumer; remove the attribute when it lands.
-    #[allow(dead_code)]
     pub(crate) async fn decode_term_postings(
         &self,
         positional: bool,
@@ -1437,12 +1429,10 @@ impl FtsReader {
         }
     }
 
-    /// Whether `column` records token positions. Merge-path helper;
-    /// `FtsError::UnknownColumn` if the column isn't FTS-indexed here.
-    // TODO(hidden-fts drain): `allow` is staging-only — the drain's
-    // fts-merge consolidation (next commit in this series) is the
-    // non-test consumer; remove the attribute when it lands.
-    #[allow(dead_code)]
+    /// Whether `column` records token positions. Test-only helper for
+    /// the round-trip tests; `FtsError::UnknownColumn` if the column
+    /// isn't FTS-indexed here.
+    #[cfg(test)]
     pub(crate) fn column_positional(&self, column: &str) -> Result<bool, FtsError> {
         let id = self.resolve_column_id(column)?;
         Ok(self.columns[id as usize].positions)
@@ -1453,10 +1443,6 @@ impl FtsReader {
     /// region. Merge-path helper for rebuilding merged doc-lengths;
     /// the query path never calls this (it scores through the
     /// byte-quantized [`NormTable`] instead).
-    // TODO(hidden-fts drain): `allow` is staging-only — the drain's
-    // fts-merge consolidation (next commit in this series) is the
-    // non-test consumer; remove the attribute when it lands.
-    #[allow(dead_code)]
     pub(crate) async fn column_doc_lengths_raw(&self, column: &str) -> Result<Vec<u32>, FtsError> {
         let id = self.resolve_column_id(column)?;
         let range = self.columns[id as usize].doc_lengths_range.clone();

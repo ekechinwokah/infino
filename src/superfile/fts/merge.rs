@@ -15,11 +15,6 @@
 //! the one shared encode/assembly path. No re-tokenization: sources
 //! are the postings themselves.
 
-// TODO(hidden-fts drain): staging-only — the drain's fts-merge
-// consolidation (next commit in this series) is the non-test consumer;
-// remove with it.
-#![allow(dead_code)]
-
 use std::{
     fs::File,
     io::{BufWriter, Error, ErrorKind, Write},

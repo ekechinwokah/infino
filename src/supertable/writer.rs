@@ -119,9 +119,9 @@ use crate::{
     storage::{StorageError, StorageProvider},
     superfile::{
         BuildError as SuperfileBuildError, SuperfileReader,
-        builder::{SuperfileBuilder, VectorConfig},
+        builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig, fts_columns_json},
         format::{
-            CRC_BYTES,
+            CRC_BYTES, FST_SEPARATOR,
             footer::read_kv_metadata,
             fts::{HEADER_SIZE_V1_LEGACY as FTS_HEADER_SIZE, U64_BYTES, hdr},
             kv,
@@ -130,6 +130,11 @@ use crate::{
                 OUTER_HEADER_SIZE, STABLE_ID_BYTES, SUB_HEADER_SIZE, U32_BYTES, cell_dir_entry,
                 dir_entry, outer_hdr, sub_hdr,
             },
+        },
+        fts::{
+            fst_value::FstValue,
+            merge::{MergeColumn, MergeSource, merge_fts_blobs},
+            reader::FtsReader,
         },
         reader::vector_layout_from_kv,
         vector::{
@@ -2358,9 +2363,14 @@ pub(super) fn prepare_superfile_with_uri(
 
     let mut fts_summary: HashMap<String, FtsSummaryAgg> = HashMap::new();
     if let Some(fts_reader) = reader.fts() {
-        for fc in &inner.options.fts_columns {
+        // The superfile is self-describing: summarize the columns its
+        // blob actually carries. For user commits these equal
+        // `options.fts_columns`; hidden text shards carry the user
+        // table's FTS columns while the hidden options declare none.
+        let columns: Vec<String> = fts_reader.fts_columns().map(str::to_string).collect();
+        for column in columns {
             let terms = fts_reader
-                .iter_column_terms(&fc.column)
+                .iter_column_terms(&column)
                 .expect("FST bytes valid: superfile just built");
             let n_terms_distinct = terms.len() as u32;
             let (min_term, max_term) = match (terms.first(), terms.last()) {
@@ -2372,7 +2382,7 @@ pub(super) fn prepare_superfile_with_uri(
                 bloom_builder.insert(term);
             }
             fts_summary.insert(
-                fc.column.clone(),
+                column,
                 FtsSummaryAgg::new_with_params(
                     bloom_builder.finish(),
                     n_terms_distinct,
@@ -3012,6 +3022,466 @@ async fn materialized_user_rows_for_drain(
     materialized_ivf_rows_in_doc_order(vec_reader, column, stable_ids, tombstones).await
 }
 
+// ---- Hidden text-shard drain (FTS) --------------------------------------
+
+/// Target byte size for one text shard's merged FTS blob. The drain
+/// slices the merged inverted index at term boundaries into shards of
+/// roughly this size: small enough that a term's routing (manifest
+/// bloom + term range) pins one shard, large enough that shard counts
+/// stay in the tens. TODO(hidden-fts): expose as a YAML knob.
+const TEXT_SHARD_TARGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Planned byte size of a df=1 inline term (no posting region bytes;
+/// FST entry only). Shard planning reads sizes off FST values, and
+/// inline terms carry no `postings_length` — this stand-in keeps them
+/// from planning as zero-width.
+const TEXT_PLAN_INLINE_BYTES: u64 = 32;
+
+/// Upper key bound for the last text shard. FST keys are
+/// `<utf8 column>\x1F<utf8 term>` and `0xFF` never occurs in UTF-8, so
+/// a single `0xFF` byte sorts above every real key.
+const TEXT_KEY_UPPER_SENTINEL: &[u8] = &[0xFF];
+
+/// Everything the text drain hands back for the epoch's single OCC
+/// commit: uploaded shard entries to append, the previous epoch's text
+/// entries to remove, and the deferred store/cache inserts applied
+/// after the commit lands.
+struct TextDrainOutcome {
+    new_entries: Vec<Arc<SuperfileEntry>>,
+    removed_entries: Vec<Arc<SuperfileEntry>>,
+    pending_cache_inserts: Vec<(SuperfileUri, Bytes)>,
+    pending_store_inserts: Vec<(SuperfileUri, Bytes)>,
+}
+
+/// Build this epoch's hidden **text superfiles**: term-range shards of
+/// the merged inverted index over the whole live user corpus.
+///
+/// V1 does a FULL re-merge every epoch — sources are ALL user
+/// superfiles, tombstone-filtered, chained batch-by-batch so working
+/// memory stays O(batch) + O(global vocabulary): each batch merges
+/// (previous intermediate + the batch's FTS blobs) into a new local
+/// intermediate; only the final result is sliced into shards and
+/// uploaded. The previous epoch's text entries are replaced wholesale
+/// in the same OCC commit that stamps the vector shards + watermark,
+/// so readers always see one consistent epoch. (Incremental folding of
+/// the previous base — old shards as merge sources filtered by the
+/// hidden deleted-id set — is the follow-up optimization.)
+///
+/// No remote checkpointing: the pass is idempotent and re-runs whole
+/// on a resumed epoch; shards uploaded by an abandoned attempt are
+/// unreferenced and reclaimed by the post-drain storage sweep.
+///
+/// Returns `None` when the user table has no FTS columns.
+#[allow(clippy::too_many_arguments)]
+async fn drain_fts_text_shards(
+    user_inner: &Arc<SupertableInner>,
+    hidden_inner: &Arc<SupertableInner>,
+    user_manifest: &Arc<ManifestSnapshot>,
+    sources: &[Arc<SuperfileEntry>],
+    storage: &Arc<dyn StorageProvider>,
+    scratch: &Path,
+    batch_budget: usize,
+) -> Result<Option<TextDrainOutcome>, BuildError> {
+    let fts_columns = &user_inner.options.fts_columns;
+    if fts_columns.is_empty() {
+        return Ok(None);
+    }
+    let text_t0 = time::Instant::now();
+
+    // The previous epoch's text shards (FTS summary, no vector
+    // summary) are replaced by this epoch's — removed in the same
+    // commit that appends the new ones.
+    let removed_entries: Vec<Arc<SuperfileEntry>> = hidden_inner
+        .manifest
+        .load_full()
+        .get_all_superfiles()
+        .iter()
+        .filter(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty())
+        .cloned()
+        .collect();
+
+    let merge_columns: Vec<MergeColumn> = fts_columns
+        .iter()
+        .map(|fc| MergeColumn {
+            name: fc.column.clone(),
+            positions: fc.positions,
+        })
+        .collect();
+    let columns_json = fts_columns_json(fts_columns);
+
+    // Deterministic source order: merged ids must be monotone within a
+    // source and disjoint ascending across sources (the merge encoder
+    // requires sorted postings), so the walk order is pinned.
+    let mut ordered: Vec<Arc<SuperfileEntry>> = sources.to_vec();
+    ordered.sort_unstable_by_key(|e| (e.birth_version, e.superfile_id));
+
+    // Surviving docs' stable ids, appended in merged-id order — the
+    // `_id` stub column every shard carries.
+    let ids_path = scratch.join("fts_text_ids.bin");
+    let mut ids_writer = BufWriter::new(
+        File::create(&ids_path)
+            .map_err(|error| BuildError::Store(format!("text ids spill create: {error}")))?,
+    );
+    let mut n_docs_merged: u64 = 0;
+    let mut id_min = i128::MAX;
+    let mut id_max = i128::MIN;
+
+    // Chained intermediate: (path, byte length) of the merge-so-far.
+    let mut intermediate: Option<(PathBuf, u64)> = None;
+    let mut chain_step = 0usize;
+    let now = time::Instant::now();
+    let store = user_inner.options.store.clone();
+    // Sources are USER superfiles: fall back to the user table's own
+    // storage (the `storage` argument is hidden-prefixed and only
+    // serves the shard uploads below).
+    let user_storage = user_inner.options.storage.clone();
+
+    for batch in ordered.chunks(batch_budget.max(1)) {
+        // Open the batch's user superfiles fully resident (reuse a
+        // resident cached reader when present — drain just opened many
+        // of these for the vector pass).
+        let readers: Vec<Arc<SuperfileReader>> = stream::iter(batch.iter().map(|entry| {
+            let entry = Arc::clone(entry);
+            let store = Arc::clone(&store);
+            let user_storage = user_storage.clone();
+            async move {
+                match store.reader(&entry.uri) {
+                    Ok(r) if r.is_fully_resident() => Ok(r),
+                    _ => {
+                        let user_storage = user_storage.as_ref().ok_or_else(|| {
+                            BuildError::Store(
+                                "text drain requires storage to load user superfiles".into(),
+                            )
+                        })?;
+                        let (bytes, _) = user_storage
+                            .get(&entry.uri.storage_path())
+                            .await
+                            .map_err(|e| BuildError::Store(e.to_string()))?;
+                        Ok::<_, BuildError>(Arc::new(
+                            SuperfileReader::open(bytes)
+                                .map_err(|e| BuildError::Store(e.to_string()))?,
+                        ))
+                    }
+                }
+            }
+        }))
+        .buffer_unordered(drain_read_concurrency())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, BuildError>>()?;
+
+        // Per source: tombstone-filtered remap into the merged doc
+        // space + surviving stable ids (in remap order).
+        let mut remaps: Vec<Vec<Option<u32>>> = Vec::with_capacity(readers.len());
+        for (entry, reader) in batch.iter().zip(&readers) {
+            let fts = reader.fts().ok_or_else(|| {
+                BuildError::Store(format!(
+                    "user superfile {} lacks an FTS blob despite configured FTS columns",
+                    entry.superfile_id
+                ))
+            })?;
+            let n_local = fts.n_docs() as usize;
+            let stable_ids = stable_ids_by_local_for_routing(user_manifest, entry, reader)
+                .await
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+            if stable_ids.len() != n_local {
+                return Err(BuildError::Store(format!(
+                    "user superfile {}: {} stable ids for {} FTS docs",
+                    entry.superfile_id,
+                    stable_ids.len(),
+                    n_local
+                )));
+            }
+            let bitmap = user_inner
+                .tombstone_cache
+                .as_ref()
+                .map(|t| t.bitmap_for(entry.superfile_id, now))
+                .transpose()
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+            let mut remap: Vec<Option<u32>> = Vec::with_capacity(n_local);
+            for local in 0..n_local as u32 {
+                if bitmap
+                    .as_deref()
+                    .map(|bm| bm.contains(local))
+                    .unwrap_or(false)
+                {
+                    remap.push(None);
+                    continue;
+                }
+                if n_docs_merged >= u32::MAX as u64 {
+                    return Err(BuildError::Store(
+                        "hidden text index exceeds u32 doc-id space".into(),
+                    ));
+                }
+                remap.push(Some(n_docs_merged as u32));
+                n_docs_merged += 1;
+                let id = stable_ids[local as usize];
+                id_min = id_min.min(id);
+                id_max = id_max.max(id);
+                ids_writer
+                    .write_all(&id.to_le_bytes())
+                    .map_err(|error| BuildError::Store(format!("text ids spill: {error}")))?;
+            }
+            remaps.push(remap);
+        }
+
+        // Merge (previous intermediate + this batch) → next
+        // intermediate. The intermediate rides first with an identity
+        // remap so already-assigned ids keep their order.
+        let prev = intermediate.take();
+        let (prev_bytes, prev_reader, identity);
+        let mut merge_sources: Vec<MergeSource<'_>> = Vec::with_capacity(batch.len() + 1);
+        if let Some((path, _)) = &prev {
+            prev_bytes = mmap_readonly_bytes(path)
+                .map_err(|error| BuildError::Store(format!("text intermediate mmap: {error}")))?;
+            prev_reader = FtsReader::open(prev_bytes.clone(), &columns_json)
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+            identity = (0..prev_reader.n_docs()).map(Some).collect::<Vec<_>>();
+            merge_sources.push(MergeSource {
+                reader: &prev_reader,
+                doc_id_remap: &identity,
+            });
+        }
+        for (reader, remap) in readers.iter().zip(&remaps) {
+            merge_sources.push(MergeSource {
+                reader: reader.fts().expect("checked above"),
+                doc_id_remap: remap,
+            });
+        }
+
+        let next_path = scratch.join(format!("fts_text_intermediate_{chain_step}.bin"));
+        chain_step += 1;
+        let mut next_file =
+            BufWriter::new(File::create(&next_path).map_err(|error| {
+                BuildError::Store(format!("text intermediate create: {error}"))
+            })?);
+        merge_fts_blobs(
+            &merge_sources,
+            &merge_columns,
+            n_docs_merged as u32,
+            None,
+            &mut next_file,
+        )
+        .await?;
+        next_file
+            .flush()
+            .map_err(|error| BuildError::Store(format!("text intermediate flush: {error}")))?;
+        drop(next_file);
+        let next_len = fs::metadata(&next_path)
+            .map_err(|error| BuildError::Store(format!("text intermediate stat: {error}")))?
+            .len();
+        if let Some((old_path, _)) = prev {
+            let _ = fs::remove_file(old_path);
+        }
+        intermediate = Some((next_path, next_len));
+    }
+    ids_writer
+        .flush()
+        .map_err(|error| BuildError::Store(format!("text ids spill flush: {error}")))?;
+    drop(ids_writer);
+
+    if n_docs_merged == 0 {
+        // Every doc tombstoned (or an empty table): the epoch's text
+        // index is empty — drop the previous shards, add none.
+        return Ok(Some(TextDrainOutcome {
+            new_entries: Vec::new(),
+            removed_entries,
+            pending_cache_inserts: Vec::new(),
+            pending_store_inserts: Vec::new(),
+        }));
+    }
+    let (final_path, _) = intermediate.expect("n_docs_merged > 0 implies a merge ran");
+    let final_bytes = mmap_readonly_bytes(&final_path)
+        .map_err(|error| BuildError::Store(format!("text final mmap: {error}")))?;
+    let final_reader = FtsReader::open(final_bytes, &columns_json)
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+
+    // Shard boundaries: walk the merged FST in key order (columns in
+    // lex name order — the FST key order), accumulating each term's
+    // postings bytes off its FST value, cutting at the size target.
+    let mut columns_lex: Vec<&FtsConfig> = fts_columns.iter().collect();
+    columns_lex.sort_unstable_by(|a, b| a.column.cmp(&b.column));
+    let mut bounds: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut lo: Vec<u8> = Vec::new(); // empty key sorts below every real key
+    let mut running: u64 = 0;
+    for fc in &columns_lex {
+        for (term, packed) in final_reader
+            .column_term_entries(&fc.column)
+            .map_err(|e| BuildError::Store(e.to_string()))?
+        {
+            let planned = match FstValue::unpack(packed) {
+                FstValue::Pfor {
+                    postings_length, ..
+                } => postings_length as u64,
+                FstValue::Inline { .. } => TEXT_PLAN_INLINE_BYTES,
+            };
+            if running > 0 && running + planned > TEXT_SHARD_TARGET_BYTES {
+                let mut cut = fc.column.as_bytes().to_vec();
+                cut.push(FST_SEPARATOR);
+                cut.extend_from_slice(&term);
+                bounds.push((lo, cut.clone()));
+                lo = cut;
+                running = 0;
+            }
+            running += planned;
+        }
+    }
+    bounds.push((lo, TEXT_KEY_UPPER_SENTINEL.to_vec()));
+
+    // Every shard shares the full merged doc space (dl arrays + `_id`
+    // stub sized to the corpus; per-shard-dense doc spaces are a
+    // follow-up), so one identity remap serves every slice.
+    let identity_all: Vec<Option<u32>> = (0..n_docs_merged as u32).map(Some).collect();
+    let scalar_schema = hidden_inner.options.scalar_schema();
+    let id_column = hidden_inner.options.id_column.clone();
+    let mut prepared: Vec<PreparedSuperfile> = Vec::with_capacity(bounds.len());
+    for (shard_id, (b_lo, b_hi)) in bounds.iter().enumerate() {
+        let blob_path = scratch.join(format!("fts_text_shard_{shard_id}.blob"));
+        let mut blob_file = BufWriter::new(
+            File::create(&blob_path)
+                .map_err(|error| BuildError::Store(format!("text shard blob create: {error}")))?,
+        );
+        merge_fts_blobs(
+            &[MergeSource {
+                reader: &final_reader,
+                doc_id_remap: &identity_all,
+            }],
+            &merge_columns,
+            n_docs_merged as u32,
+            Some((b_lo, b_hi)),
+            &mut blob_file,
+        )
+        .await?;
+        blob_file
+            .flush()
+            .map_err(|error| BuildError::Store(format!("text shard blob flush: {error}")))?;
+        drop(blob_file);
+        let blob_len = fs::metadata(&blob_path)
+            .map_err(|error| BuildError::Store(format!("text shard blob stat: {error}")))?
+            .len();
+
+        let opts = BuilderOptions::new(
+            scalar_schema.clone(),
+            id_column.clone(),
+            fts_columns.clone(),
+            vec![],
+            None,
+        )
+        .with_prebuilt_fts();
+        let mut builder = SuperfileBuilder::new(opts)?;
+        let mut scalar_stats = HashMap::new();
+        let mut ids_reader = BufReader::new(
+            File::open(&ids_path)
+                .map_err(|error| BuildError::Store(format!("text ids spill open: {error}")))?,
+        );
+        let mut remaining = n_docs_merged as usize;
+        while remaining > 0 {
+            let take = remaining.min(DRAIN_ID_BATCH_ROWS);
+            let mut ids = Vec::with_capacity(take);
+            let mut encoded = [0u8; STABLE_ID_BYTES];
+            for _ in 0..take {
+                ids_reader
+                    .read_exact(&mut encoded)
+                    .map_err(|error| BuildError::Store(format!("text ids spill read: {error}")))?;
+                ids.push(i128::from_le_bytes(encoded));
+            }
+            let id_array = Decimal128Array::from_iter_values(ids)
+                .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
+                .expect("invariant: precision 38 + scale 0 always valid for any i128 payload");
+            let scalar =
+                RecordBatch::try_new(scalar_schema.clone(), vec![Arc::new(id_array) as ArrayRef])
+                    .map_err(|_| BuildError::BatchSchemaMismatch)?;
+            ScalarStatsAgg::merge(
+                &mut scalar_stats,
+                &ScalarStatsAgg::from_batch(&scalar_schema, &scalar),
+            );
+            builder.add_batch_ids_only(&scalar)?;
+            remaining -= take;
+        }
+
+        let mut output = NamedTempFile::new_in(scratch)
+            .map_err(|error| BuildError::Store(format!("text shard temp create: {error}")))?;
+        builder.finish_with_prebuilt_fts_to(
+            BufReader::new(
+                File::open(&blob_path).map_err(|error| {
+                    BuildError::Store(format!("text shard blob reopen: {error}"))
+                })?,
+            ),
+            blob_len,
+            BufWriter::new(output.as_file_mut()),
+        )?;
+        output
+            .as_file_mut()
+            .flush()
+            .map_err(|error| BuildError::Store(format!("text shard temp flush: {error}")))?;
+        let bytes = mmap_readonly_bytes(output.path())
+            .map_err(|error| BuildError::Store(format!("text shard mmap: {error}")))?;
+        let _ = fs::remove_file(&blob_path);
+
+        let shard = ShardOutput {
+            bytes,
+            n_docs: n_docs_merged,
+            id_min,
+            id_max,
+            scalar_stats,
+        };
+        let p = prepare_superfile(hidden_inner, shard)?
+            .ok_or_else(|| BuildError::Store("text shard prepared with zero docs".into()))?;
+        let entry = finish_superfile_entry(p.entry, Some(shard_id as u32))?;
+        prepared.push(PreparedSuperfile {
+            entry,
+            bytes_for_store: p.bytes_for_store,
+            bytes_for_storage: p.bytes_for_storage,
+            bytes_for_cache: p.bytes_for_cache,
+        });
+    }
+    let _ = fs::remove_file(&final_path);
+    let _ = fs::remove_file(&ids_path);
+    let n_shards = prepared.len();
+
+    // Upload. No per-shard checkpointing (see the function docs): an
+    // interrupted upload set is unreferenced and swept later.
+    let publish = collect_prepared_superfiles(hidden_inner, prepared)?;
+    if !publish.to_remove.is_empty() {
+        return Err(BuildError::Store(
+            "text drain prepared removals while publishing new shards".into(),
+        ));
+    }
+    let multipart_threshold = hidden_inner.options.put_multipart_threshold_bytes;
+    let put_futures = publish
+        .pending_storage_writes
+        .into_iter()
+        .map(|(uri, bytes)| {
+            let storage = Arc::clone(storage);
+            async move {
+                put_new_superfile_bytes(&storage, multipart_threshold, uri, bytes)
+                    .await
+                    .map_err(|error| BuildError::Store(error.to_string()))
+            }
+        });
+    stream::iter(put_futures)
+        .buffer_unordered(commit_write_concurrency())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, BuildError>>()?;
+
+    eprintln!(
+        "[supertable drain] text shards: {} live doc(s) -> {} shard(s) (replacing {}), {:.1}ms",
+        n_docs_merged,
+        n_shards,
+        removed_entries.len(),
+        text_t0.elapsed().as_secs_f64() * 1e3,
+    );
+    Ok(Some(TextDrainOutcome {
+        new_entries: publish.new_entries,
+        removed_entries,
+        pending_cache_inserts: publish.pending_cache_inserts,
+        pending_store_inserts: publish.pending_store_inserts,
+    }))
+}
+
 pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     user_inner: Arc<SupertableInner>,
     hidden_inner: Arc<SupertableInner>,
@@ -3065,6 +3535,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     if sources.is_empty() {
         return Ok(());
     }
+    // The text drain re-merges the WHOLE live corpus each epoch (not
+    // just the undrained tail), so it keeps its own handle on the full
+    // source list — `sources` is shadowed inside the cell-build block.
+    let all_user_sources: Vec<Arc<SuperfileEntry>> = sources.clone();
     let batch_cfg = drain_batch_superfiles(&user_inner.options);
     if batch_cfg == 0 {
         eprintln!("[supertable drain] skipped (drain_batch_superfiles = 0)");
@@ -3869,6 +4343,32 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         }
         let n_shard_files = new_entries.len();
 
+        // Text shards: merged inverted-index slices over the live user
+        // corpus. They land in the SAME OCC commit as the vector
+        // shards + watermark below, replacing the previous epoch's
+        // text entries, so readers always see one consistent epoch.
+        let text_outcome = drain_fts_text_shards(
+            &user_inner,
+            &hidden_inner,
+            &user_manifest,
+            &all_user_sources,
+            &storage,
+            drain_scratch.as_path(),
+            budget,
+        )
+        .await?;
+        let (text_entries, text_removals, text_cache_inserts, text_store_inserts) =
+            match text_outcome {
+                Some(t) => (
+                    t.new_entries,
+                    t.removed_entries,
+                    t.pending_cache_inserts,
+                    t.pending_store_inserts,
+                ),
+                None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            };
+        new_entries.extend(text_entries);
+
         // Grid cell counts are read only as a populated/empty marker (`== 0`),
         // never for their magnitude — the precise live-doc total is derived
         // from the files when it matters (e.g. split eligibility reads
@@ -3905,12 +4405,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             drained_ranges: Some(new_drained),
             global_vector_index: None,
         };
-        let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
+        // The only removals a drain commit carries are the previous
+        // epoch's text shards, replaced wholesale by this epoch's.
         let new_manifest = persist_commit_async(
             &hidden_inner,
             Arc::clone(&storage),
             new_entries,
-            &no_removals,
+            &text_removals,
             Vec::new(),
             Vec::new(),
             list_metadata,
@@ -3918,7 +4419,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         .await
         .map_err(|e| BuildError::Store(e.to_string()))?;
         hidden_inner.manifest.store(Arc::new(new_manifest));
+        let mut pending_store_inserts = pending_store_inserts;
+        pending_store_inserts.extend(text_store_inserts);
         apply_pending_store_inserts(&hidden_inner, pending_store_inserts);
+        let mut pending_cache_inserts = pending_cache_inserts;
+        pending_cache_inserts.extend(text_cache_inserts);
         if !pending_cache_inserts.is_empty()
             && let Some(cache) = hidden_inner.options.disk_cache.as_ref()
         {
@@ -5218,6 +5723,12 @@ pub(in crate::supertable) async fn split_overflow_cell(
     let mut to_remove: Vec<Arc<SuperfileEntry>> = Vec::new();
     let mut keep_cells_by_entry: Vec<(Arc<SuperfileEntry>, Vec<u32>)> = Vec::new();
     for entry in manifest.superfiles.iter() {
+        // Text superfiles (the hidden table's other family) partition
+        // by term shard, not cell — a numerically colliding hint must
+        // not sweep them into a cell split.
+        if entry.vector_summary.is_empty() {
+            continue;
+        }
         if entry.vector_layout == VectorLayout::MultiCellIvf {
             let counts = cell_doc_counts_for_entry(&inner, entry).await?;
             let has_neighborhood = counts
@@ -5442,6 +5953,11 @@ pub(in crate::supertable) async fn split_overflow_cells(
     // instead of reopening every superfile for another full recount.
     let mut cell_counts: HashMap<u32, u64> = HashMap::new();
     for entry in manifest.superfiles.iter() {
+        // Text superfiles partition by term shard, not cell; counting
+        // them here would fabricate phantom over-cap cells.
+        if entry.vector_summary.is_empty() {
+            continue;
+        }
         for (cell, n) in cell_doc_counts_for_entry(&inner, entry).await? {
             *cell_counts.entry(cell).or_default() += u64::from(n);
         }

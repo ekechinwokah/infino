@@ -1782,6 +1782,12 @@ mod tests {
             .expect("load superfile entries");
         let mut payloads = HashMap::new();
         for entry in entries {
+            // Hidden tables also hold text superfiles (merged
+            // inverted-index shards) with no vector blob — this
+            // helper inspects the vector family only.
+            if entry.vector_summary.is_empty() {
+                continue;
+            }
             let reader = bridge_sync_to_async(open_reader(
                 &manifest.options.store,
                 manifest.options.disk_cache.as_ref(),
@@ -2107,6 +2113,202 @@ mod tests {
         // options the handle exposes.
         assert_eq!(r.options().id_column, st.options().id_column);
         assert_eq!(r.options().fts_columns.len(), 1);
+    }
+
+    /// The drain also builds TEXT superfiles — term-range shards of the
+    /// merged inverted index — in the same commit as the vector cells:
+    /// entries carry FTS summaries + tagged TermShard keys, the merged
+    /// blob is searchable, the `_id` stub maps merged local ids to the
+    /// live docs' stable ids, tombstoned docs are filtered out, a
+    /// re-drain replaces (never appends) the shards, and a fresh open
+    /// serves them back from the slow-CAS entry blob.
+    #[test]
+    fn drain_builds_text_shards_alongside_vector_cells() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::prelude::{col, lit};
+
+        use crate::superfile::{
+            builder::{FtsConfig, VectorConfig},
+            fts::reader::BoolMode,
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let make_options = || {
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                    positions: false,
+                }],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim,
+                    n_cent: 4,
+                    rot_seed: 7,
+                    metric: Metric::Cosine,
+                    rerank_codec: RerankCodec::Sq8FixedResidual,
+                    provided_centroids: None,
+                }],
+                Some(crate::test_helpers::default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(Arc::clone(&storage))
+            .with_writer_pool(Arc::clone(&pool))
+        };
+        let st = Supertable::create(make_options()).expect("create");
+
+        let titles = LargeStringArray::from(vec!["rust engine", "tokio runtime", "parquet files"]);
+        let flat = Float32Array::from(vec![1.0f32; 3 * dim]);
+        let fsl = FixedSizeListArray::new(item_field, dim as i32, Arc::new(flat), None);
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w); // the delete below needs the single writer slot
+
+        // Tombstone one doc BEFORE draining: the merge must drop its
+        // postings and its stable id.
+        let stats = st
+            .delete(col("title").eq(lit("tokio runtime")))
+            .expect("delete");
+        assert_eq!(stats.n_tombstoned(), 1, "one doc tombstoned");
+
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let text_entries_of = |table: &Supertable| -> Vec<Arc<SuperfileEntry>> {
+            table
+                .reader()
+                .manifest()
+                .superfiles
+                .iter()
+                .filter(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty())
+                .cloned()
+                .collect()
+        };
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        let text_entries = text_entries_of(&hidden);
+        assert_eq!(text_entries.len(), 1, "tiny corpus fits one text shard");
+        let text = &text_entries[0];
+        assert_eq!(text.n_docs, 2, "tombstoned doc filtered from the merge");
+        // Tagged TermShard key: 1 tag byte (b'T') + LE u32 shard id.
+        assert_eq!(text.partition_key.len(), 5, "tagged TermShard key");
+        assert_eq!(text.partition_key[0], b'T', "TermShard tag byte");
+        let summary = text.fts_summary.get("title").expect("title summary");
+        assert!(summary.term_bloom.is_some(), "text entry carries a bloom");
+        assert!(
+            summary.term_range.is_some(),
+            "text entry carries a term range"
+        );
+
+        // The merged blob answers BM25 with merged local ids, minus the
+        // tombstoned doc's vocabulary.
+        let hidden_reader = hidden.reader();
+        let hidden_manifest = hidden_reader.manifest();
+        let reader = bridge_sync_to_async(open_reader(
+            &hidden_manifest.options.store,
+            hidden_manifest.options.disk_cache.as_ref(),
+            hidden_manifest.options.storage.as_ref(),
+            text,
+            true,
+        ))
+        .expect("open text superfile");
+        let hits = bridge_sync_to_async(reader.bm25_search_pretokenized(
+            "title",
+            &["rust"],
+            10,
+            BoolMode::Or,
+        ))
+        .expect("bm25 over text shard");
+        assert_eq!(hits.len(), 1, "'rust' lives in one live doc");
+        let gone = bridge_sync_to_async(reader.bm25_search_pretokenized(
+            "title",
+            &["tokio"],
+            10,
+            BoolMode::Or,
+        ))
+        .expect("bm25 for tombstoned vocab");
+        assert!(gone.is_empty(), "tombstoned doc's vocabulary is gone");
+
+        // The `_id` stub carries exactly the live docs' stable ids.
+        let stub = reader.get_record_batch(None).expect("stub batch");
+        assert_eq!(stub.num_rows(), 2);
+        let live_ids: std::collections::HashSet<i128> = stub
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Decimal128Array>()
+            .expect("_id column")
+            .values()
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(live_ids.len(), 2, "distinct stable ids");
+        assert!(
+            (text.id_min..=text.id_max).contains(live_ids.iter().min().expect("nonempty")),
+            "entry id range covers the stub ids"
+        );
+
+        // Re-drain replaces the epoch's shards instead of appending.
+        st.drain_vectors_to_cells_sync().expect("re-drain");
+        let after = text_entries_of(
+            &st.reader()
+                .vector_index_table()
+                .expect("hidden index")
+                .clone(),
+        );
+        assert_eq!(after.len(), 1, "re-drain must not accumulate text shards");
+
+        // A fresh open hydrates text entries (with their FTS summaries)
+        // from the slow-CAS entry blob — the hidden table has no parts.
+        drop(hidden);
+        drop(st);
+        let reopened = Supertable::open(make_options()).expect("reopen");
+        let hidden = reopened
+            .reader()
+            .vector_index_table()
+            .expect("hidden index after reopen")
+            .clone();
+        let text_entries = text_entries_of(&hidden);
+        assert_eq!(text_entries.len(), 1, "text shard survives reopen");
+        assert!(
+            text_entries[0]
+                .fts_summary
+                .get("title")
+                .is_some_and(|s| s.term_bloom.is_some()),
+            "bloom survives the slow-CAS round trip"
+        );
     }
 
     #[test]
@@ -4074,13 +4276,20 @@ mod tests {
         );
         let hidden_reader = hidden.reader();
         let manifest = hidden_reader.manifest();
-        let n_objects = manifest.superfiles.len();
+        // Vector family only: text superfiles are shard-planned by
+        // term range, not by the writer pool.
+        let vector_entries: Vec<_> = manifest
+            .superfiles
+            .iter()
+            .filter(|e| !e.vector_summary.is_empty())
+            .collect();
+        let n_objects = vector_entries.len();
         assert_eq!(
             n_objects, POOL,
             "five populated cells span both cell % {POOL} worker shards"
         );
         let mut hints = HashSet::new();
-        for entry in manifest.superfiles.iter() {
+        for entry in vector_entries {
             assert_eq!(entry.vector_layout, VectorLayout::MultiCellIvf);
             let hint = entry.partition_hint.expect("shard partition_hint");
             assert!(
@@ -4317,7 +4526,13 @@ mod tests {
         let manifest = reader.manifest();
         let mut per_cell = HashMap::<Vec<u8>, usize>::new();
         let mut total_rows = 0u64;
-        for e in manifest.superfiles.iter() {
+        // Vector family only: the hidden table also carries text
+        // superfiles whose n_docs is the whole merged corpus.
+        for e in manifest
+            .superfiles
+            .iter()
+            .filter(|e| !e.vector_summary.is_empty())
+        {
             *per_cell.entry(e.partition_key.clone()).or_default() += 1;
             total_rows += e.n_docs;
         }
@@ -4357,7 +4572,15 @@ mod tests {
             .vector_index_table()
             .expect("hidden index")
             .clone();
-        let n_after = hidden.reader().manifest().superfiles.len();
+        // Vector family only (text superfiles are epoch-replaced, not
+        // appended, so they can't grow this count either).
+        let n_after = hidden
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .filter(|e| !e.vector_summary.is_empty())
+            .count();
         assert_eq!(
             n_after,
             per_cell.len(),
@@ -4703,7 +4926,13 @@ mod tests {
             .clone();
         let manifest = Arc::clone(hidden.reader().manifest());
         assert!(!manifest.superfiles.is_empty(), "drain built cell files");
-        for entry in manifest.superfiles.iter() {
+        // Vector family only: text superfiles carry FTS summaries
+        // instead.
+        for entry in manifest
+            .superfiles
+            .iter()
+            .filter(|e| e.fts_summary.is_empty())
+        {
             let vs = entry.vector_summary.get("emb").unwrap_or_else(|| {
                 panic!(
                     "drain-built hidden superfile {} has NO vector_summary",
@@ -5160,7 +5389,11 @@ mod tests {
             after < before,
             "compaction should collapse packed shards: before={before} after={after}"
         );
-        for entry in &after_manifest.superfiles {
+        for entry in after_manifest
+            .superfiles
+            .iter()
+            .filter(|e| !e.vector_summary.is_empty())
+        {
             assert!(
                 entry.vector_layout == VectorLayout::MultiCellIvf
                     || entry.vector_layout == VectorLayout::Ivf,

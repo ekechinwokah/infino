@@ -2044,10 +2044,15 @@ impl SupertableReader {
             let hidden_reader = vit.pinned_reader();
             let hidden_manifest = Arc::clone(hidden_reader.manifest());
             let drained = hidden_manifest.get_drained_ranges();
-            let superfiles = hidden_manifest
+            // Vector wave: only the hidden table's vector family
+            // (text superfiles carry no vector blob).
+            let superfiles: Vec<_> = hidden_manifest
                 .get_all_superfiles_loaded()
                 .await
-                .map_err(QueryError::ManifestLoad)?;
+                .map_err(QueryError::ManifestLoad)?
+                .into_iter()
+                .filter(|e| !e.vector_summary.is_empty())
+                .collect();
             if !superfiles.is_empty() {
                 let allow_for_cell = Arc::clone(&allow_global);
                 let manifest_for_ids = Arc::clone(&hidden_manifest);
@@ -2166,10 +2171,15 @@ impl SupertableReader {
             let hidden_reader = vit.pinned_reader();
             let hidden_manifest = Arc::clone(hidden_reader.manifest());
             let drained = hidden_manifest.get_drained_ranges();
-            let superfiles = hidden_manifest
+            // Vector wave: only the hidden table's vector family
+            // (text superfiles carry no vector blob).
+            let superfiles: Vec<_> = hidden_manifest
                 .get_all_superfiles_loaded()
                 .await
-                .map_err(QueryError::ManifestLoad)?;
+                .map_err(QueryError::ManifestLoad)?
+                .into_iter()
+                .filter(|e| !e.vector_summary.is_empty())
+                .collect();
             if !superfiles.is_empty() {
                 let allow_for_cell = Arc::clone(&allow_set);
                 let manifest_for_ids = Arc::clone(&hidden_manifest);
@@ -2449,10 +2459,17 @@ impl SupertableReader {
         let hidden_reader = vit.pinned_reader();
         let hidden_manifest = Arc::clone(hidden_reader.manifest());
         let drained = hidden_manifest.get_drained_ranges();
-        let hidden_entries = hidden_manifest
+        // The hidden table holds two superfile families; the vector
+        // wave fans out over the vector one only (text superfiles —
+        // merged inverted-index shards — carry no vector blob and are
+        // the FTS wave's concern).
+        let hidden_entries: Vec<_> = hidden_manifest
             .get_all_superfiles_loaded()
             .await
-            .map_err(QueryError::ManifestLoad)?;
+            .map_err(QueryError::ManifestLoad)?
+            .into_iter()
+            .filter(|e| !e.vector_summary.is_empty())
+            .collect();
         let hidden_search = async {
             if hidden_entries.is_empty() {
                 Ok(Vec::new())

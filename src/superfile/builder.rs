@@ -289,10 +289,6 @@ impl BuilderOptions {
     }
 
     /// See [`BuilderOptions::prebuilt_fts`].
-    // TODO(hidden-fts drain): `allow` is staging-only — the drain's
-    // fts-merge consolidation (next commit in this series) is the
-    // non-test consumer; remove the attribute when it lands.
-    #[allow(dead_code)]
     pub(crate) fn with_prebuilt_fts(mut self) -> Self {
         self.prebuilt_fts = true;
         self
@@ -1307,10 +1303,6 @@ impl SuperfileBuilder {
     /// the `inf.fts.columns` KV the reader opens the blob with, so
     /// they must match the merge's column declaration order) and no
     /// vector columns.
-    // TODO(hidden-fts drain): `allow` is staging-only — the drain's
-    // fts-merge consolidation (next commit in this series) is the
-    // non-test consumer; remove the attribute when it lands.
-    #[allow(dead_code)]
     pub(crate) fn finish_with_prebuilt_fts_to<R, W>(
         self,
         fts_blob: R,
@@ -1486,7 +1478,7 @@ fn check_user_column_name(name: &str) -> Result<(), BuildError> {
 /// `{"name":"<escaped>","tokenizer":"ascii_lower"}`.
 /// `ascii_lower` is hardcoded today because that's the only
 /// tokenizer the format supports.
-fn fts_columns_json(cols: &[FtsConfig]) -> String {
+pub(crate) fn fts_columns_json(cols: &[FtsConfig]) -> String {
     let mut s = String::from("[");
     for (i, c) in cols.iter().enumerate() {
         if i > 0 {
