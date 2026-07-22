@@ -46,13 +46,6 @@ const MAGIC: &[u8; 8] = b"INFFBM01";
 /// Blob format version.
 const VERSION: u32 = 1;
 
-/// Terms whose document frequency is below this floor get no resident
-/// slab: their posting lists span a handful of blocks, so whole-term
-/// fetches are already cheap and block selection has nothing to prune.
-/// At the default posting-block length (128 docs) this is ~8 blocks.
-/// TODO(hidden-fts): expose as a YAML knob.
-pub(crate) const BLOCK_MAX_DF_FLOOR: u32 = 1024;
-
 /// Quantization steps for the 1-byte per-block bound (`u8::MAX`).
 const QUANT_STEPS: f32 = 255.0;
 

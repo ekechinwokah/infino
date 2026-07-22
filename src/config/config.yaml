@@ -223,6 +223,23 @@ vector:
 # instrumentation or forces a slower code path for A/B measurement;
 # none of them change query results. Leave everything off unless you
 # are profiling or benchmarking.
+# Hidden text-index (FTS) tuning: the drain's text-shard build and the
+# resident block-max routing state.
+fts:
+  # Target size (MiB) for one text shard's merged FTS blob. The drain
+  # slices the merged inverted index at term boundaries into shards of
+  # roughly this size: small enough that a term's routing (manifest
+  # bloom + lex range) pins one shard, large enough that shard counts
+  # stay in the tens.
+  text_shard_target_mb: 256
+
+  # Terms whose document frequency is below this floor carry no
+  # resident block-max slab: their posting lists span a handful of
+  # blocks, so whole-term fetches are already cheap and block
+  # selection has nothing to prune. ~8 posting blocks at the 128-doc
+  # block length.
+  block_max_df_floor: 1024
+
 diagnostics:
   # Accumulate per-phase timers during the vector drain build.
   drain_build_timers: false

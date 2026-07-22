@@ -100,6 +100,9 @@ pub struct Config {
     /// Vector-index build / search / drain tuning knobs.
     #[serde(default)]
     pub vector: VectorSettings,
+    /// Hidden text-index (FTS) build / drain tuning knobs.
+    #[serde(default)]
+    pub fts: FtsSettings,
     /// Diagnostic and hardware-capability toggles. These gate
     /// instrumentation (timers / tracing) or force a slower code
     /// path for A/B measurement; none of them change query
@@ -400,6 +403,39 @@ impl Default for VectorSettings {
             compaction_target_mb: DEFAULT_VECTOR_COMPACTION_TARGET_MB,
             compaction_min_fill_percent: DEFAULT_VECTOR_COMPACTION_MIN_FILL_PERCENT,
             compaction_max_memory_mb: DEFAULT_VECTOR_COMPACTION_MAX_MEMORY_MB,
+        }
+    }
+}
+
+/// Hidden text-index (FTS) subsection of [`Config`] — the drain's
+/// text-shard build and the resident block-max routing state.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct FtsSettings {
+    /// Target byte size for one text shard's merged FTS blob. The
+    /// drain slices the merged inverted index at term boundaries into
+    /// shards of roughly this size: small enough that a term's routing
+    /// (manifest bloom + lex range) pins one shard, large enough that
+    /// shard counts stay in the tens.
+    pub text_shard_target_mb: u64,
+    /// Terms whose document frequency is below this floor get no
+    /// resident block-max slab: their posting lists span a handful of
+    /// blocks, so whole-term fetches are already cheap and block
+    /// selection has nothing to prune.
+    pub block_max_df_floor: u32,
+}
+
+/// Default [`FtsSettings::text_shard_target_mb`].
+const DEFAULT_FTS_TEXT_SHARD_TARGET_MB: u64 = 256;
+/// Default [`FtsSettings::block_max_df_floor`] — ~8 posting blocks at
+/// the 128-doc block length.
+const DEFAULT_FTS_BLOCK_MAX_DF_FLOOR: u32 = 1024;
+
+impl Default for FtsSettings {
+    fn default() -> Self {
+        Self {
+            text_shard_target_mb: DEFAULT_FTS_TEXT_SHARD_TARGET_MB,
+            block_max_df_floor: DEFAULT_FTS_BLOCK_MAX_DF_FLOOR,
         }
     }
 }

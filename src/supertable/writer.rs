@@ -3028,12 +3028,16 @@ async fn materialized_user_rows_for_drain(
 
 // ---- Hidden text-shard drain (FTS) --------------------------------------
 
-/// Target byte size for one text shard's merged FTS blob. The drain
-/// slices the merged inverted index at term boundaries into shards of
-/// roughly this size: small enough that a term's routing (manifest
-/// bloom + term range) pins one shard, large enough that shard counts
-/// stay in the tens. TODO(hidden-fts): expose as a YAML knob.
-const TEXT_SHARD_TARGET_BYTES: u64 = 256 * 1024 * 1024;
+/// Bytes per MiB, for the `fts.text_shard_target_mb` knob.
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+
+/// Target byte size for one text shard's merged FTS blob (the
+/// `fts.text_shard_target_mb` YAML knob): small enough that a term's
+/// routing (manifest bloom + term range) pins one shard, large enough
+/// that shard counts stay in the tens.
+fn text_shard_target_bytes() -> u64 {
+    config::global().fts.text_shard_target_mb * BYTES_PER_MIB
+}
 
 /// Planned byte size of a df=1 inline term (no posting region bytes;
 /// FST entry only). Shard planning reads sizes off FST values, and
@@ -3337,7 +3341,7 @@ async fn drain_fts_text_shards(
                 } => postings_length as u64,
                 FstValue::Inline { .. } => TEXT_PLAN_INLINE_BYTES,
             };
-            if running > 0 && running + planned > TEXT_SHARD_TARGET_BYTES {
+            if running > 0 && running + planned > text_shard_target_bytes() {
                 let mut cut = fc.column.as_bytes().to_vec();
                 cut.push(FST_SEPARATOR);
                 cut.extend_from_slice(&term);
@@ -3476,7 +3480,7 @@ async fn drain_fts_text_shards(
             let rows = slow_fts_state::build_file_block_max(
                 entry.superfile_id,
                 fts,
-                slow_fts_state::BLOCK_MAX_DF_FLOOR,
+                config::global().fts.block_max_df_floor,
             )
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
