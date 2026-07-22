@@ -3138,7 +3138,9 @@ async fn drain_fts_text_shards(
     // serves the shard uploads below).
     let user_storage = user_inner.options.storage.clone();
 
-    for batch in ordered.chunks(batch_budget.max(1)) {
+    let n_text_batches = ordered.len().div_ceil(batch_budget.max(1));
+    for (batch_idx, batch) in ordered.chunks(batch_budget.max(1)).enumerate() {
+        let batch_t0 = time::Instant::now();
         // Open the batch's user superfiles fully resident (reuse a
         // resident cached reader when present — drain just opened many
         // of these for the vector pass).
@@ -3277,6 +3279,16 @@ async fn drain_fts_text_shards(
             let _ = fs::remove_file(old_path);
         }
         intermediate = Some((next_path, next_len));
+        eprintln!(
+            "[supertable drain] text batch {}/{} ({} sf): {} live doc(s) so far, \
+             intermediate {:.1} MiB, {:.1}ms",
+            batch_idx + 1,
+            n_text_batches,
+            batch.len(),
+            n_docs_merged,
+            next_len as f64 / (1u64 << 20) as f64,
+            batch_t0.elapsed().as_secs_f64() * 1e3,
+        );
     }
     ids_writer
         .flush()
@@ -3362,6 +3374,12 @@ async fn drain_fts_text_shards(
         let blob_len = fs::metadata(&blob_path)
             .map_err(|error| BuildError::Store(format!("text shard blob stat: {error}")))?
             .len();
+        eprintln!(
+            "[supertable drain] text shard {}/{}: blob {:.1} MiB sliced, building superfile...",
+            shard_id + 1,
+            bounds.len(),
+            blob_len as f64 / (1u64 << 20) as f64,
+        );
 
         let opts = BuilderOptions::new(
             scalar_schema.clone(),
