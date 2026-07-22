@@ -1891,7 +1891,7 @@ impl FtsReader {
         if musts.len() + shoulds.len() == 1 {
             let term = musts.iter().chain(shoulds).next().expect("one atom");
             return self
-                .search_single_term_bmw(column_id, term, k, filter, floor_eff)
+                .search_single_term_bmw(column_id, term, k, filter, floor_eff, 0, u32::MAX)
                 .await;
         }
         if musts.is_empty() {
@@ -1906,13 +1906,29 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         if shoulds.is_empty() {
-            return self.run_and_intersect(column_id, must_cursors, k, filter, floor_eff);
+            return self.run_and_intersect(
+                column_id,
+                must_cursors,
+                k,
+                filter,
+                floor_eff,
+                0,
+                u32::MAX,
+            );
         }
         // Shoulds absent from this superfile contribute nothing;
         // when none survive, the walk is a plain must intersection.
         let should_cursors = self.build_term_cursors(column_id, shoulds).await?;
         if should_cursors.is_empty() {
-            return self.run_and_intersect(column_id, must_cursors, k, filter, floor_eff);
+            return self.run_and_intersect(
+                column_id,
+                must_cursors,
+                k,
+                filter,
+                floor_eff,
+                0,
+                u32::MAX,
+            );
         }
         self.run_must_should(
             column_id,
@@ -1921,6 +1937,8 @@ impl FtsReader {
             k,
             filter,
             floor_eff,
+            0,
+            u32::MAX,
         )
     }
 
@@ -2099,6 +2117,97 @@ impl FtsReader {
         )
     }
 
+    /// Term-only clause search constrained to a doc-id sub-range —
+    /// the general sibling of
+    /// [`Self::search_or_range_pretokenized_with_floor`], covering
+    /// single-term, AND, and must+should shapes so the supertable's
+    /// intra-superfile fan-out can slice big merged shards for every
+    /// phrase-free, negation-free query (phrases and negation force
+    /// the un-ranged walk, mirroring the OR path's v1 rule).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn search_terms_range_with_floor(
+        &self,
+        column: &str,
+        musts: &[&str],
+        shoulds: &[&str],
+        k: usize,
+        doc_id_start: u32,
+        doc_id_end: u32,
+        floor: f32,
+    ) -> Result<Vec<(u32, f32)>, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        if (musts.is_empty() && shoulds.is_empty()) || k == 0 || doc_id_start >= doc_id_end {
+            return Ok(Vec::new());
+        }
+        let floor_eff = floor.next_down();
+        if musts.len() + shoulds.len() == 1 {
+            let term = musts.iter().chain(shoulds).next().expect("one atom");
+            return self
+                .search_single_term_bmw(
+                    column_id,
+                    term,
+                    k,
+                    None,
+                    floor_eff,
+                    doc_id_start,
+                    doc_id_end,
+                )
+                .await;
+        }
+        if musts.is_empty() {
+            let cursors = self.build_term_cursors(column_id, shoulds).await?;
+            if cursors.is_empty() {
+                return Ok(Vec::new());
+            }
+            return self.run_max_score_bmm_range(
+                column_id,
+                cursors,
+                k,
+                doc_id_start,
+                doc_id_end,
+                None,
+                floor_eff,
+            );
+        }
+        let must_cursors = self.build_term_cursors(column_id, musts).await?;
+        if must_cursors.len() != musts.len() {
+            return Ok(Vec::new());
+        }
+        if shoulds.is_empty() {
+            return self.run_and_intersect(
+                column_id,
+                must_cursors,
+                k,
+                None,
+                floor_eff,
+                doc_id_start,
+                doc_id_end,
+            );
+        }
+        let should_cursors = self.build_term_cursors(column_id, shoulds).await?;
+        if should_cursors.is_empty() {
+            return self.run_and_intersect(
+                column_id,
+                must_cursors,
+                k,
+                None,
+                floor_eff,
+                doc_id_start,
+                doc_id_end,
+            );
+        }
+        self.run_must_should(
+            column_id,
+            must_cursors,
+            should_cursors,
+            k,
+            None,
+            floor_eff,
+            doc_id_start,
+            doc_id_end,
+        )
+    }
+
     /// Multi-column BM25 search (most_fields semantics): each
     /// `(column, weight)` runs an OR-mode search; per-column scores are
     /// multiplied by `weight` and summed across columns.
@@ -2141,6 +2250,9 @@ impl FtsReader {
     /// posting lists with high score variance — e.g. very long lists
     /// where most blocks contain mid-relevance docs and the top-k is
     /// dominated by a few outliers.
+    /// `doc_id_start..doc_id_end` bounds the walk (`0..u32::MAX` =
+    /// whole list) — the sub-range fan-out's window.
+    #[allow(clippy::too_many_arguments)]
     async fn search_single_term_bmw(
         &self,
         column_id: u32,
@@ -2148,7 +2260,12 @@ impl FtsReader {
         k: usize,
         mut filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
+        doc_id_start: u32,
+        doc_id_end: u32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
+        if doc_id_start >= doc_id_end {
+            return Ok(Vec::new());
+        }
         let fst_bytes = self.dict_bytes_async().await?;
         let dict = DictReader::open(&fst_bytes).map_err(|e| {
             FtsError::Read(ReadError::MalformedVersion(format!(
@@ -2176,7 +2293,11 @@ impl FtsReader {
                 };
                 let idf_t = bm25::idf(self.n_docs as u64, 1);
                 let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
-                // Drop the lone match if a negated term excludes it.
+                // Drop the lone match if a negated term excludes it
+                // or it falls outside the sub-range window.
+                if doc_id < doc_id_start || doc_id >= doc_id_end {
+                    return Ok(Vec::new());
+                }
                 if let Some(f) = filter.as_deref_mut()
                     && !f.admits(doc_id)
                 {
@@ -2224,11 +2345,20 @@ impl FtsReader {
         let mut buf_d = vec![0u32; BLOCK_LEN];
         let mut buf_t = vec![0u32; BLOCK_LEN];
 
+        let mut past_end = false;
         for i in 0..term_meta.num_blocks {
-            // last_doc_id (first tuple slot) is unused here — it serves
-            // AND-merge seeks, which single-term never does.
-            let (_, block_offset_in_term, block_max_bm25) = term_meta.skip_entry(postings, i);
+            if past_end {
+                break;
+            }
+            let (last_doc_id, block_offset_in_term, block_max_bm25) =
+                term_meta.skip_entry(postings, i);
 
+            // Sub-range skips: a block wholly below the window has
+            // nothing to score; doc ids ascend, so the first in-block
+            // doc at/above the window's end finishes the walk.
+            if last_doc_id < doc_id_start {
+                continue;
+            }
             // Floor skip: nothing in this block can reach the caller's
             // floor — dead regardless of local heap state.
             if block_max_bm25 <= floor_eff {
@@ -2252,6 +2382,13 @@ impl FtsReader {
 
             for j in 0..n {
                 let doc_id = buf_d[j];
+                if doc_id < doc_id_start {
+                    continue;
+                }
+                if doc_id >= doc_id_end {
+                    past_end = true;
+                    break;
+                }
                 // Drop docs excluded by a negated term (None = keep all).
                 if let Some(f) = filter.as_deref_mut()
                     && !f.admits(doc_id)
@@ -2650,6 +2787,9 @@ impl FtsReader {
     /// K postings for a common Zipfian term) followed by a HashMap
     /// intersection — orders of magnitude more work than this when
     /// any term is rare.
+    /// `doc_id_start..doc_id_end` bounds the walk (`0..u32::MAX` =
+    /// whole lists) — the sub-range fan-out's window.
+    #[allow(clippy::too_many_arguments)]
     fn run_and_intersect(
         &self,
         column_id: u32,
@@ -2657,12 +2797,19 @@ impl FtsReader {
         k: usize,
         filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
+        doc_id_start: u32,
+        doc_id_end: u32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        if cursors.is_empty() {
+        if cursors.is_empty() || doc_id_start >= doc_id_end {
             return Ok(Vec::new());
         }
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = &col_meta.dl_norm_k1;
+        if doc_id_start > 0 {
+            for cursor in &mut cursors {
+                cursor.skip_to(doc_id_start);
+            }
+        }
 
         // Smallest-df cursor at index 0 = leader. The remaining order
         // doesn't matter for correctness but ascending-df reduces the
@@ -2677,7 +2824,7 @@ impl FtsReader {
             filter,
             floor_eff,
         };
-        self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
+        self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink, doc_id_end);
         Ok(drain_top_k_desc(heap))
     }
 
@@ -2688,6 +2835,10 @@ impl FtsReader {
     /// score additionally collects every should term that lands on it.
     /// Shoulds never affect matching — a doc containing every must and
     /// no should still matches, with its must-only score.
+    /// `doc_id_start..doc_id_end` bounds the walk (`0..u32::MAX` =
+    /// whole lists). Should cursors need no pre-seek: the sink pulls
+    /// them forward per emitted (in-range) must-intersection doc.
+    #[allow(clippy::too_many_arguments)]
     fn run_must_should(
         &self,
         column_id: u32,
@@ -2696,13 +2847,23 @@ impl FtsReader {
         k: usize,
         filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
+        doc_id_start: u32,
+        doc_id_end: u32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         debug_assert!(
             !must_cursors.is_empty() && !should_cursors.is_empty(),
             "dispatch routes empty-side shapes to the AND/OR kernels"
         );
+        if doc_id_start >= doc_id_end {
+            return Ok(Vec::new());
+        }
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = &col_meta.dl_norm_k1;
+        if doc_id_start > 0 {
+            for cursor in &mut must_cursors {
+                cursor.skip_to(doc_id_start);
+            }
+        }
         must_cursors.sort_by_key(|c| c.block_count());
 
         let initial_cap = k.min(self.n_docs as usize).max(1);
@@ -2717,7 +2878,7 @@ impl FtsReader {
             should_ub,
             dl_norm_k1,
         };
-        self.and_flat_merge(&mut must_cursors, dl_norm_k1, &mut sink);
+        self.and_flat_merge(&mut must_cursors, dl_norm_k1, &mut sink, doc_id_end);
         Ok(drain_top_k_desc(heap))
     }
 
@@ -2736,7 +2897,7 @@ impl FtsReader {
         let dl_norm_k1 = &col_meta.dl_norm_k1;
         cursors.sort_by_key(|c| c.block_count());
         let mut sink = CollectSink { out: Vec::new() };
-        self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
+        self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink, u32::MAX);
         sink.out
     }
 
@@ -2752,7 +2913,7 @@ impl FtsReader {
         let dl_norm_k1 = &col_meta.dl_norm_k1;
         cursors.sort_by_key(|c| c.block_count());
         let mut sink = CountSink { n: 0 };
-        self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
+        self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink, u32::MAX);
         sink.n
     }
 
@@ -2764,16 +2925,20 @@ impl FtsReader {
     /// (rare ∧ common). The general path keeps the per-doc leapfrog,
     /// which amortizes well with the block-max pruning a scoring sink
     /// drives.
+    /// `doc_id_end` bounds the walk (exclusive); `u32::MAX` = whole
+    /// list. Sub-range fan-out seeks the cursors to the range start
+    /// before calling and relies on this bound to stop at its end.
     fn and_flat_merge<S: AndSink>(
         &self,
         cursors: &mut [TermCursor],
         dl_norm_k1: &NormTable,
         sink: &mut S,
+        doc_id_end: u32,
     ) {
         if cursors.len() == 2 {
-            self.and_flat_merge_2term(cursors, dl_norm_k1, sink);
+            self.and_flat_merge_2term(cursors, dl_norm_k1, sink, doc_id_end);
         } else {
-            self.and_flat_merge_general(cursors, dl_norm_k1, sink);
+            self.and_flat_merge_general(cursors, dl_norm_k1, sink, doc_id_end);
         }
     }
 
@@ -2791,9 +2956,15 @@ impl FtsReader {
         cursors: &mut [TermCursor],
         dl_norm_k1: &NormTable,
         sink: &mut S,
+        doc_id_end: u32,
     ) {
         'outer: loop {
             if cursors[0].is_exhausted() {
+                break;
+            }
+            // Sub-range upper bound: the leader ascends, so once it
+            // reaches the bound nothing later can be in range.
+            if cursors[0].current_doc_id() >= doc_id_end {
                 break;
             }
 
@@ -2864,6 +3035,10 @@ impl FtsReader {
             let mut i = c0.pos;
             while i < lb_n {
                 let a = c0.block_doc_ids[i];
+                if a >= doc_id_end {
+                    c0.pos = i;
+                    break 'outer;
+                }
 
                 // For each non-leader, walk its `pos` forward through
                 // the decoded block until block_doc_ids[pos] >= a (or
@@ -2939,6 +3114,7 @@ impl FtsReader {
         cursors: &mut [TermCursor],
         dl_norm_k1: &NormTable,
         sink: &mut S,
+        doc_id_end: u32,
     ) {
         debug_assert_eq!(cursors.len(), 2);
         // Split into two simultaneous mutable refs so the inner loop
@@ -2950,6 +3126,11 @@ impl FtsReader {
 
         'outer: loop {
             if c0.is_exhausted() || c1.is_exhausted() {
+                break;
+            }
+            // Sub-range upper bound: the leader ascends, so once it
+            // reaches the bound nothing later can be in range.
+            if c0.current_doc_id() >= doc_id_end {
                 break;
             }
 
@@ -3005,6 +3186,11 @@ impl FtsReader {
             let c1_idf = c1.idf_x_k1p1;
             while i < lb_n && j < rb_n {
                 let a = c0.block_doc_ids[i];
+                if a >= doc_id_end {
+                    c0.pos = i;
+                    c1.pos = j;
+                    break 'outer;
+                }
                 let b = c1.block_doc_ids[j];
                 if a < b {
                     i += 1;
@@ -6478,6 +6664,80 @@ mod tests {
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
         assert!(!ids.contains(&2));
+    }
+
+    /// The ranged clause kernels must agree with the un-ranged walk:
+    /// for every phrase-free shape, the union of a partition's
+    /// sub-range results equals the whole-list result.
+    #[tokio::test]
+    async fn ranged_terms_union_matches_unranged_walk() {
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        // 700 docs spanning several blocks: "alpha" everywhere with tf
+        // variance, "beta" on every 3rd doc, "gamma" on every 7th —
+        // AND and must+should shapes get real intersections.
+        for d in 0..700u32 {
+            let mut text = "alpha ".repeat(((d % 4) + 1) as usize);
+            if d % 3 == 0 {
+                text.push_str("beta ");
+            }
+            if d % 7 == 0 {
+                text.push_str("gamma ");
+            }
+            text.push_str(&format!("filler{d}"));
+            b.add_doc(0, d, &text).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let shapes: Vec<(Vec<&str>, Vec<&str>)> = vec![
+            (vec!["alpha"], vec![]),                // single term
+            (vec!["alpha", "beta"], vec![]),        // AND
+            (vec!["beta", "gamma"], vec![]),        // sparser AND
+            (vec!["beta"], vec!["alpha", "gamma"]), // must + should
+        ];
+        for (musts, shoulds) in shapes {
+            // Whole-list reference via the un-ranged dispatcher.
+            let mut expected = r
+                .search_excluding(
+                    "body",
+                    ClauseLists {
+                        musts: &musts,
+                        shoulds: &shoulds,
+                        negatives: &[],
+                        must_phrases: &[],
+                        should_phrases: &[],
+                        negative_phrases: &[],
+                    },
+                    usize::MAX,
+                    f32::NEG_INFINITY,
+                )
+                .await
+                .expect("unranged walk");
+            // Union of a 4-way partition of the doc space.
+            let mut got = Vec::new();
+            for w in 0..4u32 {
+                let (start, end) = (w * 175, (w + 1) * 175);
+                got.extend(
+                    r.search_terms_range_with_floor(
+                        "body",
+                        &musts,
+                        &shoulds,
+                        usize::MAX,
+                        start,
+                        end,
+                        f32::NEG_INFINITY,
+                    )
+                    .await
+                    .expect("ranged walk"),
+                );
+            }
+            expected.sort_by_key(|&(d, _)| d);
+            got.sort_by_key(|&(d, _)| d);
+            assert_eq!(got, expected, "musts={musts:?} shoulds={shoulds:?}");
+        }
     }
 
     #[tokio::test]

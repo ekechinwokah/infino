@@ -1149,6 +1149,35 @@ impl SuperfileReader {
         Ok(fts.search_excluding(column, lists, k, floor).await?)
     }
 
+    /// Term-only clause search over a doc-id sub-range — see
+    /// [`FtsReader::search_terms_range_with_floor`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn bm25_search_terms_range_with_floor(
+        &self,
+        column: &str,
+        musts: &[&str],
+        shoulds: &[&str],
+        k: usize,
+        doc_id_start: u32,
+        doc_id_end: u32,
+        floor: f32,
+    ) -> Result<Vec<(u32, f32)>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts
+            .search_terms_range_with_floor(
+                column,
+                musts,
+                shoulds,
+                k,
+                doc_id_start,
+                doc_id_end,
+                floor,
+            )
+            .await?)
+    }
+
     /// Single-term BM25 over resident-routed block selection — see
     /// [`FtsReader::bm25_single_term_block_selected`].
     #[allow(clippy::too_many_arguments)]

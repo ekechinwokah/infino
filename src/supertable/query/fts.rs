@@ -291,19 +291,39 @@ async fn bm25_fanout_wave(
     } = clauses;
 
     // Build the work-unit list. When the reader pool has more
-    // threads than there are kept superfiles AND we're on the
-    // multi-term OR hot path, slice each superfile into doc_id
-    // sub-ranges so the fan-out can saturate every pool thread.
-    // Single-term OR, AND, and any query with a must or negated
-    // clause stay on the un-ranged call.
-    let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
-    // Phrase-bearing queries stay per-superfile: the ranged
-    // kernel is the pure term-union fast path.
+    // threads than there are kept superfiles, slice each superfile
+    // into doc_id sub-ranges so the fan-out can saturate every pool
+    // thread — every phrase-free, negation-free positive shape has a
+    // range-aware kernel. Phrase-bearing (and negated) queries stay
+    // per-superfile.
     let fanout = match has_phrases {
         true => FanOut::PerSuperfile,
         false => fanout_for(must_arc.len(), should_arc.len(), !neg_arc.is_empty()),
     };
-    let work_units = build_work_units(&kept_refs, fanout, pool_threads);
+    // A single bare term whose resident block-max row CAN PRUNE keeps
+    // its file as one un-ranged unit: the block-selected walk visits
+    // (and, cold, fetches) fewer bytes than any parallel full walk.
+    // Flat-bounded or row-less files slice for parallelism instead.
+    let single_bare_term = match (must_arc.as_slice(), should_arc.as_slice()) {
+        _ if has_phrases || !neg_arc.is_empty() => None,
+        ([term], []) | ([], [term]) => Some(term.as_str()),
+        _ => None,
+    };
+    let (selected_refs, sliceable_refs): (Vec<&Arc<SuperfileEntry>>, Vec<&Arc<SuperfileEntry>>) =
+        match (single_bare_term, routing.as_ref()) {
+            (Some(term), Some(state)) => kept.iter().partition(|e| {
+                state
+                    .term_block_max(e.superfile_id, &column_arc, term)
+                    .is_some_and(|row| row.quantized.iter().min() < row.quantized.iter().max())
+            }),
+            _ => (Vec::new(), kept.iter().collect()),
+        };
+    let mut work_units = build_work_units(&sliceable_refs, fanout, pool_threads);
+    work_units.extend(build_work_units(
+        &selected_refs,
+        FanOut::PerSuperfile,
+        pool_threads,
+    ));
     let units: Vec<(Arc<SuperfileEntry>, (Option<(u32, u32)>, Uuid))> = work_units
         .into_iter()
         .map(|u| {
@@ -359,6 +379,10 @@ async fn bm25_fanout_wave(
                 let term = must_arc.first().or_else(|| should_arc.first());
                 if let Some(term) = term
                     && let Some(row) = state.term_block_max(suid, &column_arc, term)
+                    // Flat bounds can't prune: the ranged parallel
+                    // walk (sub-range units) beats a serial selected
+                    // walk that must visit everything anyway.
+                    && row.quantized.iter().min() < row.quantized.iter().max()
                 {
                     let hits = r
                         .bm25_single_term_block_selected(
@@ -384,13 +408,14 @@ async fn bm25_fanout_wave(
                 }
             }
             let hits = match range {
-                // Ranged units exist only for pure multi-should
-                // queries (`fanout_for` never slices when a must
-                // or negated clause exists).
+                // Ranged units exist for every phrase-free,
+                // negation-free positive shape (`fanout_for`).
                 Some((start, end)) => {
+                    let must_refs: Vec<&str> = must_arc.iter().map(|s| s.as_str()).collect();
                     let should_refs: Vec<&str> = should_arc.iter().map(|s| s.as_str()).collect();
-                    r.bm25_search_or_range_pretokenized_with_floor(
+                    r.bm25_search_terms_range_with_floor(
                         &column_arc,
+                        &must_refs,
                         &should_refs,
                         k,
                         start,
@@ -1558,11 +1583,6 @@ fn fts_read_error(e: ReadError) -> QueryError {
     }
 }
 
-/// Minimum query term count that makes OR sub-range fan-out eligible.
-/// The range-aware Block-Max MaxScore path is only wired up for
-/// multi-term OR, so single-term queries stay whole-superfile.
-const OR_FANOUT_MIN_TERMS: usize = 2;
-
 /// How a query fans out over the kept superfiles.
 enum FanOut {
     /// One un-ranged unit per superfile.
@@ -1572,12 +1592,16 @@ enum FanOut {
     SubRanges,
 }
 
-/// Pick the fan-out for a term query: only the pure multi-should
-/// union (a flat multi-term OR — no must and no negated clause) has a
-/// range-aware kernel, so everything else stays one un-ranged unit
-/// per superfile.
+/// Pick the fan-out for a term query: every phrase-free,
+/// negation-free positive shape (single term, AND, must+should, and
+/// the multi-should union) has a range-aware kernel, so those slice;
+/// negation forces the un-ranged walk (the ranged kernels carry no
+/// exclusion in v1). `build_work_units` still slices only big files
+/// with spare pool threads, so many-small-file tables keep the one
+/// unit per superfile shape either way — the slicing win is the
+/// hidden index's few large merged shards.
 fn fanout_for(n_musts: usize, n_shoulds: usize, has_negatives: bool) -> FanOut {
-    if n_musts == 0 && n_shoulds >= OR_FANOUT_MIN_TERMS && !has_negatives {
+    if (n_musts + n_shoulds) >= 1 && !has_negatives {
         FanOut::SubRanges
     } else {
         FanOut::PerSuperfile
@@ -2634,18 +2658,18 @@ mod tests {
     }
 
     #[test]
-    fn fanout_for_only_multi_term_or_without_negation_subranges() {
-        // Multi-should union (flat multi-term OR), no negation →
-        // sub-range eligible.
+    fn fanout_for_slices_every_negation_free_positive_shape() {
+        // Every phrase-free, negation-free positive shape has a
+        // range-aware kernel: multi-should OR, single term, AND,
+        // and must+should all slice.
         assert!(matches!(fanout_for(0, 2, false), FanOut::SubRanges));
-        // Single should stays per-superfile.
-        assert!(matches!(fanout_for(0, 1, false), FanOut::PerSuperfile));
-        // Negation disables sub-ranges.
+        assert!(matches!(fanout_for(0, 1, false), FanOut::SubRanges));
+        assert!(matches!(fanout_for(2, 0, false), FanOut::SubRanges));
+        assert!(matches!(fanout_for(1, 1, false), FanOut::SubRanges));
+        // Negation disables sub-ranges (the ranged kernels carry no
+        // exclusion in v1).
         assert!(matches!(fanout_for(0, 2, true), FanOut::PerSuperfile));
-        // Any must clause (including flat And queries, whose bare
-        // terms all resolve to musts) stays per-superfile.
-        assert!(matches!(fanout_for(2, 0, false), FanOut::PerSuperfile));
-        assert!(matches!(fanout_for(1, 1, false), FanOut::PerSuperfile));
+        assert!(matches!(fanout_for(1, 0, true), FanOut::PerSuperfile));
     }
 
     #[test]
