@@ -274,9 +274,12 @@ pub fn scalar_value_set_skip(
         .iter()
         .map(|entry| match superfile_minmax(entry, column) {
             None => true,
-            Some((min, max)) => values
-                .iter()
-                .any(|v| scalar_value_may_match(&min, &max, ScalarOp::Eq, v)),
+            Some((min, max)) => values.iter().any(|v| {
+                scalar_value_may_match(&min, &max, ScalarOp::Eq, v)
+                    && row_groups_may_match(entry, column, |min, max| {
+                        scalar_value_may_match(min, max, ScalarOp::Eq, v)
+                    })
+            }),
         })
         .collect()
 }
@@ -319,13 +322,50 @@ fn agg_all_null(agg: &ScalarStatsAgg) -> bool {
 }
 
 /// Whether `entry` *could* contain a row satisfying `pred`, judged
-/// only from the superfile's persisted min/max. Conservative: any
-/// uncertainty returns `true` (keep).
+/// only from the superfile's persisted stats. The file-level min/max
+/// envelope goes first; when it keeps the file and per-row-group
+/// stats exist, the file survives only if at least one row group's
+/// own bounds could match — dropping files whose envelope covers the
+/// predicate through a range "hole". Conservative: any uncertainty
+/// returns `true` (keep).
 fn superfile_may_match(entry: &SuperfileEntry, pred: &ScalarPredicate) -> bool {
     match superfile_minmax(entry, &pred.column) {
         None => true,
-        Some((min, max)) => scalar_value_may_match(&min, &max, pred.op, &pred.value),
+        Some((min, max)) => {
+            scalar_value_may_match(&min, &max, pred.op, &pred.value)
+                && row_groups_may_match(entry, &pred.column, |min, max| {
+                    scalar_value_may_match(min, max, pred.op, &pred.value)
+                })
+        }
     }
+}
+
+/// Per-row-group refinement: `true` when any row group's min/max
+/// could satisfy `may_match` — or when no per-row-group stats exist
+/// for the column (keep). A row group whose bound is missing or
+/// doesn't decode keeps the file; only a full set of decodable,
+/// non-matching bounds prunes.
+fn row_groups_may_match(
+    entry: &SuperfileEntry,
+    column: &str,
+    may_match: impl Fn(&ScalarValue, &ScalarValue) -> bool,
+) -> bool {
+    let Some(stats) = entry.row_group_stats.as_ref() else {
+        return true;
+    };
+    let Some(col) = stats.columns.get(column) else {
+        return true;
+    };
+    (0..col.mins.len()).any(|rg| {
+        match (
+            ScalarValue::try_from_array(col.mins.as_ref(), rg),
+            ScalarValue::try_from_array(col.maxes.as_ref(), rg),
+        ) {
+            // `scalar_value_may_match` already keeps on null bounds.
+            (Ok(min), Ok(max)) => may_match(&min, &max),
+            _ => true,
+        }
+    })
 }
 
 /// The superfile's persisted min/max for `column`, or `None` when the
@@ -406,8 +446,8 @@ mod tests {
         supertable::{
             SupertableOptions,
             manifest::{
-                FtsSummaryAgg, ManifestSnapshot, ScalarStatsAgg, SuperfileEntry, SuperfileUri,
-                VectorSummary, bloom::BloomBuilder,
+                FtsSummaryAgg, ManifestSnapshot, RowGroupColumnStats, RowGroupStats,
+                ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary, bloom::BloomBuilder,
             },
         },
         test_helpers::default_tokenizer,
@@ -474,6 +514,7 @@ mod tests {
             id_min: 0,
             id_max: 0,
             scalar_stats: HashMap::new(),
+            row_group_stats: None,
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -669,6 +710,32 @@ mod tests {
         let mx: ArrayRef = Arc::new(Int64Array::from(vec![max]));
         e.scalar_stats
             .insert(col.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
+        Arc::new(e)
+    }
+
+    /// A file-level [min, max] envelope plus per-row-group bounds —
+    /// the range-"hole" shape the row-group refinement exists for.
+    fn seg_with_int_rg_stats(col: &str, rg_bounds: &[(i64, i64)]) -> Arc<SuperfileEntry> {
+        let file_min = rg_bounds.iter().map(|&(a, _)| a).min().expect("nonempty");
+        let file_max = rg_bounds.iter().map(|&(_, b)| b).max().expect("nonempty");
+        let mut e =
+            Arc::try_unwrap(seg_with_int_stats(col, file_min, file_max)).expect("sole owner");
+        let mins: ArrayRef = Arc::new(Int64Array::from(
+            rg_bounds.iter().map(|&(a, _)| a).collect::<Vec<_>>(),
+        ));
+        let maxes: ArrayRef = Arc::new(Int64Array::from(
+            rg_bounds.iter().map(|&(_, b)| b).collect::<Vec<_>>(),
+        ));
+        let mut rg = RowGroupStats::default();
+        rg.columns.insert(
+            col.to_string(),
+            RowGroupColumnStats {
+                mins,
+                maxes,
+                null_counts: None,
+            },
+        );
+        e.row_group_stats = Some(rg);
         Arc::new(e)
     }
 
@@ -944,5 +1011,69 @@ mod tests {
             &[pred("x", ScalarOp::NotEq, ScalarValue::Int64(Some(5)))],
         );
         assert_eq!(mask, vec![false, true]);
+    }
+    /// Row-group refinement: a file whose envelope covers the value
+    /// through a hole between row groups is pruned; a value inside
+    /// one row group's own bounds keeps it.
+    #[test]
+    fn scalar_skip_prunes_row_group_holes() {
+        let segs = vec![seg_with_int_rg_stats("x", &[(0, 10), (90, 100)])];
+        // 50 is inside the file envelope [0, 100] but in the hole.
+        assert_eq!(
+            scalar_skip(
+                &segs,
+                &[pred("x", ScalarOp::Eq, ScalarValue::Int64(Some(50)))]
+            ),
+            vec![false]
+        );
+        // 5 lands in the first row group.
+        assert_eq!(
+            scalar_skip(
+                &segs,
+                &[pred("x", ScalarOp::Eq, ScalarValue::Int64(Some(5)))]
+            ),
+            vec![true]
+        );
+        // Range op spanning the hole edge still keeps (>= 95 hits RG 2).
+        assert_eq!(
+            scalar_skip(
+                &segs,
+                &[pred("x", ScalarOp::GtEq, ScalarValue::Int64(Some(95)))]
+            ),
+            vec![true]
+        );
+        // A column with no row-group stats keeps at file granularity.
+        let plain = vec![seg_with_int_stats("x", 0, 100)];
+        assert_eq!(
+            scalar_skip(
+                &plain,
+                &[pred("x", ScalarOp::Eq, ScalarValue::Int64(Some(50)))]
+            ),
+            vec![true]
+        );
+    }
+
+    /// The `IN`-list prune applies the same per-row-group refinement:
+    /// every listed value in the hole prunes; any value inside a row
+    /// group keeps.
+    #[test]
+    fn scalar_value_set_skip_prunes_row_group_holes() {
+        let segs = vec![seg_with_int_rg_stats("x", &[(0, 10), (90, 100)])];
+        assert_eq!(
+            scalar_value_set_skip(
+                &segs,
+                "x",
+                &[ScalarValue::Int64(Some(40)), ScalarValue::Int64(Some(60))]
+            ),
+            vec![false]
+        );
+        assert_eq!(
+            scalar_value_set_skip(
+                &segs,
+                "x",
+                &[ScalarValue::Int64(Some(40)), ScalarValue::Int64(Some(92))]
+            ),
+            vec![true]
+        );
     }
 }

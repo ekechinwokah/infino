@@ -616,6 +616,7 @@ mod tests {
             id_min: 10,
             id_max: 10 + n_docs.saturating_sub(1) as i128,
             scalar_stats: HashMap::new(),
+            row_group_stats: None,
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: cell.to_le_bytes().to_vec(),

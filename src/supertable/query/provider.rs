@@ -2401,6 +2401,7 @@ mod tests {
             id_min: 0,
             id_max: 0,
             scalar_stats,
+            row_group_stats: None,
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),

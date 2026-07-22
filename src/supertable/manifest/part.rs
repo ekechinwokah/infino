@@ -30,9 +30,9 @@ use crate::{
     supertable::manifest::{
         SubsectionOffsets, SuperfileEntry, SuperfileUri,
         encoding::{
-            DecodeError, SummaryWireMode, decode_fts_summary_map, decode_scalar_stats,
-            decode_vector_summary_map, encode_fts_summary_map, encode_scalar_stats,
-            encode_vector_summary_map,
+            DecodeError, SummaryWireMode, decode_fts_summary_map, decode_row_group_stats,
+            decode_scalar_stats, decode_vector_summary_map, encode_fts_summary_map,
+            encode_row_group_stats, encode_scalar_stats, encode_vector_summary_map,
         },
     },
 };
@@ -245,7 +245,8 @@ fn schema() -> &'static AvroSchema {
                 {"name": "vector_summary", "type": "bytes"},
                 {"name": "subsection_offsets", "type": ["null", "bytes"], "default": null},
                 {"name": "vector_layout", "type": ["null", "string"], "default": null},
-                {"name": "birth_version", "type": "long", "default": 0}
+                {"name": "birth_version", "type": "long", "default": 0},
+                {"name": "row_group_stats", "type": ["null", "bytes"], "default": null}
               ]
             }}}
           ]
@@ -343,6 +344,16 @@ pub(crate) fn encode_with_mode(part: &ManifestPart, mode: SummaryWireMode) -> Ve
                 (
                     "birth_version".into(),
                     AvroValue::Long(seg.birth_version as i64),
+                ),
+                (
+                    "row_group_stats".into(),
+                    match &seg.row_group_stats {
+                        Some(rg) => AvroValue::Union(
+                            AVRO_UNION_VALUE_INDEX,
+                            Box::new(AvroValue::Bytes(encode_row_group_stats(rg))),
+                        ),
+                        None => AvroValue::Union(AVRO_UNION_NULL_INDEX, Box::new(AvroValue::Null)),
+                    },
                 ),
             ])
         })
@@ -470,6 +481,12 @@ fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
         Some(AvroValue::Long(n)) => n as u64,
         _ => 0,
     };
+    // Tolerant of absence (None) so parts written before the field
+    // decode losslessly; the pruner just stays at file granularity.
+    let row_group_stats = take_optional_bytes(&mut map, "row_group_stats")?
+        .map(|b| decode_row_group_stats(&b))
+        .transpose()?
+        .filter(|rg| !rg.columns.is_empty());
 
     Ok(SuperfileEntry {
         superfile_id,
@@ -478,6 +495,7 @@ fn decode_superfile(v: AvroValue) -> Result<SuperfileEntry, PartParseError> {
         id_min,
         id_max,
         scalar_stats: decode_scalar_stats(&scalar_bytes)?,
+        row_group_stats,
         fts_summary: decode_fts_summary_map(&fts_bytes)?,
         vector_summary: decode_vector_summary_map(&vector_bytes)?,
         partition_key,
@@ -793,14 +811,19 @@ mod tests {
     //! surfaces a typed error.
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+    use arrow_array::{
+        Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array,
+    };
     use bytes::Bytes;
     use uuid::Uuid;
 
     use super::*;
     use crate::supertable::{
         SuperfileEntry, SuperfileUri,
-        manifest::{FtsSummaryAgg, ScalarStatsAgg, VectorSummary, bloom::BloomBuilder},
+        manifest::{
+            FtsSummaryAgg, RowGroupColumnStats, RowGroupStats, ScalarStatsAgg, VectorSummary,
+            bloom::BloomBuilder,
+        },
     };
 
     fn fresh_superfile(n_docs: u64) -> Arc<SuperfileEntry> {
@@ -813,6 +836,7 @@ mod tests {
             id_min: 0,
             id_max: n_docs.saturating_sub(1) as i128,
             scalar_stats: HashMap::new(),
+            row_group_stats: None,
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -906,6 +930,7 @@ mod tests {
             id_min: 1_000,
             id_max: 13_344,
             scalar_stats: make_scalar_stats(),
+            row_group_stats: None,
             fts_summary: fts,
             vector_summary: vec_summary,
             partition_key: vec![0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
@@ -1071,6 +1096,7 @@ mod tests {
             id_min: 0,
             id_max: 0,
             scalar_stats: HashMap::new(),
+            row_group_stats: None,
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: vec![0xab, 0xcd],
@@ -1087,6 +1113,7 @@ mod tests {
             id_min: 0,
             id_max: 0,
             scalar_stats: HashMap::new(),
+            row_group_stats: None,
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -1238,6 +1265,7 @@ mod tests {
             id_min: -5,
             id_max: 7,
             scalar_stats: HashMap::new(),
+            row_group_stats: None,
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -1268,6 +1296,7 @@ mod tests {
             id_min: 0,
             id_max: 0,
             scalar_stats: HashMap::new(),
+            row_group_stats: None,
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -1304,6 +1333,7 @@ mod tests {
             id_min: 0,
             id_max: 0,
             scalar_stats: HashMap::new(),
+            row_group_stats: None,
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -1761,6 +1791,7 @@ mod tests {
             id_min: 0,
             id_max: 77_999,
             scalar_stats: HashMap::new(),
+            row_group_stats: None,
             fts_summary: HashMap::new(),
             vector_summary: vec_summary,
             partition_key: Vec::new(),
@@ -1827,5 +1858,44 @@ mod tests {
             t_full * TIMING_PARTS_PER_MANIFEST as u32,
         );
         assert_eq!(decoded.superfiles.len(), TIMING_ENTRIES_PER_PART);
+    }
+    /// `row_group_stats` rides the part codec: present stats survive
+    /// bit-exactly, absence stays `None`, and both hash stably.
+    #[test]
+    fn round_trips_row_group_stats() {
+        let mut seg = Arc::try_unwrap(fresh_superfile(6)).expect("sole owner");
+        let mut rg = RowGroupStats::default();
+        rg.columns.insert(
+            "x".to_string(),
+            RowGroupColumnStats {
+                mins: Arc::new(Int64Array::from(vec![0i64, 90])) as ArrayRef,
+                maxes: Arc::new(Int64Array::from(vec![10i64, 100])) as ArrayRef,
+                null_counts: Some(UInt64Array::from(vec![1u64, 0])),
+            },
+        );
+        seg.row_group_stats = Some(rg);
+        let part = fresh_part(vec![Arc::new(seg), fresh_superfile(3)]);
+
+        let bytes = encode(&part);
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.superfiles.len(), 2);
+        let got = decoded.superfiles[0]
+            .row_group_stats
+            .as_ref()
+            .expect("stats survive");
+        let col = &got.columns["x"];
+        assert_eq!(
+            col.mins.as_ref(),
+            &Int64Array::from(vec![0i64, 90]) as &dyn Array
+        );
+        assert_eq!(
+            col.maxes.as_ref(),
+            &Int64Array::from(vec![10i64, 100]) as &dyn Array
+        );
+        assert_eq!(
+            col.null_counts.as_ref().expect("nulls"),
+            &UInt64Array::from(vec![1u64, 0])
+        );
+        assert!(decoded.superfiles[1].row_group_stats.is_none());
     }
 }

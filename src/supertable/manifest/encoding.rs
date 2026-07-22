@@ -50,7 +50,7 @@ use crate::{
         ADMIT_CODE_WORD_BITS, CellVectorSummary, ClusterCentroids, FtsSummaryAgg, RabitqAdmitCodes,
         VectorSummary,
         bloom::Bloom,
-        list::{ScalarStatsAgg, ScalarValueCounts},
+        list::{RowGroupColumnStats, RowGroupStats, ScalarStatsAgg, ScalarValueCounts},
     },
 };
 
@@ -514,6 +514,146 @@ pub(crate) fn decode_length1_array(bytes: &[u8]) -> Result<ArrayRef, DecodeError
 //   [max_term bytes]               (empty min+max ⇒ no range, i.e. None)
 //
 // ---------------------------------------------------------
+
+/// Encode per-row-group stats as one Arrow IPC batch: for each
+/// column, `<col>__min` / `<col>__max` arrays of length
+/// n_row_groups, plus an optional `<col>__nulls` UInt64 array. The
+/// same suffix convention as [`encode_scalar_stats`], but length-N
+/// instead of length-1 — the two ride separate Avro fields, so the
+/// shapes never mix. Empty input encodes as an empty blob.
+pub fn encode_row_group_stats(stats: &RowGroupStats) -> Vec<u8> {
+    if stats.columns.is_empty() {
+        return Vec::new();
+    }
+    let mut keys: Vec<&String> = stats.columns.keys().collect();
+    keys.sort();
+
+    let mut fields: Vec<Field> = Vec::new();
+    let mut arrays: Vec<ArrayRef> = Vec::new();
+    for key in keys {
+        let col = &stats.columns[key];
+        fields.push(Field::new(
+            format!("{key}{MIN_SUFFIX}"),
+            col.mins.data_type().clone(),
+            true,
+        ));
+        fields.push(Field::new(
+            format!("{key}{MAX_SUFFIX}"),
+            col.maxes.data_type().clone(),
+            true,
+        ));
+        arrays.push(col.mins.clone());
+        arrays.push(col.maxes.clone());
+        if let Some(nulls) = &col.null_counts {
+            fields.push(Field::new(
+                format!("{key}{NULLS_SUFFIX}"),
+                DataType::UInt64,
+                true,
+            ));
+            arrays.push(Arc::new(nulls.clone()) as ArrayRef);
+        }
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let batch =
+        RecordBatch::try_new(schema.clone(), arrays).expect("schema/array match by construction");
+    let mut out = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut out, &schema).expect("ipc writer init");
+        writer.write(&batch).expect("ipc write");
+        writer.finish().expect("ipc finish");
+    }
+    out
+}
+
+/// Decode the [`encode_row_group_stats`] wire form. An empty blob is
+/// an empty map (no per-row-group stats harvested).
+pub fn decode_row_group_stats(bytes: &[u8]) -> Result<RowGroupStats, DecodeError> {
+    if bytes.is_empty() {
+        return Ok(RowGroupStats::default());
+    }
+    let reader = StreamReader::try_new(Cursor::new(bytes), None)
+        .map_err(|e| DecodeError::ArrowIpc(e.to_string()))?;
+    let batches: Vec<RecordBatch> = reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| DecodeError::ArrowIpc(e.to_string()))?;
+    if batches.len() != 1 {
+        return Err(DecodeError::UnexpectedBatchCount(batches.len()));
+    }
+    let batch = &batches[0];
+    let schema = batch.schema();
+
+    let mut mins: HashMap<String, ArrayRef> = HashMap::new();
+    let mut maxes: HashMap<String, ArrayRef> = HashMap::new();
+    let mut null_counts: HashMap<String, UInt64Array> = HashMap::new();
+    for (i, field) in schema.fields().iter().enumerate() {
+        let name = field.name();
+        let column = batch.column(i);
+        if let Some(base) = name.strip_suffix(MIN_SUFFIX) {
+            mins.insert(base.to_string(), column.clone());
+        } else if let Some(base) = name.strip_suffix(MAX_SUFFIX) {
+            maxes.insert(base.to_string(), column.clone());
+        } else if let Some(base) = name.strip_suffix(NULLS_SUFFIX) {
+            let arr = column
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    DecodeError::ArrowIpc(format!("{name}: __nulls column is not UInt64"))
+                })?;
+            null_counts.insert(base.to_string(), arr.clone());
+        } else {
+            return Err(DecodeError::ArrowIpc(format!(
+                "unrecognized row-group stats column suffix: {name}"
+            )));
+        }
+    }
+    if mins.len() != maxes.len() {
+        return Err(DecodeError::ArrowIpc(format!(
+            "unpaired __min/__max row-group columns: {} mins vs {} maxes",
+            mins.len(),
+            maxes.len()
+        )));
+    }
+    let mut columns: HashMap<String, RowGroupColumnStats> = HashMap::new();
+    for (base, col_mins) in mins {
+        let col_maxes = maxes.remove(&base).ok_or_else(|| {
+            DecodeError::ArrowIpc(format!("column {base} has __min but no __max"))
+        })?;
+        if col_maxes.len() != col_mins.len() {
+            return Err(DecodeError::ArrowIpc(format!(
+                "column {base}: __min len {} != __max len {}",
+                col_mins.len(),
+                col_maxes.len()
+            )));
+        }
+        let nulls = null_counts.remove(&base);
+        if let Some(n) = &nulls
+            && n.len() != col_mins.len()
+        {
+            return Err(DecodeError::ArrowIpc(format!(
+                "column {base}: __nulls len {} != __min len {}",
+                n.len(),
+                col_mins.len()
+            )));
+        }
+        columns.insert(
+            base,
+            RowGroupColumnStats {
+                mins: col_mins,
+                maxes: col_maxes,
+                null_counts: nulls,
+            },
+        );
+    }
+    if !null_counts.is_empty() {
+        let mut orphans: Vec<String> = null_counts.into_keys().collect();
+        orphans.sort();
+        return Err(DecodeError::ArrowIpc(format!(
+            "__nulls without __min/__max for: {}",
+            orphans.join(", ")
+        )));
+    }
+    Ok(RowGroupStats { columns })
+}
 
 pub fn encode_fts_summary(s: &FtsSummaryAgg) -> Vec<u8> {
     let bloom_bytes = s
@@ -1656,6 +1796,63 @@ mod vector_summary_tests {
         assert_eq!(
             got.cells[0].clusters.centroids, centroids,
             "fallback must carry the fp32 payload"
+        );
+    }
+}
+
+#[cfg(test)]
+mod row_group_stats_tests {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, Int64Array, StringArray, UInt64Array};
+
+    use super::{
+        RowGroupColumnStats, RowGroupStats, decode_row_group_stats, encode_row_group_stats,
+    };
+
+    /// Row-group stats survive the IPC round-trip bit-exactly,
+    /// including optional null counts and the empty sentinel.
+    #[test]
+    fn row_group_stats_round_trip() {
+        let mut stats = RowGroupStats::default();
+        stats.columns.insert(
+            "x".to_string(),
+            RowGroupColumnStats {
+                mins: Arc::new(Int64Array::from(vec![Some(0), Some(90), None])) as ArrayRef,
+                maxes: Arc::new(Int64Array::from(vec![Some(10), Some(100), None])) as ArrayRef,
+                null_counts: Some(UInt64Array::from(vec![0u64, 2, 5])),
+            },
+        );
+        stats.columns.insert(
+            "name".to_string(),
+            RowGroupColumnStats {
+                mins: Arc::new(StringArray::from(vec!["aa", "mm", "ta"])) as ArrayRef,
+                maxes: Arc::new(StringArray::from(vec!["lz", "sz", "zz"])) as ArrayRef,
+                null_counts: None,
+            },
+        );
+        let bytes = encode_row_group_stats(&stats);
+        let decoded = decode_row_group_stats(&bytes).expect("decode");
+        assert_eq!(decoded.columns.len(), 2);
+        let x = &decoded.columns["x"];
+        assert_eq!(x.mins.as_ref(), stats.columns["x"].mins.as_ref());
+        assert_eq!(x.maxes.as_ref(), stats.columns["x"].maxes.as_ref());
+        assert_eq!(
+            x.null_counts.as_ref().expect("nulls"),
+            stats.columns["x"].null_counts.as_ref().expect("nulls")
+        );
+        let name = &decoded.columns["name"];
+        assert_eq!(name.mins.as_ref(), stats.columns["name"].mins.as_ref());
+        assert!(name.null_counts.is_none());
+
+        // Empty stats encode as the zero-length sentinel and decode back.
+        let empty = encode_row_group_stats(&RowGroupStats::default());
+        assert!(empty.is_empty());
+        assert!(
+            decode_row_group_stats(&empty)
+                .expect("empty decodes")
+                .columns
+                .is_empty()
         );
     }
 }

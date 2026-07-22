@@ -53,7 +53,10 @@ use futures::future;
 /// Re-export the per-column skip aggregates so callers can refer to them as
 /// `manifest::ScalarStatsAgg` / `manifest::FtsSummaryAgg` (the value types of
 /// `SuperfileEntry.scalar_stats` / `SuperfileEntry.fts_summary`).
-pub use list::{FtsSummaryAgg, GlobalVectorIndex, RoutingRef, ScalarStatsAgg};
+pub use list::{
+    FtsSummaryAgg, GlobalVectorIndex, RoutingRef, RowGroupColumnStats, RowGroupStats,
+    ScalarStatsAgg,
+};
 use rayon::{ThreadPool, prelude::*};
 use tokio::{sync::OnceCell, task::spawn_blocking};
 use uuid::Uuid;
@@ -2325,6 +2328,14 @@ pub struct SuperfileEntry {
     /// keyed by column name, for skip pruning of SQL filters. An absent
     /// column means "no usable stats" (the pruner keeps the superfile).
     pub scalar_stats: HashMap<String, ScalarStatsAgg>,
+    /// Per-row-group min/max + null counts for the parquet body's
+    /// scalar columns, letting the scalar pruner drop a superfile
+    /// whose *envelope* covers a predicate but whose individual row
+    /// groups all miss it (a range "hole"). `None` when unharvested:
+    /// a single-row-group body (file stats already exact), a file
+    /// over the encoded size cap, or a manifest written before the
+    /// field existed.
+    pub row_group_stats: Option<RowGroupStats>,
     /// Per-FTS-column term-presence bloom + lex range. The bloom
     /// drives exact-term skip; the term-range drives prefix-query
     /// skip via `[prefix, prefix_upper_bound)` overlap. Keyed by
@@ -4083,6 +4094,7 @@ mod tests {
             id_min: 0,
             id_max: n_docs.saturating_sub(1) as i128,
             scalar_stats: HashMap::new(),
+            row_group_stats: None,
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -4817,6 +4829,7 @@ mod tests {
             id_min: 0,
             id_max: docs as i128 - 1,
             scalar_stats: Default::default(),
+            row_group_stats: None,
             fts_summary: Default::default(),
             vector_summary: Default::default(),
             partition_key: pk,
@@ -7879,6 +7892,7 @@ mod tests {
             id_min: -5,
             id_max: 7,
             scalar_stats: HashMap::new(),
+            row_group_stats: None,
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),

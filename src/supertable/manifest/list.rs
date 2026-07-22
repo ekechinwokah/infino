@@ -445,6 +445,32 @@ impl ManifestPartEntry {
     }
 }
 
+/// Per-row-group skip stats for one scalar column of a superfile's
+/// parquet body: min/max bounds plus null counts, one slot per row
+/// group. Harvested at commit time from the parquet footer's column
+/// statistics (already in memory when the superfile is summarized),
+/// so the pruner can skip below superfile granularity without
+/// opening the file. A null slot means the footer carried no bound
+/// for that row group — the pruner keeps it.
+#[derive(Debug, Clone)]
+pub struct RowGroupColumnStats {
+    /// Per-row-group minimum; length = the file's row-group count.
+    pub mins: ArrayRef,
+    /// Per-row-group maximum; same length as `mins`.
+    pub maxes: ArrayRef,
+    /// Per-row-group null counts; `None` when the footer lacked them.
+    pub null_counts: Option<UInt64Array>,
+}
+
+/// Per-row-group stats for a superfile, keyed by scalar column name.
+/// Only columns that fit the encoded size cap are present (see
+/// `ROW_GROUP_STATS_MAX_BYTES` in the writer); an absent column means
+/// "no sub-file stats" and prunes at file granularity only.
+#[derive(Debug, Clone, Default)]
+pub struct RowGroupStats {
+    pub columns: HashMap<String, RowGroupColumnStats>,
+}
+
 /// Aggregate scalar stats across a part's superfiles. Min/max and exact sums
 /// use Arrow arrays; low-cardinality columns may additionally carry a capped
 /// exact value-frequency table. This is the same in-memory shape the

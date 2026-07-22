@@ -88,7 +88,8 @@ use crate::{
         },
         writer::{
             CommitListMetadata, build_column_vector_summary, build_subsection_offsets,
-            persist_commit, read_vector_layout_from_bytes, stamp_tombstone_seqs,
+            harvest_row_group_stats, persist_commit, read_vector_layout_from_bytes,
+            stamp_tombstone_seqs,
         },
     },
 };
@@ -405,6 +406,7 @@ async fn do_apply(
     let vector_summary = build_vector_summary(&reader, &inner.options);
     let scalar_stats =
         ScalarStatsAgg::from_batches(&inner.options.scalar_schema(), &[&scalar_with_id]);
+    let row_group_stats = harvest_row_group_stats(&reader, scalar_stats.keys());
 
     let (id_min, id_max) = if flat_ids.is_empty() {
         (0, 0)
@@ -422,6 +424,7 @@ async fn do_apply(
         id_min,
         id_max,
         scalar_stats,
+        row_group_stats,
         fts_summary,
         vector_summary,
         // Unpartitioned default: the supertable's partition

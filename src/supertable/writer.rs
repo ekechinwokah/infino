@@ -78,6 +78,7 @@ use futures::{
     stream::{self, StreamExt},
 };
 use object_store::{MultipartUpload, PutPayload, UploadPart};
+use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
@@ -90,8 +91,9 @@ use super::{
     error::BuildError,
     handle::{GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, Supertable, SupertableInner},
     manifest::{
-        CellVectorSummary, FtsSummaryAgg, ManifestSnapshot, RoutingRef, ScalarStatsAgg,
-        SubsectionOffsets, SuperfileEntry, SuperfileUri, VectorSummary,
+        CellVectorSummary, FtsSummaryAgg, ManifestSnapshot, RoutingRef, RowGroupColumnStats,
+        RowGroupStats, ScalarStatsAgg, SubsectionOffsets, SuperfileEntry, SuperfileUri,
+        VectorSummary,
         bloom::BloomBuilder,
         partition::{PartitionKey, encode_partition_key},
     },
@@ -177,6 +179,13 @@ use crate::{
         slow_vector_state::{CentroidSection, fetch_centroid_section},
     },
 };
+
+/// Cap on the estimated in-memory/encoded footprint of one
+/// superfile's per-row-group stats (`SuperfileEntry.row_group_stats`).
+/// Columns are admitted smallest-first until the next would cross the
+/// cap, so wide string columns drop before narrow numeric ones and a
+/// very-wide schema can't bloat the manifest part.
+const ROW_GROUP_STATS_MAX_BYTES: usize = 64 * 1024;
 
 /// Target bytes per fine IVF run inside one global cell. Fine-centroid count
 /// is derived from this target; it is not copied from the outer/global grid or
@@ -2316,6 +2325,72 @@ pub(crate) fn build_column_vector_summary(
     Some(VectorSummary { centroid, cells })
 }
 
+/// Harvest per-row-group min/max + null-count stats for `columns`
+/// from the freshly-built superfile's parquet footer (already parsed
+/// by the open reader — no I/O). Returns `None` when there is
+/// nothing worth keeping: fewer than two row groups (file-level
+/// stats are already exact), no convertible column, or every column
+/// bound missing. Columns are admitted smallest-first under
+/// [`ROW_GROUP_STATS_MAX_BYTES`].
+pub(super) fn harvest_row_group_stats<'a>(
+    reader: &SuperfileReader,
+    columns: impl Iterator<Item = &'a String>,
+) -> Option<RowGroupStats> {
+    let parquet_meta = reader.parquet_metadata();
+    if parquet_meta.num_row_groups() < 2 {
+        return None;
+    }
+    let arrow_schema = reader.schema();
+    let parquet_schema = parquet_meta.file_metadata().schema_descr();
+    let row_groups = parquet_meta.row_groups();
+
+    // (column, stats, estimated footprint) — footprint-sorted below.
+    let mut harvested: Vec<(String, RowGroupColumnStats, usize)> = Vec::new();
+    for column in columns {
+        // A column the converter can't handle (nested, unsupported
+        // physical type) simply stays at file granularity.
+        let Ok(conv) = StatisticsConverter::try_new(column, arrow_schema, parquet_schema) else {
+            continue;
+        };
+        let Ok(mins) = conv.row_group_mins(row_groups.iter()) else {
+            continue;
+        };
+        let Ok(maxes) = conv.row_group_maxes(row_groups.iter()) else {
+            continue;
+        };
+        if mins.null_count() == mins.len() || maxes.null_count() == maxes.len() {
+            // No usable bound in any row group — nothing to prune on.
+            continue;
+        }
+        let null_counts = conv.row_group_null_counts(row_groups.iter()).ok();
+        let footprint = mins.get_array_memory_size()
+            + maxes.get_array_memory_size()
+            + null_counts.as_ref().map_or(0, Array::get_array_memory_size);
+        harvested.push((
+            column.clone(),
+            RowGroupColumnStats {
+                mins,
+                maxes,
+                null_counts,
+            },
+            footprint,
+        ));
+    }
+    // Deterministic admission: smallest columns first, name as the
+    // tie-break, until the cap is reached.
+    harvested.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+    let mut budget = ROW_GROUP_STATS_MAX_BYTES;
+    let mut out = RowGroupStats::default();
+    for (column, stats, footprint) in harvested {
+        if footprint > budget {
+            break;
+        }
+        budget -= footprint;
+        out.columns.insert(column, stats);
+    }
+    (!out.columns.is_empty()).then_some(out)
+}
+
 /// Build the per-shard publish artifacts: open a `SuperfileReader`
 /// on the shard bytes, derive FTS + vector summaries, and decide
 /// the bytes-disposition triplet. Pure per-shard work — no shared
@@ -2423,6 +2498,8 @@ pub(super) fn prepare_superfile_with_uri(
         )));
     }
 
+    let row_group_stats = harvest_row_group_stats(&reader, shard.scalar_stats.keys());
+
     let entry = Arc::new(SuperfileEntry {
         // Hidden cell superfile; stamped by the hidden manifest's own
         // `update`. Irrelevant to the user-side drain watermark.
@@ -2433,6 +2510,7 @@ pub(super) fn prepare_superfile_with_uri(
         id_min: shard.id_min,
         id_max: shard.id_max,
         scalar_stats: shard.scalar_stats,
+        row_group_stats,
         fts_summary,
         vector_summary,
         // Partition assignment populated by the per-shard
@@ -2475,6 +2553,7 @@ fn finish_superfile_entry(
         id_min: old.id_min,
         id_max: old.id_max,
         scalar_stats: old.scalar_stats.clone(),
+        row_group_stats: old.row_group_stats.clone(),
         fts_summary: old.fts_summary.clone(),
         vector_summary: old.vector_summary.clone(),
         // Partition key is now stamped by manifest update at commit time.
@@ -7362,9 +7441,12 @@ mod tests {
     };
 
     use arrow_array::{
-        Array, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+        Array, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray,
+        RecordBatch,
     };
     use arrow_schema::{DataType, Field, Schema};
+    use bytes::Bytes;
+    use datafusion::scalar::ScalarValue;
     use figment::{
         Figment,
         providers::{Format, Yaml},
@@ -7376,8 +7458,9 @@ mod tests {
     use crate::{
         config::Config,
         superfile::{
-            builder::{FtsConfig, VectorConfig},
+            builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
             fts::reader::BoolMode,
+            reader::SuperfileReader,
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{SupertableOptions, handle::Supertable, storage::LocalFsStorageProvider},
@@ -8967,5 +9050,97 @@ supertable:
             read_second, read_first,
             "object content actually changed between writes"
         );
+    }
+    /// `harvest_row_group_stats` pulls per-row-group bounds from a
+    /// freshly-built superfile's parquet footer: 12 rows at
+    /// `row_group_size = 4` yield 3 row groups with the planted
+    /// clustered ranges; a single-row-group body harvests nothing.
+    #[test]
+    fn harvest_row_group_stats_reads_planted_bounds() {
+        /// Rows per row group — small so 12 rows span 3 groups.
+        const TEST_ROW_GROUP_SIZE: usize = 4;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let mut opts = BuilderOptions::new(Arc::clone(&schema), "doc_id", vec![], vec![], None);
+        opts.row_group_size = TEST_ROW_GROUP_SIZE;
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+        // Clustered values: RG0 = 0..40, RG1 = 900..1000, RG2 = 40..80 —
+        // the middle group leaves a hole the file envelope hides.
+        let values: Vec<i64> = vec![0, 10, 20, 40, 900, 950, 990, 1000, 40, 50, 60, 80];
+        let ids: Vec<i128> = (0..values.len() as i128).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(
+                    Decimal128Array::from(ids)
+                        .with_precision_and_scale(38, 0)
+                        .expect("decimal"),
+                ),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )
+        .expect("batch");
+        b.add_batch(&batch, &[]).expect("add");
+        let bytes = Bytes::from(b.finish().expect("finish"));
+        let reader = SuperfileReader::open(bytes).expect("open");
+
+        let columns = ["value".to_string(), "doc_id".to_string()];
+        let stats =
+            harvest_row_group_stats(&reader, columns.iter()).expect("multi-RG file harvests");
+        let value = &stats.columns["value"];
+        assert_eq!(value.mins.len(), 3);
+        let mins: Vec<i64> = (0..3)
+            .map(|i| {
+                match ScalarValue::try_from_array(value.mins.as_ref(), i).expect("min decodes") {
+                    ScalarValue::Int64(Some(v)) => v,
+                    other => panic!("unexpected min type: {other:?}"),
+                }
+            })
+            .collect();
+        let maxes: Vec<i64> = (0..3)
+            .map(|i| {
+                match ScalarValue::try_from_array(value.maxes.as_ref(), i).expect("max decodes") {
+                    ScalarValue::Int64(Some(v)) => v,
+                    other => panic!("unexpected max type: {other:?}"),
+                }
+            })
+            .collect();
+        assert_eq!(mins, vec![0, 900, 40]);
+        assert_eq!(maxes, vec![40, 1000, 80]);
+        assert_eq!(
+            value
+                .null_counts
+                .as_ref()
+                .map(|n| (0..3).map(|i| n.value(i)).collect::<Vec<_>>()),
+            Some(vec![0, 0, 0])
+        );
+
+        // Single row group ⇒ file-level stats already exact ⇒ None.
+        let schema1 = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let mut opts1 = BuilderOptions::new(Arc::clone(&schema1), "doc_id", vec![], vec![], None);
+        opts1.row_group_size = 100;
+        let mut b1 = SuperfileBuilder::new(opts1).expect("builder");
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema1),
+            vec![
+                Arc::new(
+                    Decimal128Array::from(vec![1i128, 2])
+                        .with_precision_and_scale(38, 0)
+                        .expect("decimal"),
+                ),
+                Arc::new(Int64Array::from(vec![5i64, 6])),
+            ],
+        )
+        .expect("batch");
+        b1.add_batch(&batch1, &[]).expect("add");
+        let bytes1 = Bytes::from(b1.finish().expect("finish"));
+        let reader1 = SuperfileReader::open(bytes1).expect("open");
+        assert!(harvest_row_group_stats(&reader1, columns.iter()).is_none());
     }
 }

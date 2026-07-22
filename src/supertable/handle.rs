@@ -1895,6 +1895,7 @@ mod tests {
             id_min: 0,
             id_max: n_docs.saturating_sub(1) as i128,
             scalar_stats: HashMap::new(),
+            row_group_stats: None,
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
