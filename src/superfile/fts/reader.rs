@@ -5303,6 +5303,11 @@ impl<'a> LiveFloorProbe<'a> {
     /// The effective floor: `max(seeded, pulled)`, refreshing
     /// `pulled` (and publishing `local_kth`) every stride-th call.
     fn checkpoint(&self, seeded: f32, local_kth: Option<f32>) -> f32 {
+        // Un-attached probes (the per-superfile un-ranged path) must
+        // cost nothing in the hot bar loops.
+        if self.live.is_none() {
+            return seeded;
+        }
         if let Some(lf) = self.live {
             let n = self.calls.get().wrapping_add(1);
             self.calls.set(n);
@@ -8514,5 +8519,224 @@ mod tests {
                 );
             }
         }
+    }
+    /// SCRATCH (uncommitted): attribute the post-drain broad-OR gap.
+    /// Same corpus as (A) one merged blob walked in 8 sub-ranges vs
+    /// (B) 16 per-file blobs walked whole — the pre/post-drain shapes
+    /// minus all supertable machinery.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "scratch diagnostic"]
+    async fn diag_merged_vs_perfile_walk() {
+        use std::time::Instant;
+
+        const DOCS: u32 = 1_000_000;
+        const FILES: u32 = 16;
+        const ITERS: u32 = 20;
+
+        let text_for = |d: u32| {
+            format!(
+                "t0w{} t1x t2y{} t3z t4a{} t5b t6c t7d t8e t9f fill{d}",
+                d % 3,
+                d % 5,
+                d % 2
+            )
+        };
+        let terms: Vec<&str> = vec![
+            "t0w0", "t1x", "t2y0", "t3z", "t4a0", "t5b", "t6c", "t7d", "t8e", "t9f",
+        ];
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+
+        // (A) merged blob.
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(Arc::clone(&tok) as _);
+        b.register_column("body".into(), false).expect("register");
+        for d in 0..DOCS {
+            b.add_doc(0, d, &text_for(d)).expect("add");
+        }
+        let merged = Arc::new(
+            FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open"),
+        );
+
+        // (B) 16 per-file blobs over the same rows.
+        let mut files = Vec::new();
+        for f in 0..FILES {
+            let mut b = FtsBuilder::new(Arc::clone(&tok) as _);
+            b.register_column("body".into(), false).expect("register");
+            for i in 0..(DOCS / FILES) {
+                let d = f * (DOCS / FILES) + i;
+                b.add_doc(0, i, &text_for(d)).expect("add");
+            }
+            files.push(Arc::new(
+                FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open"),
+            ));
+        }
+
+        let lists = |musts: &'static [&'static str]| ClauseLists {
+            musts,
+            shoulds: &[],
+            negatives: &[],
+            must_phrases: &[],
+            should_phrases: &[],
+            negative_phrases: &[],
+        };
+        let _ = lists;
+
+        // A: ranged 8 units over the merged blob (shared cache+floor).
+        let mut total_a = std::time::Duration::ZERO;
+        for it in 0..(ITERS + 3) {
+            let cache = Arc::new(FtsCursorCache::default());
+            let floor = Arc::new(SharedFloor::new());
+            let t = Instant::now();
+            let mut handles = Vec::new();
+            for u in 0..8u32 {
+                let r = Arc::clone(&merged);
+                let cache = Arc::clone(&cache);
+                let floor = Arc::clone(&floor);
+                let terms = terms.clone();
+                handles.push(tokio::spawn(async move {
+                    let (start, end) = (u * (DOCS / 8), (u + 1) * (DOCS / 8));
+                    r.search_clauses_range_with_floor(
+                        "body",
+                        ClauseLists {
+                            musts: &[],
+                            shoulds: &terms,
+                            negatives: &[],
+                            must_phrases: &[],
+                            should_phrases: &[],
+                            negative_phrases: &[],
+                        },
+                        10,
+                        start,
+                        end,
+                        floor.get(),
+                        Some(cache.as_ref()),
+                        Some(floor.as_ref()),
+                    )
+                    .await
+                    .expect("ranged")
+                }));
+            }
+            for h in handles {
+                h.await.expect("join");
+            }
+            if it >= 3 {
+                total_a += t.elapsed();
+            }
+        }
+        println!("A merged/ranged : {:>10.2?}/query", total_a / ITERS);
+
+        // B: 16 whole-file walks (shared floor via the un-ranged path
+        // has no floor arg; emulate the wave by sequential-ish spawn).
+        let mut total_b = std::time::Duration::ZERO;
+        for it in 0..(ITERS + 3) {
+            let t = Instant::now();
+            let mut handles = Vec::new();
+            for r in &files {
+                let r = Arc::clone(r);
+                let terms = terms.clone();
+                handles.push(tokio::spawn(async move {
+                    r.search_excluding(
+                        "body",
+                        ClauseLists {
+                            musts: &[],
+                            shoulds: &terms,
+                            negatives: &[],
+                            must_phrases: &[],
+                            should_phrases: &[],
+                            negative_phrases: &[],
+                        },
+                        10,
+                        f32::NEG_INFINITY,
+                    )
+                    .await
+                    .expect("whole")
+                }));
+            }
+            for h in handles {
+                h.await.expect("join");
+            }
+            if it >= 3 {
+                total_b += t.elapsed();
+            }
+        }
+        println!("B 16 per-file   : {:>10.2?}/query", total_b / ITERS);
+    }
+
+    /// SCRATCH (uncommitted): profile target for the merged-shard
+    /// ranged walk. One 1M-doc blob, 8-unit ten-term OR, looped long
+    /// enough for `perf record`. Prints per-query wall so the result
+    /// can be compared against the bench's post-drain row directly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "scratch profiling target"]
+    async fn diag_merged_ranged_walk_profile() {
+        use std::time::Instant;
+
+        const DOCS: u32 = 1_000_000;
+        const ITERS: u32 = 200;
+
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for d in 0..DOCS {
+            let text = format!(
+                "t0w{} t1x t2y{} t3z t4a{} t5b t6c t7d t8e t9f fill{d}",
+                d % 3,
+                d % 5,
+                d % 2
+            );
+            b.add_doc(0, d, &text).expect("add");
+        }
+        let r = Arc::new(
+            FtsReader::open(
+                Bytes::from(b.finish().expect("finish")),
+                r#"[{"name":"body","tokenizer":"ascii_lower"}]"#,
+            )
+            .expect("open"),
+        );
+        let terms: Vec<&str> = vec![
+            "t0w0", "t1x", "t2y0", "t3z", "t4a0", "t5b", "t6c", "t7d", "t8e", "t9f",
+        ];
+
+        let t = Instant::now();
+        for _ in 0..ITERS {
+            let cache = Arc::new(FtsCursorCache::default());
+            let floor = Arc::new(SharedFloor::new());
+            let mut handles = Vec::new();
+            for u in 0..8u32 {
+                let r = Arc::clone(&r);
+                let cache = Arc::clone(&cache);
+                let floor = Arc::clone(&floor);
+                let terms = terms.clone();
+                handles.push(tokio::spawn(async move {
+                    let (start, end) = (u * (DOCS / 8), (u + 1) * (DOCS / 8));
+                    r.search_clauses_range_with_floor(
+                        "body",
+                        ClauseLists {
+                            musts: &[],
+                            shoulds: &terms,
+                            negatives: &[],
+                            must_phrases: &[],
+                            should_phrases: &[],
+                            negative_phrases: &[],
+                        },
+                        10,
+                        start,
+                        end,
+                        floor.get(),
+                        Some(cache.as_ref()),
+                        Some(floor.as_ref()),
+                    )
+                    .await
+                    .expect("ranged")
+                }));
+            }
+            for h in handles {
+                h.await.expect("join");
+            }
+        }
+        println!(
+            "merged ranged ten-term OR: {:>10.2?}/query",
+            t.elapsed() / ITERS
+        );
     }
 }

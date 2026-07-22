@@ -3246,4 +3246,379 @@ mod tests {
             }),
         );
     }
+    /// SCRATCH (uncommitted): full-path profile target. LocalFs
+    /// supertable, 1M docs, drained; loops warm ten-term OR through
+    /// the public bm25_search so `perf` sees the whole hidden route.
+    #[test]
+    #[ignore = "scratch profiling target"]
+    fn diag_supertable_ten_term_profile() {
+        use std::time::Instant;
+
+        use tempfile::TempDir;
+
+        use crate::supertable::storage::LocalFsStorageProvider;
+
+        const DOCS: u32 = 1_000_000;
+        const COMMITS: u32 = 16;
+        const WARM_ITERS: u32 = 2000;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "body",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new_in("/mnt/scratch/tmp").expect("tempdir");
+        let storage: Arc<dyn crate::storage::StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "body".into(),
+                    positions: false,
+                }],
+                vec![],
+                Some(tok()),
+            )
+            .expect("options")
+            .with_storage(storage)
+            .with_writer_pool(pool),
+        )
+        .expect("create");
+
+        let per = DOCS / COMMITS;
+        for c in 0..COMMITS {
+            let texts: Vec<String> = (0..per)
+                .map(|i| {
+                    let d = c * per + i;
+                    format!(
+                        "t0w{} t1x t2y{} t3z t4a{} t5b t6c t7d t8e t9f fill{d}",
+                        d % 3,
+                        d % 5,
+                        d % 2
+                    )
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(LargeStringArray::from(texts)) as _],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+            println!("commit {}/{COMMITS}", c + 1);
+        }
+        let t = Instant::now();
+        st.drain_vectors_to_cells_sync().expect("drain");
+        println!("drain done in {:?}", t.elapsed());
+
+        let reader = st.reader();
+        let query = "t0w0 t1x t2y0 t3z t4a0 t5b t6c t7d t8e t9f";
+        // Warm up.
+        for _ in 0..20 {
+            reader
+                .bm25_search("body", query, 10, BoolMode::Or, None)
+                .expect("query");
+        }
+        println!("PROFILE_NOW pid={}", std::process::id());
+        let t = Instant::now();
+        for _ in 0..WARM_ITERS {
+            reader
+                .bm25_search("body", query, 10, BoolMode::Or, None)
+                .expect("query");
+        }
+        println!("warm ten-term OR: {:?}/query", t.elapsed() / WARM_ITERS);
+    }
+
+    /// SCRATCH (uncommitted): merged-shard BM25 statistics audit.
+    /// Near-universal terms make idf ~= gap/N, so any df/n_docs/avgdl
+    /// accounting drift in the drain shows up as a ratio shift
+    /// between the user files and the drained shard.
+    #[test]
+    #[ignore = "scratch diagnostic"]
+    fn diag_drained_shard_stats_audit() {
+        use tempfile::TempDir;
+
+        use crate::supertable::storage::LocalFsStorageProvider;
+
+        const FILES: u32 = 4;
+        const PER: u32 = 1000;
+        /// Docs per file missing the near-universal term.
+        const GAP: u32 = 20;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "body",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new_in("/mnt/scratch/tmp").expect("tempdir");
+        let storage: Arc<dyn crate::storage::StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "body".into(),
+                    positions: true,
+                }],
+                vec![],
+                Some(tok()),
+            )
+            .expect("options")
+            .with_storage(storage)
+            .with_writer_pool(pool),
+        )
+        .expect("create");
+
+        for f in 0..FILES {
+            let texts: Vec<String> = (0..PER)
+                .map(|i| {
+                    let d = f * PER + i;
+                    if i < GAP {
+                        format!("filler{d} pad pad")
+                    } else {
+                        format!("alpha beta filler{d}")
+                    }
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(LargeStringArray::from(texts)) as _],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        // Expected: per-file df = PER-GAP, N_f = PER; global df =
+        // FILES*(PER-GAP), N = FILES*PER — identical ratios.
+        let reader = st.reader();
+        let hidden = reader.vector_index_table().expect("hidden").reader();
+        let shard = hidden
+            .manifest()
+            .superfiles
+            .iter()
+            .find(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty())
+            .expect("text shard")
+            .clone();
+        println!("shard n_docs={} (expect {})", shard.n_docs, FILES * PER);
+        // Pull kernel-visible stats: score a 1-doc-tf query and
+        // back-derive. Simpler: bm25 scores of \"alpha beta\" phrase on
+        // user path vs hidden path must MATCH (same corpus stats).
+        let user_rows = reader
+            .bm25_search("body", "\"alpha beta\"", 5, BoolMode::Or, None)
+            .expect("hidden-route query");
+        let batches = &user_rows;
+        let score_col = batches[0]
+            .column(batches[0].num_columns() - 1)
+            .as_any()
+            .downcast_ref::<arrow_array::Float32Array>()
+            .expect("score col");
+        println!("post-drain top score = {}", score_col.value(0));
+    }
+    /// SCRATCH (uncommitted): does the per-file idf scope mis-rank
+    /// phrase results pre-drain? Files with skewed member df score in
+    /// incomparable idf domains; the drained shard scores globally.
+    /// If the pre-drain top-k differs from post-drain on identical
+    /// data, the post-drain result is the textbook-correct one and
+    /// the phrase "regression" partially prices a correctness fix.
+    #[test]
+    #[ignore = "scratch diagnostic"]
+    fn diag_phrase_idf_scope_ranking() {
+        use tempfile::TempDir;
+
+        use crate::supertable::storage::LocalFsStorageProvider;
+
+        const FILES: u32 = 4;
+        const PER: u32 = 2000;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "body",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new_in("/mnt/scratch/tmp").expect("tempdir");
+        let storage: Arc<dyn crate::storage::StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "body".into(),
+                    positions: true,
+                }],
+                vec![],
+                Some(tok()),
+            )
+            .expect("options")
+            .with_storage(storage)
+            .with_writer_pool(pool),
+        )
+        .expect("create");
+
+        // Files 0..2: "alpha beta" ubiquitous (per-file idf tiny).
+        // File 3: "alpha beta" rare within the file (per-file idf
+        // large) — its docs get inflated scores under per-file idf,
+        // beating docs in files 0..2 whose global evidence is equal.
+        for f in 0..FILES {
+            let texts: Vec<String> = (0..PER)
+                .map(|i| {
+                    let d = f * PER + i;
+                    let rare_file = f == FILES - 1;
+                    if rare_file && i >= PER / 20 {
+                        format!("gamma delta fill{d}")
+                    } else {
+                        // tf varies so scores are not exact ties.
+                        format!("{}fill{d}", "alpha beta ".repeat(((d % 3) + 1) as usize))
+                    }
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(LargeStringArray::from(texts)) as _],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        let pre = st
+            .reader()
+            .bm25_hits("body", "\"alpha beta\"", 10, BoolMode::Or)
+            .expect("pre-drain hits");
+        st.drain_vectors_to_cells_sync().expect("drain");
+        let post = st
+            .reader()
+            .bm25_hits("body", "\"alpha beta\"", 10, BoolMode::Or)
+            .expect("post-drain hits");
+        println!(
+            "pre-drain  top10: {:?}",
+            pre.iter()
+                .map(|h| (h.superfile, h.local_doc_id, h.score))
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "post-drain top10: {:?}",
+            post.iter()
+                .map(|h| (h.superfile, h.local_doc_id, h.score))
+                .collect::<Vec<_>>()
+        );
+    }
+    /// SCRATCH (uncommitted): reproduce the post-drain SQL
+    /// point-aggregate hang seen in the supertable_sql bench
+    /// ("aggregate shapes over a token_match candidate set" battery,
+    /// 2026-07-22: all threads futex-parked, main in nanosleep).
+    #[test]
+    #[ignore = "scratch diagnostic"]
+    fn diag_sql_point_aggregate_after_drain() {
+        use std::time::Duration;
+
+        use tempfile::TempDir;
+
+        use crate::supertable::storage::LocalFsStorageProvider;
+
+        const DOCS: u32 = 20_000;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("key", DataType::LargeUtf8, false),
+            Field::new("rating", DataType::Int64, false),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new_in("/mnt/scratch/tmp").expect("tempdir");
+        let storage: Arc<dyn crate::storage::StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                    positions: false,
+                }],
+                vec![],
+                Some(tok()),
+            )
+            .expect("options")
+            .with_storage(storage)
+            .with_writer_pool(pool),
+        )
+        .expect("create");
+
+        for c in 0..4u32 {
+            let n = DOCS / 4;
+            let titles: Vec<String> = (0..n)
+                .map(|i| format!("word{} text", (c * n + i) % 97))
+                .collect();
+            let keys: Vec<String> = (0..n).map(|i| format!("key{:06}", c * n + i)).collect();
+            let ratings: Vec<i64> = (0..n).map(|i| (i % 100) as i64).collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(LargeStringArray::from(titles)) as _,
+                    Arc::new(LargeStringArray::from(keys)) as _,
+                    Arc::new(arrow_array::Int64Array::from(ratings)) as _,
+                ],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        // Watchdog: the hang parks everything, so a plain test would
+        // sit forever — abort loudly instead.
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog = {
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                for _ in 0..120 {
+                    std::thread::sleep(Duration::from_millis(500));
+                    if done.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                }
+                eprintln!("DEADLOCK REPRODUCED: query_sql hung 60s");
+                std::process::abort();
+            })
+        };
+        for q in [
+            "SELECT COUNT(*) AS a FROM supertable WHERE key = 'key000042'",
+            "SELECT SUM(rating) AS a FROM supertable WHERE key = 'key000042'",
+            "SELECT MAX(rating) AS a FROM supertable WHERE key = 'key000042'",
+        ] {
+            let batches = st.reader().query_sql(q).expect("query_sql");
+            assert!(!batches.is_empty());
+            eprintln!("ok: {q}");
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        watchdog.join().expect("watchdog");
+    }
 }
