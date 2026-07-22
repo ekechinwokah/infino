@@ -1273,6 +1273,11 @@ impl FtsReader {
     /// with none, the shoulds' union matches. Docs excluded by
     /// `filter` never reach the heap; docs scoring strictly below
     /// `floor_eff` are dropped at admission.
+    /// `doc_id_start..doc_id_end` bounds the walk (`0..u32::MAX` =
+    /// whole lists) — the sub-range fan-out's window. Phrase atoms
+    /// seek with verification, so a windowed walk does position work
+    /// only inside its window.
+    #[allow(clippy::too_many_arguments)]
     fn run_atoms_search(
         &self,
         column_id: u32,
@@ -1281,7 +1286,17 @@ impl FtsReader {
         k: usize,
         mut filter: Option<AtomExcludeFilter>,
         floor_eff: f32,
+        doc_id_start: u32,
+        doc_id_end: u32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
+        if doc_id_start >= doc_id_end {
+            return Ok(Vec::new());
+        }
+        if doc_id_start > 0 {
+            for atom in musts.iter_mut().chain(shoulds.iter_mut()) {
+                atom.skip_to(doc_id_start)?;
+            }
+        }
         let dl_norm_k1 = &self.columns[column_id as usize].dl_norm_k1;
         let initial_cap = k.min(self.n_docs as usize).max(1);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
@@ -1308,6 +1323,9 @@ impl FtsReader {
                 .map(AnyCursor::current_doc_id)
                 .min()
             {
+                if doc >= doc_id_end {
+                    break;
+                }
                 let admitted = match filter.as_mut() {
                     Some(f) => f.admits(doc)?,
                     None => true,
@@ -1347,7 +1365,7 @@ impl FtsReader {
             let must_ub_total: f32 = musts.iter().map(AnyCursor::term_max_bm25).sum();
             atom_slack(&shoulds, must_ub_total)
         };
-        let mut target = 0u32;
+        let mut target = doc_id_start;
         'docs: loop {
             let bar = match heap.len() >= k {
                 true => heap.peek().expect("heap len == k").0.max(floor_eff),
@@ -1368,6 +1386,9 @@ impl FtsReader {
                     continue;
                 }
                 i += 1;
+            }
+            if aligned >= doc_id_end {
+                break 'docs;
             }
             // Bar skip: the kth-best (or the seeded floor) minus the
             // most the shoulds could add bounds what the musts must
@@ -1850,6 +1871,8 @@ impl FtsReader {
                 k,
                 filter,
                 floor_eff,
+                0,
+                u32::MAX,
             );
         }
 
@@ -2117,29 +2140,62 @@ impl FtsReader {
         )
     }
 
-    /// Term-only clause search constrained to a doc-id sub-range —
+    /// Positive-clause search constrained to a doc-id sub-range —
     /// the general sibling of
     /// [`Self::search_or_range_pretokenized_with_floor`], covering
-    /// single-term, AND, and must+should shapes so the supertable's
-    /// intra-superfile fan-out can slice big merged shards for every
-    /// phrase-free, negation-free query (phrases and negation force
-    /// the un-ranged walk, mirroring the OR path's v1 rule).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn search_terms_range_with_floor(
+    /// single-term, AND, must+should, and phrase-bearing shapes so
+    /// the supertable's intra-superfile fan-out can slice big merged
+    /// shards for every negation-free query (negation still forces
+    /// the un-ranged walk, mirroring the OR path's v1 rule — the
+    /// `lists` must carry no negative atoms).
+    pub(crate) async fn search_clauses_range_with_floor(
         &self,
         column: &str,
-        musts: &[&str],
-        shoulds: &[&str],
+        lists: ClauseLists<'_>,
         k: usize,
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
+        debug_assert!(
+            lists.negatives.is_empty() && lists.negative_phrases.is_empty(),
+            "the ranged fan-out never carries negation"
+        );
         let column_id = self.resolve_column_id(column)?;
-        if (musts.is_empty() && shoulds.is_empty()) || k == 0 || doc_id_start >= doc_id_end {
+        if lists.no_positive_atoms() || k == 0 || doc_id_start >= doc_id_end {
             return Ok(Vec::new());
         }
         let floor_eff = floor.next_down();
+        if lists.has_phrases() {
+            // Phrase-bearing shape: the heterogeneous atom walks,
+            // windowed to the sub-range (phrase atoms seek with
+            // verification, so position work stays inside it).
+            let must_atoms = self
+                .build_atom_cursors(column_id, lists.musts, lists.must_phrases)
+                .await?;
+            if must_atoms.iter().any(Option::is_none) {
+                // A must atom can never match in this superfile.
+                return Ok(Vec::new());
+            }
+            let must_atoms: Vec<AnyCursor> = must_atoms.into_iter().flatten().collect();
+            let should_atoms: Vec<AnyCursor> = self
+                .build_atom_cursors(column_id, lists.shoulds, lists.should_phrases)
+                .await?
+                .into_iter()
+                .flatten()
+                .collect();
+            return self.run_atoms_search(
+                column_id,
+                must_atoms,
+                should_atoms,
+                k,
+                None,
+                floor_eff,
+                doc_id_start,
+                doc_id_end,
+            );
+        }
+        let ClauseLists { musts, shoulds, .. } = lists;
         if musts.len() + shoulds.len() == 1 {
             let term = musts.iter().chain(shoulds).next().expect("one atom");
             return self
@@ -6721,10 +6777,16 @@ mod tests {
             for w in 0..4u32 {
                 let (start, end) = (w * 175, (w + 1) * 175);
                 got.extend(
-                    r.search_terms_range_with_floor(
+                    r.search_clauses_range_with_floor(
                         "body",
-                        &musts,
-                        &shoulds,
+                        ClauseLists {
+                            musts: &musts,
+                            shoulds: &shoulds,
+                            negatives: &[],
+                            must_phrases: &[],
+                            should_phrases: &[],
+                            negative_phrases: &[],
+                        },
                         usize::MAX,
                         start,
                         end,
@@ -6737,6 +6799,99 @@ mod tests {
             expected.sort_by_key(|&(d, _)| d);
             got.sort_by_key(|&(d, _)| d);
             assert_eq!(got, expected, "musts={musts:?} shoulds={shoulds:?}");
+        }
+    }
+
+    /// The windowed atom walk must agree with the un-ranged walk:
+    /// for every phrase-bearing shape, the union of a partition's
+    /// sub-range results equals the whole-list result.
+    #[tokio::test]
+    async fn ranged_atoms_union_matches_unranged_walk() {
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), true).expect("register");
+        // 700 docs spanning several blocks. "alpha beta" adjacent on
+        // every 3rd doc (phrase hit), reversed elsewhere so both terms
+        // are common but the phrase is selective; "gamma" on every
+        // 7th doc anchors must+phrase-should shapes.
+        for d in 0..700u32 {
+            let mut text = match d % 3 {
+                0 => "alpha beta ".repeat(((d % 4) + 1) as usize),
+                _ => "beta alpha ".to_owned(),
+            };
+            if d % 7 == 0 {
+                text.push_str("gamma ");
+            }
+            text.push_str(&format!("filler{d}"));
+            b.add_doc(0, d, &text).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower","positions":true}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let alpha_beta = vec!["alpha".to_owned(), "beta".to_owned()];
+        type Shape<'a> = (
+            Vec<&'a str>,
+            Vec<&'a str>,
+            Vec<Vec<String>>,
+            Vec<Vec<String>>,
+        );
+        let shapes: Vec<Shape> = vec![
+            // Single must phrase.
+            (vec![], vec![], vec![alpha_beta.clone()], vec![]),
+            // Must term + must phrase.
+            (vec!["gamma"], vec![], vec![alpha_beta.clone()], vec![]),
+            // Must term + should phrase (scoring-only phrase).
+            (vec!["gamma"], vec![], vec![], vec![alpha_beta.clone()]),
+            // Should term + should phrase (union driver).
+            (vec![], vec!["gamma"], vec![], vec![alpha_beta.clone()]),
+        ];
+        for (musts, shoulds, must_phrases, should_phrases) in shapes {
+            let mut expected = r
+                .search_excluding(
+                    "body",
+                    ClauseLists {
+                        musts: &musts,
+                        shoulds: &shoulds,
+                        negatives: &[],
+                        must_phrases: &must_phrases,
+                        should_phrases: &should_phrases,
+                        negative_phrases: &[],
+                    },
+                    usize::MAX,
+                    f32::NEG_INFINITY,
+                )
+                .await
+                .expect("unranged walk");
+            let mut got = Vec::new();
+            for w in 0..4u32 {
+                let (start, end) = (w * 175, (w + 1) * 175);
+                got.extend(
+                    r.search_clauses_range_with_floor(
+                        "body",
+                        ClauseLists {
+                            musts: &musts,
+                            shoulds: &shoulds,
+                            negatives: &[],
+                            must_phrases: &must_phrases,
+                            should_phrases: &should_phrases,
+                            negative_phrases: &[],
+                        },
+                        usize::MAX,
+                        start,
+                        end,
+                        f32::NEG_INFINITY,
+                    )
+                    .await
+                    .expect("ranged walk"),
+                );
+            }
+            expected.sort_by_key(|&(d, _)| d);
+            got.sort_by_key(|&(d, _)| d);
+            assert_eq!(
+                got, expected,
+                "musts={musts:?} shoulds={shoulds:?} must_phrases={must_phrases:?} should_phrases={should_phrases:?}"
+            );
         }
     }
 

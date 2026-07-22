@@ -1149,14 +1149,12 @@ impl SuperfileReader {
         Ok(fts.search_excluding(column, lists, k, floor).await?)
     }
 
-    /// Term-only clause search over a doc-id sub-range — see
-    /// [`FtsReader::search_terms_range_with_floor`].
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn bm25_search_terms_range_with_floor(
+    /// Positive-clause search over a doc-id sub-range — see
+    /// [`FtsReader::search_clauses_range_with_floor`].
+    pub(crate) async fn bm25_search_clauses_range_with_floor(
         &self,
         column: &str,
-        musts: &[&str],
-        shoulds: &[&str],
+        lists: ClauseLists<'_>,
         k: usize,
         doc_id_start: u32,
         doc_id_end: u32,
@@ -1166,15 +1164,7 @@ impl SuperfileReader {
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .search_terms_range_with_floor(
-                column,
-                musts,
-                shoulds,
-                k,
-                doc_id_start,
-                doc_id_end,
-                floor,
-            )
+            .search_clauses_range_with_floor(column, lists, k, doc_id_start, doc_id_end, floor)
             .await?)
     }
 

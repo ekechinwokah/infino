@@ -273,7 +273,6 @@ async fn bm25_fanout_wave(
     column_arc: Arc<String>,
     clauses: BmClauses,
     k: usize,
-    has_phrases: bool,
     shared: Arc<SharedTopK>,
     routing: Option<Arc<SlowFtsState>>,
 ) -> Result<Vec<SuperfileHit>, QueryError> {
@@ -290,22 +289,26 @@ async fn bm25_fanout_wave(
         negative_phrases: neg_ph_arc,
     } = clauses;
 
+    let has_phrases =
+        !must_ph_arc.is_empty() || !should_ph_arc.is_empty() || !neg_ph_arc.is_empty();
+    let has_negation = !neg_arc.is_empty() || !neg_ph_arc.is_empty();
     // Build the work-unit list. When the reader pool has more
     // threads than there are kept superfiles, slice each superfile
     // into doc_id sub-ranges so the fan-out can saturate every pool
-    // thread — every phrase-free, negation-free positive shape has a
-    // range-aware kernel. Phrase-bearing (and negated) queries stay
+    // thread — every negation-free positive shape (phrase atoms
+    // included) has a range-aware kernel. Negated queries stay
     // per-superfile.
-    let fanout = match has_phrases {
-        true => FanOut::PerSuperfile,
-        false => fanout_for(must_arc.len(), should_arc.len(), !neg_arc.is_empty()),
-    };
+    let fanout = fanout_for(
+        must_arc.len() + must_ph_arc.len(),
+        should_arc.len() + should_ph_arc.len(),
+        has_negation,
+    );
     // A single bare term whose resident block-max row CAN PRUNE keeps
     // its file as one un-ranged unit: the block-selected walk visits
     // (and, cold, fetches) fewer bytes than any parallel full walk.
     // Flat-bounded or row-less files slice for parallelism instead.
     let single_bare_term = match (must_arc.as_slice(), should_arc.as_slice()) {
-        _ if has_phrases || !neg_arc.is_empty() => None,
+        _ if has_phrases || has_negation => None,
         ([term], []) | ([], [term]) => Some(term.as_str()),
         _ => None,
     };
@@ -334,8 +337,6 @@ async fn bm25_fanout_wave(
 
     let tombstones = ctx.tombstone_cache.clone();
     let now = Instant::now();
-    let has_phrases_kernel =
-        !must_ph_arc.is_empty() || !should_ph_arc.is_empty() || !neg_ph_arc.is_empty();
 
     // One shared fan-out (`query::dispatch::fanout`) — the same
     // orchestrator the vector path uses. It warms the tombstone
@@ -360,8 +361,9 @@ async fn bm25_fanout_wave(
             // according to task completion order. Local BMW still prunes
             // those queries; share the global floor only for multi-term
             // paths.
-            let n_terms = must_arc.len() + should_arc.len();
-            let floor = if n_terms == 1 {
+            let n_atoms =
+                must_arc.len() + should_arc.len() + must_ph_arc.len() + should_ph_arc.len();
+            let floor = if n_atoms == 1 {
                 f32::NEG_INFINITY
             } else {
                 shared.floor()
@@ -371,9 +373,11 @@ async fn bm25_fanout_wave(
             // and fetches exactly those (the FTS cell-read analog).
             // Everything else keeps the whole-term kernels.
             if range.is_none()
-                && n_terms == 1
-                && !has_phrases_kernel
+                && n_atoms == 1
+                && must_ph_arc.is_empty()
+                && should_ph_arc.is_empty()
                 && neg_arc.is_empty()
+                && neg_ph_arc.is_empty()
                 && let Some(state) = routing.as_ref()
             {
                 let term = must_arc.first().or_else(|| should_arc.first());
@@ -408,15 +412,21 @@ async fn bm25_fanout_wave(
                 }
             }
             let hits = match range {
-                // Ranged units exist for every phrase-free,
-                // negation-free positive shape (`fanout_for`).
+                // Ranged units exist for every negation-free positive
+                // shape, phrase atoms included (`fanout_for`).
                 Some((start, end)) => {
                     let must_refs: Vec<&str> = must_arc.iter().map(|s| s.as_str()).collect();
                     let should_refs: Vec<&str> = should_arc.iter().map(|s| s.as_str()).collect();
-                    r.bm25_search_terms_range_with_floor(
+                    r.bm25_search_clauses_range_with_floor(
                         &column_arc,
-                        &must_refs,
-                        &should_refs,
+                        ClauseLists {
+                            musts: &must_refs,
+                            shoulds: &should_refs,
+                            negatives: &[],
+                            must_phrases: &must_ph_arc,
+                            should_phrases: &should_ph_arc,
+                            negative_phrases: &[],
+                        },
                         k,
                         start,
                         end,
@@ -864,8 +874,6 @@ impl SupertableReader {
         let should_phrases = own_phrases(clauses.should_phrases);
         let negative_phrases = own_phrases(clauses.negative_phrases);
         let has_musts = !musts.is_empty() || !must_phrases.is_empty();
-        let has_phrases =
-            !must_phrases.is_empty() || !should_phrases.is_empty() || !negative_phrases.is_empty();
 
         if !has_musts && shoulds.is_empty() && should_phrases.is_empty() {
             // No scorable clause at all. Empty / punctuation-only
@@ -947,7 +955,6 @@ impl SupertableReader {
                 Arc::clone(&column_arc),
                 clauses.clone(),
                 k_fetch,
-                has_phrases,
                 Arc::clone(&shared),
                 route.fts_routing.clone(),
             );
@@ -957,7 +964,6 @@ impl SupertableReader {
                 Arc::clone(&column_arc),
                 clauses.clone(),
                 k_fetch,
-                has_phrases,
                 Arc::clone(&shared),
                 None,
             );
@@ -978,17 +984,7 @@ impl SupertableReader {
         }
         let shared = SharedTopK::new(k);
 
-        bm25_fanout_wave(
-            self,
-            kept,
-            column_arc,
-            clauses,
-            k,
-            has_phrases,
-            shared,
-            None,
-        )
-        .await
+        bm25_fanout_wave(self, kept, column_arc, clauses, k, shared, None).await
     }
 
     /// Prefix-expanded BM25 search across the pinned manifest's
