@@ -2283,7 +2283,62 @@ mod tests {
             0
         );
 
+        // Incremental epoch: a post-drain delete + a delta commit, then
+        // a second drain — the previous shard folds in as a source
+        // (its deleted doc dropped via the resident deleted set) and
+        // only the delta file is read fresh.
+        let del = st
+            .delete(col("title").eq(lit("parquet files")))
+            .expect("post-drain delete");
+        assert_eq!(del.n_tombstoned(), 1);
+        {
+            let titles = LargeStringArray::from(vec!["stonebraker wisdom"]);
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(titles) as Arc<dyn Array>],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("incremental drain");
+        let folded: Vec<_> = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden sibling")
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .filter(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty())
+            .cloned()
+            .collect();
+        assert_eq!(folded.len(), 1, "fold + tail still fit one shard");
+        assert_eq!(
+            folded[0].n_docs, 2,
+            "old live docs minus the deleted one, plus the delta doc"
+        );
+        assert_eq!(
+            st.reader()
+                .count("title", "parquet", BoolMode::Or)
+                .expect("count of folded-out vocab"),
+            0,
+            "the deleted doc's vocabulary is physically gone after the fold"
+        );
+        let rows = st
+            .reader()
+            .bm25_search("title", "stonebraker", 10, BoolMode::Or, None)
+            .expect("bm25 for the delta doc");
+        assert_eq!(rows[0].num_rows(), 1, "delta doc searchable post-fold");
+        let rows = st
+            .reader()
+            .bm25_search("title", "engine", 10, BoolMode::Or, None)
+            .expect("bm25 for folded vocab");
+        assert_eq!(rows[0].num_rows(), 1, "folded doc still searchable");
+
         // Re-drain with nothing new is the idle no-op.
+        let text_entries = folded;
         let before: Vec<_> = text_entries.iter().map(|e| e.uri).collect();
         st.drain_vectors_to_cells_sync().expect("idle re-drain");
         let after: Vec<_> = st

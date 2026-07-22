@@ -3068,22 +3068,24 @@ struct TextDrainOutcome {
 /// Build this epoch's hidden **text superfiles**: term-range shards of
 /// the merged inverted index over the whole live user corpus.
 ///
-/// V1 does a FULL re-merge every epoch — sources are ALL user
-/// superfiles, tombstone-filtered, chained batch-by-batch so working
-/// memory stays O(batch) + O(global vocabulary): each batch merges
-/// (previous intermediate + the batch's FTS blobs) into a new local
-/// intermediate; only the final result is sliced into shards and
-/// uploaded. The previous epoch's text entries are replaced wholesale
-/// in the same OCC commit that stamps the vector shards + watermark,
-/// so readers always see one consistent epoch. (Incremental folding of
-/// the previous base — old shards as merge sources filtered by the
-/// hidden deleted-id set — is the follow-up optimization.)
+/// INCREMENTAL: the previous epoch's shards fold into the merge as
+/// batch-0 sources — each old shard's remap is identity minus the
+/// docs whose stable `_id` (read from its stub column) sits in the
+/// resident deleted set — and only the UNDRAINED user files are read
+/// fresh, tombstone-filtered. The chain then proceeds batch-by-batch
+/// so working memory stays O(batch) + O(global vocabulary): each step
+/// merges (previous intermediate + the batch's FTS blobs) into a new
+/// local intermediate; only the final result is sliced into shards
+/// and uploaded. The previous epoch's text entries are replaced in
+/// the same OCC commit that stamps the shards + watermark, so readers
+/// always see one consistent epoch.
 ///
 /// No remote checkpointing: the pass is idempotent and re-runs whole
 /// on a resumed epoch; shards uploaded by an abandoned attempt are
 /// unreferenced and reclaimed by the post-drain storage sweep.
 ///
-/// Returns `None` when the user table has no FTS columns.
+/// `sources` are the undrained user superfiles. Returns `None` when
+/// the user table has no FTS columns.
 #[allow(clippy::too_many_arguments)]
 async fn drain_fts_text_shards(
     user_inner: &Arc<SupertableInner>,
@@ -3123,7 +3125,12 @@ async fn drain_fts_text_shards(
 
     // Deterministic source order: merged ids must be monotone within a
     // source and disjoint ascending across sources (the merge encoder
-    // requires sorted postings), so the walk order is pinned.
+    // requires sorted postings). The old base folds in first (shard-id
+    // order), then the undrained user files by (birth_version, id).
+    let mut old_base: Vec<Arc<SuperfileEntry>> = removed_entries.clone();
+    old_base.sort_unstable_by_key(|e| e.partition_key.clone());
+    let deleted = hidden_deleted::deleted_user_ids(&hidden_inner.manifest.load_full())
+        .map_err(|e| BuildError::Store(e.to_string()))?;
     let mut ordered: Vec<Arc<SuperfileEntry>> = sources.to_vec();
     ordered.sort_unstable_by_key(|e| (e.birth_version, e.superfile_id));
 
@@ -3147,6 +3154,109 @@ async fn drain_fts_text_shards(
     // storage (the `storage` argument is hidden-prefixed and only
     // serves the shard uploads below).
     let user_storage = user_inner.options.storage.clone();
+
+    // Batch 0: fold the previous epoch's shards. Their doc spaces are
+    // already merged/tombstone-free; the only drops are stable ids
+    // deleted since that epoch (the resident deleted set).
+    if !old_base.is_empty() {
+        let fold_t0 = time::Instant::now();
+        let mut fold_readers: Vec<Arc<SuperfileReader>> = Vec::with_capacity(old_base.len());
+        let hidden_store = hidden_inner.options.store.clone();
+        for entry in &old_base {
+            let reader = match hidden_store.reader(&entry.uri) {
+                Ok(r) if r.is_fully_resident() => r,
+                _ => {
+                    let (bytes, _) = storage
+                        .get(&entry.uri.storage_path())
+                        .await
+                        .map_err(|e| BuildError::Store(e.to_string()))?;
+                    Arc::new(
+                        SuperfileReader::open(bytes)
+                            .map_err(|e| BuildError::Store(e.to_string()))?,
+                    )
+                }
+            };
+            fold_readers.push(reader);
+        }
+        let mut fold_remaps: Vec<Vec<Option<u32>>> = Vec::with_capacity(fold_readers.len());
+        for reader in &fold_readers {
+            // The stub's `_id` column maps shard-local ids to stable
+            // ids in local order — exactly the walk the remap needs.
+            let stub = reader
+                .get_record_batch(None)
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+            let ids = stub
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| BuildError::Store("text shard stub missing _id column".into()))?;
+            let mut remap: Vec<Option<u32>> = Vec::with_capacity(ids.len());
+            for local in 0..ids.len() {
+                let id = ids.value(local);
+                if deleted.binary_search(&id).is_ok() {
+                    remap.push(None);
+                    continue;
+                }
+                if n_docs_merged >= u32::MAX as u64 {
+                    return Err(BuildError::Store(
+                        "hidden text index exceeds u32 doc-id space".into(),
+                    ));
+                }
+                remap.push(Some(n_docs_merged as u32));
+                n_docs_merged += 1;
+                id_min = id_min.min(id);
+                id_max = id_max.max(id);
+                ids_writer
+                    .write_all(&id.to_le_bytes())
+                    .map_err(|error| BuildError::Store(format!("text ids spill: {error}")))?;
+            }
+            fold_remaps.push(remap);
+        }
+        let merge_sources: Vec<MergeSource<'_>> = fold_readers
+            .iter()
+            .zip(&fold_remaps)
+            .map(|(reader, remap)| {
+                reader
+                    .fts()
+                    .ok_or_else(|| BuildError::Store("text shard missing FTS blob".into()))
+                    .map(|fts| MergeSource {
+                        reader: fts,
+                        doc_id_remap: remap,
+                    })
+            })
+            .collect::<Result<_, BuildError>>()?;
+        let next_path = scratch.join(format!("fts_text_intermediate_{chain_step}.bin"));
+        chain_step += 1;
+        let mut next_file =
+            BufWriter::new(File::create(&next_path).map_err(|error| {
+                BuildError::Store(format!("text intermediate create: {error}"))
+            })?);
+        merge_fts_blobs(
+            &merge_sources,
+            &merge_columns,
+            n_docs_merged as u32,
+            None,
+            &mut next_file,
+        )
+        .await?;
+        next_file
+            .flush()
+            .map_err(|error| BuildError::Store(format!("text intermediate flush: {error}")))?;
+        drop(next_file);
+        let next_len = fs::metadata(&next_path)
+            .map_err(|error| BuildError::Store(format!("text intermediate stat: {error}")))?
+            .len();
+        intermediate = Some((next_path, next_len));
+        eprintln!(
+            "[supertable drain] text fold: {} prior shard(s) -> {} live doc(s) \
+             ({} deleted since the epoch), intermediate {:.1} MiB, {:.1}ms",
+            old_base.len(),
+            n_docs_merged,
+            deleted.len(),
+            next_len as f64 / (1u64 << 20) as f64,
+            fold_t0.elapsed().as_secs_f64() * 1e3,
+        );
+    }
 
     let n_text_batches = ordered.len().div_ceil(batch_budget.max(1));
     for (batch_idx, batch) in ordered.chunks(batch_budget.max(1)).enumerate() {
@@ -3598,11 +3708,16 @@ async fn drain_fts_only(
 
     let scratch = tempfile::tempdir()
         .map_err(|error| BuildError::Store(format!("fts drain scratch: {error}")))?;
+    let undrained: Vec<Arc<SuperfileEntry>> = sources
+        .iter()
+        .filter(|entry| !drained.contains(entry.birth_version))
+        .cloned()
+        .collect();
     let outcome = drain_fts_text_shards(
         user_inner,
         hidden_inner,
         &user_manifest,
-        &sources,
+        &undrained,
         &storage,
         scratch.path(),
         budget,
@@ -3712,10 +3827,17 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     if sources.is_empty() {
         return Ok(());
     }
-    // The text drain re-merges the WHOLE live corpus each epoch (not
-    // just the undrained tail), so it keeps its own handle on the full
-    // source list — `sources` is shadowed inside the cell-build block.
-    let all_user_sources: Vec<Arc<SuperfileEntry>> = sources.clone();
+    // The text drain folds the previous epoch's shards and reads only
+    // the UNDRAINED user files fresh; `sources` is shadowed inside the
+    // cell-build block, so capture the tail here.
+    let text_drain_sources: Vec<Arc<SuperfileEntry>> = {
+        let drained = hidden_inner.manifest.load_full().get_drained_ranges();
+        sources
+            .iter()
+            .filter(|entry| !drained.contains(entry.birth_version))
+            .cloned()
+            .collect()
+    };
     let batch_cfg = drain_batch_superfiles(&user_inner.options);
     if batch_cfg == 0 {
         eprintln!("[supertable drain] skipped (drain_batch_superfiles = 0)");
@@ -4534,7 +4656,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             &user_inner,
             &hidden_inner,
             &user_manifest,
-            &all_user_sources,
+            &text_drain_sources,
             &storage,
             drain_scratch.as_path(),
             budget,
