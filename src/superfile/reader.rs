@@ -52,7 +52,9 @@ use crate::{
         BytesLazyByteSource, LazyByteSource, LazySubSource, ReadError,
         format::{self, footer, kv},
         fts::{
-            reader::{self as fts_reader, BoolMode, ClauseLists, FtsCursorCache, FtsReader},
+            reader::{
+                self as fts_reader, BoolMode, ClauseLists, FtsCursorCache, FtsReader, SharedFloor,
+            },
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
         vector::{
@@ -1161,6 +1163,7 @@ impl SuperfileReader {
         doc_id_end: u32,
         floor: f32,
         cache: Option<&FtsCursorCache>,
+        live: Option<&SharedFloor>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let fts = self
             .fts()
@@ -1174,6 +1177,7 @@ impl SuperfileReader {
                 doc_id_end,
                 floor,
                 cache,
+                live,
             )
             .await?)
     }

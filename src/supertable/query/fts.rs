@@ -72,10 +72,7 @@ use std::{
     cmp::{Ordering, Reverse},
     collections::BinaryHeap,
     slice,
-    sync::{
-        Arc, Mutex,
-        atomic::{self, AtomicU32},
-    },
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -94,7 +91,7 @@ use crate::{
         SuperfileReader,
         error::{FtsError, ReadError},
         fts::{
-            reader::{ClauseLists, FtsCursorCache},
+            reader::{ClauseLists, FtsCursorCache, SharedFloor},
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
     },
@@ -172,9 +169,12 @@ struct SharedTopK {
     k: usize,
     /// Min-heap (via `Reverse`) of the best `k` scores seen so far.
     heap: Mutex<BinaryHeap<Reverse<OrdScore>>>,
-    /// f32 bits of the current floor; `NEG_INFINITY` until `k` scores
-    /// have been seen. Monotonically non-decreasing.
-    floor_bits: AtomicU32,
+    /// The live floor: `NEG_INFINITY` until `k` scores are known,
+    /// then the running global kth-best. Kernels also raise and read
+    /// it **mid-walk** (see `SharedFloor`), so sub-range units prune
+    /// against each other while running, not only via completed-unit
+    /// merges.
+    floor: Arc<SharedFloor>,
 }
 
 /// Total-order f32 wrapper for the [`SharedTopK`] heap (BM25 scores
@@ -198,13 +198,19 @@ impl SharedTopK {
         Arc::new(Self {
             k,
             heap: Mutex::new(BinaryHeap::new()),
-            floor_bits: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
+            floor: Arc::new(SharedFloor::new()),
         })
     }
 
-    /// The current global floor — `NEG_INFINITY` until k scores merged.
+    /// The current global floor — `NEG_INFINITY` until k scores are
+    /// known (merged or published mid-walk).
     fn floor(&self) -> f32 {
-        f32::from_bits(self.floor_bits.load(atomic::Ordering::Acquire))
+        self.floor.get()
+    }
+
+    /// Handle the ranged kernels use to read/raise the floor mid-walk.
+    fn live_floor(&self) -> Arc<SharedFloor> {
+        Arc::clone(&self.floor)
     }
 
     /// Merge one finished segment's (tombstone-surviving) scores and
@@ -224,10 +230,7 @@ impl SharedTopK {
         if heap.len() == self.k
             && let Some(Reverse(OrdScore(min))) = heap.peek()
         {
-            // The heap min only rises, so a plain store stays monotone
-            // under the lock.
-            self.floor_bits
-                .store(min.to_bits(), atomic::Ordering::Release);
+            self.floor.raise(*min);
         }
     }
 }
@@ -426,6 +429,7 @@ async fn bm25_fanout_wave(
                     let must_refs: Vec<&str> = must_arc.iter().map(|s| s.as_str()).collect();
                     let should_refs: Vec<&str> = should_arc.iter().map(|s| s.as_str()).collect();
                     let cache = Arc::clone(&*cursor_caches.entry(suid).or_default());
+                    let live = shared.live_floor();
                     r.bm25_search_clauses_range_with_floor(
                         &column_arc,
                         ClauseLists {
@@ -441,6 +445,7 @@ async fn bm25_fanout_wave(
                         end,
                         floor,
                         Some(&cache),
+                        Some(&live),
                     )
                     .await
                     .map_err(fts_read_error)?
@@ -1933,6 +1938,7 @@ mod tests {
         supertable::{
             Supertable, SupertableOptions,
             error::QueryError,
+            handle::SupertableReader,
             options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         },
         test_helpers::default_tokenizer as tok,
@@ -3029,6 +3035,141 @@ mod tests {
             st.count("title", "alpha -beta", BoolMode::Or)
                 .expect("count after delete"),
             2
+        );
+    }
+    /// Diagnostic, not a gate — run explicitly:
+    /// `cargo test --lib supertable::query::fts::tests::diag_hidden_route_overhead -- --ignored --nocapture`
+    /// Breaks the hidden-route per-query overhead (the post-drain
+    /// `single_df1` gap: ~8µs pre-drain vs ~86µs post-drain at 1M on
+    /// Azure) into route construction, the two prune walks, and the
+    /// full query, on a LocalFs table small enough that kernel time
+    /// is negligible and setup cost dominates.
+    #[test]
+    #[ignore = "diagnostic; run with -- --ignored --nocapture"]
+    fn diag_hidden_route_overhead() {
+        use std::{slice, time::Instant};
+
+        use tempfile::TempDir;
+
+        use crate::supertable::query::prune::PruneLeaf;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![],
+            Some(tok()),
+        )
+        .expect("valid options")
+        .with_storage(Arc::clone(&storage))
+        .with_writer_pool(Arc::clone(&pool));
+        let st = Supertable::create(options).expect("create");
+
+        // Two commits; "uniqterm" planted once (df = 1).
+        for c in 0..2u32 {
+            let texts: Vec<String> = (0..300u32)
+                .map(|i| match (c, i) {
+                    (0, 7) => "uniqterm filler".to_string(),
+                    _ => format!("common filler{c}x{i}"),
+                })
+                .collect();
+            let titles = LargeStringArray::from(texts);
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(titles) as _]).expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        /// Iterations per timed section — enough for stable µs math.
+        const ITERS: u32 = 2000;
+        let time = |label: &str, mut f: Box<dyn FnMut() + '_>| {
+            for _ in 0..50 {
+                f();
+            }
+            let t = Instant::now();
+            for _ in 0..ITERS {
+                f();
+            }
+            println!("{label:>40}: {:>10.2?}/iter", t.elapsed() / ITERS);
+        };
+
+        let reader = st.reader();
+        time(
+            "PRE-DRAIN full bm25_search(single_df1)",
+            Box::new(|| {
+                let hits = reader
+                    .bm25_search("title", "uniqterm", 10, BoolMode::Or, None)
+                    .expect("query");
+                assert_eq!(hits[0].num_rows(), 1);
+            }),
+        );
+
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let reader = st.reader();
+        time(
+            "POST-DRAIN full bm25_search(single_df1)",
+            Box::new(|| {
+                let hits = reader
+                    .bm25_search("title", "uniqterm", 10, BoolMode::Or, None)
+                    .expect("query");
+                assert_eq!(hits[0].num_rows(), 1);
+            }),
+        );
+        time(
+            "hidden_text_route() alone",
+            Box::new(|| {
+                let route = block_on(reader.hidden_text_route())
+                    .expect("route")
+                    .expect("hidden epoch present");
+                drop(route);
+            }),
+        );
+        let route = block_on(reader.hidden_text_route())
+            .expect("route")
+            .expect("hidden epoch present");
+        let leaf = PruneLeaf::TermPresence {
+            column: "title".to_string(),
+            terms: vec!["uniqterm".to_string()],
+            mode: BoolMode::Or,
+        };
+        time(
+            "text_shards_pruned()",
+            Box::new(|| {
+                let shards =
+                    block_on(SupertableReader::text_shards_pruned(&route, &leaf)).expect("prune");
+                assert_eq!(shards.len(), 1);
+            }),
+        );
+        time(
+            "undrained_tail_pruned()",
+            Box::new(|| {
+                let tail = block_on(reader.undrained_tail_pruned(
+                    &route,
+                    "title",
+                    slice::from_ref(&"uniqterm".to_string()),
+                    BoolMode::Or,
+                ))
+                .expect("tail prune");
+                assert!(tail.is_empty(), "everything drained");
+            }),
         );
     }
 }

@@ -16,10 +16,14 @@
 //! then it's a borrowed view).
 
 use std::{
+    cell::Cell,
     cmp::Ordering,
     collections::{BinaryHeap, HashMap},
     ops::Range,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering as AtomicOrdering},
+    },
 };
 
 use bytes::Bytes;
@@ -1359,6 +1363,7 @@ impl FtsReader {
     /// seek with verification, so a windowed walk does position work
     /// only inside its window.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn run_atoms_search(
         &self,
         column_id: u32,
@@ -1369,6 +1374,7 @@ impl FtsReader {
         floor_eff: f32,
         doc_id_start: u32,
         doc_id_end: u32,
+        live: Option<&SharedFloor>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         if doc_id_start >= doc_id_end {
             return Ok(Vec::new());
@@ -1378,6 +1384,7 @@ impl FtsReader {
                 atom.skip_to(doc_id_start)?;
             }
         }
+        let live_probe = LiveFloorProbe::new(live);
         let dl_norm_k1 = &self.columns[column_id as usize].dl_norm_k1;
         let initial_cap = k.min(self.n_docs as usize).max(1);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
@@ -1426,8 +1433,11 @@ impl FtsReader {
                     break;
                 };
                 let bar = match heap.len() >= k {
-                    true => heap.peek().expect("heap len == k").0.max(floor_eff),
-                    false => floor_eff,
+                    true => {
+                        let kth = heap.peek().expect("heap len == k").0;
+                        kth.max(live_probe.checkpoint(floor_eff, Some(kth)))
+                    }
+                    false => live_probe.checkpoint(floor_eff, None),
                 };
                 for (a, &others) in shoulds.iter_mut().zip(&others_ub) {
                     if !a.is_exhausted() && a.current_doc_id() == doc {
@@ -1449,8 +1459,11 @@ impl FtsReader {
         let mut target = doc_id_start;
         'docs: loop {
             let bar = match heap.len() >= k {
-                true => heap.peek().expect("heap len == k").0.max(floor_eff),
-                false => floor_eff,
+                true => {
+                    let kth = heap.peek().expect("heap len == k").0;
+                    kth.max(live_probe.checkpoint(floor_eff, Some(kth)))
+                }
+                false => live_probe.checkpoint(floor_eff, None),
             };
             let mut aligned = target;
             let mut i = 0usize;
@@ -1958,6 +1971,7 @@ impl FtsReader {
                 floor_eff,
                 0,
                 u32::MAX,
+                None,
             );
         }
 
@@ -2022,6 +2036,7 @@ impl FtsReader {
                 floor_eff,
                 0,
                 u32::MAX,
+                None,
             );
         }
         // Shoulds absent from this superfile contribute nothing;
@@ -2036,6 +2051,7 @@ impl FtsReader {
                 floor_eff,
                 0,
                 u32::MAX,
+                None,
             );
         }
         self.run_must_should(
@@ -2047,6 +2063,7 @@ impl FtsReader {
             floor_eff,
             0,
             u32::MAX,
+            None,
         )
     }
 
@@ -2222,6 +2239,7 @@ impl FtsReader {
             doc_id_end,
             None,
             floor.next_down(),
+            None,
         )
     }
 
@@ -2246,6 +2264,7 @@ impl FtsReader {
         doc_id_end: u32,
         floor: f32,
         cache: Option<&FtsCursorCache>,
+        live: Option<&SharedFloor>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         debug_assert!(
             lists.negatives.is_empty() && lists.negative_phrases.is_empty(),
@@ -2295,6 +2314,7 @@ impl FtsReader {
                 floor_eff,
                 doc_id_start,
                 doc_id_end,
+                live,
             );
         }
         let ClauseLists { musts, shoulds, .. } = lists;
@@ -2327,6 +2347,7 @@ impl FtsReader {
                 doc_id_end,
                 None,
                 floor_eff,
+                live,
             );
         }
         let must_cursors = self
@@ -2344,6 +2365,7 @@ impl FtsReader {
                 floor_eff,
                 doc_id_start,
                 doc_id_end,
+                live,
             );
         }
         let should_cursors = self
@@ -2358,6 +2380,7 @@ impl FtsReader {
                 floor_eff,
                 doc_id_start,
                 doc_id_end,
+                live,
             );
         }
         self.run_must_should(
@@ -2369,6 +2392,7 @@ impl FtsReader {
             floor_eff,
             doc_id_start,
             doc_id_end,
+            live,
         )
     }
 
@@ -2929,7 +2953,7 @@ impl FtsReader {
         filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        self.run_max_score_bmm_range(column_id, cursors, k, 0, u32::MAX, filter, floor_eff)
+        self.run_max_score_bmm_range(column_id, cursors, k, 0, u32::MAX, filter, floor_eff, None)
     }
 
     /// Multi-term AND via leapfrog intersection over the skip table.
@@ -2963,6 +2987,7 @@ impl FtsReader {
         floor_eff: f32,
         doc_id_start: u32,
         doc_id_end: u32,
+        live: Option<&SharedFloor>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         if cursors.is_empty() || doc_id_start >= doc_id_end {
             return Ok(Vec::new());
@@ -2987,6 +3012,7 @@ impl FtsReader {
             k,
             filter,
             floor_eff,
+            live: LiveFloorProbe::new(live),
         };
         self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink, doc_id_end);
         Ok(drain_top_k_desc(heap))
@@ -3013,6 +3039,7 @@ impl FtsReader {
         floor_eff: f32,
         doc_id_start: u32,
         doc_id_end: u32,
+        live: Option<&SharedFloor>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         debug_assert!(
             !must_cursors.is_empty() && !should_cursors.is_empty(),
@@ -3041,6 +3068,7 @@ impl FtsReader {
             shoulds: should_cursors,
             should_ub,
             dl_norm_k1,
+            live: LiveFloorProbe::new(live),
         };
         self.and_flat_merge(&mut must_cursors, dl_norm_k1, &mut sink, doc_id_end);
         Ok(drain_top_k_desc(heap))
@@ -3408,6 +3436,7 @@ impl FtsReader {
     /// from looser pruning is bounded by the bookkeeping path (and
     /// in practice ~10–20% of single-thread serial), well below the
     /// 2× cores-doubled headroom.
+    #[allow(clippy::too_many_arguments)]
     fn run_max_score_bmm_range(
         &self,
         column_id: u32,
@@ -3417,6 +3446,7 @@ impl FtsReader {
         doc_id_end: u32,
         mut filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
+        live: Option<&SharedFloor>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = &col_meta.dl_norm_k1;
@@ -3480,7 +3510,22 @@ impl FtsReader {
         // essential cursors below.
         let total_term_ub = partial_max[0];
 
+        // Cross-unit live floor: the probe (stride-gated internally)
+        // publishes the local kth and pulls the global floor into
+        // `threshold`, re-deriving the essential boundary when it
+        // rises — so sub-range units prune against each other's
+        // progress mid-walk.
+        let live_probe = LiveFloorProbe::new(live);
+
         loop {
+            {
+                let kth = (heap.len() >= k).then(|| heap.peek().expect("heap len == k").0);
+                let pulled = live_probe.checkpoint(f32::NEG_INFINITY, kth);
+                if pulled > threshold {
+                    threshold = pulled;
+                    f_essential = recompute_f(&partial_max, threshold);
+                }
+            }
             // **f=1 block-batch fast path.** Once threshold rises
             // enough that only `cursors[0]` (highest term_max) is
             // essential, the candidate set is *exactly* `cursors[0]`'s
@@ -4755,20 +4800,22 @@ struct ScoreSink<'a> {
     k: usize,
     filter: Option<&'a mut ExcludeFilter>,
     floor_eff: f32,
+    /// Cross-unit live floor, probed from `bar()` (see
+    /// [`LiveFloorProbe`]); `floor_eff` never decreases, so raising
+    /// it from the probe is sound.
+    live: LiveFloorProbe<'a>,
 }
 
 impl AndSink for ScoreSink<'_> {
     fn bar(&self) -> f32 {
         // kth-best once the heap fills, else the caller's seeded floor —
-        // whichever is higher.
+        // whichever is higher. The live probe periodically publishes
+        // the local kth and pulls the global floor in.
         if self.heap.len() >= self.k {
-            self.heap
-                .peek()
-                .expect("heap len == k")
-                .0
-                .max(self.floor_eff)
+            let kth = self.heap.peek().expect("heap len == k").0;
+            kth.max(self.live.checkpoint(self.floor_eff, Some(kth)))
         } else {
-            self.floor_eff
+            self.live.checkpoint(self.floor_eff, None)
         }
     }
 
@@ -4778,9 +4825,56 @@ impl AndSink for ScoreSink<'_> {
 
     fn emit(&mut self, doc: u32, score: f32) {
         // Floor gate: strictly-below-floor docs are dead to the caller.
-        if score > self.floor_eff {
+        if score > self.floor_eff.max(self.live.current()) {
             and_heap_push(self.heap, self.k, self.filter.as_deref_mut(), score, doc);
         }
+    }
+}
+
+/// Periodic bridge between a kernel's local pruning bar and the
+/// wave's [`SharedFloor`]: every [`LIVE_FLOOR_STRIDE`] probes it
+/// publishes the unit's local kth-best (a valid global floor) and
+/// pulls the global floor in (`next_down`-adjusted so score ties
+/// survive exactly as with the seeded floor). With no live floor
+/// attached it is a no-op returning the seeded value.
+struct LiveFloorProbe<'a> {
+    live: Option<&'a SharedFloor>,
+    /// Highest `next_down`-adjusted global floor seen so far.
+    pulled: Cell<f32>,
+    calls: Cell<u32>,
+}
+
+impl<'a> LiveFloorProbe<'a> {
+    fn new(live: Option<&'a SharedFloor>) -> Self {
+        Self {
+            live,
+            pulled: Cell::new(f32::NEG_INFINITY),
+            calls: Cell::new(0),
+        }
+    }
+
+    /// The effective floor: `max(seeded, pulled)`, refreshing
+    /// `pulled` (and publishing `local_kth`) every stride-th call.
+    fn checkpoint(&self, seeded: f32, local_kth: Option<f32>) -> f32 {
+        if let Some(lf) = self.live {
+            let n = self.calls.get().wrapping_add(1);
+            self.calls.set(n);
+            if n & (LIVE_FLOOR_STRIDE - 1) == 0 {
+                if let Some(kth) = local_kth {
+                    lf.raise(kth);
+                }
+                let g = lf.get().next_down();
+                if g > self.pulled.get() {
+                    self.pulled.set(g);
+                }
+            }
+        }
+        seeded.max(self.pulled.get())
+    }
+
+    /// Last pulled floor without probing (for admission gates).
+    fn current(&self) -> f32 {
+        self.pulled.get()
     }
 }
 
@@ -4802,6 +4896,8 @@ struct MustShouldSink<'a> {
     /// Per-doc BM25 length normalization for the column, for scoring
     /// the should terms at emitted docs.
     dl_norm_k1: &'a NormTable,
+    /// Cross-unit live floor (see [`LiveFloorProbe`]).
+    live: LiveFloorProbe<'a>,
 }
 
 impl AndSink for MustShouldSink<'_> {
@@ -4812,13 +4908,10 @@ impl AndSink for MustShouldSink<'_> {
         // (kth-best − should_ub) can't produce a top-k doc even with
         // every should matching at its maximum.
         let full_bar = if self.heap.len() >= self.k {
-            self.heap
-                .peek()
-                .expect("heap len == k")
-                .0
-                .max(self.floor_eff)
+            let kth = self.heap.peek().expect("heap len == k").0;
+            kth.max(self.live.checkpoint(self.floor_eff, Some(kth)))
         } else {
-            self.floor_eff
+            self.live.checkpoint(self.floor_eff, None)
         };
         full_bar - self.should_ub
     }
@@ -4838,7 +4931,7 @@ impl AndSink for MustShouldSink<'_> {
         }
         // Floor gate on the FULL score — a must-only score below the
         // floor can still survive once its shoulds are added.
-        if score > self.floor_eff {
+        if score > self.floor_eff.max(self.live.current()) {
             and_heap_push(self.heap, self.k, self.filter.as_deref_mut(), score, doc);
         }
     }
@@ -5247,6 +5340,64 @@ struct BlockMeta {
 /// `current_doc_id() == u32::MAX` is the "exhausted" sentinel; the
 /// WAND loop drops cursors that are exhausted at the top of each
 /// iteration.
+/// A cross-unit live floor: the running global kth-best score,
+/// shared by every work unit of one query wave (all files, all
+/// sub-ranges) so a unit can prune against what the others have
+/// already proven mid-walk — not only at unit boundaries. Without
+/// this, sub-range units all start with an empty floor and each
+/// scores its whole slice; per-file waves used to get the benefit
+/// implicitly from thread-pool generations (later files started
+/// after earlier ones had merged), which one sliced shard never has.
+///
+/// Encoding: an f32 in monotone u32 order-key form so `fetch_max`
+/// is numerically correct across the sign bit (`NEG_INFINITY` until
+/// any unit has k hits). Publishing a unit's *local* kth-best is
+/// sound: k hits ≥ s in one unit put the global kth-best at ≥ s.
+pub(crate) struct SharedFloor(AtomicU32);
+
+impl SharedFloor {
+    pub(crate) fn new() -> Self {
+        Self(AtomicU32::new(f32_order_key(f32::NEG_INFINITY)))
+    }
+
+    /// Current floor (monotone non-decreasing).
+    pub(crate) fn get(&self) -> f32 {
+        f32_from_order_key(self.0.load(AtomicOrdering::Acquire))
+    }
+
+    /// Raise the floor to at least `kth` (no-op if already higher).
+    pub(crate) fn raise(&self, kth: f32) {
+        self.0.fetch_max(f32_order_key(kth), AtomicOrdering::AcqRel);
+    }
+}
+
+/// Order-preserving f32 → u32 key (IEEE-754 total order trick):
+/// negative floats flip all bits, non-negative set the sign bit, so
+/// unsigned comparison matches numeric comparison.
+fn f32_order_key(v: f32) -> u32 {
+    let b = v.to_bits();
+    if b & SIGN_BIT != 0 { !b } else { b | SIGN_BIT }
+}
+
+fn f32_from_order_key(k: u32) -> f32 {
+    if k & SIGN_BIT != 0 {
+        f32::from_bits(k & !SIGN_BIT)
+    } else {
+        f32::from_bits(!k)
+    }
+}
+
+/// IEEE-754 f32 sign bit, for the order-key mapping above.
+const SIGN_BIT: u32 = 0x8000_0000;
+
+/// Steps between a ranged kernel's live-floor checkpoints (power of
+/// two; checked via mask). Each checkpoint is one atomic read +
+/// (heap-full) one atomic `fetch_max`, so the stride keeps the
+/// synchronization cost far below the per-doc scoring work while
+/// still propagating floors across units within ~a block's worth of
+/// docs.
+const LIVE_FLOOR_STRIDE: u32 = 256;
+
 /// One fan-out wave's shared cursor prototypes for a single
 /// superfile. Keyed by `(column_id, joined term list)` — tokenized
 /// terms never contain NUL, so `\0` joins losslessly. Values are
@@ -6966,6 +7117,7 @@ mod tests {
                         end,
                         f32::NEG_INFINITY,
                         None,
+                        None,
                     )
                     .await
                     .expect("ranged walk"),
@@ -6994,6 +7146,7 @@ mod tests {
                         end,
                         f32::NEG_INFINITY,
                         Some(&cache),
+                        None,
                     )
                     .await
                     .expect("cached ranged walk"),
@@ -7090,6 +7243,7 @@ mod tests {
                         end,
                         f32::NEG_INFINITY,
                         None,
+                        None,
                     )
                     .await
                     .expect("ranged walk"),
@@ -7118,6 +7272,7 @@ mod tests {
                         end,
                         f32::NEG_INFINITY,
                         Some(&cache),
+                        None,
                     )
                     .await
                     .expect("cached ranged walk"),
