@@ -460,11 +460,14 @@ fn eligible_summary<'e>(
 /// With `admit` set (`(prefilter query, must-include cells)`), a 1-bit
 /// XOR+popcount pass first ranks tagged cells by their best estimated
 /// fine-centroid score and keeps the [`admit_shortlist_window`] top
-/// slice plus the caller's grid picks; the exact fp32 scan below then
-/// skips instances outside that set. Every *emitted* score is exact
-/// fp32, so routing and near-tie logic never see 1-bit noise — the
-/// estimates only bound which cells get exact-scored. Untagged
-/// (`cell_id: None`) summaries are always exact-scored.
+/// slice plus any caller force-includes; the exact fp32 scan below then
+/// skips instances outside that set. Unfiltered callers leave
+/// must-include empty (1-bit is the sole cell filter). Filtered callers
+/// may exact-score the cell grid first and pass the probe-cutoff picks
+/// as must-include so the wide filtered beam cannot lose cells to 1-bit
+/// noise. Every *emitted* score is exact fp32, so selection never sees
+/// 1-bit estimates; they only bound which cells get exact-scored.
+/// Untagged (`cell_id: None`) summaries are always exact-scored.
 fn score_fine_candidates(
     superfiles: &[Arc<SuperfileEntry>],
     column: &str,
@@ -553,47 +556,14 @@ fn score_fine_candidates(
     Ok((candidates, deferred))
 }
 
-/// Default-path cell selection, shared by the hidden (post-drain) and user
-/// (pre-drain) branches: probe the fine-ranked top cell, adding the grid's
-/// top cell only when its own fine score is a genuine near-tie of the fine
-/// winner (same relative window replica closure uses at drain time, so
-/// probing and replication agree on what counts as a boundary). At the
-/// shipped grid shapes (256/1024 cells) fine p1 coverage measures 1.000
-/// (drain-diag, 1M–100M), so a second unconditional pick only multiplies
-/// the probed-cell fan without recall to show for it.
-fn fine_first_cell_selection(fine_ranked: &[(u32, f32)], grid_top: Option<u32>) -> Vec<u32> {
-    let Some(&(fine_top, fine_top_score)) = fine_ranked.first() else {
-        return grid_top.into_iter().collect();
-    };
-    let mut cells = vec![fine_top];
-    if let Some(grid_top) = grid_top
-        && grid_top != fine_top
-    {
-        let tie_threshold =
-            relative_score_window(fine_top_score, REPLICA_CLOSURE_DISTANCE_RATIO - 1.0);
-        let grid_top_fine_score = fine_ranked
-            .iter()
-            .find(|(cell, _)| *cell == grid_top)
-            .map(|(_, score)| *score);
-        if grid_top_fine_score.is_some_and(|score| score <= tie_threshold) {
-            cells.push(grid_top);
-        }
-    }
-    cells
-}
-
 /// Union of the grid-ranked and fine-ranked cell selections, in probe
 /// priority order: grid picks first, then fine picks not already selected.
 ///
-/// The two rankings fail in opposite regimes, so probing their union holds
-/// the coverage floor at every measured scale. Small cells (100K/64c: ~1.5K
-/// rows, ~3 fine runs each) make fine centroids noisy — grid ranking wins
-/// (measured neighbor coverage 0.950 grid vs 0.700 fine). Large cells
-/// (10M/64c: ~230K rows, ~250 fine runs each) make the single grid centroid
-/// a poor proxy for the cell's extent — fine ranking wins (0.919 fine vs
-/// 0.629 grid; fine p2 = 0.997). Grid-only p=1 routing pinned 10M recall to
-/// the 0.63 ceiling; the union restores the better ranking at each scale for
-/// at most one extra probed cell per pick.
+/// Used only on the filtered path, which exact-scores the cell grid before
+/// admit and probes a wide cell set — the two rankings fail in opposite
+/// regimes, so their union holds the coverage floor. Unfiltered search
+/// stays fine-first after the global 1-bit admit and never builds this
+/// union.
 fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
     let mut selected: Vec<u32> = Vec::with_capacity(grid.len() + fine.len());
     for &cell in grid.iter().chain(fine) {
@@ -602,6 +572,37 @@ fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
         }
     }
     selected
+}
+
+/// Default-path (unfiltered) cell selection, shared by the hidden
+/// (post-drain) and user (pre-drain) branches: probe the fine-ranked top
+/// cell, optionally adding `tie_cell` when its fine score is a genuine
+/// near-tie of the fine winner (same relative window replica closure
+/// uses at drain time). `tie_cell` is the fine runner-up after the
+/// global 1-bit admit — unfiltered search does not exact-score cell
+/// centroids before that filter. At the shipped grid shapes (256/1024
+/// cells) fine p1 coverage measures 1.000 (drain-diag, 1M–100M), so a
+/// second unconditional pick only multiplies the probed-cell fan without
+/// recall to show for it.
+fn fine_first_cell_selection(fine_ranked: &[(u32, f32)], tie_cell: Option<u32>) -> Vec<u32> {
+    let Some(&(fine_top, fine_top_score)) = fine_ranked.first() else {
+        return tie_cell.into_iter().collect();
+    };
+    let mut cells = vec![fine_top];
+    if let Some(tie_cell) = tie_cell
+        && tie_cell != fine_top
+    {
+        let tie_threshold =
+            relative_score_window(fine_top_score, REPLICA_CLOSURE_DISTANCE_RATIO - 1.0);
+        let tie_fine_score = fine_ranked
+            .iter()
+            .find(|(cell, _)| *cell == tie_cell)
+            .map(|(_, score)| *score);
+        if tie_fine_score.is_some_and(|score| score <= tie_threshold) {
+            cells.push(tie_cell);
+        }
+    }
+    cells
 }
 
 /// Map a per-superfile vector-search error to a query error. A budget refusal
@@ -1248,40 +1249,22 @@ impl SupertableReader {
             .map(|vc| (vc.metric, vc.rot_seed))
             .ok_or_else(|| QueryError::Execute(format!("unknown vector column `{column}`")))?;
 
-        // Borrow grids only. Cloning `GlobalVectorIndex` / `ClusterCentroids`
-        // on this path cleared the lazily-built transposed cache every query
-        // and rebuilt it with the scalar `transpose_centroids_cluster_major`
-        // loop (~ms at dim=1024) before any SIMD scoring ran.
-        let grid = manifest
-            .global_vector_index()
-            .filter(|g| g.column == column)
-            // Route on the same grid commit packing stamped cell tags from:
-            // the finer user grid when trained, else the drain grid. (Hidden
-            // manifests carry no `global_vector_index` and take the
-            // `VectorCell` branch below.)
-            .map(|g| g.user_grid())
-            .filter(|grid| grid.n_cent > 0 && grid.dim as usize == query.len())
-            .or_else(|| {
-                manifest
-                    .vector_cell_clusters(column)
-                    .filter(|clusters| clusters.n_cent > 0 && clusters.dim as usize == query.len())
-            });
-        // Admit: rank the coarse grid, score every fine IVF centroid in
-        // eligible summaries, then fine/grid cell selection + per-fragment
-        // gate. Phase timers (INFINO_TRACE_VECTOR_WARM_PHASES): admit covers
+        // Admit:
+        //   * Unfiltered — global fine 1-bit first, exact-score fines only
+        //     on that shortlist, then fine-first cell selection. No exact
+        //     cell-centroid scan (the 1-bit stage replaces it).
+        //   * Filtered — pay the O(k) exact cell-centroid scan; those
+        //     probe-cutoff picks are must-include so 1-bit cannot drop
+        //     cells the wide filtered probe needs. Matching neighbors sit
+        //     deeper than unfiltered top cells (~rank k/selectivity).
+        // Phase timers (INFINO_TRACE_VECTOR_WARM_PHASES): admit covers
         // that work; fanout_wall is probe+rerank+remap wall.
         let admit_t0 = io_counters::phase_start();
-        let ranked_cells_scored: Option<Vec<(u32, f32)>> =
-            grid.map(|grid| grid.rank_cells(metric, query));
-        let ranked_cells: Option<Vec<u32>> = ranked_cells_scored
-            .as_ref()
-            .map(|cells| cells.iter().map(|(cell, _)| *cell).collect());
 
-        // Cell cutoff shared by the hidden and user branches: probe the
-        // `nprobe_min` nearest cells under GRID ranking, widening toward
-        // `nprobe_max` while a cell's score stays within the slack threshold
-        // of the nearest cell.
-        let grid_cell_cutoff = |ranked: &[(u32, f32)], routing: &CellRoutingParams| -> usize {
+        // Probe-width cutoff over a scored cell ranking: `nprobe_min`
+        // nearest, widening toward `nprobe_max` while a cell's score stays
+        // within the slack threshold of the nearest.
+        let cell_probe_cutoff = |ranked: &[(u32, f32)], routing: &CellRoutingParams| -> usize {
             if ranked.is_empty() {
                 return 0;
             }
@@ -1309,7 +1292,7 @@ impl SupertableReader {
         // Assigned in both admit arms; used below for the posting-aware
         // budget expand (keep scoring until we cover ≥ k postings).
         let candidate_counts: HashMap<(usize, u32), u64>;
-        if let (Some(ranked_scored), true) = (&ranked_cells_scored, any_tagged) {
+        if any_tagged {
             let cell_routing = if hidden_vector_index {
                 let base = hidden_routing.expect("hidden manifest carries routing");
                 if filtered && options.nprobe.is_some() {
@@ -1358,38 +1341,46 @@ impl SupertableReader {
             } else {
                 CellRoutingParams::default()
             };
-            let ranked_for_beam: Vec<(u32, f32)> = ranked_scored
-                .iter()
-                .filter(|(cell, _)| postings_by_cell.contains_key(cell))
-                .copied()
-                .collect();
-            if ranked_for_beam.is_empty() {
-                return Err(QueryError::Execute(
-                    "vector candidates name no cell present in the grid — \
-                     malformed cell tags"
-                        .into(),
-                ));
-            }
-            let cutoff = grid_cell_cutoff(&ranked_for_beam, &cell_routing);
-            // 1-bit prefilter for the exact fine scan: the grid's cutoff
-            // picks are must-include so every cell the beam can select has
-            // exact candidate scores (near-tie checks included). Filtered
-            // queries use the same prefilter — same code, same budgets;
-            // the allow-set only decides which rows may take shortlist
-            // slots inside the probed runs.
+            // Filtered: exact-score the resident cell grid (user grid on
+            // the global index, else VectorCell clusters). Unfiltered
+            // skips this scan — 1-bit admit ranks cells instead.
+            let grid_ranked: Option<Vec<(u32, f32)>> = if filtered {
+                let grid = manifest
+                    .global_vector_index()
+                    .map(|g| g.user_grid())
+                    .filter(|grid| grid.n_cent > 0 && grid.dim as usize == query.len())
+                    .or_else(|| {
+                        manifest.vector_cell_clusters(column).filter(|clusters| {
+                            clusters.n_cent > 0 && clusters.dim as usize == query.len()
+                        })
+                    });
+                grid.map(|grid| {
+                    grid.rank_cells(metric, query)
+                        .into_iter()
+                        .filter(|(cell, _)| postings_by_cell.contains_key(cell))
+                        .collect()
+                })
+            } else {
+                None
+            };
             let admit_q = RabitqAdmitQuery::new(query.len(), rot_seed, query);
-            let must_include: Vec<u32> = ranked_for_beam[..cutoff]
-                .iter()
-                .map(|(cell, _)| *cell)
-                .collect();
-            let (mut candidates, deferred) = score_fine_candidates(
-                &superfiles,
-                column,
-                query,
-                metric,
-                Some((&admit_q, must_include.as_slice())),
-                allow_ref,
-            )?;
+            let filtered_must_include: Vec<u32> = match &grid_ranked {
+                Some(ranked) if !ranked.is_empty() => {
+                    let cutoff = cell_probe_cutoff(ranked, &cell_routing);
+                    ranked[..cutoff].iter().map(|(cell, _)| *cell).collect()
+                }
+                _ => Vec::new(),
+            };
+            // Filtered with a grid: 1-bit + must-include the cell-scan
+            // cutoff. Filtered without a grid: exact-score every fine
+            // (no admit). Unfiltered: 1-bit with empty must-include.
+            let admit = if filtered && grid_ranked.is_none() {
+                None
+            } else {
+                Some((&admit_q, filtered_must_include.as_slice()))
+            };
+            let (mut candidates, deferred) =
+                score_fine_candidates(&superfiles, column, query, metric, admit, allow_ref)?;
             if !deferred.is_empty() {
                 self.rescore_deferred_cells(
                     &superfiles,
@@ -1405,31 +1396,45 @@ impl SupertableReader {
                 .iter()
                 .map(|(si, cluster, _, _, count)| ((*si, *cluster), *count))
                 .collect();
-            let ranked = ranked_cells
-                .as_ref()
-                .expect("ranked cell ids exist with scored ranking");
+            let fine_ranked = cells_ranked_by_fine_score(&candidates);
+            let fine_for_beam: Vec<(u32, f32)> = fine_ranked
+                .iter()
+                .filter(|(cell, _)| postings_by_cell.contains_key(cell))
+                .copied()
+                .collect();
+            if fine_for_beam.is_empty() {
+                return Err(QueryError::Execute(
+                    "vector candidates name no cell present in the grid — \
+                     malformed cell tags"
+                        .into(),
+                ));
+            }
+            // Unfiltered default: fine-first p=1. Filtered (and explicit
+            // nprobe): grid∪fine over the probe cutoff — the cell scan
+            // paid above supplies the grid half.
+            let default_p1 = !filtered && options.nprobe.is_none();
+            let fine_cutoff = cell_probe_cutoff(&fine_for_beam, &cell_routing);
+            let tie_cell = fine_for_beam.get(1).map(|(cell, _)| *cell);
             if hidden_vector_index {
-                let fine_ranked = cells_ranked_by_fine_score(&candidates);
-                // Default path: fine-first p=1, the same selection the user
-                // (pre-drain) branch ships. Filtered search and explicit
-                // caller nprobe keep the wider grid/fine union.
-                let default_p1 = !filtered && options.nprobe.is_none() && cutoff == 1;
-                let selected_cells_ordered: Vec<u32> = if default_p1 {
-                    fine_first_cell_selection(
-                        &fine_ranked,
-                        ranked_for_beam.first().map(|(cell, _)| *cell),
-                    )
-                } else {
-                    let grid_cells: Vec<u32> = ranked_for_beam[..cutoff]
+                let selected_cells_ordered: Vec<u32> = if default_p1 && fine_cutoff == 1 {
+                    fine_first_cell_selection(&fine_for_beam, tie_cell)
+                } else if let Some(grid_ranked) = &grid_ranked {
+                    let grid_cutoff = cell_probe_cutoff(grid_ranked, &cell_routing);
+                    let grid_cells: Vec<u32> = grid_ranked[..grid_cutoff]
                         .iter()
                         .map(|(cell, _)| *cell)
                         .collect();
-                    let fine_cells: Vec<u32> = fine_ranked
-                        .iter()
-                        .take(cutoff.max(UNION_FINE_PICKS_MIN))
-                        .map(|(cell, _)| *cell)
-                        .collect();
+                    let n = grid_cutoff
+                        .max(UNION_FINE_PICKS_MIN)
+                        .min(fine_for_beam.len());
+                    let fine_cells: Vec<u32> =
+                        fine_for_beam[..n].iter().map(|(cell, _)| *cell).collect();
                     union_cell_selection(&grid_cells, &fine_cells)
+                } else {
+                    let n = fine_cutoff
+                        .max(UNION_FINE_PICKS_MIN)
+                        .min(fine_for_beam.len());
+                    fine_for_beam[..n].iter().map(|(cell, _)| *cell).collect()
                 };
                 let selected_cells: HashSet<u32> = selected_cells_ordered.iter().copied().collect();
                 gated = gate_fine_candidates_by_fragment(
@@ -1443,26 +1448,38 @@ impl SupertableReader {
                     Some(&birth_versions),
                 );
             } else {
-                // Fine-first p=1 over all scored fines. Explicit nprobe /
-                // filtered search keep the grid/fine union.
-                let fine_ranked = cells_ranked_by_fine_score(&candidates);
-                let default_p1 = !filtered && options.nprobe.is_none() && cutoff == 1;
-                let mut selected_cells: Vec<u32> = if default_p1 && !fine_ranked.is_empty() {
-                    fine_first_cell_selection(&fine_ranked, ranked.first().copied())
-                } else {
-                    let grid_cells: Vec<u32> = ranked[..cutoff].to_vec();
-                    let fine_cells: Vec<u32> = fine_ranked
-                        .iter()
-                        .take(cutoff)
-                        .map(|(cell, _)| *cell)
-                        .collect();
-                    union_cell_selection(&grid_cells, &fine_cells)
-                };
+                let mut selected_cells: Vec<u32> =
+                    if default_p1 && fine_cutoff == 1 && !fine_for_beam.is_empty() {
+                        fine_first_cell_selection(&fine_for_beam, tie_cell)
+                    } else if let Some(grid_ranked) = &grid_ranked {
+                        let grid_cutoff = cell_probe_cutoff(grid_ranked, &cell_routing);
+                        let grid_cells: Vec<u32> = grid_ranked[..grid_cutoff]
+                            .iter()
+                            .map(|(cell, _)| *cell)
+                            .collect();
+                        let fine_cells: Vec<u32> = fine_for_beam
+                            [..fine_cutoff.min(fine_for_beam.len())]
+                            .iter()
+                            .map(|(cell, _)| *cell)
+                            .collect();
+                        union_cell_selection(&grid_cells, &fine_cells)
+                    } else {
+                        fine_for_beam[..fine_cutoff]
+                            .iter()
+                            .map(|(cell, _)| *cell)
+                            .collect()
+                    };
+                let expand_order: Vec<u32> = grid_ranked
+                    .as_ref()
+                    .map(|ranked| ranked.iter().map(|(cell, _)| *cell).collect())
+                    .unwrap_or_else(|| fine_for_beam.iter().map(|(cell, _)| *cell).collect());
                 let mut covered: u64 = selected_cells
                     .iter()
                     .map(|cell| postings_by_cell.get(cell).copied().unwrap_or(0))
                     .sum();
-                for cell in ranked.iter().copied() {
+                // Expand toward the gated posting target in grid-rank
+                // order when filtered paid for a cell scan; else fine-rank.
+                for cell in expand_order {
                     if covered >= gated_target {
                         break;
                     }
@@ -1485,10 +1502,10 @@ impl SupertableReader {
                 );
             }
         } else {
-            // No grid, or untagged summaries: score every fine centroid
-            // (legacy flat path, no prefilter). Stripped summaries defer to
-            // the exact rescore — untagged legacy tables have no per-cell
-            // gating to absorb estimate noise.
+            // Untagged summaries: score every fine centroid (legacy flat
+            // path, no prefilter). Stripped summaries defer to the exact
+            // rescore — untagged legacy tables have no per-cell gating to
+            // absorb estimate noise.
             let (mut candidates, deferred) =
                 score_fine_candidates(&superfiles, column, query, metric, None, allow_ref)?;
             if !deferred.is_empty() {
@@ -2866,6 +2883,17 @@ mod tests {
         assert_eq!(admit_shortlist_window(241), 49);
     }
 
+    /// Union keeps grid picks first (probe priority), appends fine picks
+    /// not already selected, and collapses to one cell when both rankings
+    /// agree. Filtered search uses this after the exact cell scan.
+    #[test]
+    fn union_cell_selection_dedups_with_grid_priority() {
+        assert_eq!(union_cell_selection(&[4], &[9]), vec![4, 9]);
+        assert_eq!(union_cell_selection(&[4], &[4]), vec![4]);
+        assert_eq!(union_cell_selection(&[4, 9], &[9, 1]), vec![4, 9, 1]);
+        assert_eq!(union_cell_selection(&[], &[2]), vec![2]);
+    }
+
     #[test]
     fn cells_ranked_by_fine_score_takes_min_per_cell_in_order() {
         let candidates: Vec<(usize, u32, f32, Option<u32>, u64)> = vec![
@@ -2880,17 +2908,6 @@ mod tests {
         assert_eq!(ranked[0], (7, 0.2));
         assert_eq!(ranked[1].0, 2, "score tie broken by lower cell id");
         assert_eq!(ranked[2].0, 3);
-    }
-
-    /// Union keeps grid picks first (probe priority), appends fine picks
-    /// not already selected, and collapses to one cell when both rankings
-    /// agree.
-    #[test]
-    fn union_cell_selection_dedups_with_grid_priority() {
-        assert_eq!(union_cell_selection(&[4], &[9]), vec![4, 9]);
-        assert_eq!(union_cell_selection(&[4], &[4]), vec![4]);
-        assert_eq!(union_cell_selection(&[4, 9], &[9, 1]), vec![4, 9, 1]);
-        assert_eq!(union_cell_selection(&[], &[2]), vec![2]);
     }
 
     /// The inline stable-id fast path: hits carrying `stable_id` are resolved
