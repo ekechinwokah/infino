@@ -90,8 +90,8 @@ use super::{
     error::BuildError,
     handle::{GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, Supertable, SupertableInner},
     manifest::{
-        CellVectorSummary, FtsSummaryAgg, ManifestSnapshot, ScalarStatsAgg, SubsectionOffsets,
-        SuperfileEntry, SuperfileUri, VectorSummary,
+        CellVectorSummary, FtsSummaryAgg, ManifestSnapshot, RoutingRef, ScalarStatsAgg,
+        SubsectionOffsets, SuperfileEntry, SuperfileUri, VectorSummary,
         bloom::BloomBuilder,
         partition::{PartitionKey, encode_partition_key},
     },
@@ -101,6 +101,7 @@ use super::{
     },
     opann,
     options::{DECIMAL128_PRECISION, DECIMAL128_SCALE, SupertableOptions},
+    slow_fts_state::{self, FileBlockMax, SlowFtsState},
     utils::vector_split::split_vectors,
     wal::{
         WalStore,
@@ -1593,6 +1594,7 @@ impl SupertableWriter {
             partition_strategy: None,
             global_vector_index: pending_gvi.clone(),
             drained_ranges: None,
+            slow_fts_state: None,
         };
 
         // Vector commit: same row-shard fanout as the legacy path. Each writer
@@ -3053,6 +3055,10 @@ struct TextDrainOutcome {
     removed_entries: Vec<Arc<SuperfileEntry>>,
     pending_cache_inserts: Vec<(SuperfileUri, Bytes)>,
     pending_store_inserts: Vec<(SuperfileUri, Bytes)>,
+    /// Resident block-max routing rows for this epoch's shards; the
+    /// caller publishes them as the slow-CAS FTS blob and stamps the
+    /// ref in the same commit.
+    fts_state: SlowFtsState,
 }
 
 /// Build this epoch's hidden **text superfiles**: term-range shards of
@@ -3303,6 +3309,7 @@ async fn drain_fts_text_shards(
             removed_entries,
             pending_cache_inserts: Vec::new(),
             pending_store_inserts: Vec::new(),
+            fts_state: SlowFtsState::default(),
         }));
     }
     let (final_path, _) = intermediate.expect("n_docs_merged > 0 implies a merge ran");
@@ -3350,6 +3357,7 @@ async fn drain_fts_text_shards(
     let scalar_schema = hidden_inner.options.scalar_schema();
     let id_column = hidden_inner.options.id_column.clone();
     let mut prepared: Vec<PreparedSuperfile> = Vec::with_capacity(bounds.len());
+    let mut fts_state_files: Vec<FileBlockMax> = Vec::with_capacity(bounds.len());
     for (shard_id, (b_lo, b_hi)) in bounds.iter().enumerate() {
         let blob_path = scratch.join(format!("fts_text_shard_{shard_id}.blob"));
         let mut blob_file = BufWriter::new(
@@ -3438,6 +3446,7 @@ async fn drain_fts_text_shards(
         let bytes = mmap_readonly_bytes(output.path())
             .map_err(|error| BuildError::Store(format!("text shard mmap: {error}")))?;
         let _ = fs::remove_file(&blob_path);
+        let shard_bytes = bytes.clone();
 
         let shard = ShardOutput {
             bytes,
@@ -3456,6 +3465,23 @@ async fn drain_fts_text_shards(
             partition_key: encode_partition_key(&PartitionKey::TermShard(shard_id as u32)),
             ..(*entry).clone()
         });
+        // Resident block-max routing rows for this shard: every heavy
+        // term's ceil-quantized per-block bounds (the FTS admit slab).
+        {
+            let shard_reader = SuperfileReader::open(shard_bytes)
+                .map_err(|e| BuildError::Store(format!("text shard reopen: {e}")))?;
+            let fts = shard_reader
+                .fts()
+                .ok_or_else(|| BuildError::Store("text shard missing FTS blob".into()))?;
+            let rows = slow_fts_state::build_file_block_max(
+                entry.superfile_id,
+                fts,
+                slow_fts_state::BLOCK_MAX_DF_FLOOR,
+            )
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+            fts_state_files.push(rows);
+        }
         prepared.push(PreparedSuperfile {
             entry,
             bytes_for_store: p.bytes_for_store,
@@ -3501,11 +3527,15 @@ async fn drain_fts_text_shards(
         removed_entries.len(),
         text_t0.elapsed().as_secs_f64() * 1e3,
     );
+    fts_state_files.sort_unstable_by_key(|f| f.superfile_id);
     Ok(Some(TextDrainOutcome {
         new_entries: publish.new_entries,
         removed_entries,
         pending_cache_inserts: publish.pending_cache_inserts,
         pending_store_inserts: publish.pending_store_inserts,
+        fts_state: SlowFtsState {
+            files: fts_state_files,
+        },
     }))
 }
 
@@ -3576,6 +3606,14 @@ async fn drain_fts_only(
     .await?
     .expect("fts columns checked by the caller");
 
+    let text_routing = match outcome.fts_state.files.is_empty() {
+        true => None,
+        false => Some(
+            slow_fts_state::write_state(storage.as_ref(), &outcome.fts_state)
+                .await
+                .map_err(|e| BuildError::Store(e.to_string()))?,
+        ),
+    };
     let mut new_drained = drained;
     let drained_max = sources
         .iter()
@@ -3588,6 +3626,7 @@ async fn drain_fts_only(
         partition_strategy: None,
         drained_ranges: Some(new_drained),
         global_vector_index: None,
+        slow_fts_state: text_routing,
     };
     let new_manifest = persist_commit_async(
         hidden_inner,
@@ -4497,15 +4536,30 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             budget,
         )
         .await?;
-        let (text_entries, text_removals, text_cache_inserts, text_store_inserts) =
+        let (text_entries, text_removals, text_cache_inserts, text_store_inserts, text_routing) =
             match text_outcome {
-                Some(t) => (
-                    t.new_entries,
-                    t.removed_entries,
-                    t.pending_cache_inserts,
-                    t.pending_store_inserts,
-                ),
-                None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+                Some(t) => {
+                    // Publish the routing blob BEFORE the commit
+                    // (content-addressed: orphan-safe if the commit
+                    // loses the race) and stamp its ref in the same
+                    // OCC attempt as the shards it describes.
+                    let routing = match t.fts_state.files.is_empty() {
+                        true => None,
+                        false => Some(
+                            slow_fts_state::write_state(storage.as_ref(), &t.fts_state)
+                                .await
+                                .map_err(|e| BuildError::Store(e.to_string()))?,
+                        ),
+                    };
+                    (
+                        t.new_entries,
+                        t.removed_entries,
+                        t.pending_cache_inserts,
+                        t.pending_store_inserts,
+                        routing,
+                    )
+                }
+                None => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), None),
             };
         new_entries.extend(text_entries);
 
@@ -4544,6 +4598,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             }),
             drained_ranges: Some(new_drained),
             global_vector_index: None,
+            slow_fts_state: text_routing,
         };
         // The only removals a drain commit carries are the previous
         // epoch's text shards, replaced wholesale by this epoch's.
@@ -6040,6 +6095,7 @@ pub(in crate::supertable) async fn split_overflow_cell(
         }),
         drained_ranges: None,
         global_vector_index: None,
+        slow_fts_state: None,
     };
 
     let new_manifest = persist_commit_async(
@@ -6400,6 +6456,10 @@ pub(crate) struct CommitListMetadata {
     pub(crate) partition_strategy: Option<PartitionStrategy>,
     pub(crate) global_vector_index: Option<GlobalVectorIndex>,
     pub(crate) drained_ranges: Option<DrainedVersionRanges>,
+    /// The FTS block-max routing blob describing this commit's text
+    /// shards — stamped in the same OCC attempt so routing state and
+    /// membership publish together (the slow-vector rule).
+    pub(crate) slow_fts_state: Option<RoutingRef>,
 }
 
 impl CommitListMetadata {
@@ -6411,6 +6471,7 @@ impl CommitListMetadata {
         self.partition_strategy.is_none()
             && self.global_vector_index.is_none()
             && self.drained_ranges.is_none()
+            && self.slow_fts_state.is_none()
     }
 
     /// Overlay stamped fields onto `base`. `ManifestSnapshot` is not
@@ -6426,6 +6487,9 @@ impl CommitListMetadata {
         }
         if let Some(ranges) = self.drained_ranges.clone() {
             out = out.with_drained_ranges(ranges);
+        }
+        if let Some(state) = self.slow_fts_state.clone() {
+            out = out.with_slow_fts_state_ref(state);
         }
         out
     }

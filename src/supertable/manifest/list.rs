@@ -152,6 +152,13 @@ pub struct Manifest {
     /// Stamped and cleared together with the full ref; absent on older
     /// manifests (consumers fall back to per-superfile centroid reads).
     pub slow_vector_state_centroids: Option<RoutingRef>,
+    /// FTS routing sibling: the hidden table's resident block-max
+    /// state — per text superfile, each heavy term's 1-byte-quantized
+    /// per-block max-impact (the FTS analog of the 1-bit admit slab).
+    /// Stamped by the drain alongside the text shards; republished by
+    /// maintenance; absent on user manifests and pre-text epochs
+    /// (consumers fall back to whole-term posting fetches).
+    pub slow_fts_state: Option<RoutingRef>,
     /// Entries — one per manifest part referenced by this
     /// list. Ordered by insertion order (commit order); the
     /// list-level pruner walks them in order.
@@ -1065,6 +1072,10 @@ struct ManifestDto {
     slow_vector_state_centroids_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     slow_vector_state_centroids_content_hash: Option<String>, // "blake3:<64hex>"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slow_fts_state_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slow_fts_state_content_hash: Option<String>, // "blake3:<64hex>"
     partition_strategy: PartitionStrategyDto,
     #[serde(default)]
     global_vector_index: Option<GlobalVectorIndexDto>,
@@ -1602,6 +1613,11 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
             .slow_vector_state_centroids
             .as_ref()
             .map(|r| encode_hash(&r.content_hash)),
+        slow_fts_state_uri: l.slow_fts_state.as_ref().map(|r| r.uri.clone()),
+        slow_fts_state_content_hash: l
+            .slow_fts_state
+            .as_ref()
+            .map(|r| encode_hash(&r.content_hash)),
         parts,
         tombstone_seqs: l
             .tombstone_seqs
@@ -1695,6 +1711,16 @@ fn list_from_dto(d: ManifestDto) -> Result<Manifest, ListParseError> {
         slow_vector_state_centroids: match (
             d.slow_vector_state_centroids_uri,
             d.slow_vector_state_centroids_content_hash.as_deref(),
+        ) {
+            (Some(uri), Some(hash)) => Some(RoutingRef {
+                uri,
+                content_hash: decode_hash(hash)?,
+            }),
+            _ => None,
+        },
+        slow_fts_state: match (
+            d.slow_fts_state_uri,
+            d.slow_fts_state_content_hash.as_deref(),
         ) {
             (Some(uri), Some(hash)) => Some(RoutingRef {
                 uri,
@@ -2299,6 +2325,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![],
         }
     }

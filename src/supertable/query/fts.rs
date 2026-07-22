@@ -109,6 +109,7 @@ use crate::{
             vector::user_placement_for_scalar_resolve,
         },
         reader_cache::disk::ForegroundQueryGuard,
+        slow_fts_state::SlowFtsState,
         tombstones::SidecarCache,
     },
 };
@@ -237,6 +238,9 @@ struct HiddenTextRoute {
     /// Reader whose store/options open the hidden table's superfiles.
     hidden_reader: SupertableReader,
     hidden_manifest: Arc<ManifestSnapshot>,
+    /// Resident block-max routing (the FTS admit slab), when the
+    /// epoch's generation is stamped and readable.
+    fts_routing: Option<Arc<SlowFtsState>>,
     /// Stable ids deleted since the text epoch (sorted); hits are
     /// identity-filtered against it after the waves merge.
     deleted: Arc<Vec<i128>>,
@@ -271,6 +275,7 @@ async fn bm25_fanout_wave(
     k: usize,
     has_phrases: bool,
     shared: Arc<SharedTopK>,
+    routing: Option<Arc<SlowFtsState>>,
 ) -> Result<Vec<SuperfileHit>, QueryError> {
     if kept.is_empty() {
         return Ok(Vec::new());
@@ -309,6 +314,8 @@ async fn bm25_fanout_wave(
 
     let tombstones = ctx.tombstone_cache.clone();
     let now = Instant::now();
+    let has_phrases_kernel =
+        !must_ph_arc.is_empty() || !should_ph_arc.is_empty() || !neg_ph_arc.is_empty();
 
     // One shared fan-out (`query::dispatch::fanout`) — the same
     // orchestrator the vector path uses. It warms the tombstone
@@ -327,6 +334,7 @@ async fn bm25_fanout_wave(
         let neg_ph_arc = Arc::clone(&neg_ph_arc);
         let shared = Arc::clone(&shared);
         let tombstones = tombstones.clone();
+        let routing = routing.clone();
         async move {
             // A cross-file floor can suppress score-tied single-term hits
             // according to task completion order. Local BMW still prunes
@@ -338,6 +346,43 @@ async fn bm25_fanout_wave(
             } else {
                 shared.floor()
             };
+            // Resident-routed block selection: a single bare term with
+            // a resident admit row visits blocks best-first by bound
+            // and fetches exactly those (the FTS cell-read analog).
+            // Everything else keeps the whole-term kernels.
+            if range.is_none()
+                && n_terms == 1
+                && !has_phrases_kernel
+                && neg_arc.is_empty()
+                && let Some(state) = routing.as_ref()
+            {
+                let term = must_arc.first().or_else(|| should_arc.first());
+                if let Some(term) = term
+                    && let Some(row) = state.term_block_max(suid, &column_arc, term)
+                {
+                    let hits = r
+                        .bm25_single_term_block_selected(
+                            &column_arc,
+                            k,
+                            floor,
+                            row.metadata_offset,
+                            &row.quantized,
+                            row.scale,
+                        )
+                        .await
+                        .map_err(fts_read_error)?;
+                    match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
+                        Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
+                            hits.iter()
+                                .filter(|(d, _)| !bitmap.contains(*d))
+                                .map(|(_, s)| *s),
+                        ),
+                        Some(Err(_)) => {}
+                        _ => shared.merge(hits.iter().map(|(_, s)| *s)),
+                    }
+                    return Ok(hits);
+                }
+            }
             let hits = match range {
                 // Ranged units exist only for pure multi-should
                 // queries (`fanout_for` never slices when a must
@@ -687,9 +732,11 @@ impl SupertableReader {
             .hidden_deleted_ids()
             .map_err(|error| QueryError::Execute(error.to_string()))?;
         let drained = hidden_manifest.get_drained_ranges();
+        let fts_routing = hidden_reader.slow_fts_state_resident().await;
         Ok(Some(HiddenTextRoute {
             hidden_reader,
             hidden_manifest,
+            fts_routing,
             deleted,
             drained,
         }))
@@ -877,6 +924,7 @@ impl SupertableReader {
                 k_fetch,
                 has_phrases,
                 Arc::clone(&shared),
+                route.fts_routing.clone(),
             );
             let tail_wave = bm25_fanout_wave(
                 self,
@@ -886,6 +934,7 @@ impl SupertableReader {
                 k_fetch,
                 has_phrases,
                 Arc::clone(&shared),
+                None,
             );
             let (text_hits, tail_hits) = join!(text_wave, tail_wave);
             let mut combined = top_k_descending(vec![text_hits?, tail_hits?], k_fetch);
@@ -904,7 +953,17 @@ impl SupertableReader {
         }
         let shared = SharedTopK::new(k);
 
-        bm25_fanout_wave(self, kept, column_arc, clauses, k, has_phrases, shared).await
+        bm25_fanout_wave(
+            self,
+            kept,
+            column_arc,
+            clauses,
+            k,
+            has_phrases,
+            shared,
+            None,
+        )
+        .await
     }
 
     /// Prefix-expanded BM25 search across the pinned manifest's

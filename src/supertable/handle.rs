@@ -34,6 +34,7 @@ use super::{
     hidden_deleted::{self, HiddenDeletedError},
     manifest::{ManifestSnapshot, list::CellRoutingParams},
     options::SupertableOptions,
+    slow_fts_state::{self, SlowFtsState},
 };
 use crate::{
     config,
@@ -185,6 +186,10 @@ pub(super) struct SupertableInner {
     /// top: decode the inline bytes once per manifest version, not once per
     /// query. Keyed by `manifest_id`, which bumps on every deleted-id stamp.
     pub(super) hidden_deleted_cache: Mutex<Option<(u64, Arc<Vec<i128>>)>>,
+    /// Hydrated FTS block-max routing state, keyed by its blob URI —
+    /// one fetch per published generation (see
+    /// [`crate::supertable::slow_fts_state`]).
+    pub(super) slow_fts_state_cache: Mutex<Option<(String, Arc<SlowFtsState>)>>,
 }
 
 impl SupertableInner {
@@ -1343,6 +1348,7 @@ async fn build_handle(
         last_pointer_check: Mutex::new(None),
         last_pointer_etag: Mutex::new(None),
         hidden_deleted_cache: Mutex::new(None),
+        slow_fts_state_cache: Mutex::new(None),
         sql_schemas: OnceLock::new(),
     });
     install_disk_cache_pinning(&inner);
@@ -1746,6 +1752,46 @@ impl SupertableReader {
             .lock()
             .expect("hidden deleted-set cache mutex poisoned") = Some((version, Arc::clone(&ids)));
         Ok(ids)
+    }
+
+    /// The hydrated FTS block-max routing state for this snapshot's
+    /// stamped generation, or `None` when absent / unreadable —
+    /// consumers fall back to whole-term posting fetches (the state is
+    /// a pure accelerator; see [`crate::supertable::slow_fts_state`]).
+    /// One storage fetch per generation, cached by blob URI.
+    pub(crate) async fn slow_fts_state_resident(&self) -> Option<Arc<SlowFtsState>> {
+        let reference = self.manifest.slow_fts_state_blob()?.clone();
+        {
+            let cache = self
+                .inner
+                .slow_fts_state_cache
+                .lock()
+                .expect("slow_fts_state_cache mutex poisoned");
+            if let Some((uri, state)) = cache.as_ref()
+                && *uri == reference.uri
+            {
+                return Some(Arc::clone(state));
+            }
+        }
+        let storage = self.manifest.options.storage.as_ref()?;
+        match slow_fts_state::fetch_state(storage.as_ref(), &reference).await {
+            Ok(state) => {
+                let mut cache = self
+                    .inner
+                    .slow_fts_state_cache
+                    .lock()
+                    .expect("slow_fts_state_cache mutex poisoned");
+                *cache = Some((reference.uri.clone(), Arc::clone(&state)));
+                Some(state)
+            }
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    "slow-fts-state hydration failed; serving without block routing"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -2207,6 +2253,10 @@ mod tests {
         assert_eq!(
             text_entries[0].n_docs, 2,
             "merged across both commits, minus the delete"
+        );
+        assert!(
+            hidden.reader().manifest().slow_fts_state_blob().is_some(),
+            "drain stamps the FTS block-max routing ref with the shards"
         );
 
         // Queries route through the shard.

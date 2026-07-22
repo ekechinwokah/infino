@@ -1149,6 +1149,26 @@ impl SuperfileReader {
         Ok(fts.search_excluding(column, lists, k, floor).await?)
     }
 
+    /// Single-term BM25 over resident-routed block selection — see
+    /// [`FtsReader::bm25_single_term_block_selected`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn bm25_single_term_block_selected(
+        &self,
+        column: &str,
+        k: usize,
+        floor: f32,
+        metadata_offset: u64,
+        quantized: &[u8],
+        scale: f32,
+    ) -> Result<Vec<(u32, f32)>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts
+            .bm25_single_term_block_selected(column, k, floor, metadata_offset, quantized, scale)
+            .await?)
+    }
+
     /// Prefix-expanded BM25 search.
     ///
     /// Expands `prefix` to the lex-ordered list of indexed terms

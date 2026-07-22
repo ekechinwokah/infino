@@ -20,6 +20,7 @@ use crate::{
             SUPERFILE_DATA_DIR,
             commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
         },
+        slow_fts_state::STORAGE_PREFIX as SLOW_FTS_STATE_STORAGE_PREFIX,
         slow_vector_state::{self, STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX},
         wal::persistence::{SUPERFILES_DIR, WalStore},
     },
@@ -74,6 +75,9 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     }
     if let Some(centroids) = manifest.slow_vector_state_centroids_blob() {
         live.insert(centroids.uri.clone());
+    }
+    if let Some(fts) = manifest.slow_fts_state_blob() {
+        live.insert(fts.uri.clone());
     }
     for sf in manifest.get_all_superfiles() {
         live.insert(sf.uri.storage_path());
@@ -133,6 +137,7 @@ pub(super) async fn gc_storage_sweep_for_inner(
         MANIFEST_DIR,
         MANIFEST_PARTS_DIR,
         SLOW_VECTOR_STATE_STORAGE_PREFIX,
+        SLOW_FTS_STATE_STORAGE_PREFIX,
         // Tombstone sidecars under `superfiles/` (live set includes the
         // paths for current superfiles; orphans age out past the safety gap).
         SUPERFILES_DIR,
@@ -275,6 +280,7 @@ mod tests {
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
                 slow_vector_state_centroids: None,
+                slow_fts_state: None,
                 parts: vec![ManifestPartEntry {
                     part_id,
                     uri: format!("manifest-parts/part-{part_id}.avro.zst"),
@@ -343,6 +349,7 @@ mod tests {
                 deleted_user_ids_inline: None,
                 slow_vector_state_uri: Some(uri.clone()),
                 slow_vector_state_content_hash: Some(hash),
+                slow_fts_state: None,
                 slow_vector_state_centroids: Some(RoutingRef {
                     uri: section_uri.clone(),
                     content_hash: section_hash,

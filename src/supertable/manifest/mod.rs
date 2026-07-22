@@ -233,6 +233,9 @@ pub struct ManifestSnapshot {
     /// it back via [`ManifestSnapshot::get_drained_ranges`] to persist it. Hidden
     /// manifest only.
     stamped_drained_ranges: Option<list::DrainedVersionRanges>,
+    /// Pre-list stamp for the FTS block-max routing ref — same
+    /// carry-through contract as [`Self::stamped_drained_ranges`].
+    stamped_slow_fts_state: Option<RoutingRef>,
 }
 
 impl fmt::Debug for ManifestSnapshot {
@@ -289,6 +292,7 @@ impl ManifestSnapshot {
                 stamped_partition_strategy: None,
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
+                stamped_slow_fts_state: None,
             }
         } else {
             Self {
@@ -299,6 +303,7 @@ impl ManifestSnapshot {
                 stamped_partition_strategy: None,
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
+                stamped_slow_fts_state: None,
             }
         }
     }
@@ -322,6 +327,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         }
     }
 
@@ -340,6 +346,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         }
     }
 
@@ -384,6 +391,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         }
     }
 
@@ -432,6 +440,7 @@ impl ManifestSnapshot {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts,
             tombstone_seqs,
         }
@@ -905,8 +914,8 @@ impl ManifestSnapshot {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         };
-
         Ok(Arc::new(new_manifest))
     }
 
@@ -1140,6 +1149,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_slow_fts_state: self.stamped_slow_fts_state.clone(),
         }
     }
 
@@ -1170,6 +1180,46 @@ impl ManifestSnapshot {
         self.list.as_ref()?.slow_vector_state_centroids.as_ref()
     }
 
+    /// The hidden table's resident FTS block-max routing blob, when
+    /// stamped (see [`crate::supertable::slow_fts_state`]).
+    pub(crate) fn slow_fts_state_blob(&self) -> Option<&RoutingRef> {
+        if let Some(state) = &self.stamped_slow_fts_state {
+            return Some(state);
+        }
+        self.list.as_ref()?.slow_fts_state.as_ref()
+    }
+
+    /// Stamp (or replace) the FTS block-max routing ref. Mirrors
+    /// [`Self::with_slow_vector_state_ref`]: applied to the successor
+    /// inside the same OCC commit attempt that publishes the text
+    /// shards it describes.
+    pub(crate) fn with_slow_fts_state_ref(&self, state: RoutingRef) -> Self {
+        let new_list = self.list.as_ref().map(|list| {
+            let mut list = list.clone();
+            list.slow_fts_state = Some(state.clone());
+            list
+        });
+        let stamped = Some(state);
+        Self {
+            superfile_list: SuperfileList {
+                manifest_id: self.superfile_list.manifest_id,
+                options: Arc::clone(&self.superfile_list.options),
+                superfiles: self.superfile_list.superfiles.clone(),
+                vector_index_storage_prefix: self
+                    .superfile_list
+                    .vector_index_storage_prefix
+                    .clone(),
+            },
+            list: new_list,
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_slow_fts_state: stamped,
+        }
+    }
+
     /// Stamp (or replace) the hidden index's consolidated deleted-user-`_id`
     /// bytes in the manifest list. Bumps `manifest_id` like a normal commit
     /// without touching superfiles or parts.
@@ -1197,6 +1247,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_slow_fts_state: self.stamped_slow_fts_state.clone(),
         }
     }
 
@@ -1238,6 +1289,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_slow_fts_state: self.stamped_slow_fts_state.clone(),
         }
     }
 
@@ -1275,6 +1327,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_slow_fts_state: self.stamped_slow_fts_state.clone(),
         }
     }
 
@@ -1303,6 +1356,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: Some(strategy),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_slow_fts_state: self.stamped_slow_fts_state.clone(),
         }
     }
 
@@ -1329,6 +1383,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: Some(index),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_slow_fts_state: self.stamped_slow_fts_state.clone(),
         }
     }
 
@@ -1356,6 +1411,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: Some(ranges),
+            stamped_slow_fts_state: self.stamped_slow_fts_state.clone(),
         }
     }
 
@@ -1398,6 +1454,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: self.stamped_partition_strategy.clone(),
             stamped_global_vector_index: self.stamped_global_vector_index.clone(),
             stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_slow_fts_state: self.stamped_slow_fts_state.clone(),
         })
     }
 
@@ -1833,6 +1890,12 @@ impl ManifestSnapshot {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            // A fresh in-commit stamp is the only way the FTS routing
+            // ref survives a membership change — the slow-vector rule
+            // above applies to it too, except the drain stamps BEFORE
+            // the commit (content-addressed blob), so the stamp rides
+            // this same successor.
+            slow_fts_state: self.stamped_slow_fts_state.clone(),
             parts: out_list_entries_after_removal,
         };
         let mut new_superfile_list = self
@@ -1885,6 +1948,7 @@ impl ManifestSnapshot {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         };
 
         Ok((new_manifest, parts_to_write))
@@ -4334,6 +4398,7 @@ mod tests {
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
                 slow_vector_state_centroids: None,
+                slow_fts_state: None,
                 parts: entries,
             }
         }
@@ -4360,6 +4425,7 @@ mod tests {
                 stamped_partition_strategy: None,
                 stamped_global_vector_index: None,
                 stamped_drained_ranges: None,
+                stamped_slow_fts_state: None,
             }
         }
 
@@ -4638,6 +4704,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![list::ManifestPartEntry {
                 part_id: entry,
                 uri: "manifests/part-x".into(),
@@ -4659,6 +4726,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         };
         let dbg = format!("{m:?}");
         assert!(dbg.contains("n_parts: 1"), "{dbg}");
@@ -4814,6 +4882,7 @@ mod tests {
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
                 slow_vector_state_centroids: None,
+                slow_fts_state: None,
                 parts: vec![],
             }),
             parts: DashMap::new(),
@@ -4821,6 +4890,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         })
     }
 
@@ -4921,6 +4991,7 @@ mod tests {
             slow_vector_state_uri: Some("slow-vector-state/state-abc.bin".into()),
             slow_vector_state_content_hash: Some(ContentHash([7u8; 32])),
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: Vec::new(),
         };
         // Storage must be attached: `new` only keeps the list (and builds
@@ -5045,6 +5116,7 @@ mod tests {
             slow_vector_state_uri: slow_uri,
             slow_vector_state_content_hash: slow_hash,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -5253,6 +5325,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![ManifestPartEntry {
                 part_id: part.part_id,
                 uri: part_uri(&full_hash),
@@ -5511,6 +5584,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -5544,6 +5618,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         });
 
         // Add new entry to the SAME partition (not a new/cold partition)
@@ -5661,6 +5736,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![
                 entry_for(&pw_a_old),
                 entry_for(&pw_a_latest),
@@ -5694,6 +5770,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         });
 
         // Commit one new superfile. Keep `new_entry` around — the second
@@ -5869,6 +5946,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -5902,6 +5980,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         });
 
         // Add 1 new superfile to same partition (2 + 1 = 3, within target)
@@ -5969,6 +6048,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -6002,6 +6082,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         });
 
         // Add 2 new superfiles to same partition (2 + 2 = 4, exceeds target of 2)
@@ -6096,6 +6177,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri.clone(),
@@ -6131,6 +6213,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         });
 
         // 2 + 1 = 3 superfiles — far under the 10_000 count target, so only
@@ -6213,6 +6296,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_old.part_id,
@@ -6260,6 +6344,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         });
 
         // Add one new entry for the partition
@@ -6346,6 +6431,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
@@ -6396,6 +6482,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         });
 
         let new_entries = vec![make_new_entry_hinted(50, 0), make_new_entry_hinted(80, 1)];
@@ -6489,6 +6576,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
@@ -6539,6 +6627,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         });
 
         // Only touch partition A
@@ -6646,6 +6735,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
@@ -6720,6 +6810,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         });
 
         let new_entries = vec![make_new_entry_hinted(75, 0), make_new_entry_hinted(90, 1)];
@@ -6865,6 +6956,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -6897,6 +6989,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -6962,6 +7055,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -6994,6 +7088,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         });
 
         let sf_new = make_new_entry(75);
@@ -7075,6 +7170,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a.part_id,
@@ -7125,6 +7221,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -7211,6 +7308,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
@@ -7265,6 +7363,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -7342,6 +7441,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -7374,6 +7474,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         });
 
         let (new_manifest, parts) = old_manifest
@@ -7430,6 +7531,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![ManifestPartEntry {
                 part_id: pw.part_id,
                 uri: pw.uri,
@@ -7462,6 +7564,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         });
 
         // sf_ghost was never added to any part; its superfile_id won't match anything
@@ -7536,6 +7639,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts: vec![
                 ManifestPartEntry {
                     part_id: pw_a_old.part_id,
@@ -7590,6 +7694,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         });
 
         let (new_manifest, parts_to_write) = old_manifest
@@ -7665,6 +7770,7 @@ mod tests {
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
+            slow_fts_state: None,
             parts,
         }
     }
@@ -7678,6 +7784,7 @@ mod tests {
             stamped_partition_strategy: None,
             stamped_global_vector_index: None,
             stamped_drained_ranges: None,
+            stamped_slow_fts_state: None,
         }
     }
 

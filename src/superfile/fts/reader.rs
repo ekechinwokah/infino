@@ -51,6 +51,12 @@ use crate::superfile::{
 };
 
 /// Largest gap worth overfetching when adjacent term postings share a request.
+/// Blocks fetched per wave on the best-first block-selected walk.
+/// Large enough to amortize one ranged-GET round trip across blocks,
+/// small enough that a rising kth-best floor stops the walk after a
+/// few waves on selective queries.
+const BLOCK_SELECT_WAVE: usize = 16;
+
 const TERM_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
 /// Maximum total gap bytes tolerated in one coalesced postings request.
 const TERM_RANGE_COALESCE_MAX_OVERFETCH: usize = 512 * 1024;
@@ -914,6 +920,216 @@ impl FtsReader {
                     "fts/positions term range fetch failed: {e}"
                 )))
             })
+    }
+
+    /// Walk `column`'s FST and return, for every PFOR term whose
+    /// document frequency is at least `df_floor`, its term bytes,
+    /// postings-region `metadata_offset`, and exact per-block BM25
+    /// upper bounds (decoded from the skip table). The extraction
+    /// side of the hidden index's resident block-max routing slab;
+    /// callers run it over resident just-built text shards.
+    pub(crate) async fn column_block_maxes(
+        &self,
+        column: &str,
+        df_floor: u32,
+    ) -> Result<Vec<(Vec<u8>, u64, Vec<f32>)>, FtsError> {
+        let positional = match self.column_id_by_name.get(column) {
+            Some(&id) => self.columns[id as usize].positions,
+            None => return Ok(Vec::new()),
+        };
+        let mut out = Vec::new();
+        for (term, packed) in self.column_term_entries(column)? {
+            let FstValue::Pfor {
+                metadata_offset,
+                postings_length,
+            } = FstValue::unpack(packed)
+            else {
+                continue; // df=1 inline: nothing to select between
+            };
+            let postings_length = self
+                .resolve_pfor_length(metadata_offset, postings_length, positional)
+                .await?;
+            let fetched = self
+                .fetch_term_postings(&[(metadata_offset as usize, postings_length as usize)])
+                .await?;
+            let region = &fetched[0];
+            let meta = TermMeta::parse(region, 0, positional)?;
+            if (meta.df as u32) < df_floor {
+                continue;
+            }
+            let maxes: Vec<f32> = (0..meta.num_blocks)
+                .map(|i| meta.skip_entry(region, i).2)
+                .collect();
+            out.push((term, metadata_offset, maxes));
+        }
+        Ok(out)
+    }
+
+    /// Ranged reads inside the postings region without the term-meta
+    /// minimum-length gate of [`Self::fetch_term_postings`] — posting
+    /// BLOCKS are routinely shorter than a term header. Bounds checks
+    /// stay.
+    async fn fetch_block_ranges(&self, ranges: &[(usize, usize)]) -> Result<Vec<Bytes>, FtsError> {
+        let base = self.postings_range.start;
+        let region_len = self.postings_range.len();
+        let mut abs: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+        for &(off, len) in ranges {
+            if off + len > region_len {
+                return Err(FtsError::Read(ReadError::MalformedVersion(
+                    "posting block range runs past postings region".into(),
+                )));
+            }
+            abs.push(base + off..base + off + len);
+        }
+        let plan = RangeCoalescePlan::new(
+            &abs,
+            TERM_RANGE_COALESCE_MAX_GAP,
+            TERM_RANGE_COALESCE_MAX_OVERFETCH,
+        );
+        let fetched = self
+            .source
+            .get_ranges_parallel_async(plan.fetch_ranges())
+            .await
+            .map_err(|e| {
+                FtsError::Read(ReadError::MalformedVersion(format!(
+                    "fts/postings block range fetch failed: {e}"
+                )))
+            })?;
+        Ok(plan.restore(&fetched))
+    }
+
+    /// Single-term BM25 over **resident-routed block selection** — the
+    /// FTS analog of admitting top cells off the 1-bit slab and
+    /// fetching only their bytes. `quantized`/`scale` are the term's
+    /// resident per-block upper bounds (ceil-quantized, so a skipped
+    /// block truly cannot beat the floor); `metadata_offset` is its
+    /// postings-region offset (the resident row spares the FST
+    /// lookup).
+    ///
+    /// One ranged read pulls the term header + full skip table; blocks
+    /// are then visited best-first by resident bound in
+    /// [`BLOCK_SELECT_WAVE`]-sized fetch waves, each block re-gated by
+    /// its exact skip bound before decode, until the kth-best floor
+    /// exceeds every remaining bound. Results equal the full walk's
+    /// (`search_with_floor` semantics: strictly-below-`floor` docs are
+    /// dead, ties survive). Deeper scans (larger `k`) admit more
+    /// blocks.
+    pub(crate) async fn bm25_single_term_block_selected(
+        &self,
+        column: &str,
+        k: usize,
+        floor: f32,
+        metadata_offset: u64,
+        quantized: &[u8],
+        scale: f32,
+    ) -> Result<Vec<(u32, f32)>, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        if k == 0 || quantized.is_empty() {
+            return Ok(Vec::new());
+        }
+        let col_meta = &self.columns[column_id as usize];
+        let floor_eff = floor.next_down();
+        let dequant = |q: u8| -> f32 { q as f32 / u8::MAX as f32 * scale };
+
+        // One ranged read: term header + the whole skip table (the
+        // exact bounds + per-block offsets the fetch waves need).
+        let term_meta_size = match col_meta.positions {
+            true => TERM_META_POSITIONAL_SIZE,
+            false => TERM_META_SIZE,
+        };
+        let head_len = term_meta_size + quantized.len() * SKIP_ENTRY_SIZE;
+        let fetched = self
+            .fetch_term_postings(&[(metadata_offset as usize, head_len)])
+            .await?;
+        let head = &fetched[0];
+        let meta = TermMeta::parse(head, 0, col_meta.positions)?;
+        if meta.num_blocks != quantized.len() {
+            return Err(FtsError::Read(ReadError::MalformedVersion(format!(
+                "resident block-max rows ({}) disagree with the skip table ({}) — stale routing",
+                quantized.len(),
+                meta.num_blocks
+            ))));
+        }
+
+        let idf_t = bm25::idf(self.n_docs as u64, meta.df);
+        let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
+        let dl_norm_k1 = &col_meta.dl_norm_k1;
+
+        // Best-first visit order off the resident bounds.
+        let mut order: Vec<u32> = (0..meta.num_blocks as u32).collect();
+        order.sort_unstable_by(|&a, &b| quantized[b as usize].cmp(&quantized[a as usize]));
+
+        let mut heap: BinaryHeap<TopKEntry> =
+            BinaryHeap::with_capacity(k.min(meta.num_blocks * BLOCK_LEN).max(1));
+        let mut buf_d = vec![0u32; BLOCK_LEN];
+        let mut buf_t = vec![0u32; BLOCK_LEN];
+        let mut next = 0usize;
+        while next < order.len() {
+            let bar = match heap.len() >= k {
+                true => {
+                    let TopKEntry(min_score, _) = heap.peek().expect("heap full");
+                    min_score.max(floor_eff)
+                }
+                false => floor_eff,
+            };
+            // The order is bound-descending: once the best remaining
+            // resident bound can't beat the bar, nothing after it can.
+            let mut wave: Vec<u32> = Vec::with_capacity(BLOCK_SELECT_WAVE);
+            while next < order.len() && wave.len() < BLOCK_SELECT_WAVE {
+                let block = order[next];
+                if dequant(quantized[block as usize]) <= bar {
+                    next = order.len();
+                    break;
+                }
+                wave.push(block);
+                next += 1;
+            }
+            if wave.is_empty() {
+                break;
+            }
+            let ranges: Vec<(usize, usize)> = wave
+                .iter()
+                .map(|&i| {
+                    let (_, off, _) = meta.skip_entry(head, i as usize);
+                    let end = meta.block_end_in_term(head, i as usize);
+                    (metadata_offset as usize + off, end - off)
+                })
+                .collect();
+            let blocks = self.fetch_block_ranges(&ranges).await?;
+            for (&block, bytes) in wave.iter().zip(&blocks) {
+                // Exact skip bound re-gate (tighter than the resident
+                // quantized bound) against the LIVE bar.
+                let bar = match heap.len() >= k {
+                    true => {
+                        let TopKEntry(min_score, _) = heap.peek().expect("heap full");
+                        min_score.max(floor_eff)
+                    }
+                    false => floor_eff,
+                };
+                let (_, _, exact_bound) = meta.skip_entry(head, block as usize);
+                if exact_bound <= bar {
+                    continue;
+                }
+                let n = decode_block(bytes, &mut buf_d, &mut buf_t);
+                for j in 0..n {
+                    let doc_id = buf_d[j];
+                    let score =
+                        bm25::score_with_dl_norm_k1(idf_x_k1p1, buf_t[j], dl_norm_k1.get(doc_id));
+                    if score <= floor_eff {
+                        continue;
+                    }
+                    if heap.len() < k {
+                        heap.push(TopKEntry(score, doc_id));
+                    } else if let Some(TopKEntry(min_score, _)) = heap.peek()
+                        && score > *min_score
+                    {
+                        heap.pop();
+                        heap.push(TopKEntry(score, doc_id));
+                    }
+                }
+            }
+        }
+        Ok(drain_top_k_desc(heap))
     }
 
     /// True postings byte length for a PFOR term. Lengths below the
