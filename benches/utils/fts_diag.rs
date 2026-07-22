@@ -70,6 +70,11 @@ const SHAPES: &[FtsShape] = &[
         query: "term00050 term00051 term00052",
         mode: BoolMode::Or,
     },
+    FtsShape {
+        name: "phrase_two_common",
+        query: "\"term00001 term00002\"",
+        mode: BoolMode::Or,
+    },
 ];
 
 pub fn run() {
