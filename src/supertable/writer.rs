@@ -3464,15 +3464,65 @@ async fn drain_fts_text_shards(
     }
     bounds.push((lo, TEXT_KEY_UPPER_SENTINEL.to_vec()));
 
-    // Every shard shares the full merged doc space (dl arrays + `_id`
-    // stub sized to the corpus; per-shard-dense doc spaces are a
-    // follow-up), so one identity remap serves every slice.
-    let identity_all: Vec<Option<u32>> = (0..n_docs_merged as u32).map(Some).collect();
+    // Each shard gets a DENSE doc space: only the docs its term range
+    // references get shard-local ids, so dl arrays and the `_id` stub
+    // scale with the shard's own postings — not the corpus. Dense ids
+    // are assigned in merged-id order, keeping every term's remapped
+    // postings sorted (the merge encoder's contract).
+    let mut referenced = vec![false; n_docs_merged as usize];
+    let mut dense_remap: Vec<Option<u32>> = Vec::with_capacity(n_docs_merged as usize);
     let scalar_schema = hidden_inner.options.scalar_schema();
     let id_column = hidden_inner.options.id_column.clone();
     let mut prepared: Vec<PreparedSuperfile> = Vec::with_capacity(bounds.len());
     let mut fts_state_files: Vec<FileBlockMax> = Vec::with_capacity(bounds.len());
     for (shard_id, (b_lo, b_hi)) in bounds.iter().enumerate() {
+        // Pass 1: mark the merged ids this shard's terms reference.
+        referenced.iter_mut().for_each(|r| *r = false);
+        {
+            let mut pairs: Vec<(u32, u32)> = Vec::new();
+            let mut key_buf: Vec<u8> = Vec::new();
+            for fc in &columns_lex {
+                let positional = fc.positions;
+                for (term, packed) in final_reader
+                    .column_term_entries(&fc.column)
+                    .map_err(|e| BuildError::Store(e.to_string()))?
+                {
+                    key_buf.clear();
+                    key_buf.extend_from_slice(fc.column.as_bytes());
+                    key_buf.push(FST_SEPARATOR);
+                    key_buf.extend_from_slice(&term);
+                    if key_buf.as_slice() < b_lo.as_slice() || key_buf.as_slice() >= b_hi.as_slice()
+                    {
+                        continue;
+                    }
+                    final_reader
+                        .decode_term_postings(positional, packed, &mut pairs)
+                        .await
+                        .map_err(|e| BuildError::Store(e.to_string()))?;
+                    for &(doc, _) in &pairs {
+                        referenced[doc as usize] = true;
+                    }
+                }
+            }
+        }
+        // Dense remap in merged-id order + this shard's doc count.
+        dense_remap.clear();
+        let mut shard_docs: u32 = 0;
+        for &hit in &referenced {
+            match hit {
+                true => {
+                    dense_remap.push(Some(shard_docs));
+                    shard_docs += 1;
+                }
+                false => dense_remap.push(None),
+            }
+        }
+        if shard_docs == 0 {
+            return Err(BuildError::Store(format!(
+                "text shard {shard_id} references no docs — planner emitted an empty slice"
+            )));
+        }
+
         let blob_path = scratch.join(format!("fts_text_shard_{shard_id}.blob"));
         let mut blob_file = BufWriter::new(
             File::create(&blob_path)
@@ -3481,10 +3531,10 @@ async fn drain_fts_text_shards(
         merge_fts_blobs(
             &[MergeSource {
                 reader: &final_reader,
-                doc_id_remap: &identity_all,
+                doc_id_remap: &dense_remap,
             }],
             &merge_columns,
-            n_docs_merged as u32,
+            shard_docs,
             Some((b_lo, b_hi)),
             &mut blob_file,
         )
@@ -3517,30 +3567,48 @@ async fn drain_fts_text_shards(
             File::open(&ids_path)
                 .map_err(|error| BuildError::Store(format!("text ids spill open: {error}")))?,
         );
-        let mut remaining = n_docs_merged as usize;
-        while remaining > 0 {
-            let take = remaining.min(DRAIN_ID_BATCH_ROWS);
-            let mut ids = Vec::with_capacity(take);
-            let mut encoded = [0u8; STABLE_ID_BYTES];
-            for _ in 0..take {
-                ids_reader
-                    .read_exact(&mut encoded)
-                    .map_err(|error| BuildError::Store(format!("text ids spill read: {error}")))?;
-                ids.push(i128::from_le_bytes(encoded));
+        // Stub = the shard's OWN docs' stable ids, selected from the
+        // merged-order spill by the reference bitmap.
+        let mut shard_id_min = i128::MAX;
+        let mut shard_id_max = i128::MIN;
+        let mut batch_ids: Vec<i128> = Vec::with_capacity(DRAIN_ID_BATCH_ROWS);
+        let mut encoded = [0u8; STABLE_ID_BYTES];
+        let flush_batch = |builder: &mut SuperfileBuilder,
+                           scalar_stats: &mut HashMap<String, ScalarStatsAgg>,
+                           batch_ids: &mut Vec<i128>|
+         -> Result<(), BuildError> {
+            if batch_ids.is_empty() {
+                return Ok(());
             }
-            let id_array = Decimal128Array::from_iter_values(ids)
+            let id_array = Decimal128Array::from_iter_values(batch_ids.drain(..))
                 .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
                 .expect("invariant: precision 38 + scale 0 always valid for any i128 payload");
             let scalar =
                 RecordBatch::try_new(scalar_schema.clone(), vec![Arc::new(id_array) as ArrayRef])
                     .map_err(|_| BuildError::BatchSchemaMismatch)?;
             ScalarStatsAgg::merge(
-                &mut scalar_stats,
+                scalar_stats,
                 &ScalarStatsAgg::from_batch(&scalar_schema, &scalar),
             );
             builder.add_batch_ids_only(&scalar)?;
-            remaining -= take;
+            Ok(())
+        };
+        for &hit in referenced.iter() {
+            ids_reader
+                .read_exact(&mut encoded)
+                .map_err(|error| BuildError::Store(format!("text ids spill read: {error}")))?;
+            if !hit {
+                continue;
+            }
+            let id = i128::from_le_bytes(encoded);
+            shard_id_min = shard_id_min.min(id);
+            shard_id_max = shard_id_max.max(id);
+            batch_ids.push(id);
+            if batch_ids.len() >= DRAIN_ID_BATCH_ROWS {
+                flush_batch(&mut builder, &mut scalar_stats, &mut batch_ids)?;
+            }
         }
+        flush_batch(&mut builder, &mut scalar_stats, &mut batch_ids)?;
 
         let mut output = NamedTempFile::new_in(scratch)
             .map_err(|error| BuildError::Store(format!("text shard temp create: {error}")))?;
@@ -3564,9 +3632,9 @@ async fn drain_fts_text_shards(
 
         let shard = ShardOutput {
             bytes,
-            n_docs: n_docs_merged,
-            id_min,
-            id_max,
+            n_docs: u64::from(shard_docs),
+            id_min: shard_id_min,
+            id_max: shard_id_max,
             scalar_stats,
         };
         let p = prepare_superfile(hidden_inner, shard)?
