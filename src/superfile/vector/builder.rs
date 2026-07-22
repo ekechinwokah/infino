@@ -39,7 +39,7 @@ use crate::{
             cell_posting::{MaterializedIvfRow, sq8_residual_norm_sq},
             distance::{Metric, dequantize_sq8_residual_into, distance, mean_f32_cluster_major},
             ivf_merge::MergedIvfSubsection,
-            kmeans::{assign_to_centroids, kmeans},
+            kmeans::{assign_to_centroids, kmeans, kmeans_with_assignments},
             quant::BitQuantizer,
             rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
             reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
@@ -1152,8 +1152,21 @@ fn materialized_centroids(cfg: &VectorConfig, n_docs: usize, sample: &[f32]) -> 
             .min(n_cent_row_count_cap(n_docs))
             .min(n_docs.max(1))
     };
-    let mut centroids = kmeans(sample, dim, requested, KMEANS_ITERS, cfg.rot_seed);
-    let n_cent = split_oversized_fine_runs(&mut centroids, sample, dim, requested, cfg.rot_seed);
+    // Keep the final Lloyd assignments — `split_oversized_fine_runs`
+    // consumes them for the first bound check so a balanced pack (the
+    // common commit-cell case) does not pay a redundant full sample
+    // assign on top of the train. `kmeans` alone would drop them and
+    // force that duplicate pass (see `kmeans_with_assignments`).
+    let (mut centroids, assignments) =
+        kmeans_with_assignments(sample, dim, requested, KMEANS_ITERS, cfg.rot_seed);
+    let n_cent = split_oversized_fine_runs(
+        &mut centroids,
+        sample,
+        dim,
+        requested,
+        cfg.rot_seed,
+        Some(assignments),
+    );
     order_centroids_geometrically(&mut centroids, dim, n_cent);
     (n_cent, centroids)
 }
@@ -1166,6 +1179,13 @@ fn materialized_centroids(cfg: &VectorConfig, n_docs: usize, sample: &[f32]) -> 
 /// in place). Single-run packs (the commit-time cell delta shape,
 /// `requested == 1`) can never exceed the bound and pass through untouched.
 ///
+/// When `initial_assignments` matches the current `centroids` (the final
+/// Lloyd labeling from [`kmeans_with_assignments`]), the first round
+/// skips `assign_to_centroids` and only scans counts — balanced packs
+/// return without another distance pass. Pass `None` when the caller
+/// has no labeling (tests / synthetic centroid fixtures); the first
+/// round then assigns normally.
+///
 /// Deterministic: assignment and sub-k-means are seeded from `seed` plus a
 /// fixed offset mixed with the round and run index.
 fn split_oversized_fine_runs(
@@ -1174,6 +1194,7 @@ fn split_oversized_fine_runs(
     dim: usize,
     requested: usize,
     seed: u64,
+    initial_assignments: Option<Vec<u32>>,
 ) -> usize {
     let mut n_cent = centroids.len() / dim.max(1);
     let sample_n = sample.len() / dim.max(1);
@@ -1182,9 +1203,18 @@ fn split_oversized_fine_runs(
     }
     let target = sample_n.div_ceil(requested.max(1)).max(1);
     let bound = target.saturating_mul(FINE_RUN_SPLIT_BOUND_FACTOR);
-    let mut assignments = vec![0u32; sample_n];
+    // Reuse the caller's Lloyd labeling on round 0 when it covers every
+    // sample row; any later round (or a missing/mismatched labeling)
+    // re-assigns against the current centroids.
+    let (mut assignments, mut need_assign) = match initial_assignments {
+        Some(a) if a.len() == sample_n => (a, false),
+        _ => (vec![0u32; sample_n], true),
+    };
     for round in 0..FINE_RUN_SPLIT_MAX_ROUNDS {
-        assign_to_centroids(sample, centroids, dim, n_cent, &mut assignments);
+        if need_assign {
+            assign_to_centroids(sample, centroids, dim, n_cent, &mut assignments);
+        }
+        need_assign = true;
         let mut counts = vec![0usize; n_cent];
         for &a in &assignments {
             counts[a as usize] += 1;
@@ -3543,8 +3573,14 @@ mod tests {
             before.iter().max().expect("nonempty")
         );
 
-        let n_cent =
-            split_oversized_fine_runs(&mut centroids, &sample, SPLIT_DIM, SPLIT_REQUESTED, 7);
+        let n_cent = split_oversized_fine_runs(
+            &mut centroids,
+            &sample,
+            SPLIT_DIM,
+            SPLIT_REQUESTED,
+            7,
+            None,
+        );
         assert_eq!(centroids.len(), n_cent * SPLIT_DIM);
         assert!(n_cent > 5, "split must add sub-centroids");
         let after = run_counts(&sample, &centroids, n_cent);
@@ -3613,7 +3649,7 @@ mod tests {
         let sample = two_blob_sample();
         let mut centroids = vec![0.5f32; SPLIT_DIM];
         let original = centroids.clone();
-        let n_cent = split_oversized_fine_runs(&mut centroids, &sample, SPLIT_DIM, 1, 7);
+        let n_cent = split_oversized_fine_runs(&mut centroids, &sample, SPLIT_DIM, 1, 7, None);
         assert_eq!(n_cent, 1);
         assert_eq!(centroids, original);
     }
@@ -3699,7 +3735,14 @@ mod tests {
                 }
             }
             let n =
-                split_oversized_fine_runs(&mut centroids, &sample, SPLIT_DIM, SPLIT_REQUESTED, 7);
+                split_oversized_fine_runs(
+                    &mut centroids,
+                    &sample,
+                    SPLIT_DIM,
+                    SPLIT_REQUESTED,
+                    7,
+                    None,
+                );
             (n, centroids)
         };
         assert_eq!(make(), make());
