@@ -359,11 +359,12 @@ async fn bm25_fanout_wave(
         async move {
             // A cross-file floor can suppress score-tied single-term hits
             // according to task completion order. Local BMW still prunes
-            // those queries; share the global floor only for multi-term
-            // paths.
-            let n_atoms =
-                must_arc.len() + should_arc.len() + must_ph_arc.len() + should_ph_arc.len();
-            let floor = if n_atoms == 1 {
+            // those queries; share the global floor for every other
+            // shape — including a single bare phrase, whose position
+            // verification makes the floor's block pruning a large win.
+            let n_terms = must_arc.len() + should_arc.len();
+            let phrase_free = must_ph_arc.is_empty() && should_ph_arc.is_empty();
+            let floor = if n_terms == 1 && phrase_free {
                 f32::NEG_INFINITY
             } else {
                 shared.floor()
@@ -373,9 +374,8 @@ async fn bm25_fanout_wave(
             // and fetches exactly those (the FTS cell-read analog).
             // Everything else keeps the whole-term kernels.
             if range.is_none()
-                && n_atoms == 1
-                && must_ph_arc.is_empty()
-                && should_ph_arc.is_empty()
+                && n_terms == 1
+                && phrase_free
                 && neg_arc.is_empty()
                 && neg_ph_arc.is_empty()
                 && let Some(state) = routing.as_ref()
@@ -2686,6 +2686,7 @@ mod tests {
                 id_min: 0,
                 id_max: n_docs.saturating_sub(1) as i128,
                 scalar_stats: HashMap::new(),
+                row_group_stats: None,
                 fts_summary: HashMap::new(),
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
@@ -2736,6 +2737,7 @@ mod tests {
             id_min: 0,
             id_max: 199_999,
             scalar_stats: HashMap::new(),
+            row_group_stats: None,
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
