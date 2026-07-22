@@ -51,11 +51,18 @@ use crate::superfile::{
 };
 
 /// Largest gap worth overfetching when adjacent term postings share a request.
-/// Blocks fetched per wave on the best-first block-selected walk.
-/// Large enough to amortize one ranged-GET round trip across blocks,
-/// small enough that a rising kth-best floor stops the walk after a
-/// few waves on selective queries.
-const BLOCK_SELECT_WAVE: usize = 16;
+/// First-wave block count on the best-first block-selected walk.
+/// Sized so a selective query often finishes in one coalesced fetch;
+/// each subsequent wave quadruples ([`BLOCK_SELECT_WAVE_GROWTH`]), so
+/// a non-pruning walk over B blocks costs O(log B) coalesced fetch
+/// rounds — never one round trip per handful of blocks.
+const BLOCK_SELECT_FIRST_WAVE: usize = 16;
+
+/// Wave growth factor between best-first fetch rounds. Mirrors the
+/// vector path's economics: admitted bytes arrive in a few parallel
+/// coalesced waves, and the rising kth-best floor gets a chance to
+/// stop the walk between rounds.
+const BLOCK_SELECT_WAVE_GROWTH: usize = 4;
 
 const TERM_RANGE_COALESCE_MAX_GAP: usize = 64 * 1024;
 /// Maximum total gap bytes tolerated in one coalesced postings request.
@@ -1030,6 +1037,15 @@ impl FtsReader {
         let col_meta = &self.columns[column_id as usize];
         let floor_eff = floor.next_down();
         let dequant = |q: u8| -> f32 { q as f32 / u8::MAX as f32 * scale };
+        // Flat bounds cannot prune: every block ties the maximum, so
+        // best-first would visit them all and only add wave overhead —
+        // the whole-term walk (one contiguous fetch, one pass) is
+        // strictly better. Term identity is already resolved, so reuse
+        // the direct-offset walk below with every block admitted at
+        // once by falling through with a single full wave.
+        let min_q = quantized.iter().copied().min().unwrap_or(0);
+        let max_q = quantized.iter().copied().max().unwrap_or(0);
+        let bounds_can_prune = min_q < max_q;
 
         // One ranged read: term header + the whole skip table (the
         // exact bounds + per-block offsets the fetch waves need).
@@ -1055,15 +1071,23 @@ impl FtsReader {
         let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
         let dl_norm_k1 = &col_meta.dl_norm_k1;
 
-        // Best-first visit order off the resident bounds.
+        // Best-first visit order off the resident bounds. Flat bounds
+        // keep index order: the single full wave then coalesces into
+        // contiguous ranges instead of a shuffled scatter.
         let mut order: Vec<u32> = (0..meta.num_blocks as u32).collect();
-        order.sort_unstable_by(|&a, &b| quantized[b as usize].cmp(&quantized[a as usize]));
+        if bounds_can_prune {
+            order.sort_unstable_by(|&a, &b| quantized[b as usize].cmp(&quantized[a as usize]));
+        }
 
         let mut heap: BinaryHeap<TopKEntry> =
             BinaryHeap::with_capacity(k.min(meta.num_blocks * BLOCK_LEN).max(1));
         let mut buf_d = vec![0u32; BLOCK_LEN];
         let mut buf_t = vec![0u32; BLOCK_LEN];
         let mut next = 0usize;
+        let mut wave_cap = match bounds_can_prune {
+            true => BLOCK_SELECT_FIRST_WAVE,
+            false => order.len(),
+        };
         while next < order.len() {
             let bar = match heap.len() >= k {
                 true => {
@@ -1074,8 +1098,8 @@ impl FtsReader {
             };
             // The order is bound-descending: once the best remaining
             // resident bound can't beat the bar, nothing after it can.
-            let mut wave: Vec<u32> = Vec::with_capacity(BLOCK_SELECT_WAVE);
-            while next < order.len() && wave.len() < BLOCK_SELECT_WAVE {
+            let mut wave: Vec<u32> = Vec::with_capacity(wave_cap.min(order.len() - next));
+            while next < order.len() && wave.len() < wave_cap {
                 let block = order[next];
                 if dequant(quantized[block as usize]) <= bar {
                     next = order.len();
@@ -1084,6 +1108,7 @@ impl FtsReader {
                 wave.push(block);
                 next += 1;
             }
+            wave_cap = wave_cap.saturating_mul(BLOCK_SELECT_WAVE_GROWTH);
             if wave.is_empty() {
                 break;
             }
