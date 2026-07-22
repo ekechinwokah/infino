@@ -1,0 +1,4174 @@
+diff --git a/benches/utils/cost.rs b/benches/utils/cost.rs
+index b47a6aa..e704ea2 100644
+--- a/benches/utils/cost.rs
++++ b/benches/utils/cost.rs
+@@ -116,47 +116,19 @@ impl Instance {
+         resident_bytes as f64 / BYTES_PER_GIB / self.ram_gib
+     }
+ 
+-    /// Compute dollars for a saturating parallel phase (ingest, drain,
+-    /// compaction): wall time billed at the phase's **binding** share of
+-    /// the machine — the writer pool's CPU share or the phase's peak-RSS
+-    /// share of RAM, whichever is larger. RAM is held for the whole phase
+-    /// wall (allocated at phase start, dropped at phase end), so a
+-    /// RAM-bound phase bills its RSS share for its full duration.
+-    fn phase_compute_usd(&self, wall_s: f64, writers: u32, peak_rss_bytes: Option<u64>) -> f64 {
+-        wall_s * self.phase_binding_share(writers, peak_rss_bytes) * self.usd_per_sec()
++    /// Dollars for a measured slice of CPU time. This is the *only* compute
++    /// pricing: cost is `on-CPU seconds × $/vCPU-second`. Wall time is never
++    /// converted to compute, so async object-store wait (a thread off-CPU,
++    /// blocked on a GET) is not billed as CPU.
++    fn cpu_seconds_usd(&self, cpu_s: f64) -> f64 {
++        cpu_s * self.usd_per_sec()
+     }
+ 
+-    /// The binding share for a parallel phase; `> cpu_share` ⇒ RAM-bound.
+-    fn phase_binding_share(&self, writers: u32, peak_rss_bytes: Option<u64>) -> f64 {
+-        let cpu_share = f64::from(writers.min(self.vcpu)) / f64::from(self.vcpu.max(1));
+-        cpu_share.max(peak_rss_bytes.map(|b| self.ram_share(b)).unwrap_or(0.0))
+-    }
+-
+-    /// Whether RAM (not the pool's CPU share) binds a parallel phase.
+-    fn phase_ram_binds(&self, writers: u32, peak_rss_bytes: Option<u64>) -> bool {
+-        let cpu_share = f64::from(writers.min(self.vcpu)) / f64::from(self.vcpu.max(1));
+-        peak_rss_bytes.map(|b| self.ram_share(b)).unwrap_or(0.0) > cpu_share
+-    }
+-
+-    fn parallel_vcpu_seconds(&self, wall_s: f64, writers: u32) -> f64 {
+-        let cpu_share = f64::from(writers.min(self.vcpu)) / f64::from(self.vcpu.max(1));
+-        wall_s * cpu_share
+-    }
+-
+-    fn per_query_usd(&self, p50_s: f64, resident_anon_bytes: u64) -> f64 {
+-        self.per_query_vcpu_seconds(p50_s, resident_anon_bytes) * self.usd_per_sec()
+-    }
+-
+-    fn per_query_vcpu_seconds(&self, p50_s: f64, resident_anon_bytes: u64) -> f64 {
+-        let cpu_share = 1.0 / f64::from(self.vcpu.max(1));
+-        let ram_share = resident_anon_bytes as f64 / BYTES_PER_GIB / self.ram_gib;
+-        p50_s * cpu_share.max(ram_share)
+-    }
+-
+-    fn ram_binds(&self, resident_anon_bytes: u64) -> bool {
+-        let cpu_share = 1.0 / f64::from(self.vcpu.max(1));
+-        let ram_share = resident_anon_bytes as f64 / BYTES_PER_GIB / self.ram_gib;
+-        ram_share > cpu_share
++    /// Whether a single query's resident heap share exceeds its per-core CPU
++    /// share — the label on the serving block. This is a sizing signal only;
++    /// it does not feed any dollar figure (compute is measured CPU).
++    fn ram_binds_single_query(&self, resident_anon_bytes: u64) -> bool {
++        self.ram_share(resident_anon_bytes) > 1.0 / f64::from(self.vcpu.max(1))
+     }
+ }
+ 
+@@ -165,6 +137,11 @@ pub struct ColdQuery {
+     pub name: String,
+     pub open_s: f64,
+     pub search_s: f64,
++    /// Measured process CPU seconds for the cold open (fg+bg). `None` if the
++    /// harness did not sample CPU for this row.
++    pub open_cpu_s: Option<f64>,
++    /// Measured process CPU seconds for the cold search (fg+bg).
++    pub search_cpu_s: Option<f64>,
+ }
+ 
+ /// Metered object-store I/O for the lifecycle phases of one bench cell.
+@@ -178,17 +155,21 @@ pub struct StorePhases {
+     /// The hidden vector-index drain: reads user vector blobs, writes
+     /// per-cell superfiles + routing/manifest updates.
+     pub drain: Option<ObjectStoreMeter>,
+-    /// Wall-clock seconds of the drain window, when it ran.
++    /// Wall-clock seconds of the drain window, when it ran (latency only).
+     pub drain_wall_s: Option<f64>,
+-    /// Peak RSS sampled over the drain window — the drain is billed at
+-    /// `max(pool CPU share, peak-RSS share)` for its wall duration.
++    /// Measured process CPU seconds consumed by the drain (fg+bg). This is
++    /// what the drain's compute is priced from — never its wall time.
++    pub drain_cpu_s: Option<f64>,
++    /// Peak RSS sampled over the drain window — reported for sizing context.
+     pub drain_peak_rss_bytes: Option<u64>,
+     /// Maintenance compaction (`optimize()`: user + hidden tables) —
+     /// reads the small superfiles, writes merged replacements.
+     pub compaction: Option<ObjectStoreMeter>,
+-    /// Wall-clock seconds of the compaction window, when it ran.
++    /// Wall-clock seconds of the compaction window, when it ran (latency only).
+     pub compaction_wall_s: Option<f64>,
+-    /// Peak RSS sampled over the compaction window (same billing rule).
++    /// Measured process CPU seconds consumed by compaction (fg+bg).
++    pub compaction_cpu_s: Option<f64>,
++    /// Peak RSS sampled over the compaction window (sizing context).
+     pub compaction_peak_rss_bytes: Option<u64>,
+     /// One cold table open on a fresh cache (manifest + pointer + open
+     /// blobs) — one-time, amortized across queries on a supertable.
+@@ -221,6 +202,9 @@ pub struct StorePhases {
+ /// Everything one cell (one tier × modality) needs to be priced.
+ pub struct CellCost<'a> {
+     pub ingest_wall_s: f64,
++    /// Measured process CPU seconds consumed by ingest/build (fg+bg). Ingest
++    /// compute is priced from this, not from `ingest_wall_s`.
++    pub ingest_cpu_s: Option<f64>,
+     pub writers: u32,
+     /// Peak RSS during the ingest window, when sampled. Ingest is billed
+     /// on the *binding* resource — `max(writer-pool CPU share, peak-RSS
+@@ -238,10 +222,15 @@ pub struct CellCost<'a> {
+     pub resident_anon_bytes: u64,
+     /// Steady-state (post-drain, on a vector cell) warm latency battery.
+     pub warm: &'a [(String, f64)],
++    /// Measured warm per-query CPU seconds, keyed by the same names as `warm`.
++    /// `None` (or a missing name) prices that warm row as "CPU not metered".
++    pub warm_cpu_s: Option<&'a [(String, f64)]>,
+     /// Cold latency rows (open and search timed separately), steady state.
+     pub cold: Option<&'a [ColdQuery]>,
+     /// Pre-drain warm battery — the transient shape before maintenance.
+     pub warm_pre: Option<&'a [(String, f64)]>,
++    /// Measured warm per-query CPU seconds for `warm_pre` rows.
++    pub warm_pre_cpu_s: Option<&'a [(String, f64)]>,
+     /// Pre-drain cold latency rows.
+     pub cold_pre: Option<&'a [ColdQuery]>,
+     /// Measured object-store I/O per phase.
+@@ -314,10 +303,11 @@ fn fmt_wall_seconds(s: f64) -> String {
+     }
+ }
+ 
+-/// Request dollars for one metered window (PUTs at the PUT rate,
+-/// HEAD + GET at the GET rate).
++/// Request dollars for one metered window: PUT + LIST at the PUT/list rate,
++/// HEAD + GET at the GET rate. DELETE is free on S3, so it is counted but not
++/// priced.
+ fn request_usd(io: &ObjectStoreMeter) -> f64 {
+-    io.put_count as f64 * USD_PER_PUT + io.read_requests() as f64 * USD_PER_GET
++    (io.put_count + io.list_count) as f64 * USD_PER_PUT + io.read_requests() as f64 * USD_PER_GET
+ }
+ 
+ /// "N PUT + M GET (+ K HEAD)" — the request-count cell of an I/O row.
+@@ -332,6 +322,12 @@ fn fmt_requests(io: &ObjectStoreMeter) -> String {
+     if io.head_count > 0 {
+         parts.push(format!("{} HEAD", io.head_count));
+     }
++    if io.list_count > 0 {
++        parts.push(format!("{} LIST", io.list_count));
++    }
++    if io.delete_count > 0 {
++        parts.push(format!("{} DELETE", io.delete_count));
++    }
+     if parts.is_empty() {
+         "0".into()
+     } else {
+@@ -339,6 +335,12 @@ fn fmt_requests(io: &ObjectStoreMeter) -> String {
+     }
+ }
+ 
++/// Measured CPU seconds for a warm row, looked up by name. `None` when CPU
++/// was not sampled for that row (prices as "CPU not metered").
++fn cpu_for_name(rows: Option<&[(String, f64)]>, name: &str) -> Option<f64> {
++    rows.and_then(|r| r.iter().find(|(n, _)| n == name).map(|(_, s)| *s))
++}
++
+ /// "X up · Y down" byte-volume cell (only the directions that moved).
+ fn fmt_io_bytes(io: &ObjectStoreMeter) -> String {
+     let mut parts = Vec::new();
+@@ -360,23 +362,14 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
+     let retention_months = c.storage_months.unwrap_or_else(storage_months);
+ 
+     // ---- Write path: ingest + drain + compaction (compute and requests).
+-    // Each phase is billed at its binding share — pool CPU or peak-RSS
+-    // share of RAM, whichever is larger — for its full wall duration.
+-    let ingest_vcpu_s = inst.parallel_vcpu_seconds(c.ingest_wall_s, c.writers);
+-    let ingest_compute =
+-        inst.phase_compute_usd(c.ingest_wall_s, c.writers, c.ingest_peak_rss_bytes);
+-    let drain_wall_s = c.store.drain_wall_s.unwrap_or(0.0);
+-    let drain_vcpu_s = inst.parallel_vcpu_seconds(drain_wall_s, c.writers);
+-    let drain_compute =
+-        inst.phase_compute_usd(drain_wall_s, c.writers, c.store.drain_peak_rss_bytes);
+-
+-    let compaction_wall_s = c.store.compaction_wall_s.unwrap_or(0.0);
+-    let compaction_vcpu_s = inst.parallel_vcpu_seconds(compaction_wall_s, c.writers);
+-    let compaction_compute = inst.phase_compute_usd(
+-        compaction_wall_s,
+-        c.writers,
+-        c.store.compaction_peak_rss_bytes,
+-    );
++    // Compute is priced from MEASURED process CPU seconds only. Wall time is
++    // retained for the latency columns but never converted to compute, so a
++    // phase that spends most of its wall awaiting object-store I/O (a thread
++    // off-CPU) is not billed for CPU it never used. A phase without a measured
++    // CPU value renders "NOT METERED" rather than a wall-derived guess.
++    let ingest_compute = c.ingest_cpu_s.map(|cpu| inst.cpu_seconds_usd(cpu));
++    let drain_compute = c.store.drain_cpu_s.map(|cpu| inst.cpu_seconds_usd(cpu));
++    let compaction_compute = c.store.compaction_cpu_s.map(|cpu| inst.cpu_seconds_usd(cpu));
+ 
+     let ingest_req_usd = match (c.store.ingest, c.unmetered_put_count) {
+         (Some(io), _) => request_usd(&io),
+@@ -386,7 +379,10 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
+     let drain_req_usd = c.store.drain.map(|io| request_usd(&io)).unwrap_or(0.0);
+     let compaction_req_usd = c.store.compaction.map(|io| request_usd(&io)).unwrap_or(0.0);
+ 
+-    let write_compute = ingest_compute + drain_compute + compaction_compute;
++    let write_compute =
++        ingest_compute.unwrap_or(0.0) + drain_compute.unwrap_or(0.0) + compaction_compute.unwrap_or(0.0);
++    let write_compute_metered =
++        ingest_compute.is_some() || drain_compute.is_some() || compaction_compute.is_some();
+     let write_requests = ingest_req_usd + drain_req_usd + compaction_req_usd;
+     let write_total = write_compute + write_requests;
+     let write_per_million_docs = if c.n_docs > 0 {
+@@ -408,13 +404,15 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
+     let gb_months = stored_gb * retention_months;
+     let storage_month = gb_months * USD_PER_GB_MONTH;
+ 
+-    // ---- Warm query battery (CPU-priced) ----
++    // ---- Warm query battery (priced from measured CPU) ----
++    // Only rows with a measured CPU value get a dollar figure; the rest are
++    // reported as latency-only below.
+     let warm_costs: Vec<(f64, f64, String)> = c
+         .warm
+         .iter()
+-        .map(|(name, p50_s)| {
+-            let per_q = inst.per_query_usd(*p50_s, c.resident_anon_bytes);
+-            (per_q, *p50_s, name.clone())
++        .filter_map(|(name, p50_s)| {
++            cpu_for_name(c.warm_cpu_s, name)
++                .map(|cpu| (inst.cpu_seconds_usd(cpu), *p50_s, name.clone()))
+         })
+         .collect();
+     let (min_q_cost, max_q_cost, fastest_name, fastest_p50) = if warm_costs.is_empty() {
+@@ -441,16 +439,24 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
+             .or_else(|| rows.first())
+     });
+ 
+-    // Per-query cold dollars = marginal CPU for the search + measured
+-    // object-store requests for the first-query fetch window.
++    // Per-query cold dollars = measured search CPU + measured object-store
++    // requests for the first-query fetch window. `None` when cold-search CPU
++    // was not sampled.
+     let cold_query_req_usd = c.store.cold_query.map(|io| request_usd(&io));
+-    let cold_query_usd = anchor_cold.map(|q| {
+-        inst.per_query_usd(q.search_s, c.resident_anon_bytes) + cold_query_req_usd.unwrap_or(0.0)
++    let cold_query_usd = anchor_cold.and_then(|q| {
++        q.search_cpu_s
++            .map(|cpu| inst.cpu_seconds_usd(cpu) + cold_query_req_usd.unwrap_or(0.0))
+     });
+ 
+     // ---- Block 1: rate card ----
+     let warm_query_cell = if warm_costs.is_empty() {
+-        "—".into()
++        match c.warm.first() {
++            Some((name, p50_s)) => format!(
++                "latency only: {} p50 ({name}); CPU not metered",
++                fmt_time(*p50_s * 1e9)
++            ),
++            None => "—".into(),
++        }
+     } else if (max_q_cost - min_q_cost).abs() < f64::EPSILON {
+         format!(
+             "{} queries @ {} p50 ({})",
+@@ -493,27 +499,34 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
+         ],
+         vec![
+             text(write_label),
+-            text(format!(
+-                "{} compute + {} requests → {} total ({}/1M docs)",
+-                usd(write_compute),
+-                usd(write_requests),
+-                usd(write_total),
+-                usd(write_per_million_docs),
+-            )),
++            text(if write_compute_metered {
++                format!(
++                    "{} compute + {} requests → {} total ({}/1M docs)",
++                    usd(write_compute),
++                    usd(write_requests),
++                    usd(write_total),
++                    usd(write_per_million_docs),
++                )
++            } else {
++                format!(
++                    "compute NOT METERED + {} requests ({}/1M docs, requests only)",
++                    usd(write_requests),
++                    usd(per_million_docs(write_requests)),
++                )
++            }),
+         ],
+         vec![
+             text("Serving RAM (instance sizing)"),
+             text(format!(
+-                "{} resident = {:.0}% of {:.0} GiB RAM — sizing fact, not a dollar line: \
+-                 RAM held during a query is already inside $/1M queries via the \
+-                 binding-resource rule",
++                "{} resident = {:.0}% of {:.0} GiB RAM — sizing only, not billed as \
++                 CPU (compute is measured on-CPU time)",
+                 fmt_bytes(c.resident_anon_bytes),
+                 inst.ram_share(c.resident_anon_bytes) * 100.0,
+                 inst.ram_gib,
+             )),
+         ],
+         vec![
+-            text("Warm query (marginal, binding resource)"),
++            text("Warm query (marginal, measured CPU)"),
+             text(warm_query_cell),
+         ],
+     ];
+@@ -771,100 +784,108 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
+         rows: io_rows,
+     });
+ 
+-    // ---- Block 3: compute ledger ----
+-    let writers_used = c.writers.min(inst.vcpu);
+-    let vcpu_share = format!("{writers_used}/{}/vCPU share", inst.vcpu);
+-    // A parallel phase's label carries its binding resource: peak RSS when
+-    // the phase's RAM share exceeds the pool's CPU share, else CPU.
+-    let phase_binding_tag = |peak_rss: Option<u64>| -> String {
+-        match peak_rss {
+-            Some(rss) if inst.phase_ram_binds(c.writers, Some(rss)) => {
+-                format!(" — RAM-bound: {} peak held for the window", fmt_bytes(rss))
+-            }
+-            Some(rss) => format!(" — {} peak, CPU binds", fmt_bytes(rss)),
+-            None => String::new(),
++    // ---- Block 3: compute ledger (measured process CPU only) ----
++    // Each row shows measured wall (latency, never priced), measured CPU
++    // seconds (fg+bg across all threads), and the dollar cost of *that CPU*.
++    // A phase without a measured CPU value says NOT METERED — never a
++    // wall-derived guess. `per_million` rows are per-query (priced /1M).
++    let rss_tag = |peak_rss: Option<u64>| -> String {
++        peak_rss
++            .map(|r| format!(" — peak RSS {}", fmt_bytes(r)))
++            .unwrap_or_default()
++    };
++    // Per-query rows (`per_million`) are sub-millisecond, so their wall/CPU
++    // print in `fmt_time` units (µs/ns) rather than whole seconds; one-time
++    // phases print in seconds.
++    let wall_cell = |wall_s: Option<f64>, per_million: bool| -> String {
++        match (wall_s, per_million) {
++            (Some(w), true) => format!("{} p50", fmt_time(w * 1e9)),
++            (Some(w), false) => fmt_wall_seconds(w),
++            (None, _) => "—".into(),
+         }
+     };
+-    let mut compute_rows = vec![vec![
+-        text(format!(
++    let cpu_row =
++        |label: String, wall_s: Option<f64>, cpu_s: Option<f64>, per_million: bool| -> Vec<Cell> {
++            match cpu_s {
++                Some(cpu) => {
++                    let usd_v = inst.cpu_seconds_usd(cpu);
++                    let (cpu_cell, cost) = if per_million {
++                        (
++                            format!("{}/query", fmt_time(cpu * 1e9)),
++                            metric(
++                                usd_v * PER_MILLION,
++                                format!("{} queries", usd_per_million(usd_v)),
++                                Better::Lower,
++                            ),
++                        )
++                    } else {
++                        (fmt_vcpu_seconds(cpu), metric(usd_v, usd(usd_v), Better::Lower))
++                    };
++                    vec![
++                        text(label),
++                        text(wall_cell(wall_s, per_million)),
++                        text(cpu_cell),
++                        cost,
++                    ]
++                }
++                None => vec![
++                    text(label),
++                    text(if wall_s.is_some() {
++                        wall_cell(wall_s, per_million)
++                    } else {
++                        "NOT METERED".into()
++                    }),
++                    text("NOT METERED"),
++                    text("—"),
++                ],
++            }
++        };
++    let mut compute_rows = vec![cpu_row(
++        format!(
+             "Ingest ({}w on {} vCPU{})",
+             c.writers,
+             inst.vcpu,
+-            phase_binding_tag(c.ingest_peak_rss_bytes),
+-        )),
+-        text(format!(
+-            "{} × {vcpu_share}",
+-            fmt_wall_seconds(c.ingest_wall_s)
+-        )),
+-        text(fmt_vcpu_seconds(ingest_vcpu_s)),
+-        metric(ingest_compute, usd(ingest_compute), Better::Lower),
+-    ]];
+-    if c.store.drain_wall_s.is_some() {
+-        compute_rows.push(vec![
+-            text(format!(
++            rss_tag(c.ingest_peak_rss_bytes),
++        ),
++        Some(c.ingest_wall_s),
++        c.ingest_cpu_s,
++        false,
++    )];
++    if c.store.drain_wall_s.is_some() || c.vector_cell {
++        compute_rows.push(cpu_row(
++            format!(
+                 "Drain (hidden index, one-time{})",
+-                phase_binding_tag(c.store.drain_peak_rss_bytes),
+-            )),
+-            text(format!("{} × {vcpu_share}", fmt_wall_seconds(drain_wall_s))),
+-            text(fmt_vcpu_seconds(drain_vcpu_s)),
+-            metric(drain_compute, usd(drain_compute), Better::Lower),
+-        ]);
+-    } else if c.vector_cell {
+-        compute_rows.push(vec![
+-            text("Drain (hidden index, one-time)"),
+-            text("NOT METERED"),
+-            text("—"),
+-            text("—"),
+-        ]);
++                rss_tag(c.store.drain_peak_rss_bytes)
++            ),
++            c.store.drain_wall_s,
++            c.store.drain_cpu_s,
++            false,
++        ));
+     }
+-    if c.store.compaction_wall_s.is_some() {
+-        compute_rows.push(vec![
+-            text(format!(
++    if c.store.compaction_wall_s.is_some() || c.vector_cell {
++        compute_rows.push(cpu_row(
++            format!(
+                 "Compaction (optimize, one-time{})",
+-                phase_binding_tag(c.store.compaction_peak_rss_bytes),
+-            )),
+-            text(format!(
+-                "{} × {vcpu_share}",
+-                fmt_wall_seconds(compaction_wall_s)
+-            )),
+-            text(fmt_vcpu_seconds(compaction_vcpu_s)),
+-            metric(compaction_compute, usd(compaction_compute), Better::Lower),
+-        ]);
+-    } else if c.vector_cell {
+-        compute_rows.push(vec![
+-            text("Compaction (optimize, one-time)"),
+-            text("NOT METERED"),
+-            text("—"),
+-            text("—"),
+-        ]);
++                rss_tag(c.store.compaction_peak_rss_bytes)
++            ),
++            c.store.compaction_wall_s,
++            c.store.compaction_cpu_s,
++            false,
++        ));
+     }
+     if let Some(q) = anchor_cold {
+-        let open_vcpu = inst.per_query_vcpu_seconds(q.open_s, c.resident_anon_bytes);
+-        let open_usd = open_vcpu * inst.usd_per_sec();
+         let open_label = if c.cold_open_amortized {
+             format!("Table open CPU (one-time, {})", q.name)
+         } else {
+             format!("Cold open CPU ({})", q.name)
+         };
+-        compute_rows.push(vec![
+-            text(open_label),
+-            text(fmt_wall_seconds(q.open_s)),
+-            text(fmt_vcpu_seconds(open_vcpu)),
+-            metric(open_usd, usd(open_usd), Better::Lower),
+-        ]);
+-        let search_per_q = inst.per_query_usd(q.search_s, c.resident_anon_bytes);
+-        compute_rows.push(vec![
+-            text(format!("Cold query CPU ({})", q.name)),
+-            text(format!("{} p50", fmt_time(q.search_s * 1e9))),
+-            text(fmt_vcpu_seconds(
+-                inst.per_query_vcpu_seconds(q.search_s, c.resident_anon_bytes),
+-            )),
+-            metric(
+-                search_per_q * PER_MILLION,
+-                format!("{} queries", usd_per_million(search_per_q)),
+-                Better::Lower,
+-            ),
+-        ]);
++        compute_rows.push(cpu_row(open_label, Some(q.open_s), q.open_cpu_s, false));
++        compute_rows.push(cpu_row(
++            format!("Cold query CPU ({})", q.name),
++            Some(q.search_s),
++            q.search_cpu_s,
++            true,
++        ));
+     }
+     if let Some((name, p50_s)) = c
+         .warm
+@@ -872,59 +893,62 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
+         .find(|(n, _)| n == "ten_term_or")
+         .or_else(|| c.warm.first())
+     {
+-        let per_q = inst.per_query_usd(*p50_s, c.resident_anon_bytes);
+-        compute_rows.push(vec![
+-            text(format!("Warm query CPU ({name})")),
+-            text(format!("{} p50", fmt_time(*p50_s * 1e9))),
+-            text(fmt_vcpu_seconds(
+-                inst.per_query_vcpu_seconds(*p50_s, c.resident_anon_bytes),
+-            )),
+-            metric(
+-                per_q * PER_MILLION,
+-                format!("{} queries", usd_per_million(per_q)),
+-                Better::Lower,
+-            ),
+-        ]);
++        compute_rows.push(cpu_row(
++            format!("Warm query CPU ({name})"),
++            Some(*p50_s),
++            cpu_for_name(c.warm_cpu_s, name),
++            true,
++        ));
+     }
+     let compute_ledger = Block {
+         subtitle: format!(
+-            "Compute — wall × vCPU share priced on {} ({} vCPU / {:.0} GiB / {:.0} GB NVMe @ \
+-             ${:.4}/hr); one-time phases in absolute $, per-query phases per 1M queries",
++            "Compute — MEASURED process CPU time (fg+bg, all threads) priced on {} ({} vCPU / \
++             {:.0} GiB / {:.0} GB NVMe @ ${:.4}/hr). Wall/p50 is latency only and is never \
++             converted to compute; one-time phases in absolute $, per-query phases per 1M queries",
+             inst.name, inst.vcpu, inst.ram_gib, inst.nvme_gb, inst.usd_per_hour,
+         ),
+         headers: vec![
+             "Phase".into(),
+             "Wall / p50".into(),
+-            "vCPU·s".into(),
++            "CPU·s".into(),
+             "Cost".into(),
+         ],
+         rows: compute_rows,
+     };
+ 
+     // ---- Block 4: serving ----
+-    let binding = if inst.ram_binds(c.resident_anon_bytes) {
++    let binding = if inst.ram_binds_single_query(c.resident_anon_bytes) {
+         "DRAM"
+     } else {
+         "CPU"
+     };
++    // Warm serving row: $/query is measured CPU only; if CPU wasn't sampled
++    // the row is latency-only ("CPU not metered") rather than a wall guess.
++    let warm_serving_row =
++        |name: &str, p50_s: f64, cpu_s: Option<f64>, suffix: &str| -> Vec<Cell> {
++            match cpu_s {
++                Some(cpu) => {
++                    let per_q = inst.cpu_seconds_usd(cpu).max(f64::MIN_POSITIVE);
++                    let queries_per_usd = 1.0 / per_q;
++                    vec![
++                        text(format!("{name} — warm{suffix}")),
++                        text(fmt_time(p50_s * 1e9)),
++                        metric(queries_per_usd, format!("{queries_per_usd:.0}"), Better::Higher),
++                        text(usd(per_q * PER_MILLION)),
++                    ]
++                }
++                None => vec![
++                    text(format!("{name} — warm{suffix}")),
++                    text(fmt_time(p50_s * 1e9)),
++                    text("—"),
++                    text("CPU not metered"),
++                ],
++            }
++        };
+     let mut serving_rows: Vec<Vec<Cell>> = c
+         .warm
+         .iter()
+-        .map(|(name, p50_s)| {
+-            let per_q = inst.per_query_usd(*p50_s, c.resident_anon_bytes);
+-            let per_q_usd = per_q.max(f64::MIN_POSITIVE);
+-            let queries_per_usd = 1.0 / per_q_usd;
+-            vec![
+-                text(format!("{name} — warm")),
+-                text(fmt_time(p50_s * 1e9)),
+-                metric(
+-                    queries_per_usd,
+-                    format!("{queries_per_usd:.0}"),
+-                    Better::Higher,
+-                ),
+-                text(usd(per_q * PER_MILLION)),
+-            ]
+-        })
++        .map(|(name, p50_s)| warm_serving_row(name, *p50_s, cpu_for_name(c.warm_cpu_s, name), ""))
+         .collect();
+     if let (Some(q), Some(per_q)) = (anchor_cold, cold_query_usd) {
+         let queries_per_usd = 1.0 / per_q.max(f64::MIN_POSITIVE);
+@@ -947,49 +971,48 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
+     // Pre-drain (transient) serving rows: what a query costs on a fresh
+     // table before maintenance drains the hidden index.
+     if let Some((name, p50_s)) = c.warm_pre.and_then(|rows| rows.first()) {
+-        let per_q = inst.per_query_usd(*p50_s, c.resident_anon_bytes);
+-        let queries_per_usd = 1.0 / per_q.max(f64::MIN_POSITIVE);
+-        serving_rows.push(vec![
+-            text(format!("{name} — warm, pre-drain (transient)")),
+-            text(fmt_time(p50_s * 1e9)),
+-            metric(
+-                queries_per_usd,
+-                format!("{queries_per_usd:.0}"),
+-                Better::Higher,
+-            ),
+-            text(usd(per_q * PER_MILLION)),
+-        ]);
++        serving_rows.push(warm_serving_row(
++            name,
++            *p50_s,
++            cpu_for_name(c.warm_pre_cpu_s, name),
++            ", pre-drain (transient)",
++        ));
+     }
+     if let Some(q) = c.cold_pre.and_then(|rows| rows.first()) {
+-        let per_q = inst.per_query_usd(q.search_s, c.resident_anon_bytes)
+-            + c.store
+-                .cold_query_pre
+-                .map(|io| request_usd(&io))
+-                .unwrap_or(0.0);
+-        let queries_per_usd = 1.0 / per_q.max(f64::MIN_POSITIVE);
+         let requests_note = c
+             .store
+             .cold_query_pre
+             .map(|io| format!(" (incl. {} GET/query)", io.get_count))
+             .unwrap_or_default();
+-        serving_rows.push(vec![
+-            text(format!(
+-                "{} — cold, pre-drain (transient){requests_note}",
+-                q.name
+-            )),
+-            text(fmt_time(q.search_s * 1e9)),
+-            metric(
+-                queries_per_usd,
+-                format!("{queries_per_usd:.0}"),
+-                Better::Higher,
+-            ),
+-            text(usd(per_q * PER_MILLION)),
+-        ]);
++        let label = format!("{} — cold, pre-drain (transient){requests_note}", q.name);
++        match q.search_cpu_s {
++            Some(cpu) => {
++                let per_q = (inst.cpu_seconds_usd(cpu)
++                    + c.store
++                        .cold_query_pre
++                        .map(|io| request_usd(&io))
++                        .unwrap_or(0.0))
++                .max(f64::MIN_POSITIVE);
++                let queries_per_usd = 1.0 / per_q;
++                serving_rows.push(vec![
++                    text(label),
++                    text(fmt_time(q.search_s * 1e9)),
++                    metric(queries_per_usd, format!("{queries_per_usd:.0}"), Better::Higher),
++                    text(usd(per_q * PER_MILLION)),
++                ]);
++            }
++            None => serving_rows.push(vec![
++                text(label),
++                text(fmt_time(q.search_s * 1e9)),
++                text("—"),
++                text("CPU not metered"),
++            ]),
++        }
+     }
+     let serving = Block {
+         subtitle: format!(
+             "Serving — latency per dollar (binding: {binding}; resident heap {}, file-backed \
+-             cache free on NVMe; cold row includes measured request cost)",
++             cache free on NVMe; compute = measured CPU, cold row adds measured request cost)",
+             fmt_bytes(c.resident_anon_bytes),
+         ),
+         headers: vec![
+@@ -1015,20 +1038,19 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
+                metering wrapper around the storage provider — requests and bytes are measured, \
+                never estimated, and multipart uploads count one PUT per part plus the create and \
+                complete calls. A phase this cell has but the harness failed to measure says \
+-               **NOT METERED**. **RAM billing:** per-query and per-phase marginals bill the \
+-               *binding* resource — `max(CPU share, resident-RSS share)` — because at packing \
+-               density the non-binding resource is stranded capacity that cannot be sold twice \
+-               (dominant-resource pricing, so CPU and RAM are not summed); the **Serving \
+-               RAM** line is an instance-sizing fact, not a dollar line — query-time RAM is \
+-               already inside the per-query marginal. Every dollar figure is normalized per \
+-               **1M docs** (write path; storage over the stated retention) or per **1M \
+-               queries** (serving). Per-query costs are per **1M queries** (warm = marginal \
+-               binding resource; cold = the same + measured GET requests). Warm/filtered I/O \
+-               rows average a multi-query window on the **same cache-hot consumer the warm \
+-               latency battery timed**; the fill-lag probe row is a diagnostic (repeat query \
+-               on a fresh consumer), not a steady-state price. Pre-drain rows show the \
+-               transient shape before hidden-index maintenance. The supertable's cold `open` \
+-               is one-time and amortized. Δ is vs the previous run."
++               **NOT METERED**. **Compute** is priced from **measured process CPU time** \
++               (on-CPU nanoseconds summed across all threads, fg+bg); wall/p50 is latency only \
++               and is never converted to compute, so async object-store wait is not billed as \
++               CPU. Warm-query CPU is measured by amortization (the op is sub-microsecond, so \
++               it is run in a loop and divided). The **Serving RAM** line is an instance-sizing \
++               fact, not a dollar line — compute is measured CPU, not an RSS share. Every dollar \
++               figure is normalized per **1M docs** (write path; storage over the stated \
++               retention) or per **1M queries** (serving; warm = measured CPU, cold = measured \
++               CPU + measured GET requests). Warm/filtered I/O rows average a multi-query window \
++               on the **same cache-hot consumer the warm latency battery timed**; the fill-lag \
++               probe row is a diagnostic (repeat query on a fresh consumer), not a steady-state \
++               price. Pre-drain rows show the transient shape before hidden-index maintenance. \
++               The supertable's cold `open` is one-time and amortized. Δ is vs the previous run."
+             .into(),
+         blocks,
+     });
+@@ -1043,6 +1065,8 @@ pub fn cold_from_timings(cold: &HashMap<&'static str, ColdTiming>) -> Vec<ColdQu
+             name: (*name).to_string(),
+             open_s: t.open.as_secs_f64(),
+             search_s: t.search.as_secs_f64(),
++            open_cpu_s: t.open_cpu_s,
++            search_cpu_s: t.search_cpu_s,
+         })
+         .collect()
+ }
+@@ -1055,6 +1079,14 @@ pub fn warm_from_fts(stats: &[FtsQueryStat]) -> Vec<(String, f64)> {
+         .collect()
+ }
+ 
++/// Measured warm CPU seconds `(name, cpu_s)` for FTS query rows.
++pub fn warm_cpu_from_fts(stats: &[FtsQueryStat]) -> Vec<(String, f64)> {
++    stats
++        .iter()
++        .filter_map(|s| s.cpu_s.map(|cpu| (s.name.to_string(), cpu)))
++        .collect()
++}
++
+ /// Flatten warm SQL query sets into `(name, p50_seconds)`.
+ pub fn warm_from_sql(sets: &QuerySets) -> Vec<(String, f64)> {
+     sets.scalar
+@@ -1066,18 +1098,40 @@ pub fn warm_from_sql(sets: &QuerySets) -> Vec<(String, f64)> {
+         .collect()
+ }
+ 
++/// Measured warm CPU seconds `(name, cpu_s)` for SQL query rows.
++pub fn warm_cpu_from_sql(sets: &QuerySets) -> Vec<(String, f64)> {
++    sets.scalar
++        .iter()
++        .chain(&sets.tvf)
++        .chain(&sets.fts_pushdown)
++        .chain(&sets.agg_idx)
++        .filter_map(|s| s.cpu_s.map(|cpu| (s.name.to_string(), cpu)))
++        .collect()
++}
++
++/// The rendered label for a recall row (`target` plus its `(p, r)` params).
++fn recall_row_label(r: &RecallRow) -> String {
++    if r.params.is_empty() || r.params == "—" {
++        r.target.clone()
++    } else {
++        format!("{} ({})", r.target, r.params)
++    }
++}
++
+ /// Flatten warm vector recall rows into `(label, p50_seconds)`.
+ pub fn warm_from_vector(rows: &[RecallRow]) -> Vec<(String, f64)> {
++    rows.iter()
++        .filter_map(|r| r.warm.as_ref().map(|w| (recall_row_label(r), w.p50_ns / 1e9)))
++        .collect()
++}
++
++/// Measured warm CPU seconds `(label, cpu_s)` for vector recall rows.
++pub fn warm_cpu_from_vector(rows: &[RecallRow]) -> Vec<(String, f64)> {
+     rows.iter()
+         .filter_map(|r| {
+-            r.warm.as_ref().map(|w| {
+-                let label = if r.params.is_empty() || r.params == "—" {
+-                    r.target.clone()
+-                } else {
+-                    format!("{} ({})", r.target, r.params)
+-                };
+-                (label, w.p50_ns / 1e9)
+-            })
++            r.warm
++                .as_ref()
++                .and_then(|w| w.cpu_s.map(|cpu| (recall_row_label(r), cpu)))
+         })
+         .collect()
+ }
+@@ -1086,17 +1140,12 @@ pub fn warm_from_vector(rows: &[RecallRow]) -> Vec<(String, f64)> {
+ pub fn cold_from_vector(rows: &[RecallRow]) -> Vec<ColdQuery> {
+     rows.iter()
+         .filter_map(|r| {
+-            r.cold.map(|t| {
+-                let label = if r.params.is_empty() || r.params == "—" {
+-                    r.target.clone()
+-                } else {
+-                    format!("{} ({})", r.target, r.params)
+-                };
+-                ColdQuery {
+-                    name: label,
+-                    open_s: t.open.as_secs_f64(),
+-                    search_s: t.search.as_secs_f64(),
+-                }
++            r.cold.map(|t| ColdQuery {
++                name: recall_row_label(r),
++                open_s: t.open.as_secs_f64(),
++                search_s: t.search.as_secs_f64(),
++                open_cpu_s: t.open_cpu_s,
++                search_cpu_s: t.search_cpu_s,
+             })
+         })
+         .collect()
+@@ -1117,32 +1166,20 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn parallel_ingest_costs_more_per_second_than_single_writer() {
+-        let inst = test_instance();
+-        let single = inst.phase_compute_usd(10.0, 1, None);
+-        let full = inst.phase_compute_usd(10.0, 8, None);
+-        assert!((full / single - 8.0).abs() < 1e-9);
+-    }
+-
+-    #[test]
+-    fn ram_bound_phase_bills_rss_share_for_full_wall() {
++    fn compute_cost_is_linear_in_measured_cpu_seconds() {
+         let inst = test_instance();
+-        // 1 writer on 8 vCPU = 12.5% CPU share; 8 GiB peak on 16 GiB = 50%
+-        // RAM share → RAM binds and the phase bills 4× the CPU-only price.
+-        let eight_gib = 8u64 << 30;
+-        let cpu_only = inst.phase_compute_usd(10.0, 1, None);
+-        let ram_bound = inst.phase_compute_usd(10.0, 1, Some(eight_gib));
+-        assert!(inst.phase_ram_binds(1, Some(eight_gib)));
+-        assert!((ram_bound / cpu_only - 4.0).abs() < 1e-9);
+-        // Full-pool CPU (100%) dominates the same 50% RAM share.
+-        assert!(!inst.phase_ram_binds(8, Some(eight_gib)));
++        let one = inst.cpu_seconds_usd(10.0);
++        let eight = inst.cpu_seconds_usd(80.0);
++        assert!((eight / one - 8.0).abs() < 1e-9);
++        // At $0.3629/hr on 8 vCPU, one vCPU-second is a fixed rate.
++        assert!((inst.cpu_seconds_usd(1.0) - 0.3629 / 3600.0).abs() < 1e-12);
+     }
+ 
+     #[test]
+-    fn lower_latency_yields_more_queries_per_dollar() {
++    fn more_measured_cpu_costs_more() {
+         let inst = test_instance();
+-        let fast = inst.per_query_usd(0.001, 1 << 20);
+-        let slow = inst.per_query_usd(0.010, 1 << 20);
++        let fast = inst.cpu_seconds_usd(0.001);
++        let slow = inst.cpu_seconds_usd(0.010);
+         assert!(slow > fast);
+         assert!((slow / fast - 10.0).abs() < 1e-6);
+     }
+@@ -1150,8 +1187,8 @@ mod tests {
+     #[test]
+     fn ram_binds_only_when_heap_exceeds_per_core_budget() {
+         let inst = test_instance();
+-        assert!(!inst.ram_binds(1 << 30));
+-        assert!(inst.ram_binds(3 * (1 << 30)));
++        assert!(!inst.ram_binds_single_query(1 << 30));
++        assert!(inst.ram_binds_single_query(3 * (1 << 30)));
+     }
+ 
+     #[test]
+diff --git a/benches/utils/executors.rs b/benches/utils/executors.rs
+index f540346..6ffcd23 100644
+--- a/benches/utils/executors.rs
++++ b/benches/utils/executors.rs
+@@ -12,7 +12,10 @@
+ //! per-modality trait here, so the measured + reported surface can never
+ //! drift between the two tiers again.
+ 
+-use std::{sync::Arc, time::{Duration, Instant}};
++use std::{
++    sync::Arc,
++    time::{Duration, Instant},
++};
+ 
+ /// p50 of a sample set (lower-median; matches the historical bench
+ /// definition shared by every runner).
+@@ -24,6 +27,27 @@ pub fn p50(samples: &mut [Duration]) -> Duration {
+     samples[(samples.len() - 1) / 2]
+ }
+ 
++/// Minimum wall time a warm-CPU amortization loop runs before it stops, so
++/// the two boundary CPU reads amortize to ~0 even for hundreds-of-ns ops.
++/// 100 ms is still ~330k iterations at ~300 ns/op — the CPU delta is resolved
++/// to well under a percent — while keeping the per-query measurement overhead
++/// modest.
++pub const WARM_CPU_MIN_WALL: Duration = Duration::from_millis(100);
++/// Hard iteration cap for the warm-CPU loop, so a slower-than-expected op
++/// can't spin unbounded (at ~300ns/op, 200ms is ~700k iters — the cap is
++/// generous headroom above that).
++pub const WARM_CPU_MAX_ITERS: usize = 20_000_000;
++
++/// Mean of a CPU-seconds sample set, or `None` when nothing was sampled
++/// (CPU accounting unavailable on the platform).
++fn mean_cpu_s(samples: &[f64]) -> Option<f64> {
++    if samples.is_empty() {
++        None
++    } else {
++        Some(samples.iter().sum::<f64>() / samples.len() as f64)
++    }
++}
++
+ /// Cold timings for one query, split at the open/search boundary:
+ /// `open` is the fresh-consumer open (consumer + manifest + every
+ /// superfile reader), `search` is the first query over the opened but
+@@ -34,6 +58,11 @@ pub fn p50(samples: &mut [Duration]) -> Duration {
+ pub struct ColdTiming {
+     pub open: Duration,
+     pub search: Duration,
++    /// Mean process CPU seconds (fg+bg, all threads) attributed to the open
++    /// phase per cold iteration. `None` if CPU accounting is unavailable.
++    pub open_cpu_s: Option<f64>,
++    /// Mean process CPU seconds attributed to the cold search per iteration.
++    pub search_cpu_s: Option<f64>,
+ }
+ 
+ /// Force-open every superfile reader on the consumer's pinned snapshot —
+@@ -353,6 +382,10 @@ pub mod fts {
+         pub name: &'static str,
+         pub p50: Duration,
+         pub p50_fetched: Duration,
++        /// Amortized process CPU seconds per query-phase call (id + score).
++        pub cpu_s: Option<f64>,
++        /// Amortized process CPU seconds per fetch-phase call (+ text column).
++        pub fetched_cpu_s: Option<f64>,
+         pub rss: RssStats,
+     }
+ 
+@@ -390,11 +423,32 @@ pub mod fts {
+                     fetched_samples.push(t.elapsed());
+                     std::hint::black_box(rows);
+                 }
++                // CPU is measured by amortization, not per-call: warm BM25 is
++                // hundreds of ns, far below any clock's per-read cost, so we
++                // run each phase in a loop and divide (see `crate::cpu`).
++                let cpu_s = crate::cpu::amortized_cpu_per_iter(
++                    || {
++                        let rows = reader.bm25_rows(column, &query, k, mode);
++                        std::hint::black_box(rows);
++                    },
++                    WARM_CPU_MIN_WALL,
++                    WARM_CPU_MAX_ITERS,
++                );
++                let fetched_cpu_s = crate::cpu::amortized_cpu_per_iter(
++                    || {
++                        let rows = reader.bm25_rows_fetched(column, &query, k, mode);
++                        std::hint::black_box(rows);
++                    },
++                    WARM_CPU_MIN_WALL,
++                    WARM_CPU_MAX_ITERS,
++                );
+                 let rss = sampler.stop_stats();
+                 FtsQueryStat {
+                     name: q.name,
+                     p50: p50(&mut samples),
+                     p50_fetched: p50(&mut fetched_samples),
++                    cpu_s,
++                    fetched_cpu_s,
+                     rss,
+                 }
+             })
+@@ -425,13 +479,26 @@ pub mod fts {
+             let mode = to_infino_mode(q.mode);
+             let mut open_samples = Vec::with_capacity(iters);
+             let mut search_samples = Vec::with_capacity(iters);
++            // Cold open + search are ms-scale, so a per-iteration CPU bracket
++            // (ns-resolution `schedstat`) is already accurate — no need to
++            // amortize as the warm path does.
++            let mut open_cpu = Vec::with_capacity(iters);
++            let mut search_cpu = Vec::with_capacity(iters);
+             for _ in 0..iters {
++                let c_open = crate::cpu::process_cpu_ns();
+                 let t_open = Instant::now();
+                 let guard = open_fresh();
+                 open_samples.push(t_open.elapsed());
++                if let Some(s) = crate::cpu::cpu_seconds_since(c_open) {
++                    open_cpu.push(s);
++                }
++                let c_search = crate::cpu::process_cpu_ns();
+                 let t = Instant::now();
+                 let rows = guard.bm25_rows(column, &query, k, mode);
+                 search_samples.push(t.elapsed());
++                if let Some(s) = crate::cpu::cpu_seconds_since(c_search) {
++                    search_cpu.push(s);
++                }
+                 std::hint::black_box(rows);
+                 drop(guard);
+             }
+@@ -440,6 +507,8 @@ pub mod fts {
+                 ColdTiming {
+                     open: p50(&mut open_samples),
+                     search: p50(&mut search_samples),
++                    open_cpu_s: mean_cpu_s(&open_cpu),
++                    search_cpu_s: mean_cpu_s(&search_cpu),
+                 },
+             );
+         }
+@@ -1032,6 +1101,8 @@ pub mod vector {
+     #[derive(Clone, Copy)]
+     pub struct VecTiming {
+         pub p50_ns: f64,
++        /// Amortized process CPU seconds per warm search (fg+bg, all threads).
++        pub cpu_s: Option<f64>,
+         pub rss: RssStats,
+     }
+ 
+@@ -1052,9 +1123,20 @@ pub mod vector {
+             samples.push(t0.elapsed());
+             black_box(hits);
+         }
++        // Warm CPU by amortization (see `crate::cpu`): warm search is far too
++        // fast to time per call, so run it in a loop and divide.
++        let cpu_s = crate::cpu::amortized_cpu_per_iter(
++            || {
++                let hits = reader.topk_global(column, query, k, nprobe, rerank);
++                black_box(hits);
++            },
++            WARM_CPU_MIN_WALL,
++            WARM_CPU_MAX_ITERS,
++        );
+         let rss = sampler.stop_stats();
+         VecTiming {
+             p50_ns: p50(&mut samples).as_secs_f64() * NS_PER_SEC,
++            cpu_s,
+             rss,
+         }
+     }
+@@ -1072,19 +1154,31 @@ pub mod vector {
+     ) -> ColdTiming {
+         let mut open_samples = Vec::with_capacity(iters);
+         let mut search_samples = Vec::with_capacity(iters);
++        let mut open_cpu = Vec::with_capacity(iters);
++        let mut search_cpu = Vec::with_capacity(iters);
+         for _ in 0..iters {
++            let c_open = crate::cpu::process_cpu_ns();
+             let t_open = Instant::now();
+             let guard = open_fresh();
+             open_samples.push(t_open.elapsed());
++            if let Some(s) = crate::cpu::cpu_seconds_since(c_open) {
++                open_cpu.push(s);
++            }
++            let c_search = crate::cpu::process_cpu_ns();
+             let t0 = Instant::now();
+             let hits = guard.topk_global(column, query, k, nprobe, rerank);
+             search_samples.push(t0.elapsed());
++            if let Some(s) = crate::cpu::cpu_seconds_since(c_search) {
++                search_cpu.push(s);
++            }
+             black_box(hits);
+             drop(guard);
+         }
+         ColdTiming {
+             open: p50(&mut open_samples),
+             search: p50(&mut search_samples),
++            open_cpu_s: mean_cpu_s(&open_cpu),
++            search_cpu_s: mean_cpu_s(&search_cpu),
+         }
+     }
+ 
+@@ -1107,9 +1201,17 @@ pub mod vector {
+ 
+     fn rss_cells(stats: &RssStats) -> Vec<Cell> {
+         vec![
++            // Peak total RSS, annotated with the anon (heap working set) vs
++            // file-backed (mmap cache, free on NVMe) split — the sizing
++            // discriminator when peak RSS looks high.
+             metric(
+                 stats.peak_rss_bytes as f64,
+-                rss::fmt_bytes(stats.peak_rss_bytes),
++                format!(
++                    "{} (anon {}, file {})",
++                    rss::fmt_bytes(stats.peak_rss_bytes),
++                    rss::fmt_bytes(stats.peak_anon_rss_bytes),
++                    rss::fmt_bytes(stats.peak_file_rss_bytes),
++                ),
+                 Better::Lower,
+             ),
+             metric(
+@@ -1510,6 +1612,8 @@ pub mod sql {
+     pub struct SqlQueryStat {
+         pub name: &'static str,
+         pub p50: Duration,
++        /// Amortized process CPU seconds per warm query (fg+bg, all threads).
++        pub cpu_s: Option<f64>,
+         pub rows: usize,
+         pub rss: RssStats,
+     }
+@@ -1534,10 +1638,19 @@ pub mod sql {
+             samples.push(t0.elapsed());
+             black_box(r);
+         }
++        let cpu_s = crate::cpu::amortized_cpu_per_iter(
++            || {
++                let r = reader.query_rows(sql);
++                black_box(r);
++            },
++            WARM_CPU_MIN_WALL,
++            WARM_CPU_MAX_ITERS,
++        );
+         let rss = sampler.stop_stats();
+         SqlQueryStat {
+             name,
+             p50: p50(&mut samples),
++            cpu_s,
+             rows: warm_rows,
+             rss,
+         }
+@@ -1762,13 +1875,23 @@ pub mod sql {
+             );
+             let mut open_samples = Vec::with_capacity(iters);
+             let mut search_samples = Vec::with_capacity(iters);
++            let mut open_cpu = Vec::with_capacity(iters);
++            let mut search_cpu = Vec::with_capacity(iters);
+             for _ in 0..iters {
++                let c_open = crate::cpu::process_cpu_ns();
+                 let t_open = Instant::now();
+                 let guard = open_fresh();
+                 open_samples.push(t_open.elapsed());
++                if let Some(s) = crate::cpu::cpu_seconds_since(c_open) {
++                    open_cpu.push(s);
++                }
++                let c_search = crate::cpu::process_cpu_ns();
+                 let t0 = Instant::now();
+                 let rows = guard.query_rows(q.sql);
+                 search_samples.push(t0.elapsed());
++                if let Some(s) = crate::cpu::cpu_seconds_since(c_search) {
++                    search_cpu.push(s);
++                }
+                 black_box(rows);
+                 drop(guard);
+             }
+@@ -1777,6 +1900,8 @@ pub mod sql {
+                 ColdTiming {
+                     open: p50(&mut open_samples),
+                     search: p50(&mut search_samples),
++                    open_cpu_s: mean_cpu_s(&open_cpu),
++                    search_cpu_s: mean_cpu_s(&search_cpu),
+                 },
+             );
+         }
+diff --git a/benches/utils/harness/driver.rs b/benches/utils/harness/driver.rs
+index 84ae414..31f08a9 100644
+--- a/benches/utils/harness/driver.rs
++++ b/benches/utils/harness/driver.rs
+@@ -30,6 +30,9 @@ pub struct FtsQuery {
+ #[derive(Clone, Copy, Debug)]
+ pub struct PhaseStats {
+     pub wall: Duration,
++    /// Measured process CPU seconds (fg+bg) for the phase. `None` if CPU
++    /// sampling was unavailable.
++    pub cpu_s: Option<f64>,
+     pub rss: RssStats,
+ }
+ 
+@@ -102,14 +105,17 @@ pub fn run_fts_with_index<E: FtsEngine>(
+     );
+     let mut index = E::open(column);
+     let sampler = PeakSampler::start_default();
++    let cpu0 = crate::cpu::process_cpu_ns();
+     let t0 = Instant::now();
+     E::write(&mut index, docs);
+     let build_wall = t0.elapsed();
++    let build_cpu = crate::cpu::cpu_seconds_since(cpu0);
+     let build_rss = sampler.stop_stats();
+     let mut builds = vec![BuildStat {
+         writers: 1,
+         phase: PhaseStats {
+             wall: build_wall,
++            cpu_s: build_cpu,
+             rss: build_rss,
+         },
+     }];
+@@ -121,13 +127,15 @@ pub fn run_fts_with_index<E: FtsEngine>(
+             E::name(),
+         );
+         let sampler = PeakSampler::start_default();
++        let cpu0 = crate::cpu::process_cpu_ns();
+         let t0 = Instant::now();
+         E::parallel_write(column, docs, parallel);
+         let wall = t0.elapsed();
++        let cpu_s = crate::cpu::cpu_seconds_since(cpu0);
+         let rss = sampler.stop_stats();
+         builds.push(BuildStat {
+             writers: parallel,
+-            phase: PhaseStats { wall, rss },
++            phase: PhaseStats { wall, cpu_s, rss },
+         });
+     }
+ 
+diff --git a/benches/utils/harness/sql_driver.rs b/benches/utils/harness/sql_driver.rs
+index 22e2dcd..513f250 100644
+--- a/benches/utils/harness/sql_driver.rs
++++ b/benches/utils/harness/sql_driver.rs
+@@ -33,6 +33,9 @@ pub struct SqlRunConfig {
+ pub struct SqlBuildStat {
+     pub writers: usize,
+     pub wall: Duration,
++    /// Measured process CPU seconds (fg+bg) for the build. `None` if CPU
++    /// sampling was unavailable.
++    pub cpu_s: Option<f64>,
+     pub rss: RssStats,
+ }
+ 
+@@ -74,13 +77,16 @@ pub fn run_sql_with_index<E: SqlEngine>(
+     );
+     let mut index = E::open();
+     let sampler = PeakSampler::start_default();
++    let cpu0 = crate::cpu::process_cpu_ns();
+     let t0 = Instant::now();
+     E::write(&mut index, rows);
+     let wall = t0.elapsed();
++    let cpu_s = crate::cpu::cpu_seconds_since(cpu0);
+     let rss = sampler.stop_stats();
+     let mut builds = vec![SqlBuildStat {
+         writers: 1,
+         wall,
++        cpu_s,
+         rss,
+     }];
+ 
+@@ -91,13 +97,16 @@ pub fn run_sql_with_index<E: SqlEngine>(
+             cfg.parallel,
+         );
+         let sampler = PeakSampler::start_default();
++        let cpu0 = crate::cpu::process_cpu_ns();
+         let t0 = Instant::now();
+         E::parallel_write(rows, cfg.parallel);
+         let wall = t0.elapsed();
++        let cpu_s = crate::cpu::cpu_seconds_since(cpu0);
+         let rss = sampler.stop_stats();
+         builds.push(SqlBuildStat {
+             writers: cfg.parallel,
+             wall,
++            cpu_s,
+             rss,
+         });
+     }
+diff --git a/benches/utils/harness/vector_driver.rs b/benches/utils/harness/vector_driver.rs
+index b6a52ba..e016238 100644
+--- a/benches/utils/harness/vector_driver.rs
++++ b/benches/utils/harness/vector_driver.rs
+@@ -56,6 +56,9 @@ pub struct VectorRunConfig<'a> {
+ pub struct VectorBuildStat {
+     pub writers: usize,
+     pub wall: Duration,
++    /// Measured process CPU seconds (fg+bg) for the build. `None` if CPU
++    /// sampling was unavailable.
++    pub cpu_s: Option<f64>,
+     pub rss: RssStats,
+ }
+ 
+@@ -101,13 +104,16 @@ pub fn run_vector_with_index<E: VectorEngine>(
+     );
+     let mut index = E::open(cfg.column, cfg.dim, cfg.metric, n_cent);
+     let sampler = PeakSampler::start_default();
++    let cpu0 = crate::cpu::process_cpu_ns();
+     let t0 = Instant::now();
+     E::write(&mut index, vectors);
+     let wall = t0.elapsed();
++    let cpu_s = crate::cpu::cpu_seconds_since(cpu0);
+     let rss = sampler.stop_stats();
+     let mut builds = vec![VectorBuildStat {
+         writers: 1,
+         wall,
++        cpu_s,
+         rss,
+     }];
+ 
+@@ -118,13 +124,16 @@ pub fn run_vector_with_index<E: VectorEngine>(
+             cfg.parallel,
+         );
+         let sampler = PeakSampler::start_default();
++        let cpu0 = crate::cpu::process_cpu_ns();
+         let t0 = Instant::now();
+         E::parallel_write(cfg.column, vectors, cfg.dim, cfg.metric, cfg.parallel);
+         let wall = t0.elapsed();
++        let cpu_s = crate::cpu::cpu_seconds_since(cpu0);
+         let rss = sampler.stop_stats();
+         builds.push(VectorBuildStat {
+             writers: cfg.parallel,
+             wall,
++            cpu_s,
+             rss,
+         });
+     }
+diff --git a/benches/utils/mod.rs b/benches/utils/mod.rs
+index 6be603b..c8b1506 100644
+--- a/benches/utils/mod.rs
++++ b/benches/utils/mod.rs
+@@ -11,6 +11,7 @@
+ 
+ pub mod corpus;
+ pub mod cost;
++pub mod cpu;
+ pub mod dataset;
+ pub mod executors;
+ pub mod fixture;
+diff --git a/benches/utils/rss.rs b/benches/utils/rss.rs
+index 5f36aba..24022db 100644
+--- a/benches/utils/rss.rs
++++ b/benches/utils/rss.rs
+@@ -94,6 +94,15 @@ pub fn current_rss_bytes() -> Option<u64> {
+ /// pages (the disk-cache mmap on free local NVMe) are excluded.
+ pub fn current_anon_rss_bytes() -> Option<u64> {
+     purge_allocator();
++    anon_rss_bytes_fast()
++}
++
++/// Anonymous resident bytes from `/proc/self/smaps_rollup` **without** purging
++/// the allocator. Cheap enough for the peak sampler's per-tick cadence (unlike
++/// [`current_anon_rss_bytes`], which purges); the split between anonymous heap
++/// and file-backed (mmap'd cache) resident pages is the discriminator for RSS
++/// investigations. `None` on hosts without `smaps_rollup`.
++fn anon_rss_bytes_fast() -> Option<u64> {
+     let rollup = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+     rollup
+         .lines()
+@@ -113,7 +122,7 @@ pub fn current_anon_rss_bytes() -> Option<u64> {
+ /// to the work the sampler watches.
+ pub struct PeakSampler {
+     stop: Arc<AtomicBool>,
+-    handle: Option<JoinHandle<Vec<u64>>>,
++    handle: Option<JoinHandle<Vec<(u64, u64)>>>,
+ }
+ 
+ #[derive(Debug, Clone, Copy)]
+@@ -121,18 +130,39 @@ pub struct RssStats {
+     pub peak_rss_bytes: u64,
+     pub median_rss_bytes: u64,
+     pub p90_rss_bytes: u64,
++    /// Peak anonymous (private heap) resident bytes over the window. This is
++    /// the working set the cost model treats as sizing context — file-backed
++    /// mmap pages (the disk cache on free NVMe) are excluded.
++    pub peak_anon_rss_bytes: u64,
++    /// Peak file-backed resident bytes (`total − anonymous`) over the window —
++    /// the mmap'd cache/corpus pages, free on local NVMe.
++    pub peak_file_rss_bytes: u64,
+ }
+ 
+ impl RssStats {
+-    fn from_samples(mut samples: Vec<u64>) -> Self {
++    /// Build from `(total_rss, anon_rss)` samples. Totals drive
++    /// peak/median/p90; the anon/file split takes the per-sample maxima.
++    fn from_samples(mut samples: Vec<(u64, u64)>) -> Self {
+         if samples.is_empty() {
+-            samples.push(current_rss_bytes().unwrap_or(0));
++            samples.push((
++                current_rss_bytes().unwrap_or(0),
++                anon_rss_bytes_fast().unwrap_or(0),
++            ));
+         }
+-        samples.sort_unstable();
++        let peak_anon = samples.iter().map(|(_, a)| *a).max().unwrap_or(0);
++        let peak_file = samples
++            .iter()
++            .map(|(t, a)| t.saturating_sub(*a))
++            .max()
++            .unwrap_or(0);
++        let mut totals: Vec<u64> = samples.iter().map(|(t, _)| *t).collect();
++        totals.sort_unstable();
+         Self {
+-            peak_rss_bytes: *samples.last().expect("rss samples is non-empty"),
+-            median_rss_bytes: percentile_nearest_rank(&samples, RSS_MEDIAN_PERCENTILE),
+-            p90_rss_bytes: percentile_nearest_rank(&samples, RSS_P90_PERCENTILE),
++            peak_rss_bytes: *totals.last().expect("rss samples is non-empty"),
++            median_rss_bytes: percentile_nearest_rank(&totals, RSS_MEDIAN_PERCENTILE),
++            p90_rss_bytes: percentile_nearest_rank(&totals, RSS_P90_PERCENTILE),
++            peak_anon_rss_bytes: peak_anon,
++            peak_file_rss_bytes: peak_file,
+         }
+     }
+ }
+@@ -158,7 +188,10 @@ impl PeakSampler {
+         // window opens on the process's true working set.
+         purge_allocator();
+         let stop = Arc::new(AtomicBool::new(false));
+-        let initial = current_rss_bytes().unwrap_or(0);
++        let initial = (
++            current_rss_bytes().unwrap_or(0),
++            anon_rss_bytes_fast().unwrap_or(0),
++        );
+ 
+         let stop_t = Arc::clone(&stop);
+         let handle = thread::Builder::new()
+@@ -167,12 +200,12 @@ impl PeakSampler {
+                 let mut samples = vec![initial];
+                 while !stop_t.load(Ordering::Acquire) {
+                     if let Some(rss) = current_rss_bytes() {
+-                        samples.push(rss);
++                        samples.push((rss, anon_rss_bytes_fast().unwrap_or(0)));
+                     }
+                     thread::sleep(interval);
+                 }
+                 if let Some(rss) = current_rss_bytes() {
+-                    samples.push(rss);
++                    samples.push((rss, anon_rss_bytes_fast().unwrap_or(0)));
+                 }
+                 samples
+             })
+@@ -195,11 +228,12 @@ impl PeakSampler {
+     /// peak / median / p90 VmRSS observed over the sampler's lifetime.
+     pub fn stop_stats(mut self) -> RssStats {
+         self.stop.store(true, Ordering::Release);
+-        let samples = self
+-            .handle
+-            .take()
+-            .and_then(|h| h.join().ok())
+-            .unwrap_or_else(|| vec![current_rss_bytes().unwrap_or(0)]);
++        let samples = self.handle.take().and_then(|h| h.join().ok()).unwrap_or_else(|| {
++            vec![(
++                current_rss_bytes().unwrap_or(0),
++                anon_rss_bytes_fast().unwrap_or(0),
++            )]
++        });
+         RssStats::from_samples(samples)
+     }
+ }
+@@ -335,9 +369,13 @@ mod tests {
+ 
+     #[test]
+     fn rss_stats_use_nearest_rank_percentiles() {
+-        let stats = RssStats::from_samples(vec![50, 10, 40, 20, 30]);
++        let stats =
++            RssStats::from_samples(vec![(50, 5), (10, 1), (40, 30), (20, 2), (30, 3)]);
+         assert_eq!(stats.peak_rss_bytes, 50);
+         assert_eq!(stats.median_rss_bytes, 30);
+         assert_eq!(stats.p90_rss_bytes, 50);
++        // Anon peak is the max anon sample; file peak is the max (total-anon).
++        assert_eq!(stats.peak_anon_rss_bytes, 30);
++        assert_eq!(stats.peak_file_rss_bytes, 45);
+     }
+ }
+diff --git a/benches/utils/storage_meter.rs b/benches/utils/storage_meter.rs
+index 0fe37f7..5829bd3 100644
+--- a/benches/utils/storage_meter.rs
++++ b/benches/utils/storage_meter.rs
+@@ -24,9 +24,12 @@ use std::{
+ 
+ use async_trait::async_trait;
+ use bytes::Bytes;
++use futures::stream::BoxStream;
+ use infino::storage::{ObjectMeta, StorageError, StorageProvider};
+ use object_store::{
+-    MultipartUpload, PutPayload, PutResult, Result as ObjectStoreResult, UploadPart,
++    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta as OsObjectMeta,
++    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
++    Result as ObjectStoreResult, UploadPart, path::Path as ObjPath,
+ };
+ 
+ use crate::rss::fmt_bytes;
+@@ -120,6 +123,10 @@ pub struct ObjectStoreMeter {
+     pub get_bytes: u64,
+     pub put_count: u64,
+     pub put_bytes: u64,
++    /// LIST requests (billed at the PUT/list rate on S3).
++    pub list_count: u64,
++    /// DELETE requests (free on S3; counted for completeness, not priced).
++    pub delete_count: u64,
+     /// GET counts attributed per URI class (indexed by `UriClass::index`).
+     pub get_by_class: [ClassIo; N_URI_CLASSES],
+ }
+@@ -143,6 +150,8 @@ impl ObjectStoreMeter {
+             get_bytes: self.get_bytes.saturating_sub(earlier.get_bytes),
+             put_count: self.put_count.saturating_sub(earlier.put_count),
+             put_bytes: self.put_bytes.saturating_sub(earlier.put_bytes),
++            list_count: self.list_count.saturating_sub(earlier.list_count),
++            delete_count: self.delete_count.saturating_sub(earlier.delete_count),
+             get_by_class,
+         }
+     }
+@@ -197,6 +206,8 @@ struct MeterCounters {
+     get_bytes: AtomicU64,
+     put_count: AtomicU64,
+     put_bytes: AtomicU64,
++    list_count: AtomicU64,
++    delete_count: AtomicU64,
+     /// Per-[`UriClass`] GET request counts (indexed by `UriClass::index`).
+     class_get_count: [AtomicU64; N_URI_CLASSES],
+     /// Per-[`UriClass`] GET byte volumes (indexed by `UriClass::index`).
+@@ -220,6 +231,8 @@ impl MeterCounters {
+             get_bytes: self.get_bytes.load(Ordering::Relaxed),
+             put_count: self.put_count.load(Ordering::Relaxed),
+             put_bytes: self.put_bytes.load(Ordering::Relaxed),
++            list_count: self.list_count.load(Ordering::Relaxed),
++            delete_count: self.delete_count.load(Ordering::Relaxed),
+             get_by_class,
+         }
+     }
+@@ -391,18 +404,137 @@ impl StorageProvider for CountingStorage {
+     }
+ 
+     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
++        self.counters.delete_count.fetch_add(1, Ordering::Relaxed);
+         self.inner.delete(uri).await
+     }
+ 
+     async fn list_with_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
++        self.counters.list_count.fetch_add(1, Ordering::Relaxed);
+         self.inner.list_with_prefix(prefix).await
+     }
+ 
++    async fn list_with_prefix_metadata(
++        &self,
++        prefix: &str,
++    ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
++        self.counters.list_count.fetch_add(1, Ordering::Relaxed);
++        self.inner.list_with_prefix_metadata(prefix).await
++    }
++
+     fn object_store_handle(
+         &self,
+         uri: &str,
+     ) -> Option<(Arc<dyn object_store::ObjectStore>, object_store::path::Path)> {
+-        self.inner.object_store_handle(uri)
++        let (inner, path) = self.inner.object_store_handle(uri)?;
++        // Wrap the raw store so parquet range reads issued straight against the
++        // object-store handle (row materialization via `take_rows_object_store`,
++        // cold `_id` resolution) are metered too. Without this, those GETs
++        // bypass the meter entirely — a real per-query blind spot.
++        let counted: Arc<dyn ObjectStore> = Arc::new(CountingObjectStore {
++            inner,
++            counters: Arc::clone(&self.counters),
++        });
++        Some((counted, path))
++    }
++}
++
++/// Counting wrapper around a raw [`ObjectStore`] handed out by
++/// [`CountingStorage::object_store_handle`]. Only the read surface is
++/// metered (`get_opts` / `get_ranges`); every other method delegates
++/// unchanged. Reads land in the *same* [`MeterCounters`] as the
++/// `StorageProvider`-level reads, so a query's full GET fan is captured
++/// whether it flows through the provider or the parquet object-store path.
++struct CountingObjectStore {
++    inner: Arc<dyn ObjectStore>,
++    counters: Arc<MeterCounters>,
++}
++
++impl fmt::Debug for CountingObjectStore {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("CountingObjectStore").finish_non_exhaustive()
++    }
++}
++
++impl fmt::Display for CountingObjectStore {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "CountingObjectStore({})", self.inner)
++    }
++}
++
++#[async_trait]
++impl ObjectStore for CountingObjectStore {
++    async fn get_opts(&self, location: &ObjPath, options: GetOptions) -> ObjectStoreResult<GetResult> {
++        let is_head = options.head;
++        let res = self.inner.get_opts(location, options).await?;
++        if is_head {
++            self.counters.head_count.fetch_add(1, Ordering::Relaxed);
++        } else {
++            // The resolved `range` gives the byte count without consuming the
++            // (streamed) payload.
++            let len = res.range.end.saturating_sub(res.range.start);
++            self.counters
++                .record_get(location.as_ref(), Some((res.range.start, res.range.end)), len);
++        }
++        Ok(res)
++    }
++
++    async fn get_ranges(
++        &self,
++        location: &ObjPath,
++        ranges: &[std::ops::Range<u64>],
++    ) -> ObjectStoreResult<Vec<Bytes>> {
++        // Delegate so the inner store's range coalescing is preserved, then
++        // count one GET per requested range with its returned byte length.
++        let out = self.inner.get_ranges(location, ranges).await?;
++        for (r, b) in ranges.iter().zip(&out) {
++            self.counters
++                .record_get(location.as_ref(), Some((r.start, r.end)), b.len() as u64);
++        }
++        Ok(out)
++    }
++
++    async fn put_opts(
++        &self,
++        location: &ObjPath,
++        payload: PutPayload,
++        opts: PutOptions,
++    ) -> ObjectStoreResult<PutResult> {
++        self.inner.put_opts(location, payload, opts).await
++    }
++
++    async fn put_multipart_opts(
++        &self,
++        location: &ObjPath,
++        opts: PutMultipartOptions,
++    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
++        self.inner.put_multipart_opts(location, opts).await
++    }
++
++    fn delete_stream(
++        &self,
++        locations: BoxStream<'static, ObjectStoreResult<ObjPath>>,
++    ) -> BoxStream<'static, ObjectStoreResult<ObjPath>> {
++        self.inner.delete_stream(locations)
++    }
++
++    fn list(&self, prefix: Option<&ObjPath>) -> BoxStream<'static, ObjectStoreResult<OsObjectMeta>> {
++        self.inner.list(prefix)
++    }
++
++    async fn list_with_delimiter(
++        &self,
++        prefix: Option<&ObjPath>,
++    ) -> ObjectStoreResult<ListResult> {
++        self.inner.list_with_delimiter(prefix).await
++    }
++
++    async fn copy_opts(
++        &self,
++        from: &ObjPath,
++        to: &ObjPath,
++        options: CopyOptions,
++    ) -> ObjectStoreResult<()> {
++        self.inner.copy_opts(from, to, options).await
+     }
+ }
+ 
+@@ -492,4 +624,59 @@ mod tests {
+         };
+         assert_eq!(m.read_requests(), 5);
+     }
++
++    /// Regression: a read issued straight against the raw store from
++    /// `object_store_handle` (the parquet row-materialization / cold `_id`
++    /// path) must be metered, not silently bypass the wrapper.
++    #[tokio::test]
++    async fn object_store_handle_reads_are_metered() {
++        use infino::storage::LocalFsStorageProvider;
++        use object_store::ObjectStoreExt;
++
++        let dir = tempfile::TempDir::new().expect("tempdir");
++        let provider: Arc<dyn StorageProvider> =
++            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
++        provider
++            .put_atomic("seg/x.bin", Bytes::from_static(b"0123456789"))
++            .await
++            .expect("put");
++
++        let meter = wrap(provider);
++        let before = meter.snapshot();
++        let (store, path) = meter
++            .provider()
++            .object_store_handle("seg/x.bin")
++            .expect("handle");
++        let bytes = store.get_range(&path, 2..5).await.expect("range");
++        assert_eq!(&bytes[..], b"234");
++
++        let delta = meter.snapshot().since(&before);
++        assert_eq!(
++            delta.get_count, 1,
++            "a read via object_store_handle must be metered, not bypassed"
++        );
++        assert_eq!(delta.get_bytes, 3);
++    }
++
++    /// LIST and DELETE at the provider level are counted (LIST is billed; the
++    /// count feeds the detailed I/O ledger either way).
++    #[tokio::test]
++    async fn list_and_delete_are_counted() {
++        use infino::storage::LocalFsStorageProvider;
++
++        let dir = tempfile::TempDir::new().expect("tempdir");
++        let provider: Arc<dyn StorageProvider> =
++            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
++        let meter = wrap(provider);
++        let p = meter.provider();
++        p.put_atomic("seg/a.bin", Bytes::from_static(b"a"))
++            .await
++            .expect("put");
++        let before = meter.snapshot();
++        let _ = p.list_with_prefix("seg").await.expect("list");
++        p.delete("seg/a.bin").await.expect("delete");
++        let delta = meter.snapshot().since(&before);
++        assert_eq!(delta.list_count, 1);
++        assert_eq!(delta.delete_count, 1);
++    }
+ }
+diff --git a/benches/utils/superfile.rs b/benches/utils/superfile.rs
+index 712235f..1e341e3 100644
+--- a/benches/utils/superfile.rs
++++ b/benches/utils/superfile.rs
+@@ -55,11 +55,13 @@ fn emit_cost_warm(
+     anchor: &str,
+     title: String,
+     ingest_wall_s: f64,
++    ingest_cpu_s: Option<f64>,
+     writers: u32,
+     stored_bytes: u64,
+     corpus_bytes: u64,
+     n_docs: usize,
+     warm: &[(String, f64)],
++    warm_cpu: Option<&[(String, f64)]>,
+ ) {
+     if warm.is_empty() {
+         return;
+@@ -71,6 +73,7 @@ fn emit_cost_warm(
+         title,
+         &cost::CellCost {
+             ingest_wall_s,
++            ingest_cpu_s,
+             writers,
+             ingest_peak_rss_bytes: None,
+             // A single-superfile commit is exactly one `put_atomic`.
+@@ -81,8 +84,10 @@ fn emit_cost_warm(
+             n_docs,
+             resident_anon_bytes: resident,
+             warm,
++            warm_cpu_s: warm_cpu,
+             cold: None,
+             warm_pre: None,
++            warm_pre_cpu_s: None,
+             cold_pre: None,
+             store: cost::StorePhases::default(),
+             vector_cell: false,
+@@ -551,11 +556,13 @@ pub mod fts {
+                     "bench/fts/superfile/cost",
+                     format!("Superfile FTS — cost model ({} docs)", fmt_count(n_docs)),
+                     b.phase.wall.as_secs_f64(),
++                    b.phase.cpu_s,
+                     b.writers as u32,
+                     index.bytes().len() as u64,
+                     corpus.total_bytes(),
+                     n_docs,
+                     &cost::warm_from_fts(warm_stats),
++                    Some(&cost::warm_cpu_from_fts(warm_stats)),
+                 );
+             }
+             if phases.cold {
+@@ -1352,11 +1359,13 @@ pub mod vector {
+                         fmt_count(n_docs)
+                     ),
+                     b.wall.as_secs_f64(),
++                    b.cpu_s,
+                     b.writers as u32,
+                     index.bytes().len() as u64,
+                     corpus_bytes,
+                     n_docs,
+                     &cost::warm_from_vector(&recall_rows),
++                    Some(&cost::warm_cpu_from_vector(&recall_rows)),
+                 );
+             }
+ 
+@@ -1741,11 +1750,13 @@ pub mod sql {
+                 "bench/sql/superfile/cost",
+                 format!("Superfile SQL — cost model ({} rows)", fmt_count(n_docs)),
+                 b.wall.as_secs_f64(),
++                b.cpu_s,
+                 b.writers as u32,
+                 stored_bytes(&index),
+                 corpus.total_bytes(),
+                 n_docs,
+                 &cost::warm_from_sql(&sets),
++                Some(&cost::warm_cpu_from_sql(&sets)),
+             );
+         }
+         if phases.cold {
+diff --git a/benches/utils/supertable.rs b/benches/utils/supertable.rs
+index b85b6e6..72770e3 100644
+--- a/benches/utils/supertable.rs
++++ b/benches/utils/supertable.rs
+@@ -78,6 +78,9 @@ const SHAPES: [(&str, &str, Modality); 4] = [
+ /// parent/child process boundary as a single `key=value` line.
+ pub struct ShapeMetrics {
+     pub wall_ns: f64,
++    /// Measured process CPU seconds for the ingest/build (fg+bg). `None` when
++    /// CPU sampling was unavailable; serialized as `-1` across the child pipe.
++    pub cpu_s: Option<f64>,
+     pub n_superfiles: usize,
+     pub peak_rss_bytes: u64,
+     pub median_rss_bytes: u64,
+@@ -102,8 +105,9 @@ impl ShapeMetrics {
+     /// Render as the single stdout line the parent parses.
+     fn to_result_line(&self) -> String {
+         format!(
+-            "{RESULT_PREFIX}wall_ns={} n_superfiles={} peak={} median={} p90={} index_bytes={} corpus_bytes={}",
++            "{RESULT_PREFIX}wall_ns={} cpu_s={} n_superfiles={} peak={} median={} p90={} index_bytes={} corpus_bytes={}",
+             self.wall_ns,
++            self.cpu_s.unwrap_or(-1.0),
+             self.n_superfiles,
+             self.peak_rss_bytes,
+             self.median_rss_bytes,
+@@ -118,6 +122,7 @@ impl ShapeMetrics {
+     fn from_result_line(line: &str) -> Option<Self> {
+         let body = line.strip_prefix(RESULT_PREFIX)?;
+         let mut wall_ns = None;
++        let mut cpu_s: Option<f64> = None;
+         let mut n_superfiles = None;
+         let mut peak = None;
+         let mut median = None;
+@@ -128,6 +133,9 @@ impl ShapeMetrics {
+             let (k, v) = tok.split_once('=')?;
+             match k {
+                 "wall_ns" => wall_ns = v.parse().ok(),
++                "cpu_s" => {
++                    cpu_s = v.parse::<f64>().ok().filter(|x| *x >= 0.0);
++                }
+                 "n_superfiles" => n_superfiles = v.parse().ok(),
+                 "peak" => peak = v.parse().ok(),
+                 "median" => median = v.parse().ok(),
+@@ -139,6 +147,7 @@ impl ShapeMetrics {
+         }
+         Some(ShapeMetrics {
+             wall_ns: wall_ns?,
++            cpu_s,
+             n_superfiles: n_superfiles?,
+             peak_rss_bytes: peak?,
+             median_rss_bytes: median?,
+@@ -177,9 +186,11 @@ fn run_child_shape(key: &str) {
+     // measured window covers the engine only.
+     let corpus = supertable::prepare_corpus(modality);
+     let sampler = PeakSampler::start_default();
++    let cpu0 = crate::cpu::process_cpu_ns();
+     let t0 = Instant::now();
+     let built = supertable::build_on_storage(modality, &corpus);
+     let wall = t0.elapsed();
++    let cpu_s = crate::cpu::cpu_seconds_since(cpu0);
+     let rss = sampler.stop_stats();
+ 
+     // This child wrote its own unique prefix; delete it before exiting so the
+@@ -192,6 +203,7 @@ fn run_child_shape(key: &str) {
+ 
+     let metrics = ShapeMetrics {
+         wall_ns: wall.as_secs_f64() * 1e9,
++        cpu_s,
+         n_superfiles: built.n_superfiles,
+         peak_rss_bytes: rss.peak_rss_bytes,
+         median_rss_bytes: rss.median_rss_bytes,
+@@ -482,8 +494,10 @@ fn emit_cost_warm(
+     metrics: Option<&ShapeMetrics>,
+     n_docs: usize,
+     warm: &[(String, f64)],
++    warm_cpu: Option<&[(String, f64)]>,
+     cold: Option<&[cost::ColdQuery]>,
+     pre_drain: Option<PreDrainLatencies<'_>>,
++    pre_drain_warm_cpu: Option<&[(String, f64)]>,
+     vector_cell: bool,
+     mut store: cost::StorePhases,
+     stored_bytes_override: Option<u64>,
+@@ -507,6 +521,7 @@ fn emit_cost_warm(
+         title,
+         &cost::CellCost {
+             ingest_wall_s: wall_s,
++            ingest_cpu_s: metrics.and_then(|m| m.cpu_s),
+             writers: supertable::n_writers() as u32,
+             ingest_peak_rss_bytes: metrics.map(|m| m.peak_rss_bytes),
+             n_commits: supertable::n_commits() as u64,
+@@ -516,8 +531,10 @@ fn emit_cost_warm(
+             n_docs,
+             resident_anon_bytes: resident,
+             warm,
++            warm_cpu_s: warm_cpu,
+             cold,
+             warm_pre: pre_drain.map(|(w, _)| w),
++            warm_pre_cpu_s: pre_drain_warm_cpu,
+             cold_pre: pre_drain.map(|(_, c)| c),
+             store,
+             vector_cell,
+@@ -625,12 +642,15 @@ fn build_measured(
+     phases: Phases,
+ ) -> (supertable::IngestResult, Option<ShapeMetrics>) {
+     let sampler = PeakSampler::start_default();
++    let cpu0 = crate::cpu::process_cpu_ns();
+     let t0 = Instant::now();
+     let built = supertable::build_on_storage(modality, corpus);
+     let wall = t0.elapsed();
++    let cpu_s = crate::cpu::cpu_seconds_since(cpu0);
+     let rss = sampler.stop_stats();
+     let metrics = phases.build.then_some(ShapeMetrics {
+         wall_ns: wall.as_secs_f64() * 1e9,
++        cpu_s,
+         n_superfiles: built.n_superfiles,
+         peak_rss_bytes: rss.peak_rss_bytes,
+         median_rss_bytes: rss.median_rss_bytes,
+@@ -731,9 +751,9 @@ pub mod fts {
+                     "Supertable FTS — search, multi-superfile / object-store ({} docs)",
+                     fmt_count(n_docs)
+                 ),
+-                "Warm = shared consumer + disk cache; each query runs once untimed (cache fill), then \
+-                 p50 over repeated bm25_search. Cold = fresh disk cache + consumer per iteration, so \
+-                 each read pays the object-store cold open. Δ is vs the previous run.",
++                "Warm = shared consumer + disk cache; each query runs once untimed (block cache retains \
++                 the touched ranges), then p50 over repeated bm25_search. Cold = fresh disk cache + \
++                 consumer per iteration, so each read pays the object-store cold open. Δ is vs the previous run.",
+                 warm.as_deref(),
+                 cold.as_ref(),
+                 None,
+@@ -759,6 +779,10 @@ pub mod fts {
+ 
+         if phases.warm || phases.cold {
+             let warm_vec = warm.as_deref().map(cost::warm_from_fts).unwrap_or_default();
++            let warm_cpu_vec = warm
++                .as_deref()
++                .map(cost::warm_cpu_from_fts)
++                .unwrap_or_default();
+             let cold_vec = cold
+                 .as_ref()
+                 .map(cost::cold_from_timings)
+@@ -773,12 +797,14 @@ pub mod fts {
+                     ingest_metrics.as_ref(),
+                     n_docs,
+                     &warm_vec,
++                    (!warm_cpu_vec.is_empty()).then_some(warm_cpu_vec.as_slice()),
+                     if cold_vec.is_empty() {
+                         None
+                     } else {
+                         Some(&cold_vec)
+                     },
+                     None,
++                    None,
+                     false,
+                     store_phases_from_split(cold_split),
+                     None,
+@@ -820,7 +846,7 @@ pub mod fts {
+         let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
+         let reader = consumer.reader();
+         eprintln!(
+-            "[supertable_fts] warm: timing {} queries × {WARM_ITERS} iters via bm25_search (untimed prewarm per query)...",
++            "[supertable_fts] warm: timing {} queries × {WARM_ITERS} iters via bm25_search (untimed prewarm per query fills the block cache)...",
+             FTS_BATTERY.len(),
+         );
+         let out = exec_fts::measure_warm(
+@@ -976,7 +1002,10 @@ pub mod vector {
+     use super::*;
+     use crate::{
+         corpus,
+-        executors::{vector as exec_vec, vector::{SupertableVectorRead, VectorRead}},
++        executors::{
++            vector as exec_vec,
++            vector::{SupertableVectorRead, VectorRead},
++        },
+     };
+ 
+     // Correctness gate, recall targets, calibration grid, and p50 iters
+@@ -1356,9 +1385,9 @@ pub mod vector {
+             // only.
+             drop(corpus);
+ 
+-            const PRE_DRAIN_NOTE: &str = "Pre-drain (incoming staging): hidden IVF commit shards still in INCOMING; every query includes INCOMING plus nprobe-routed cells. Warm = query-driven cache fill; cold = fresh cache per iteration. Δ vs previous run.";
+-            const POST_DRAIN_NOTE: &str = "Post-drain (routed cells): incoming empty after OPANN route; queries hit ~nprobe cell-local IVF superfiles only. Warm = query-driven cache fill; cold = fresh cache per iteration. Δ vs previous run.";
+-            const LEGACY_NOTE: &str = "Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = shared disk cache; each row runs one untimed query then timed iterations (only probed superfiles are cached). Cold = fresh disk cache + consumer per iteration. Δ is vs the previous run.";
++            const PRE_DRAIN_NOTE: &str = "Pre-drain (incoming staging): hidden IVF commit shards still in INCOMING; every query includes INCOMING plus nprobe-routed cells. Warm = query-driven cache fill (each query runs once untimed; the block cache retains every touched range on NVMe); cold = fresh cache per iteration. Δ vs previous run.";
++            const POST_DRAIN_NOTE: &str = "Post-drain (routed cells): incoming empty after OPANN route; queries hit ~nprobe cell-local IVF superfiles only. Warm = query-driven cache fill (each query runs once untimed; the block cache retains every touched range on NVMe); cold = fresh cache per iteration. Δ vs previous run.";
++            const LEGACY_NOTE: &str = "Recall rows use the lowest-p50 calibrated (p, r) clearing each target (recall vs brute-force ground truth on the regenerated corpus); `default` is the user-facing config. Warm = shared disk cache, query-driven fill (untimed first run per query; block cache retains touched ranges). Cold = fresh disk cache + consumer per iteration. Δ is vs the previous run.";
+ 
+             // Fresh ingest leaves hidden IVF in INCOMING; dataset / existing-prefix
+             // tables may already be post-drain — run the two-phase comparison only
+@@ -1398,7 +1427,8 @@ pub mod vector {
+                 table: &consumer,
+                 id_to_dense: Arc::clone(&id_to_dense),
+             };
+-            let mut drain_stats: Option<(f64, storage_meter::ObjectStoreMeter, u64)> = None;
++            let mut drain_stats: Option<(f64, Option<f64>, storage_meter::ObjectStoreMeter, u64)> =
++                None;
+             let mut filtered_stats: Option<(storage_meter::ObjectStoreMeter, u64)> = None;
+             let mut cold_split_pre: Option<storage_meter::ColdStoreSplit> = None;
+             let mut pre_search_rows = None;
+@@ -1446,9 +1476,11 @@ pub mod vector {
+ 
+                 let before_drain = consumer_meter.snapshot();
+                 let drain_sampler = PeakSampler::start_default();
++                let drain_cpu0 = crate::cpu::process_cpu_ns();
+                 let drain_t0 = Instant::now();
+                 drain_hidden_incoming(&consumer);
+                 let drain_wall_s = drain_t0.elapsed().as_secs_f64();
++                let drain_cpu_s = crate::cpu::cpu_seconds_since(drain_cpu0);
+                 let drain_peak_rss = drain_sampler.stop_stats().peak_rss_bytes;
+                 let drain_io = consumer_meter.snapshot().since(&before_drain);
+                 eprintln!(
+@@ -1460,7 +1492,7 @@ pub mod vector {
+                     drain_io.head_count,
+                     rss::fmt_bytes(drain_peak_rss),
+                 );
+-                drain_stats = Some((drain_wall_s, drain_io, drain_peak_rss));
++                drain_stats = Some((drain_wall_s, drain_cpu_s, drain_io, drain_peak_rss));
+ 
+                 if phases.warm {
+                     log_hidden_stats(&consumer, "at warm open (post-drain)");
+@@ -1617,12 +1649,11 @@ pub mod vector {
+             }
+ 
+             if phases.warm || phases.cold {
+-                // Steady-state warm I/O: replay the correctness queries on
+-                // the shared, cache-hot consumer — the same consumer the
+-                // warm latency battery timed — so the ledger's warm GET/query
+-                // and the compute ledger's warm CPU describe one path.
++                // Steady-state warm I/O: run the same query set twice on the
++                // shared consumer. First pass is an untimed warm-up that fills
++                // the block cache for those exact ranges; second pass is metered.
++                // This reports "same-bytes touched again" GETs.
+                 let warm_io = (phases.warm && !q_correct.is_empty()).then(|| {
+-                    let before = consumer_meter.snapshot();
+                     let reader = consumer.reader();
+                     for q in &q_correct {
+                         let _ = reader
+@@ -1636,9 +1667,22 @@ pub mod vector {
+                             )
+                             .expect("warm-window vector_search");
+                     }
++                    let before = consumer_meter.snapshot();
++                    for q in &q_correct {
++                        let _ = reader
++                            .vector_search(
++                                supertable::VEC_COLUMN,
++                                q,
++                                TOP_K,
++                                exec_vec::search_opts(nprobe, rerank),
++                                None,
++                                None,
++                            )
++                            .expect("warm-window repeat vector_search");
++                    }
+                     let io = consumer_meter.snapshot().since(&before);
+                     eprintln!(
+-                        "[supertable_vector] warm window (cache hot): {} GET ({} down) over {} queries",
++                        "[supertable_vector] warm window (cache hot, repeat pass): {} GET ({} down) over {} queries",
+                         io.get_count,
+                         rss::fmt_bytes(io.get_bytes),
+                         q_correct.len(),
+@@ -1654,11 +1698,13 @@ pub mod vector {
+                     eprintln!("[supertable_vector] compacting (optimize: user + hidden)...");
+                     let before = consumer_meter.snapshot();
+                     let sampler = PeakSampler::start_default();
++                    let cpu0 = crate::cpu::process_cpu_ns();
+                     let t0 = Instant::now();
+                     consumer
+                         .optimize(&OptimizeOptions::default())
+                         .expect("optimize (compaction)");
+                     let wall_s = t0.elapsed().as_secs_f64();
++                    let cpu_s = crate::cpu::cpu_seconds_since(cpu0);
+                     let peak_rss = sampler.stop_stats().peak_rss_bytes;
+                     let io = consumer_meter.snapshot().since(&before);
+                     eprintln!(
+@@ -1670,7 +1716,7 @@ pub mod vector {
+                         rss::fmt_bytes(peak_rss),
+                     );
+                     log_hidden_stats(&consumer, "after compaction");
+-                    (wall_s, io, peak_rss)
++                    (wall_s, cpu_s, io, peak_rss)
+                 });
+ 
+                 // Steady-state footprint = user table + derived hidden vector
+@@ -1703,6 +1749,7 @@ pub mod vector {
+                     rss::fmt_bytes(slow_state_stored),
+                 );
+                 let warm_vec = cost::warm_from_vector(&recall_rows);
++                let warm_cpu_vec = cost::warm_cpu_from_vector(&recall_rows);
+                 let cold_vec = cost::cold_from_vector(&recall_rows);
+                 let cold_split = phases
+                     .cold
+@@ -1711,12 +1758,14 @@ pub mod vector {
+                     })
+                     .flatten();
+                 let store = cost::StorePhases {
+-                    drain: drain_stats.map(|(_, io, _)| io),
+-                    drain_wall_s: drain_stats.map(|(wall_s, _, _)| wall_s),
+-                    drain_peak_rss_bytes: drain_stats.map(|(_, _, peak)| peak),
+-                    compaction: compaction_stats.map(|(_, io, _)| io),
+-                    compaction_wall_s: compaction_stats.map(|(wall_s, _, _)| wall_s),
+-                    compaction_peak_rss_bytes: compaction_stats.map(|(_, _, peak)| peak),
++                    drain: drain_stats.map(|(_, _, io, _)| io),
++                    drain_wall_s: drain_stats.map(|(wall_s, _, _, _)| wall_s),
++                    drain_cpu_s: drain_stats.and_then(|(_, cpu, _, _)| cpu),
++                    drain_peak_rss_bytes: drain_stats.map(|(_, _, _, peak)| peak),
++                    compaction: compaction_stats.map(|(_, _, io, _)| io),
++                    compaction_wall_s: compaction_stats.map(|(wall_s, _, _, _)| wall_s),
++                    compaction_cpu_s: compaction_stats.and_then(|(_, cpu, _, _)| cpu),
++                    compaction_peak_rss_bytes: compaction_stats.map(|(_, _, _, peak)| peak),
+                     cold_open_pre: cold_split_pre.map(|s| s.open),
+                     cold_query_pre: cold_split_pre.map(|s| s.first_query),
+                     warm_query: warm_io.map(|(io, _)| io),
+@@ -1729,6 +1778,10 @@ pub mod vector {
+                     .as_deref()
+                     .map(cost::warm_from_vector)
+                     .unwrap_or_default();
++                let warm_pre_cpu_vec = pre_search_rows
++                    .as_deref()
++                    .map(cost::warm_cpu_from_vector)
++                    .unwrap_or_default();
+                 let cold_pre_vec = pre_search_rows
+                     .as_deref()
+                     .map(cost::cold_from_vector)
+@@ -1745,10 +1798,13 @@ pub mod vector {
+                     ingest_metrics.as_ref(),
+                     n_docs,
+                     &warm_vec,
++                    (!warm_cpu_vec.is_empty()).then_some(warm_cpu_vec.as_slice()),
+                     (!cold_vec.is_empty()).then_some(cold_vec.as_slice()),
+                     pre_search_rows
+                         .is_some()
+                         .then_some((warm_pre_vec.as_slice(), cold_pre_vec.as_slice())),
++                    (pre_search_rows.is_some() && !warm_pre_cpu_vec.is_empty())
++                        .then_some(warm_pre_cpu_vec.as_slice()),
+                     true,
+                     store,
+                     Some(post_drain_stored),
+@@ -1837,7 +1893,7 @@ pub mod sql {
+                     "Supertable SQL — warm queries, warm cache / object-store ({} rows)",
+                     fmt_count(n_docs)
+                 ),
+-                "Warm = committed table reopened with a disk cache sized to the index; each query runs once untimed then p50 over repeated `query_sql` calls, all through infino's own path (the DataFusion-only control arms are not run here). Δ is vs the previous run.",
++                "Warm = committed table reopened with a disk cache sized to the index; each query runs once untimed (block cache retains touched ranges) then p50 over repeated `query_sql` calls, all through infino's own path (the DataFusion-only control arms are not run here). Δ is vs the previous run.",
+                 &sets,
+             );
+             Some(sets)
+@@ -1870,6 +1926,10 @@ pub mod sql {
+             .as_ref()
+             .map(cost::warm_from_sql)
+             .unwrap_or_default();
++        let warm_cpu_vec = warm_sets
++            .as_ref()
++            .map(cost::warm_cpu_from_sql)
++            .unwrap_or_default();
+         let cold_vec = cold
+             .as_ref()
+             .map(cost::cold_from_timings)
+@@ -1884,8 +1944,10 @@ pub mod sql {
+                 ingest_metrics.as_ref(),
+                 n_docs,
+                 &warm_vec,
++                (!warm_cpu_vec.is_empty()).then_some(warm_cpu_vec.as_slice()),
+                 (!cold_vec.is_empty()).then_some(cold_vec.as_slice()),
+                 None,
++                None,
+                 false,
+                 store_phases_from_split(cold_split),
+                 None,
+diff --git a/src/storage/azure.rs b/src/storage/azure.rs
+index 7618cca..f0fdc8c 100644
+--- a/src/storage/azure.rs
++++ b/src/storage/azure.rs
+@@ -183,6 +183,7 @@ impl StorageProvider for AzureStorageProvider {
+             .head(&path)
+             .await
+             .map_err(|e| translate(uri, e))?;
++        crate::storage::io_counters::record_head();
+         Ok(ObjectMeta {
+             size: meta.size as u64,
+             etag: meta.e_tag,
+@@ -194,7 +195,7 @@ impl StorageProvider for AzureStorageProvider {
+         let path = self.path(uri)?;
+         // etag and bytes are atomically paired in the same response, so
+         // no follow-up HEAD is needed.
+-        retry::complete_get(uri, || async {
++        let out = retry::complete_get(uri, || async {
+             let result = self.store.get(&path).await.map_err(|e| translate(uri, e))?;
+             let meta = ObjectMeta {
+                 size: result.meta.size as u64,
+@@ -204,18 +205,26 @@ impl StorageProvider for AzureStorageProvider {
+             let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
+             Ok((bytes, meta))
+         })
+-        .await
++        .await;
++        if let Ok((b, _)) = &out {
++            crate::storage::io_counters::record_get(b.len() as u64);
++        }
++        out
+     }
+ 
+     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+         let path = self.path(uri)?;
+-        retry::complete_range(uri, range, |r| async {
++        let out = retry::complete_range(uri, range, |r| async {
+             self.store
+                 .get_range(&path, r)
+                 .await
+                 .map_err(|e| translate(uri, e))
+         })
+-        .await
++        .await;
++        if let Ok(b) = &out {
++            crate::storage::io_counters::record_get(b.len() as u64);
++        }
++        out
+     }
+ 
+     /// Tail fetch on Azure. Unlike S3, object_store's Azure backend
+@@ -239,15 +248,21 @@ impl StorageProvider for AzureStorageProvider {
+ 
+     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
+         let path = self.path(uri)?;
++        let n = bytes.len() as u64;
+         let opts = PutOptions {
+             mode: PutMode::Create,
+             ..Default::default()
+         };
+-        self.store
++        let out = self
++            .store
+             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
+             .await
+             .map(|r| r.e_tag)
+-            .map_err(|e| translate(uri, e))
++            .map_err(|e| translate(uri, e));
++        if out.is_ok() {
++            crate::storage::io_counters::record_put(n);
++        }
++        out
+     }
+ 
+     async fn put_if_match(
+@@ -274,11 +289,17 @@ impl StorageProvider for AzureStorageProvider {
+                 ..Default::default()
+             },
+         };
+-        self.store
++        let n = bytes.len() as u64;
++        let out = self
++            .store
+             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
+             .await
+             .map(|r| r.e_tag)
+-            .map_err(|e| translate(uri, e))
++            .map_err(|e| translate(uri, e));
++        if out.is_ok() {
++            crate::storage::io_counters::record_put(n);
++        }
++        out
+     }
+ 
+     async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
+@@ -291,6 +312,7 @@ impl StorageProvider for AzureStorageProvider {
+ 
+     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+         let path = self.path(uri)?;
++        crate::storage::io_counters::record_delete();
+         match self.store.delete(&path).await {
+             Ok(()) => Ok(()),
+             Err(ObjError::NotFound { .. }) => Ok(()),
+@@ -302,6 +324,7 @@ impl StorageProvider for AzureStorageProvider {
+         &self,
+         prefix: &str,
+     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
++        crate::storage::io_counters::record_list();
+         let path = ObjPath::from(prefix);
+         let mut stream = self.store.list(Some(&path));
+         let mut out = Vec::new();
+diff --git a/src/storage/local_fs.rs b/src/storage/local_fs.rs
+index f2ee488..9f2e7ca 100644
+--- a/src/storage/local_fs.rs
++++ b/src/storage/local_fs.rs
+@@ -109,6 +109,7 @@ impl StorageProvider for LocalFsStorageProvider {
+             .head(&path)
+             .await
+             .map_err(|e| translate(uri, e))?;
++        crate::storage::io_counters::record_head();
+         Ok(ObjectMeta {
+             size: meta.size as u64,
+             etag: meta.e_tag,
+@@ -127,28 +128,40 @@ impl StorageProvider for LocalFsStorageProvider {
+             last_modified: result.meta.last_modified.into(),
+         };
+         let bytes = result.bytes().await.map_err(|e| translate(uri, e))?;
++        crate::storage::io_counters::record_get(bytes.len() as u64);
+         Ok((bytes, meta))
+     }
+ 
+     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+         let path = Self::path(uri)?;
+-        self.store
++        let out = self
++            .store
+             .get_range(&path, range)
+             .await
+-            .map_err(|e| translate(uri, e))
++            .map_err(|e| translate(uri, e));
++        if let Ok(b) = &out {
++            crate::storage::io_counters::record_get(b.len() as u64);
++        }
++        out
+     }
+ 
+     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
+         let path = Self::path(uri)?;
++        let n = bytes.len() as u64;
+         let opts = PutOptions {
+             mode: PutMode::Create,
+             ..Default::default()
+         };
+-        self.store
++        let out = self
++            .store
+             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
+             .await
+             .map(|r| r.e_tag)
+-            .map_err(|e| translate(uri, e))
++            .map_err(|e| translate(uri, e));
++        if out.is_ok() {
++            crate::storage::io_counters::record_put(n);
++        }
++        out
+     }
+ 
+     async fn put_if_match(
+@@ -158,7 +171,8 @@ impl StorageProvider for LocalFsStorageProvider {
+         expected_etag: Option<&str>,
+     ) -> Result<Option<String>, StorageError> {
+         let path = Self::path(uri)?;
+-        match expected_etag {
++        let put_bytes = bytes.len() as u64;
++        let out = match expected_etag {
+             // None == create-only-if-absent. Same as put_atomic.
+             None => {
+                 let opts = PutOptions {
+@@ -262,7 +276,13 @@ impl StorageProvider for LocalFsStorageProvider {
+                 let _ = lock_file.unlock_async().await;
+                 result
+             }
++        };
++        // Count only a PUT that actually wrote (matches S3/Azure, which count
++        // on success): a stale-etag CAS returns without writing.
++        if out.is_ok() {
++            crate::storage::io_counters::record_put(put_bytes);
+         }
++        out
+     }
+ 
+     async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
+@@ -275,6 +295,7 @@ impl StorageProvider for LocalFsStorageProvider {
+ 
+     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+         let path = Self::path(uri)?;
++        crate::storage::io_counters::record_delete();
+         match self.store.delete(&path).await {
+             Ok(()) => Ok(()),
+             Err(ObjError::NotFound { .. }) => Ok(()),
+@@ -286,6 +307,7 @@ impl StorageProvider for LocalFsStorageProvider {
+         &self,
+         prefix: &str,
+     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
++        crate::storage::io_counters::record_list();
+         let path = ObjPath::from(prefix);
+         let mut stream = self.store.list(Some(&path));
+         let mut out = Vec::new();
+diff --git a/src/storage/mod.rs b/src/storage/mod.rs
+index 9a4012f..1bb6099 100644
+--- a/src/storage/mod.rs
++++ b/src/storage/mod.rs
+@@ -110,14 +110,43 @@ pub mod io_counters {
+     static BYTES: AtomicU64 = AtomicU64::new(0);
+     static HIDDEN_FETCHES: AtomicU64 = AtomicU64::new(0);
+     static HIDDEN_BYTES: AtomicU64 = AtomicU64::new(0);
+-
+-    /// Record one object-store range fetch returning `bytes` bytes. The real
+-    /// providers call this on every `get_range`, so it counts the *total*.
++    // Full per-op counters (read via [`snapshot`]; never reset by `take`, which
++    // stays scoped to the get-family for the existing timeline diagnostics).
++    static HEADS: AtomicU64 = AtomicU64::new(0);
++    static PUTS: AtomicU64 = AtomicU64::new(0);
++    static PUT_BYTES: AtomicU64 = AtomicU64::new(0);
++    static LISTS: AtomicU64 = AtomicU64::new(0);
++    static DELETES: AtomicU64 = AtomicU64::new(0);
++
++    /// Record one object-store range/get/tail fetch returning `bytes` bytes.
++    /// Every provider calls this on the successful result (after the retry
++    /// wrapper, so re-issues are not double-counted), so it counts the *total*.
+     pub fn record_get(bytes: u64) {
+         FETCHES.fetch_add(1, Ordering::Relaxed);
+         BYTES.fetch_add(bytes, Ordering::Relaxed);
+     }
+ 
++    /// Record one HEAD (metadata) request.
++    pub fn record_head() {
++        HEADS.fetch_add(1, Ordering::Relaxed);
++    }
++
++    /// Record one PUT (or conditional PUT) writing `bytes` bytes.
++    pub fn record_put(bytes: u64) {
++        PUTS.fetch_add(1, Ordering::Relaxed);
++        PUT_BYTES.fetch_add(bytes, Ordering::Relaxed);
++    }
++
++    /// Record one LIST request.
++    pub fn record_list() {
++        LISTS.fetch_add(1, Ordering::Relaxed);
++    }
++
++    /// Record one DELETE request.
++    pub fn record_delete() {
++        DELETES.fetch_add(1, Ordering::Relaxed);
++    }
++
+     /// Tag a fetch as targeting the hidden vector index (prefixed namespace).
+     /// Called by `PrefixedStorageProvider` *in addition to* the inner provider's
+     /// `record_get`, so `hidden ⊆ total` and `user = total − hidden`.
+@@ -127,7 +156,9 @@ pub mod io_counters {
+     }
+ 
+     /// `(fetches, bytes, hidden_fetches, hidden_bytes)` since the last call;
+-    /// resets all. Derive the user-table share as `total − hidden`.
++    /// resets those four. Derive the user-table share as `total − hidden`.
++    /// (Scoped to the get-family so the existing per-batch timeline diagnostics
++    /// keep working; use [`snapshot`] for the full, non-resetting picture.)
+     pub fn take() -> (u64, u64, u64, u64) {
+         (
+             FETCHES.swap(0, Ordering::Relaxed),
+@@ -137,6 +168,90 @@ pub mod io_counters {
+         )
+     }
+ 
++    /// Cumulative per-op counts since process start (never reset). The
++    /// complete engine-side I/O picture across every provider — the counterpart
++    /// of the bench's storage meter, for embedders that read engine counters
++    /// directly rather than wrapping the provider.
++    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++    pub struct Snapshot {
++        pub get_count: u64,
++        pub get_bytes: u64,
++        pub hidden_get_count: u64,
++        pub hidden_get_bytes: u64,
++        pub head_count: u64,
++        pub put_count: u64,
++        pub put_bytes: u64,
++        pub list_count: u64,
++        pub delete_count: u64,
++    }
++
++    impl Snapshot {
++        /// Per-op counts accrued since an `earlier` snapshot — the window delta
++        /// to price. Makes window-scoped measurement first-class over the
++        /// process-global counters: snapshot, do work, `snapshot().since(&start)`.
++        /// Saturating, since a window never runs backwards.
++        pub fn since(&self, earlier: &Snapshot) -> Snapshot {
++            Snapshot {
++                get_count: self.get_count.saturating_sub(earlier.get_count),
++                get_bytes: self.get_bytes.saturating_sub(earlier.get_bytes),
++                hidden_get_count: self.hidden_get_count.saturating_sub(earlier.hidden_get_count),
++                hidden_get_bytes: self.hidden_get_bytes.saturating_sub(earlier.hidden_get_bytes),
++                head_count: self.head_count.saturating_sub(earlier.head_count),
++                put_count: self.put_count.saturating_sub(earlier.put_count),
++                put_bytes: self.put_bytes.saturating_sub(earlier.put_bytes),
++                list_count: self.list_count.saturating_sub(earlier.list_count),
++                delete_count: self.delete_count.saturating_sub(earlier.delete_count),
++            }
++        }
++    }
++
++    /// Read all counters without resetting any.
++    pub fn snapshot() -> Snapshot {
++        Snapshot {
++            get_count: FETCHES.load(Ordering::Relaxed),
++            get_bytes: BYTES.load(Ordering::Relaxed),
++            hidden_get_count: HIDDEN_FETCHES.load(Ordering::Relaxed),
++            hidden_get_bytes: HIDDEN_BYTES.load(Ordering::Relaxed),
++            head_count: HEADS.load(Ordering::Relaxed),
++            put_count: PUTS.load(Ordering::Relaxed),
++            put_bytes: PUT_BYTES.load(Ordering::Relaxed),
++            list_count: LISTS.load(Ordering::Relaxed),
++            delete_count: DELETES.load(Ordering::Relaxed),
++        }
++    }
++
++    /// Best-effort process CPU time (on-CPU nanoseconds summed across every
++    /// thread of this process, from `/proc/self/task/*/schedstat`). Excludes
++    /// I/O wait by construction (a blocked thread is off-CPU). Used by the
++    /// gated phase diagnostics to price a compute wave in CPU, not wall.
++    /// `None` on platforms without that procfs surface.
++    pub fn process_cpu_ns() -> Option<u128> {
++        #[cfg(target_os = "linux")]
++        {
++            let mut total: u128 = 0;
++            let mut any = false;
++            for entry in std::fs::read_dir("/proc/self/task").ok()? {
++                let Ok(entry) = entry else { continue };
++                let Ok(raw) = std::fs::read_to_string(entry.path().join("schedstat")) else {
++                    continue;
++                };
++                if let Some(ns) = raw
++                    .split_whitespace()
++                    .next()
++                    .and_then(|f| f.parse::<u128>().ok())
++                {
++                    total += ns;
++                    any = true;
++                }
++            }
++            any.then_some(total)
++        }
++        #[cfg(not(target_os = "linux"))]
++        {
++            None
++        }
++    }
++
+     /// Per-fetch *timeline* — diagnostic for the cold-search critical path.
+     ///
+     /// Fetch counts/bytes tell us breadth; they can't tell us whether the cold
+@@ -859,4 +974,38 @@ mod tests {
+         assert_eq!(cloned.etag.as_deref(), Some("e"));
+         assert!(format!("{meta:?}").contains("ObjectMeta"));
+     }
++
++    /// Each per-op recorder advances its counter; `snapshot` reads them all
++    /// without resetting. Assertions are relative (before/after) because the
++    /// counters are process-global and other tests may increment concurrently.
++    #[test]
++    fn io_counters_record_and_snapshot_are_monotonic() {
++        use super::io_counters;
++        let before = io_counters::snapshot();
++        io_counters::record_get(100);
++        io_counters::record_head();
++        io_counters::record_put(50);
++        io_counters::record_list();
++        io_counters::record_delete();
++        let after = io_counters::snapshot();
++        // `since` gives the window delta directly (≥ our own increments; other
++        // threads may add more concurrently).
++        let delta = after.since(&before);
++        assert!(delta.get_count >= 1);
++        assert!(delta.get_bytes >= 100);
++        assert!(delta.head_count >= 1);
++        assert!(delta.put_count >= 1);
++        assert!(delta.put_bytes >= 50);
++        assert!(delta.list_count >= 1);
++        assert!(delta.delete_count >= 1);
++    }
++
++    /// On Linux the process-CPU probe returns a positive on-CPU nanosecond
++    /// total; elsewhere it is `None` (both are acceptable).
++    #[test]
++    fn process_cpu_ns_is_positive_when_available() {
++        if let Some(ns) = super::io_counters::process_cpu_ns() {
++            assert!(ns > 0, "process CPU ns should be positive");
++        }
++    }
+ }
+diff --git a/src/storage/s3.rs b/src/storage/s3.rs
+index 6dde7ae..93a549e 100644
+--- a/src/storage/s3.rs
++++ b/src/storage/s3.rs
+@@ -289,6 +289,7 @@ impl StorageProvider for S3StorageProvider {
+             .head(&path)
+             .await
+             .map_err(|e| translate(uri, e))?;
++        crate::storage::io_counters::record_head();
+         Ok(ObjectMeta {
+             size: meta.size as u64,
+             etag: meta.e_tag,
+@@ -313,6 +314,7 @@ impl StorageProvider for S3StorageProvider {
+         })
+         .await;
+         if let Ok((b, _)) = &out {
++            crate::storage::io_counters::record_get(b.len() as u64);
+             crate::storage::io_counters::timeline_record("get", uri, 0, b.len() as u64, tl);
+         }
+         out
+@@ -372,6 +374,7 @@ impl StorageProvider for S3StorageProvider {
+         })
+         .await;
+         if let Ok((b, size)) = &out {
++            crate::storage::io_counters::record_get(b.len() as u64);
+             crate::storage::io_counters::timeline_record(
+                 "tail",
+                 uri,
+@@ -385,15 +388,21 @@ impl StorageProvider for S3StorageProvider {
+ 
+     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
+         let path = self.path(uri)?;
++        let n = bytes.len() as u64;
+         let opts = PutOptions {
+             mode: PutMode::Create,
+             ..Default::default()
+         };
+-        self.store
++        let out = self
++            .store
+             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
+             .await
+             .map(|r| r.e_tag)
+-            .map_err(|e| translate(uri, e))
++            .map_err(|e| translate(uri, e));
++        if out.is_ok() {
++            crate::storage::io_counters::record_put(n);
++        }
++        out
+     }
+ 
+     async fn put_if_match(
+@@ -425,11 +434,17 @@ impl StorageProvider for S3StorageProvider {
+                 ..Default::default()
+             },
+         };
+-        self.store
++        let n = bytes.len() as u64;
++        let out = self
++            .store
+             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
+             .await
+             .map(|r| r.e_tag)
+-            .map_err(|e| translate(uri, e))
++            .map_err(|e| translate(uri, e));
++        if out.is_ok() {
++            crate::storage::io_counters::record_put(n);
++        }
++        out
+     }
+ 
+     async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
+@@ -442,6 +457,7 @@ impl StorageProvider for S3StorageProvider {
+ 
+     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+         let path = self.path(uri)?;
++        crate::storage::io_counters::record_delete();
+         match self.store.delete(&path).await {
+             Ok(()) => Ok(()),
+             Err(ObjError::NotFound { .. }) => Ok(()),
+@@ -453,6 +469,7 @@ impl StorageProvider for S3StorageProvider {
+         &self,
+         prefix: &str,
+     ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
++        crate::storage::io_counters::record_list();
+         let path = ObjPath::from(prefix);
+         let mut stream = self.store.list(Some(&path));
+         let mut out = Vec::new();
+diff --git a/src/superfile/vector/spill.rs b/src/superfile/vector/spill.rs
+index 2dcecfd..426dbc3 100644
+--- a/src/superfile/vector/spill.rs
++++ b/src/superfile/vector/spill.rs
+@@ -24,8 +24,10 @@
+ //! per-chunk loop runs inside.
+ 
+ use std::{
+-    fs::{File, OpenOptions},
+-    io::{BufWriter, Error, ErrorKind, Write},
++    collections::HashMap,
++    fs::{self, File, OpenOptions},
++    io::{BufReader, BufWriter, Error, ErrorKind, Read, Write},
++    mem::size_of,
+     path::{Path, PathBuf},
+     sync::Arc,
+ };
+@@ -33,7 +35,10 @@ use std::{
+ use bytemuck::{cast_slice, try_cast_slice};
+ use memmap2::Mmap;
+ 
+-use crate::superfile::BuildError;
++use crate::superfile::{
++    BuildError,
++    vector::cell_posting::{EncodedCellRow, MaterializedIvfRow},
++};
+ 
+ /// Append-only spill writer for f32 vectors. Backed by a
+ /// `BufWriter<File>` so the hot path (per-vector `write_vec` in
+@@ -345,6 +350,270 @@ impl ChunkedVectorSource for MmapVectorSource {
+     }
+ }
+ 
++/// Bytes of the fixed per-row prefix in a [`MaterializedRowSpillWriter`]
++/// record: `stable_id` (i128) + `cluster` (u32) + quantizer-table index (u32)
++/// + `norm_sq` presence flag (u8) + `norm_sq` payload (f32, zero when absent).
++const ROW_SPILL_PREFIX_BYTES: usize =
++    size_of::<i128>() + size_of::<u32>() + size_of::<u32>() + size_of::<u8>() + size_of::<f32>();
++
++/// `norm_sq` presence flag values in the spilled row prefix.
++const NORM_ABSENT: u8 = 0;
++const NORM_PRESENT: u8 = 1;
++
++/// One finished per-cell spill: the row-record file, its quantizer-table
++/// sidecar, and the counts needed to read them back.
++pub(crate) struct SpilledCellRows {
++    rows_path: PathBuf,
++    quants_path: PathBuf,
++    n_rows: u32,
++    n_quants: u32,
++    dim: usize,
++    rabitq_len: usize,
++}
++
++impl SpilledCellRows {
++    /// Rows recorded in this spill.
++    pub(crate) fn n_rows(&self) -> u32 {
++        self.n_rows
++    }
++
++    /// On-disk size of the row-record file — the working-set estimate the
++    /// drain uses to group cells into memory-bounded build waves.
++    pub(crate) fn row_bytes(&self) -> u64 {
++        (self.n_rows as u64) * record_bytes(self.dim, self.rabitq_len) as u64
++    }
++
++    /// Delete both backing files. Called after the cell superfile is built
++    /// and uploaded so drain scratch shrinks as cells complete; the owning
++    /// tempdir still sweeps anything left behind on early exit.
++    pub(crate) fn remove_files(&self) {
++        let _ = fs::remove_file(&self.rows_path);
++        let _ = fs::remove_file(&self.quants_path);
++    }
++}
++
++/// Byte length of one spilled row record for a `(dim, rabitq_len)` shape:
++/// the fixed prefix plus the RaBitQ code and the Sq8+ε `codes`/`residuals`
++/// legs (each `dim` bytes).
++fn record_bytes(dim: usize, rabitq_len: usize) -> usize {
++    ROW_SPILL_PREFIX_BYTES + rabitq_len + 2 * dim
++}
++
++/// Append-only spill for [`MaterializedIvfRow`]s of ONE cell, accumulated
++/// across the drain's memory-bounded batches so the drain can build exactly
++/// one superfile per cell per run regardless of its batch size.
++///
++/// Rows are written as their already-encoded Sq8+ε bytes — no decode, no
++/// re-quantization. The per-cluster dequant params (`scale`/`offset`, shared
++/// `Arc<[f32]>`s ~8 KiB at dim=1024) are NOT duplicated per row: each distinct
++/// quantizer is appended once to a sidecar table and rows reference it by
++/// index. Dedup is by `Arc` pointer identity, valid only while the source
++/// batch's rows are alive — callers must call [`Self::begin_batch`] at each
++/// batch boundary so a freed-and-reallocated `Arc` can't alias a stale entry.
++pub(crate) struct MaterializedRowSpillWriter {
++    rows: BufWriter<File>,
++    quants: BufWriter<File>,
++    rows_path: PathBuf,
++    quants_path: PathBuf,
++    dim: usize,
++    rabitq_len: usize,
++    n_rows: u32,
++    n_quants: u32,
++    quant_idx_by_ptr: HashMap<usize, u32>,
++}
++
++impl MaterializedRowSpillWriter {
++    /// Create the row + quantizer spill files for `cell` under `dir`.
++    /// `dim`/`rabitq_len` fix the record shape; rows that disagree are
++    /// rejected (mixed shapes in one column are a build invariant break).
++    pub(crate) fn create(
++        dir: &Path,
++        cell: u32,
++        dim: usize,
++        rabitq_len: usize,
++    ) -> Result<Self, BuildError> {
++        let rows_path = dir.join(format!("cell-{cell}.rows"));
++        let quants_path = dir.join(format!("cell-{cell}.quants"));
++        let rows_file = OpenOptions::new()
++            .create(true)
++            .write(true)
++            .truncate(true)
++            .open(&rows_path)?;
++        let quants_file = OpenOptions::new()
++            .create(true)
++            .write(true)
++            .truncate(true)
++            .open(&quants_path)?;
++        Ok(Self {
++            rows: BufWriter::with_capacity(SpillWriter::BUF_CAPACITY, rows_file),
++            quants: BufWriter::with_capacity(SpillWriter::BUF_CAPACITY, quants_file),
++            rows_path,
++            quants_path,
++            dim,
++            rabitq_len,
++            n_rows: 0,
++            n_quants: 0,
++            quant_idx_by_ptr: HashMap::new(),
++        })
++    }
++
++    /// Reset the pointer-identity dedup at a batch boundary. The previous
++    /// batch's `Arc<[f32]>`s may be freed after this, so their addresses can
++    /// be legally reused by unrelated later allocations (ABA); clearing the
++    /// map makes the next batch re-append its quantizers instead of aliasing.
++    pub(crate) fn begin_batch(&mut self) {
++        self.quant_idx_by_ptr.clear();
++    }
++
++    /// Append one row's encoded bytes (and its quantizer, first time seen
++    /// this batch). Borrows only — no row payload is cloned.
++    pub(crate) fn append(&mut self, row: &MaterializedIvfRow) -> Result<(), BuildError> {
++        let enc = &row.encoded;
++        if enc.codes.len() != self.dim
++            || enc.residuals.len() != self.dim
++            || row.rabitq_code.len() != self.rabitq_len
++            || enc.scale.len() != self.dim
++            || enc.offset.len() != self.dim
++        {
++            return Err(BuildError::Io(Error::new(
++                ErrorKind::InvalidData,
++                format!(
++                    "drain spill: row shape mismatch (codes {}, residuals {}, rabitq {}, \
++                     scale {}, offset {}) vs expected dim {} / rabitq {}",
++                    enc.codes.len(),
++                    enc.residuals.len(),
++                    row.rabitq_code.len(),
++                    enc.scale.len(),
++                    enc.offset.len(),
++                    self.dim,
++                    self.rabitq_len,
++                ),
++            )));
++        }
++        let ptr = Arc::as_ptr(&enc.scale) as *const () as usize;
++        let quant_idx = match self.quant_idx_by_ptr.get(&ptr) {
++            Some(&idx) => idx,
++            None => {
++                let idx = self.n_quants;
++                self.quants.write_all(cast_slice(enc.scale.as_ref()))?;
++                self.quants.write_all(cast_slice(enc.offset.as_ref()))?;
++                self.n_quants += 1;
++                self.quant_idx_by_ptr.insert(ptr, idx);
++                idx
++            }
++        };
++        self.rows.write_all(&row.stable_id.to_le_bytes())?;
++        self.rows.write_all(&row.cluster.to_le_bytes())?;
++        self.rows.write_all(&quant_idx.to_le_bytes())?;
++        match enc.norm_sq {
++            Some(n) => {
++                self.rows.write_all(&[NORM_PRESENT])?;
++                self.rows.write_all(&n.to_le_bytes())?;
++            }
++            None => {
++                self.rows.write_all(&[NORM_ABSENT])?;
++                self.rows.write_all(&0f32.to_le_bytes())?;
++            }
++        }
++        self.rows.write_all(&row.rabitq_code)?;
++        self.rows.write_all(&enc.codes)?;
++        self.rows.write_all(&enc.residuals)?;
++        self.n_rows += 1;
++        Ok(())
++    }
++
++    /// Flush both files and return the readable spill handle.
++    pub(crate) fn finish(mut self) -> Result<SpilledCellRows, BuildError> {
++        self.rows.flush()?;
++        self.quants.flush()?;
++        Ok(SpilledCellRows {
++            rows_path: self.rows_path,
++            quants_path: self.quants_path,
++            n_rows: self.n_rows,
++            n_quants: self.n_quants,
++            dim: self.dim,
++            rabitq_len: self.rabitq_len,
++        })
++    }
++}
++
++/// Read one cell's spilled rows back into [`MaterializedIvfRow`]s. The
++/// quantizer table is materialized once as shared `Arc<[f32]>`s, so read-back
++/// restores the same shared-quantizer memory shape the drain materialized
++/// from the source superfiles (rows of one cluster point at one buffer).
++/// `local_doc_id` is left 0 — the drain reassigns it after its stable-id sort.
++pub(crate) fn read_spilled_cell_rows(
++    spill: &SpilledCellRows,
++) -> Result<Vec<MaterializedIvfRow>, BuildError> {
++    let dim = spill.dim;
++    // Quantizer table: `n_quants` × (scale[dim] | offset[dim]) f32 pairs.
++    let mut quants: Vec<(Arc<[f32]>, Arc<[f32]>)> = Vec::with_capacity(spill.n_quants as usize);
++    {
++        let mut reader = BufReader::new(File::open(&spill.quants_path)?);
++        let mut f32_buf = vec![0u8; dim * size_of::<f32>()];
++        for _ in 0..spill.n_quants {
++            reader.read_exact(&mut f32_buf)?;
++            let scale: Arc<[f32]> = Arc::from(cast_f32_vec(&f32_buf));
++            reader.read_exact(&mut f32_buf)?;
++            let offset: Arc<[f32]> = Arc::from(cast_f32_vec(&f32_buf));
++            quants.push((scale, offset));
++        }
++    }
++
++    let mut rows = Vec::with_capacity(spill.n_rows as usize);
++    let mut reader = BufReader::new(File::open(&spill.rows_path)?);
++    let mut prefix = [0u8; ROW_SPILL_PREFIX_BYTES];
++    for _ in 0..spill.n_rows {
++        reader.read_exact(&mut prefix)?;
++        let stable_id = i128::from_le_bytes(prefix[0..16].try_into().expect("16-byte i128 slice"));
++        let cluster = u32::from_le_bytes(prefix[16..20].try_into().expect("4-byte u32 slice"));
++        let quant_idx =
++            u32::from_le_bytes(prefix[20..24].try_into().expect("4-byte u32 slice")) as usize;
++        let norm_flag = prefix[24];
++        let norm =
++            f32::from_le_bytes(prefix[25..29].try_into().expect("4-byte f32 slice"));
++        let (scale, offset) = quants.get(quant_idx).cloned().ok_or_else(|| {
++            BuildError::Io(Error::new(
++                ErrorKind::InvalidData,
++                format!(
++                    "drain spill: quantizer index {quant_idx} out of range ({} entries)",
++                    quants.len()
++                ),
++            ))
++        })?;
++        let mut rabitq_code = vec![0u8; spill.rabitq_len];
++        reader.read_exact(&mut rabitq_code)?;
++        let mut codes = vec![0u8; dim];
++        reader.read_exact(&mut codes)?;
++        let mut residuals = vec![0u8; dim];
++        reader.read_exact(&mut residuals)?;
++        let norm_sq = (norm_flag == NORM_PRESENT).then_some(norm);
++        rows.push(MaterializedIvfRow {
++            local_doc_id: 0,
++            stable_id,
++            cluster,
++            rabitq_code,
++            encoded: EncodedCellRow {
++                stable_id,
++                scale,
++                offset,
++                codes,
++                residuals,
++                norm_sq,
++            },
++        });
++    }
++    Ok(rows)
++}
++
++/// Decode a raw little-endian f32 byte buffer into an owned vec.
++fn cast_f32_vec(bytes: &[u8]) -> Vec<f32> {
++    bytes
++        .chunks_exact(size_of::<f32>())
++        .map(|c| f32::from_le_bytes(c.try_into().expect("4-byte f32 chunk")))
++        .collect()
++}
++
+ #[cfg(test)]
+ mod tests {
+     use std::{
+@@ -531,6 +800,89 @@ mod tests {
+         }
+     }
+ 
++    /// Row-spill round trip: rows written across two "batches" (dedup reset
++    /// between them) read back bit-identical, with quantizers shared per
++    /// source cluster and the batch-boundary reset forcing a re-append.
++    #[test]
++    fn materialized_row_spill_round_trips() {
++        const DIM: usize = 8;
++        const RABITQ_LEN: usize = 2;
++        let tmp = tempdir().expect("tempdir");
++
++        let quant_a: (Arc<[f32]>, Arc<[f32]>) = (
++            Arc::from(vec![1.0f32; DIM]),
++            Arc::from(vec![0.5f32; DIM]),
++        );
++        let quant_b: (Arc<[f32]>, Arc<[f32]>) = (
++            Arc::from(vec![2.0f32; DIM]),
++            Arc::from(vec![0.25f32; DIM]),
++        );
++        let row = |id: i128, cluster: u32, q: &(Arc<[f32]>, Arc<[f32]>), norm: Option<f32>| {
++            MaterializedIvfRow {
++                local_doc_id: 0,
++                stable_id: id,
++                cluster,
++                rabitq_code: vec![id as u8, cluster as u8],
++                encoded: EncodedCellRow {
++                    stable_id: id,
++                    scale: Arc::clone(&q.0),
++                    offset: Arc::clone(&q.1),
++                    codes: vec![id as u8; DIM],
++                    residuals: vec![cluster as u8; DIM],
++                    norm_sq: norm,
++                },
++            }
++        };
++
++        let mut w =
++            MaterializedRowSpillWriter::create(tmp.path(), 7, DIM, RABITQ_LEN).expect("create");
++        w.begin_batch();
++        w.append(&row(1, 10, &quant_a, Some(3.5))).expect("append");
++        w.append(&row(2, 10, &quant_a, None)).expect("append");
++        w.append(&row(3, 11, &quant_b, Some(1.25))).expect("append");
++        // Second batch: same quantizer CONTENT as quant_a but the dedup map
++        // was reset, so it re-appends (correctness over dedup ratio).
++        w.begin_batch();
++        w.append(&row(4, 10, &quant_a, Some(9.0))).expect("append");
++        let spill = w.finish().expect("finish");
++
++        assert_eq!(spill.n_rows(), 4);
++        assert_eq!(
++            spill.row_bytes(),
++            4 * (ROW_SPILL_PREFIX_BYTES + RABITQ_LEN + 2 * DIM) as u64
++        );
++
++        let rows = read_spilled_cell_rows(&spill).expect("read back");
++        assert_eq!(rows.len(), 4);
++        for (got, want_id) in rows.iter().zip([1i128, 2, 3, 4]) {
++            assert_eq!(got.stable_id, want_id);
++            assert_eq!(got.encoded.stable_id, want_id);
++            assert_eq!(got.rabitq_code.len(), RABITQ_LEN);
++            assert_eq!(got.encoded.codes, vec![want_id as u8; DIM]);
++        }
++        assert_eq!(rows[0].cluster, 10);
++        assert_eq!(rows[2].cluster, 11);
++        assert_eq!(rows[0].encoded.norm_sq, Some(3.5));
++        assert_eq!(rows[1].encoded.norm_sq, None);
++        assert_eq!(rows[2].encoded.norm_sq, Some(1.25));
++        assert_eq!(rows[2].encoded.scale.as_ref(), vec![2.0f32; DIM].as_slice());
++        assert_eq!(
++            rows[2].encoded.offset.as_ref(),
++            vec![0.25f32; DIM].as_slice()
++        );
++        // Rows 0 and 1 share one quantizer Arc (same batch, same cluster).
++        assert!(Arc::ptr_eq(&rows[0].encoded.scale, &rows[1].encoded.scale));
++
++        // Shape mismatches are rejected.
++        let mut w2 =
++            MaterializedRowSpillWriter::create(tmp.path(), 8, DIM, RABITQ_LEN).expect("create");
++        let mut bad = row(9, 12, &quant_a, None);
++        bad.encoded.codes = vec![0u8; DIM - 1];
++        assert!(w2.append(&bad).is_err(), "shape mismatch must be rejected");
++
++        spill.remove_files();
++    }
++
+     #[test]
+     fn empty_corpus_yields_no_chunks() {
+         let mem_src = InMemoryVectorSource::new(Arc::new(Vec::<f32>::new()), 4, 8);
+diff --git a/src/supertable/handle.rs b/src/supertable/handle.rs
+index cce10e1..8e792a3 100644
+--- a/src/supertable/handle.rs
++++ b/src/supertable/handle.rs
+@@ -2261,11 +2261,13 @@ mod tests {
+         );
+     }
+ 
+-    /// Bounded-batch drain: with `drain_batch_superfiles = 1`, a SINGLE drain
+-    /// call over N user superfiles processes them in N batches, each appending
+-    /// one file per touched cell — so the (single) cell ends up with N files.
+-    /// `drain_batch_superfiles = 0` skips the drain entirely. This exercises the
+-    /// per-batch loop itself (vs. the multi-drain-call path above).
++    /// Bounded-batch drain: `drain_batch_superfiles` is a MEMORY bound (how
++    /// many user superfiles are materialized per batch) and must never change
++    /// the published layout — a single drain call over N user superfiles
++    /// produces exactly ONE file per touched cell whether the budget forces N
++    /// batches (`1`) or a single merge (`-1`). `0` skips the drain entirely.
++    /// This exercises the per-batch loop itself (vs. the multi-drain-call
++    /// path above, where each drain RUN legitimately appends one more file).
+     #[test]
+     fn bounded_drain_batches_by_superfile_count() {
+         use std::{collections::HashMap, sync::Arc};
+@@ -2358,15 +2360,16 @@ mod tests {
+             by_cell.values().copied().max().unwrap_or(0)
+         };
+ 
+-        // batch=1: 3 user superfiles → 3 batches → 3 files in the cell.
++        // batch=1: 3 user superfiles → 3 memory batches, but still ONE file
++        // per cell — the batch budget must not leak into the layout.
+         let st1 = make(1);
+         assert_eq!(
+             max_files_per_cell(&st1),
+-            3,
+-            "batch=1 over 3 user superfiles must append 3 cell files in one drain"
++            1,
++            "batch=1 over 3 user superfiles must still publish one file per cell per drain"
+         );
+ 
+-        // batch=-1 (unbounded): all 3 in one merge → 1 file in the cell.
++        // batch=-1 (unbounded): all 3 in one merge → identical layout.
+         let st_unb = make(-1);
+         assert_eq!(
+             max_files_per_cell(&st_unb),
+@@ -3055,6 +3058,130 @@ mod tests {
+         );
+     }
+ 
++    /// The drain batch budget is a MEMORY bound (how many user superfiles are
++    /// materialized at once) — it must never change the published layout. One
++    /// drain run over N undrained commits produces exactly ONE superfile per
++    /// touched cell, whether the budget forces N batches (budget 1, as here)
++    /// or a single batch. Regression for the fragmentation where each batch
++    /// published its own file per cell (files/cell == batch count).
++    #[test]
++    fn drain_batch_budget_never_changes_cell_layout() {
++        use std::{collections::HashMap, sync::Arc};
++
++        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
++        use arrow_schema::{DataType, Field, Schema};
++
++        use crate::superfile::{
++            builder::{FtsConfig, VectorConfig},
++            vector::{distance::Metric, rerank_codec::RerankCodec},
++        };
++
++        let dim = 16usize;
++        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
++        let schema = Arc::new(Schema::new(vec![
++            Field::new("title", DataType::LargeUtf8, false),
++            Field::new(
++                "emb",
++                DataType::FixedSizeList(item_field.clone(), dim as i32),
++                false,
++            ),
++        ]));
++        let pool = Arc::new(
++            rayon::ThreadPoolBuilder::new()
++                .num_threads(1)
++                .build()
++                .expect("pool"),
++        );
++        let dir = TempDir::new().expect("tempdir");
++        let storage: Arc<dyn StorageProvider> =
++            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
++        let mut options = SupertableOptions::new(
++            schema.clone(),
++            vec![FtsConfig {
++                column: "title".into(),
++            }],
++            vec![VectorConfig {
++                column: "emb".into(),
++                dim,
++                n_cent: 4,
++                rot_seed: 7,
++                metric: Metric::Cosine,
++                rerank_codec: RerankCodec::Sq8Residual,
++                provided_centroids: None,
++            }],
++            Some(crate::test_helpers::default_tokenizer()),
++        )
++        .expect("valid options")
++        .with_storage(storage)
++        .with_writer_pool(pool);
++        // The smallest budget = the worst historical fragmentation: one batch
++        // per commit. The layout must come out identical to a single batch.
++        options.drain_batch_superfiles = 1;
++        let st = Supertable::create(options).expect("create");
++
++        const N_COMMITS: usize = 3;
++        for commit in 0..N_COMMITS {
++            let titles = LargeStringArray::from(vec![format!("doc-{commit}")]);
++            let flat = Float32Array::from(vec![1.0f32; dim]);
++            let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
++            let batch = arrow_array::RecordBatch::try_new(
++                schema.clone(),
++                vec![
++                    Arc::new(titles) as Arc<dyn Array>,
++                    Arc::new(fsl) as Arc<dyn Array>,
++                ],
++            )
++            .expect("batch");
++            let mut w = st.writer().expect("writer");
++            w.append(&batch).expect("append");
++            w.commit().expect("commit");
++        }
++
++        st.drain_vectors_to_cells_sync().expect("drain");
++
++        let hidden = st
++            .reader()
++            .vector_index_table()
++            .expect("hidden index")
++            .clone();
++        let reader = hidden.reader();
++        let manifest = reader.manifest();
++        let mut per_cell = HashMap::<Vec<u8>, usize>::new();
++        let mut total_rows = 0u64;
++        for e in manifest.superfiles.iter() {
++            *per_cell.entry(e.partition_key.clone()).or_default() += 1;
++            total_rows += e.n_docs;
++        }
++        let max_per_cell = per_cell.values().copied().max().unwrap_or(0);
++        assert_eq!(
++            max_per_cell, 1,
++            "one drain run must publish exactly one superfile per cell, \
++             independent of the batch budget (got {max_per_cell} for some cell)"
++        );
++        assert_eq!(
++            total_rows, N_COMMITS as u64,
++            "every drained row lands exactly once (no batch duplication)"
++        );
++        assert!(
++            !manifest.get_drained_ranges().is_empty(),
++            "the single publish must advance the drained watermark"
++        );
++
++        // Re-drain with nothing new: a no-op (watermark covers all commits).
++        st.drain_vectors_to_cells_sync().expect("re-drain no-op");
++        let hidden = st
++            .reader()
++            .vector_index_table()
++            .expect("hidden index")
++            .clone();
++        let n_after = hidden.reader().manifest().superfiles.iter().count();
++        assert_eq!(
++            n_after,
++            per_cell.len(),
++            "no-op re-drain must not append cell files"
++        );
++    }
++
+     #[test]
+     fn hidden_ivf_compaction_collapses_per_cell() {
+         use std::{collections::HashMap, sync::Arc};
+diff --git a/src/supertable/reader_cache/disk.rs b/src/supertable/reader_cache/disk.rs
+index ea46135..c9c0733 100644
+--- a/src/supertable/reader_cache/disk.rs
++++ b/src/supertable/reader_cache/disk.rs
+@@ -33,7 +33,10 @@ use tokio::{
+     task::{JoinHandle, spawn_blocking},
+ };
+ 
+-use super::config::{ColdFetchMode, DiskCacheConfig, EvictionCandidate};
++use super::{
++    block_source::BlockCachedSource,
++    config::{ColdFetchMode, DiskCacheConfig, EvictionCandidate},
++};
+ use crate::{
+     storage::{StorageError, StorageProvider},
+     superfile::{
+@@ -92,6 +95,12 @@ const BACKGROUND_FILL_MAX_STREAMS: usize = 2;
+ /// queries (see [`foreground_query_active`]).
+ const BACKGROUND_FILL_YIELD_POLL: Duration = Duration::from_millis(5);
+ 
++/// Filename suffix of the sparse per-superfile block-cache files written by
++/// [`super::block_source::BlockCachedSource`]. Their filled-block bitmaps
++/// are in-memory only, so files from a previous process are unreadable and
++/// swept at open ([`DiskCacheStore::restore_from_cache_root`]).
++const BLOCKS_FILE_SUFFIX: &str = ".blocks";
++
+ /// Upper bound on how long a background fill yields to foreground queries
+ /// before proceeding anyway. Prevents a sustained query stream from starving
+ /// the cache warm-up indefinitely; under bursty load the fill simply resumes
+@@ -200,10 +209,33 @@ struct CachedEntry {
+     /// on either path affects the cached entry's resident
+     /// pages.
+     mmap: Option<Arc<Mmap>>,
+-    size_bytes: u64,
++    /// Accounted bytes. Fixed at insert for eagerly-accounted entries;
++    /// for block-backed lazy entries this is the [`BlockCachedSource`]'s
++    /// shared filled-bytes counter, growing as blocks land — so eviction
++    /// candidates report the entry's true, live footprint.
++    ///
++    /// [`BlockCachedSource`]: super::block_source::BlockCachedSource
++    size_bytes: Arc<AtomicU64>,
++    /// Who releases this entry's budget accounting at removal.
++    accounting: EntryAccounting,
+     last_access_us: AtomicU64,
+ }
+ 
++/// Budget-accounting ownership for one [`CachedEntry`].
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum EntryAccounting {
++    /// The store reserved this entry's bytes up front (mmap, hybrid,
++    /// warm-insert, sync cold-fetch); removal releases `size_bytes`.
++    Eager,
++    /// A block-backed lazy entry: bytes were reserved block-by-block by
++    /// its [`BlockCachedSource`], which releases them in its `Drop` (when
++    /// the last in-flight reader over it goes away). Removal from the map
++    /// must NOT release — that would double-count with the source.
++    ///
++    /// [`BlockCachedSource`]: super::block_source::BlockCachedSource
++    SourceOwned,
++}
++
+ /// Coalescing cell — concurrent cold readers on the same URI
+ /// share one `OnceCell` and observe the same fetch result.
+ type Coordinator = Arc<OnceCell<Result<Arc<CachedEntry>, DiskCacheError>>>;
+@@ -844,7 +876,7 @@ impl DiskCacheStore {
+                     *e.key(),
+                     mmap,
+                     e.value().last_access_us.load(Ordering::Acquire),
+-                    e.value().size_bytes,
++                    e.value().size_bytes.load(Ordering::Acquire),
+                 ))
+             })
+             .collect();
+@@ -1021,7 +1053,8 @@ impl DiskCacheStore {
+         Ok(Arc::new(CachedEntry {
+             reader: Arc::new(reader),
+             mmap: Some(mmap_arc),
+-            size_bytes: size,
++            size_bytes: Arc::new(AtomicU64::new(size)),
++            accounting: EntryAccounting::Eager,
+             last_access_us: AtomicU64::new(self.now_us()),
+         }))
+     }
+@@ -1045,6 +1078,13 @@ impl DiskCacheStore {
+             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                 continue;
+             };
++            if name.ends_with(BLOCKS_FILE_SUFFIX) {
++                // Sparse block file from a prior process: its filled-block
++                // bitmap died with that process, so the bytes are
++                // unaddressable. Reclaim the space.
++                let _ = fs::remove_file(&path);
++                continue;
++            }
+             let Some(uri) = SuperfileUri::from_cache_filename(name) else {
+                 continue; // `.tmp` in-flight or foreign file — skip.
+             };
+@@ -1072,6 +1112,15 @@ impl DiskCacheStore {
+         self.config.cache_root.join(uri.cache_filename())
+     }
+ 
++    /// Per-URI sparse block-cache file (see
++    /// [`super::block_source::BlockCachedSource`]). Sibling of the full
++    /// cache file, distinguished by the [`BLOCKS_FILE_SUFFIX`] suffix.
++    fn blocks_path(&self, uri: &SuperfileUri) -> PathBuf {
++        self.config
++            .cache_root
++            .join(format!("{}{BLOCKS_FILE_SUFFIX}", uri.cache_filename()))
++    }
++
+     /// Build a per-URI tempfile path (sparse destination
+     /// during cold fetch; renamed to `cache_path` on success).
+     fn tmp_path(&self, uri: &SuperfileUri) -> PathBuf {
+@@ -1207,7 +1256,8 @@ impl DiskCacheStore {
+         let entry = Arc::new(CachedEntry {
+             reader: Arc::clone(&foreground_reader),
+             mmap: None, // hybrid foreground entry is in-memory; finalizer mmaps later
+-            size_bytes: size,
++            size_bytes: Arc::new(AtomicU64::new(size)),
++            accounting: EntryAccounting::Eager,
+             last_access_us: AtomicU64::new(self.now_us()),
+         });
+         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
+@@ -1315,6 +1365,9 @@ impl DiskCacheStore {
+         fetch_storage: Arc<dyn StorageProvider>,
+     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
+         let storage_uri = Self::storage_path(uri);
++        // Accounting counter of the block cache layer wired under the lazy
++        // reader below; becomes the cache entry's live `size_bytes`.
++        let filled_bytes: Arc<AtomicU64>;
+         let (lazy_reader, size) = if let Some(offsets) = offsets {
+             let total_size = offsets.total_size;
+ 
+@@ -1348,16 +1401,24 @@ impl DiskCacheStore {
+                 }
+             };
+ 
+-            // Build the lazy source: a `StorageRangeSource` with the
+-            // size baked in (no HEAD, no suffix-range discovery)
+-            // wrapped in a `PrefetchedSource` overlay carrying the
+-            // open-time byte ranges at their absolute offsets.
++            // Build the lazy source stack, bottom to top:
++            //   `StorageRangeSource` (network range GETs, size baked in — no
++            //   HEAD, no suffix-range discovery)
++            //   → `BlockCachedSource` (block-granular NVMe retention: every
++            //     data range a query pulls is kept locally, so repeat reads
++            //     of the same bytes never re-GET — without whole-file
++            //     promotion)
++            //   → `PrefetchedSource` overlay carrying the open-time byte
++            //     ranges at their absolute offsets.
+             let inner: Arc<dyn LazyByteSource> = Arc::new(StorageRangeSource::with_known_size(
+                 Arc::clone(&fetch_storage),
+                 storage_uri.clone(),
+                 total_size,
+             ));
+-            let mut overlay = PrefetchedSource::new(inner);
++            let block_src =
++                BlockCachedSource::new(inner, Arc::downgrade(self), *uri, self.blocks_path(uri));
++            filled_bytes = block_src.filled_bytes_handle();
++            let mut overlay = PrefetchedSource::new(block_src);
+ 
+             if !offsets.open_blob.is_empty() {
+                 // The open-batch bytes (parquet tail + vector + FTS open
+@@ -1424,29 +1485,42 @@ impl DiskCacheStore {
+             // Unknown-size path: avoid the cold-open HEAD round-trip.
+             // The first `tail()` inside `open_lazy_with` is a native
+             // suffix-range GET that returns both footer bytes and total
+-            // object size, then patches the source's size atomic.
++            // object size, then patches the source's size atomic. The block
++            // layer sits on top; its sparse file is sized lazily once the
++            // tail discovers the object size.
+             let range_src: Arc<dyn LazyByteSource> =
+                 Arc::new(StorageRangeSource::with_unknown_size(
+                     Arc::clone(&fetch_storage),
+                     storage_uri.clone(),
+                 ));
++            let block_src = BlockCachedSource::new(
++                range_src,
++                Arc::downgrade(self),
++                *uri,
++                self.blocks_path(uri),
++            );
++            filled_bytes = block_src.filled_bytes_handle();
++            let block_src: Arc<dyn LazyByteSource> = block_src;
+             let lazy_reader = SuperfileReader::open_lazy_with(
+-                Arc::clone(&range_src),
++                Arc::clone(&block_src),
+                 OpenOptions { verify_crc: false },
+             )
+             .await?;
+-            let size = range_src.size();
++            let size = block_src.size();
+             (lazy_reader, size)
+         };
+ 
+-        self.reserve_manual(size).await?;
+-        let reserved_bytes = size;
+-
++        // No up-front reservation: a block-backed lazy entry starts at zero
++        // accounted bytes and grows as its source fills blocks (each fill
++        // reserves through the same eviction loop). This is what lets a
++        // table larger than the disk budget still keep its hot working set
++        // cached — full-size reservations would reject most files outright.
+         let lazy_reader = Arc::new(lazy_reader);
+         let entry = Arc::new(CachedEntry {
+             reader: Arc::clone(&lazy_reader),
+             mmap: None,
+-            size_bytes: size,
++            size_bytes: filled_bytes,
++            accounting: EntryAccounting::SourceOwned,
+             last_access_us: AtomicU64::new(self.now_us()),
+         });
+         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
+@@ -1468,7 +1542,6 @@ impl DiskCacheStore {
+                     uri_owned,
+                     storage_uri_owned,
+                     size,
+-                    reserved_bytes,
+                     fetch_storage_bg,
+                 )
+                 .await;
+@@ -1514,7 +1587,8 @@ impl DiskCacheStore {
+         let entry = Arc::new(CachedEntry {
+             reader: Arc::new(reader),
+             mmap: Some(mmap_arc),
+-            size_bytes: size,
++            size_bytes: Arc::new(AtomicU64::new(size)),
++            accounting: EntryAccounting::Eager,
+             last_access_us: AtomicU64::new(self.now_us()),
+         });
+         self.cached.insert(*uri, Arc::clone(&entry));
+@@ -1551,6 +1625,71 @@ impl DiskCacheStore {
+         }
+     }
+ 
++    /// Reserve budget for one block-cache fill run (see
++    /// [`super::block_source::BlockCachedSource`]). Same CAS + eviction
++    /// loop as every other reservation.
++    pub(super) async fn reserve_block_bytes(&self, bytes: u64) -> Result<(), DiskCacheError> {
++        self.reserve_manual(bytes).await
++    }
++
++    /// Release previously reserved bytes (duplicate block fill, failed
++    /// fill, or a block source dropping its accumulated footprint).
++    pub(super) fn release_block_bytes(&self, bytes: u64) {
++        self.current_bytes.fetch_sub(bytes, Ordering::Release);
++    }
++
++    /// Whether `filled` is still the live cache entry's accounting counter
++    /// for `uri`. A block source checks this before growing its footprint:
++    /// once its entry was evicted or replaced by an mmap promotion, further
++    /// fills would leak accounting, so the source degrades to passthrough.
++    pub(super) fn lazy_block_entry_is_current(
++        &self,
++        uri: &SuperfileUri,
++        filled: &Arc<AtomicU64>,
++    ) -> bool {
++        self.cached
++            .get(uri)
++            .map(|e| Arc::ptr_eq(&e.size_bytes, filled))
++            .unwrap_or(false)
++    }
++
++    /// Release an entry's budget accounting at removal time. Block-backed
++    /// (`SourceOwned`) entries release via their source's `Drop` instead —
++    /// their bytes stay accounted until the last in-flight reader drops,
++    /// which is also when the sparse blocks file is unlinked.
++    fn release_entry_accounting(&self, entry: &CachedEntry) {
++        if entry.accounting == EntryAccounting::Eager {
++            self.current_bytes
++                .fetch_sub(entry.size_bytes.load(Ordering::Acquire), Ordering::Release);
++        }
++    }
++
++    /// Test-only (block-source tests): register a minimal entry whose
++    /// `size_bytes` IS the given block source's filled counter, making that
++    /// source "current" for accounting (see
++    /// [`Self::lazy_block_entry_is_current`]).
++    #[cfg(test)]
++    pub(super) fn install_block_entry_for_test(&self, uri: SuperfileUri, filled: Arc<AtomicU64>) {
++        let reader =
++            SuperfileReader::open(tests::tiny_superfile_bytes()).expect("tiny superfile opens");
++        self.cached.insert(
++            uri,
++            Arc::new(CachedEntry {
++                reader: Arc::new(reader),
++                mmap: None,
++                size_bytes: filled,
++                accounting: EntryAccounting::SourceOwned,
++                last_access_us: AtomicU64::new(self.now_us()),
++            }),
++        );
++    }
++
++    /// Test-only companion of [`Self::install_block_entry_for_test`].
++    #[cfg(test)]
++    pub(super) fn remove_block_entry_for_test(&self, uri: &SuperfileUri) {
++        let _ = self.cached.remove(uri);
++    }
++
+     /// Reserve `bytes` of disk budget via CAS-loop on
+     /// `current_bytes`. On budget pressure runs eviction;
+     /// retries until either reserved or `BudgetExceeded`.
+@@ -1603,7 +1742,7 @@ impl DiskCacheStore {
+             .iter()
+             .map(|e| EvictionCandidate {
+                 uri: *e.key(),
+-                size_bytes: e.value().size_bytes,
++                size_bytes: e.value().size_bytes.load(Ordering::Acquire),
+                 last_access_us: e.value().last_access_us.load(Ordering::Acquire),
+             })
+             .collect();
+@@ -1623,8 +1762,10 @@ impl DiskCacheStore {
+             if let Some((_, entry)) = self.cached.remove(&uri) {
+                 let path = self.cache_path(&uri);
+                 let _ = fs::remove_file(&path);
+-                self.current_bytes
+-                    .fetch_sub(entry.size_bytes, Ordering::Release);
++                // Eager entries release here; block-backed lazy entries
++                // release (and unlink their sparse file) in their source's
++                // `Drop`, once the last in-flight reader over them is gone.
++                self.release_entry_accounting(&entry);
+                 self.n_evictions.fetch_add(1, Ordering::AcqRel);
+             }
+         }
+@@ -1797,7 +1938,8 @@ async fn finalize_to_mmap(
+                 *occ.get_mut() = Arc::new(CachedEntry {
+                     reader: Arc::new(reader),
+                     mmap: Some(mmap_arc),
+-                    size_bytes: size,
++                    size_bytes: Arc::new(AtomicU64::new(size)),
++                    accounting: EntryAccounting::Eager,
+                     last_access_us: AtomicU64::new(store.started_at.elapsed().as_micros() as u64),
+                 });
+             }
+@@ -1815,9 +1957,7 @@ async fn finalize_to_mmap(
+         // decrement when a racing eviction already removed
+         // this entry + released its bytes.
+         if let Some((_, entry)) = store.cached.remove(&uri) {
+-            store
+-                .current_bytes
+-                .fetch_sub(entry.size_bytes, Ordering::Release);
++            store.release_entry_accounting(&entry);
+         }
+         store.coordinators.remove(&uri);
+     }
+@@ -1971,24 +2111,6 @@ async fn cold_fetch_to_disk_cancelable(
+     Ok(true)
+ }
+ 
+-fn rollback_lazy_background_fill(store: &Arc<DiskCacheStore>, uri: &SuperfileUri, tmp: &Path) {
+-    if let Some((_, entry)) = store.cached.remove(uri) {
+-        store
+-            .current_bytes
+-            .fetch_sub(entry.size_bytes, Ordering::Release);
+-    }
+-    store.coordinators.remove(uri);
+-    let _ = fs::remove_file(tmp);
+-}
+-
+-/// background promotion path for the
+-/// `LazyForegroundWithBackgroundFill` cold-fetch mode.
+-/// Waits for foreground lazy readers to release, downloads the
+-/// full superfile via cancelable parallel range-GETs to NVMe,
+-/// mmaps the resulting file, and atomically replaces the lazy
+-/// cache entry with a mmap-backed reader. Subsequent
+-/// `reader(uri)` calls hit the promoted entry — every query
+-/// resolves from mmap (zero S3 GETs).
+ /// Diagnostic gate for the `LazyForegroundWithBackgroundFill`
+ /// full-superfile promotion. When `INFINO_DISABLE_BG_FILL=1` (or
+ /// `true`), the cold-fetch path installs the open-blob overlay
+@@ -2005,13 +2127,22 @@ pub(crate) fn skip_background_fill() -> bool {
+     })
+ }
+ 
++/// Background promotion path for the `LazyForegroundWithBackgroundFill`
++/// cold-fetch mode. Waits for foreground lazy readers to release, reserves
++/// the full object size (with eviction pressure), downloads the superfile
++/// via cancelable parallel range-GETs to NVMe, mmaps the file, and
++/// atomically replaces the lazy cache entry with a mmap-backed reader.
++///
++/// Promotion is an *upgrade*, not a requirement: the lazy entry it would
++/// replace is block-cached (repeat reads already serve from local blocks),
++/// so every failure or cancellation path — budget exhausted, store
++/// abandoned, fetch error — simply leaves the block-backed entry in place.
+ async fn lazy_background_fill(
+     store: Weak<DiskCacheStore>,
+     reader: Weak<SuperfileReader>,
+     uri: SuperfileUri,
+     storage_uri: String,
+     size: u64,
+-    reserved_bytes: u64,
+     fetch_storage: Arc<dyn StorageProvider>,
+ ) -> Result<(), DiskCacheError> {
+     let Some(store) = wait_for_lazy_foreground_release(&store, &reader).await else {
+@@ -2021,8 +2152,7 @@ async fn lazy_background_fill(
+     let final_path = store.cache_path(&uri);
+ 
+     if background_store_abandoned(&store) {
+-        rollback_lazy_background_fill(&store, &uri, &tmp);
+-        let _ = reserved_bytes;
++        store.coordinators.remove(&uri);
+         return Ok(());
+     }
+ 
+@@ -2035,17 +2165,24 @@ async fn lazy_background_fill(
+         Ok(p) => p,
+         Err(e) => {
+             store.coordinators.remove(&uri);
+-            if let Some((_, entry)) = store.cached.remove(&uri) {
+-                store
+-                    .current_bytes
+-                    .fetch_sub(entry.size_bytes, Ordering::Release);
+-            }
+             return Err(DiskCacheError::SuperfileOpen(format!(
+                 "prefetch semaphore closed: {e}"
+             )));
+         }
+     };
+ 
++    // Reserve the full object size at promotion time (the lazy entry only
++    // accounts its filled blocks). On a table larger than the disk budget
++    // this is the expected outcome for most files — keep the block-backed
++    // entry and skip the upgrade.
++    if store.reserve_manual(size).await.is_err() {
++        store.coordinators.remove(&uri);
++        return Ok(());
++    }
++    // True once the reservation's ownership was settled — either consumed
++    // by the promoted entry or explicitly released on the Vacant arm.
++    let mut reservation_settled = false;
++
+     let res: Result<(), DiskCacheError> = async {
+         if background_store_abandoned(&store) {
+             return Ok(());
+@@ -2072,18 +2209,21 @@ async fn lazy_background_fill(
+             },
+         )?;
+ 
+-        // 3. Atomically replace the lazy entry with the
+-        //    mmap-backed one — but only if it's still
+-        //    present (a racing eviction may have removed it
+-        //    + released the reservation in the meantime).
++        // 3. Atomically replace the lazy entry with the mmap-backed one —
++        //    but only if it's still present (a racing eviction may have
++        //    removed it in the meantime). The replaced block-backed entry
++        //    releases its own filled-block accounting via its source's
++        //    `Drop` once the last in-flight reader over it finishes.
+         match store.cached.entry(uri) {
+             Entry::Occupied(mut occ) => {
+                 *occ.get_mut() = Arc::new(CachedEntry {
+                     reader: Arc::new(reader),
+                     mmap: Some(mmap_arc),
+-                    size_bytes: size,
++                    size_bytes: Arc::new(AtomicU64::new(size)),
++                    accounting: EntryAccounting::Eager,
+                     last_access_us: AtomicU64::new(store.now_us()),
+                 });
++                reservation_settled = true;
+             }
+             Entry::Vacant(_) => {
+                 let _ = fs::remove_file(&final_path);
+@@ -2094,16 +2234,15 @@ async fn lazy_background_fill(
+     }
+     .await;
+ 
+-    if res.is_err() || background_store_abandoned(&store) {
+-        // Rollback — same atomic gate as eviction so we don't
+-        // double-decrement when a racing eviction already
+-        // removed this entry + released its bytes.
+-        rollback_lazy_background_fill(&store, &uri, &tmp);
+-        // Clean up the temp file if cold_fetch_to_disk failed
+-        // mid-way.
++    if !reservation_settled {
++        // Promotion didn't land (error, cancellation, or the entry was
++        // evicted): release the full-size reservation and clean up the
++        // temp file. The lazy block-backed entry (if still present) keeps
++        // serving — nothing to roll back there.
++        store.release_block_bytes(size);
++        store.coordinators.remove(&uri);
+         let _ = fs::remove_file(&tmp);
+     }
+-    let _ = reserved_bytes; // retained for future observability
+     res
+ }
+ 
+@@ -2161,8 +2300,9 @@ mod tests {
+     const PROMOTE_TIMEOUT: Duration = Duration::from_secs(10);
+ 
+     /// Build the raw bytes of a minimal superfile (one scalar batch,
+-    /// no indexes).
+-    fn tiny_superfile_bytes() -> Bytes {
++    /// no indexes). `pub(super)` so the store's test-only block-entry
++    /// helper (used by the block-source tests) can open a real reader.
++    pub(super) fn tiny_superfile_bytes() -> Bytes {
+         let schema = Arc::new(Schema::new(vec![
+             decimal128_id_field("doc_id"),
+             Field::new("title", DataType::LargeUtf8, false),
+diff --git a/src/supertable/reader_cache/mod.rs b/src/supertable/reader_cache/mod.rs
+index da1a081..a2c8533 100644
+--- a/src/supertable/reader_cache/mod.rs
++++ b/src/supertable/reader_cache/mod.rs
+@@ -34,6 +34,7 @@
+ //! layer below in [`crate::storage::StorageProvider`]; the
+ //! `DiskCacheStore` is built on top of it.
+ 
++pub(crate) mod block_source;
+ pub mod config;
+ pub mod disk;
+ pub mod in_memory;
+diff --git a/src/supertable/writer.rs b/src/supertable/writer.rs
+index 2265c5a..5197f19 100644
+--- a/src/supertable/writer.rs
++++ b/src/supertable/writer.rs
+@@ -49,10 +49,11 @@
+ 
+ use std::{
+     cmp,
+-    collections::HashMap,
++    collections::{HashMap, hash_map::Entry},
+     fmt, io,
+     marker::PhantomData,
+     mem,
++    path::Path,
+     sync::{Arc, atomic::Ordering},
+     time,
+ };
+@@ -84,8 +85,8 @@ use super::{
+         CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
+         PendingDelete, PendingUpdate,
+     },
+-    options::{DECIMAL128_PRECISION, DECIMAL128_SCALE, SupertableOptions},
+     opann,
++    options::{DECIMAL128_PRECISION, DECIMAL128_SCALE, SupertableOptions},
+     utils::vector_split::split_vectors,
+     wal::{
+         WalStore,
+@@ -123,6 +124,7 @@ use crate::{
+             kmeans::kmeans_with_assignments,
+             layout::VectorLayout,
+             reader::VectorReader,
++            spill::{MaterializedRowSpillWriter, SpilledCellRows, read_spilled_cell_rows},
+         },
+     },
+     supertable::{
+@@ -301,6 +303,17 @@ fn schedule_background_storage_reclaim(inner: Arc<SupertableInner>) {
+     }
+ }
+ 
++/// Non-negative fg+bg process CPU seconds between two
++/// [`crate::storage::io_counters::process_cpu_ns`] snapshots (`0.0` when CPU
++/// sampling is unavailable). Powers the drain's per-phase CPU-vs-wall log line
++/// — wall ≫ CPU means a phase is I/O-bound, wall ≈ CPU means CPU-bound.
++fn drain_cpu_s(start: Option<u128>, end: Option<u128>) -> f64 {
++    match (start, end) {
++        (Some(a), Some(b)) => b.saturating_sub(a) as f64 / 1e9,
++        _ => 0.0,
++    }
++}
++
+ /// Sq8+ε IVF rows aligned to scalar `_id` row order. Optional tombstone bitmap
+ /// skips deleted locals (cell maintenance); incoming routing passes `None`.
+ async fn materialized_ivf_rows_in_doc_order(
+@@ -2011,6 +2024,39 @@ fn drain_batch_superfiles(opts: &SupertableOptions) -> i64 {
+         .unwrap_or(opts.drain_batch_superfiles)
+ }
+ 
++/// Working-set cap for one wave of the drain's end-of-run per-cell builds:
++/// cells are grouped until their spilled row bytes reach this budget, then the
++/// group is built in parallel, uploaded, and freed before the next wave. Keeps
++/// end-build RAM bounded by the cap (plus one build in flight) instead of the
++/// whole hidden index, without letting the batch knob leak into the layout.
++const DRAIN_BUILD_GROUP_BYTES: u64 = 4 * (1 << 30);
++
++/// Append one materialized row to `cell`'s spill, creating the cell's writer
++/// on first touch (row shape — dim + RaBitQ length — is taken from that first
++/// row). Borrows the row; nothing is cloned. `added` tracks per-cell row
++/// counts for the end-of-drain grid update.
++fn spill_row_to_cell(
++    spills: &mut HashMap<u32, MaterializedRowSpillWriter>,
++    added: &mut HashMap<u32, u32>,
++    scratch: &Path,
++    cell: u32,
++    row: &MaterializedIvfRow,
++) -> Result<(), BuildError> {
++    let writer = match spills.entry(cell) {
++        Entry::Occupied(o) => o.into_mut(),
++        Entry::Vacant(v) => v.insert(MaterializedRowSpillWriter::create(
++            scratch,
++            cell,
++            row.encoded.codes.len(),
++            row.rabitq_code.len(),
++        )?),
++    };
++    writer.append(row)?;
++    let n = added.entry(cell).or_insert(0);
++    *n = n.saturating_add(1);
++    Ok(())
++}
++
+ /// Default drain replica factor: `1.0` means no boundary replicas.
+ const DEFAULT_DRAIN_REPLICA_TARGET_FACTOR: f32 = 1.0;
+ 
+@@ -2161,6 +2207,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
+     //   `splice` — route each superfile's LOCAL clusters to their nearest global
+     //     cell, keep them verbatim as multi-cluster fragments (no re-cluster).
+     let mode = std::env::var("INFINO_DRAIN_CONSOLIDATE").unwrap_or_else(|_| "kmeans".into());
++    let is_splice = mode == "splice";
+     // assign-skip: with global-aligned user superfiles (`INFINO_USER_CENTROIDS=
+     // global`) cluster c == cell c, so group by the row's own cluster ordinal
+     // instead of the O(n·n_cent) per-row nearest-cell scoring.
+@@ -2177,8 +2224,31 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
+     // `apply_cell_updates` builds on the prior batches' running totals.
+     let mut running_clusters = clusters;
+ 
++    // kmeans mode decouples the batch budget (a MEMORY bound on how many user
++    // superfiles are materialized at once) from the published layout: every
++    // batch spills its rows per cell to local scratch, and the drain builds +
++    // publishes EXACTLY ONE superfile per touched cell after the last batch.
++    // The batch knob therefore cannot change the output — `budget 1` and
++    // `budget -1` produce identical hidden layouts. (`splice` keeps its
++    // per-batch publish: it routes cluster subsections without materializing
++    // rows, so its end-assembly needs subsection-level spill — a separate
++    // diagnostic-mode change.)
++    let drain_scratch = if is_splice {
++        None
++    } else {
++        Some(
++            tempfile::tempdir()
++                .map_err(|e| BuildError::Store(format!("drain spill scratch dir: {e}")))?,
++        )
++    };
++    let mut cell_spills: HashMap<u32, MaterializedRowSpillWriter> = HashMap::new();
++    let mut added_per_cell: HashMap<u32, u32> = HashMap::new();
++
+     for (batch_idx, (batch_versions, batch_sources)) in batches.iter().enumerate() {
+         let batch_t0 = std::time::Instant::now();
++        // fg+bg process CPU at the batch start; sampled again after each
++        // sub-phase so the log shows CPU vs wall (I/O-bound vs CPU-bound).
++        let cpu_batch0 = crate::storage::io_counters::process_cpu_ns();
+         // Zero the I/O timeline so the readout below reflects only this batch's
+         // superfile reads (INFINO_IO_TIMELINE; a no-op otherwise).
+         if crate::storage::io_counters::timeline_enabled() {
+@@ -2320,12 +2390,14 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
+                     bytes_for_cache: prep.bytes_for_cache,
+                 });
+             }
++            let cpu_after_splice = crate::storage::io_counters::process_cpu_ns();
+             eprintln!(
+-                "[supertable drain] batch {}/{} ({} sf, splice): route+build {:.1}ms, {} cell file(s)",
++                "[supertable drain] batch {}/{} ({} sf, splice): route+build {:.1}ms (cpu {:.2}s), {} cell file(s)",
+                 batch_idx + 1,
+                 n_batches,
+                 batch_sources.len(),
+                 batch_t0.elapsed().as_secs_f64() * 1e3,
++                drain_cpu_s(cpu_batch0, cpu_after_splice),
+                 n_cells,
+             );
+         } else {
+@@ -2354,15 +2426,31 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
+                 .into_iter()
+                 .collect::<Result<Vec<_>, BuildError>>()?;
+             let t_mat = batch_t0.elapsed().as_secs_f64() * 1e3;
++            let cpu_after_mat = crate::storage::io_counters::process_cpu_ns();
+ 
+             let all_rows: Vec<MaterializedIvfRow> = row_sets.into_iter().flatten().collect();
+-            let mut by_cell: HashMap<u32, Vec<MaterializedIvfRow>> = HashMap::new();
++            let n_batch_rows = all_rows.len();
++            let scratch = drain_scratch
++                .as_ref()
++                .expect("kmeans drain owns a scratch dir")
++                .path();
++            // Batch boundary: reset the spill writers' Arc-pointer dedup —
++            // the previous batch's quantizer Arcs are about to be freed and
++            // their addresses may be reused (ABA).
++            for writer in cell_spills.values_mut() {
++                writer.begin_batch();
++            }
+             let replica_target = drain_replica_target_factor();
+-            let replica_extra_budget =
+-                drain_replica_extra_budget(all_rows.len(), replica_target);
++            let replica_extra_budget = drain_replica_extra_budget(all_rows.len(), replica_target);
+             if replica_extra_budget == 0 && assign_skip {
+-                for row in all_rows {
+-                    by_cell.entry(row.cluster).or_default().push(row);
++                for row in &all_rows {
++                    spill_row_to_cell(
++                        &mut cell_spills,
++                        &mut added_per_cell,
++                        scratch,
++                        row.cluster,
++                        row,
++                    )?;
+                 }
+             } else {
+                 let clusters_ref = &running_clusters;
+@@ -2395,103 +2483,63 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
+                     })
+                     .collect();
+                 replica_candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
+-                let replicas: Vec<(usize, u32)> = replica_candidates
+-                    .into_iter()
+-                    .take(replica_extra_budget)
+-                    .map(|(row_idx, neighbor, _)| (row_idx, neighbor))
+-                    .collect();
+-                for &(row_idx, cell) in &replicas {
+-                    by_cell.entry(cell).or_default().push(all_rows[row_idx].clone());
++                // Boundary replicas: the same row bytes are appended to the
++                // neighbor cell's spill — serialized twice, cloned never.
++                for (row_idx, cell, _) in replica_candidates.into_iter().take(replica_extra_budget)
++                {
++                    spill_row_to_cell(
++                        &mut cell_spills,
++                        &mut added_per_cell,
++                        scratch,
++                        cell,
++                        &all_rows[row_idx],
++                    )?;
+                 }
+-                for (row, assignment) in all_rows.into_iter().zip(assignments) {
+-                    by_cell.entry(assignment.primary).or_default().push(row);
++                for (row, assignment) in all_rows.iter().zip(&assignments) {
++                    spill_row_to_cell(
++                        &mut cell_spills,
++                        &mut added_per_cell,
++                        scratch,
++                        assignment.primary,
++                        row,
++                    )?;
+                 }
+             }
+-            let t_assign = batch_t0.elapsed().as_secs_f64() * 1e3;
+-
+-            crate::superfile::vector::builder::build_phase_timers::reset();
+-            let shards: Vec<(u32, ShardOutput, u32)> =
+-                hidden_inner.options.writer_pool.install(|| {
+-                    by_cell
+-                        .into_par_iter()
+-                        .filter(|(_, rows)| !rows.is_empty())
+-                        .map(|(cell_id, mut rows)| {
+-                            rows.sort_by_key(|r| r.stable_id);
+-                            for (local, row) in rows.iter_mut().enumerate() {
+-                                row.local_doc_id = local as u32;
+-                            }
+-                            let added = rows.len() as u32;
+-                            let shard = build_one_shard_from_materialized(
+-                                &rows,
+-                                &hidden_inner.options,
+-                                VectorLayout::Ivf,
+-                            )?;
+-                            Ok::<_, BuildError>((cell_id, shard, added))
+-                        })
+-                        .collect::<Result<Vec<_>, BuildError>>()
+-                })?;
+-            let n_cells = shards.len();
+-
+-            for (cell_id, shard, added) in shards {
+-                let prep =
+-                    prepare_superfile(&hidden_inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
+-                let entry = finish_superfile_entry(&hidden_inner, prep.entry, Some(cell_id))?;
+-                let base = running_clusters
+-                    .counts
+-                    .get(cell_id as usize)
+-                    .copied()
+-                    .unwrap_or(0);
+-                cell_updates.insert(cell_id, base.saturating_add(added));
+-                prepared.push(PreparedSuperfile {
+-                    entry,
+-                    bytes_for_store: prep.bytes_for_store,
+-                    bytes_for_storage: prep.bytes_for_storage,
+-                    bytes_for_cache: prep.bytes_for_cache,
+-                });
+-            }
++            let t_spill = batch_t0.elapsed().as_secs_f64() * 1e3;
++            let cpu_after_spill = crate::storage::io_counters::process_cpu_ns();
+             eprintln!(
+-                "[supertable drain] batch {}/{} ({} sf, kmeans): materialize {:.1}ms + {} {:.1}ms + build {:.1}ms, {} cell file(s)",
++                "[supertable drain] batch {}/{} ({} sf, kmeans): materialize {:.1}ms (cpu {:.2}s) + {} {:.1}ms (cpu {:.2}s), {} batch row(s) → {} cell spill(s)",
+                 batch_idx + 1,
+                 n_batches,
+                 batch_sources.len(),
+                 t_mat,
++                drain_cpu_s(cpu_batch0, cpu_after_mat),
+                 if assign_skip {
+-                    "group(assign-skip)"
++                    "group(assign-skip)+spill"
+                 } else {
+-                    "assign"
++                    "assign+spill"
+                 },
+-                t_assign - t_mat,
+-                batch_t0.elapsed().as_secs_f64() * 1e3 - t_assign,
+-                n_cells,
++                t_spill - t_mat,
++                drain_cpu_s(cpu_after_mat, cpu_after_spill),
++                n_batch_rows,
++                cell_spills.len(),
+             );
+-            // Optional intra-build breakdown (INFINO_DRAIN_BUILD_TIMERS=1): summed
+-            // CPU across the parallel per-cell builds, to see whether the build is
+-            // train- / assign- / calibrate-bound (the SIMD/GPU decision).
+-            if crate::superfile::vector::builder::build_phase_timers::enabled() {
+-                let (train_ms, assign_ms, calib_ms) =
+-                    crate::superfile::vector::builder::build_phase_timers::snapshot_ms();
+-                eprintln!(
+-                    "[supertable drain] batch {}/{} build phases (summed CPU, {} cells): train {:.1}ms + assign {:.1}ms + calibrate {:.1}ms",
+-                    batch_idx + 1,
+-                    n_batches,
+-                    n_cells,
+-                    train_ms,
+-                    assign_ms,
+-                    calib_ms,
+-                );
+-            }
+         }
+ 
+         if prepared.is_empty() {
++            // kmeans mode always lands here: its rows were spilled per cell
++            // above and are built + published ONCE after the last batch (see
++            // the cell build below), so batching can't fragment the layout.
+             continue;
+         }
+-        // Publish this batch's cell superfiles (append — no removals; the user
+-        // superfiles stay as the durable source). In the SAME hidden commit,
+-        // advance the derived grid (counts) AND mark this batch's user
+-        // versions drained — so cells-written and watermark-advanced are one
+-        // atomic CAS (a crash can only drop uncommitted work, never re-drive or
+-        // exclude committed work). Re-read drained_ranges so sequential batches
+-        // (and a prior drainer's progress) compose.
++        // Splice mode only: publish this batch's cell superfiles (append — no
++        // removals; the user superfiles stay as the durable source). In the
++        // SAME hidden commit, advance the derived grid (counts) AND mark this
++        // batch's user versions drained — so cells-written and
++        // watermark-advanced are one atomic CAS (a crash can only drop
++        // uncommitted work, never re-drive or exclude committed work).
++        // Re-read drained_ranges so sequential batches (and a prior drainer's
++        // progress) compose.
+         let publish_batch = collect_prepared_superfiles(&hidden_inner, prepared)?;
+         running_clusters = opann::apply_cell_updates(&running_clusters, &cell_updates);
+         let mut new_drained = hidden_inner.manifest.load_full().get_drained_ranges();
+@@ -2563,6 +2611,148 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
+             );
+         }
+     }
++
++    // kmeans cell build: turn the per-cell spills into EXACTLY ONE superfile
++    // per touched cell, in memory-bounded waves, then publish everything in a
++    // single atomic CAS (entries + grid counts + drained watermark). Uploads
++    // happen per wave BEFORE the CAS, so a crash leaves only unreferenced
++    // storage objects for GC — never a partially-drained manifest and never a
++    // duplicate re-drain.
++    if !cell_spills.is_empty() {
++        let build_t0 = time::Instant::now();
++        let cpu_build0 = crate::storage::io_counters::process_cpu_ns();
++        let mut spilled: Vec<(u32, SpilledCellRows)> = cell_spills
++            .into_iter()
++            .map(|(cell, writer)| writer.finish().map(|s| (cell, s)).map_err(BuildError::from))
++            .collect::<Result<Vec<_>, BuildError>>()?;
++        spilled.sort_unstable_by_key(|(cell, _)| *cell);
++        let n_cells_total = spilled.len();
++        let total_rows: u64 = spilled.iter().map(|(_, s)| s.n_rows() as u64).sum();
++
++        crate::superfile::vector::builder::build_phase_timers::reset();
++        let mut new_entries: Vec<Arc<SuperfileEntry>> = Vec::with_capacity(n_cells_total);
++        let mut wave: Vec<(u32, SpilledCellRows)> = Vec::new();
++        let mut wave_bytes: u64 = 0;
++        let mut n_waves = 0usize;
++        let mut spilled_iter = spilled.into_iter().peekable();
++        while let Some((cell, spill)) = spilled_iter.next() {
++            wave_bytes += spill.row_bytes();
++            wave.push((cell, spill));
++            let flush = wave_bytes >= DRAIN_BUILD_GROUP_BYTES || spilled_iter.peek().is_none();
++            if !flush {
++                continue;
++            }
++            n_waves += 1;
++            // Read the wave's rows back (sequential scratch reads), then build
++            // every cell of the wave in parallel on the writer pool — the same
++            // sort + local-id reassignment + Sq8-native build the per-batch
++            // path ran, now over each cell's FULL row set.
++            let cells_rows: Vec<(u32, Vec<MaterializedIvfRow>)> = wave
++                .iter()
++                .map(|(cell, spill)| {
++                    read_spilled_cell_rows(spill)
++                        .map(|rows| (*cell, rows))
++                        .map_err(BuildError::from)
++                })
++                .collect::<Result<Vec<_>, BuildError>>()?;
++            let prepared_wave: Vec<PreparedSuperfile> =
++                hidden_inner.options.writer_pool.install(|| {
++                    cells_rows
++                        .into_par_iter()
++                        .filter(|(_, rows)| !rows.is_empty())
++                        .map(|(cell, mut rows)| {
++                            rows.sort_by_key(|r| r.stable_id);
++                            for (local, row) in rows.iter_mut().enumerate() {
++                                row.local_doc_id = local as u32;
++                            }
++                            build_prepared_ivf_from_materialized(&hidden_inner, cell, rows)
++                        })
++                        .collect::<Result<Vec<_>, BuildError>>()
++                })?;
++            let publish = collect_prepared_superfiles(&hidden_inner, prepared_wave)?;
++            // Upload this wave's bytes now (multipart-aware, idempotent on
++            // retry) and free them; only the entries ride to the final CAS.
++            let mut pending_writes = publish.pending_storage_writes;
++            let mut pending_replaces: Vec<(SuperfileUri, Bytes)> = Vec::new();
++            write_superfile_list(
++                &storage,
++                &hidden_inner.options,
++                &mut pending_writes,
++                &mut pending_replaces,
++            )
++            .await
++            .map_err(|e| BuildError::Store(e.to_string()))?;
++            new_entries.extend(publish.new_entries);
++            for (_, spill) in wave.drain(..) {
++                spill.remove_files();
++            }
++            wave_bytes = 0;
++        }
++
++        // One atomic CAS: cell entries + updated per-cell counts + the drained
++        // watermark over EVERY consumed version. Same contiguous-prefix logic
++        // as the per-batch (splice) path, applied once.
++        let mut cell_updates: HashMap<u32, u32> = HashMap::new();
++        for (cell, added) in &added_per_cell {
++            let base = running_clusters
++                .counts
++                .get(*cell as usize)
++                .copied()
++                .unwrap_or(0);
++            cell_updates.insert(*cell, base.saturating_add(*added));
++        }
++        running_clusters = opann::apply_cell_updates(&running_clusters, &cell_updates);
++        let mut new_drained = hidden_inner.manifest.load_full().get_drained_ranges();
++        let drained_max = batches
++            .iter()
++            .flat_map(|(versions, _)| versions.iter().copied())
++            .max()
++            .unwrap_or(0);
++        let lo = new_drained.prefix_end().map(|end| end + 1).unwrap_or(0);
++        new_drained.insert_range(lo.min(drained_max), drained_max);
++        hidden_inner.manifest.store(Arc::new(
++            hidden_inner
++                .manifest
++                .load()
++                .with_partition_strategy(PartitionStrategy::VectorCell {
++                    column: column.clone(),
++                    clusters: running_clusters.clone(),
++                    routing,
++                })
++                .with_drained_ranges(new_drained),
++        ));
++        let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
++        let new_manifest = persist_commit_async(
++            &hidden_inner,
++            Arc::clone(&storage),
++            new_entries,
++            &no_removals,
++            Vec::new(),
++            Vec::new(),
++        )
++        .await
++        .map_err(|e| BuildError::Store(e.to_string()))?;
++        hidden_inner.manifest.store(Arc::new(new_manifest));
++        let cpu_build_end = crate::storage::io_counters::process_cpu_ns();
++        eprintln!(
++            "[supertable drain] cell build: {} row(s) → {} cell superfile(s) (1 per cell) in {} wave(s), {:.1}ms (cpu {:.2}s)",
++            total_rows,
++            n_cells_total,
++            n_waves,
++            build_t0.elapsed().as_secs_f64() * 1e3,
++            drain_cpu_s(cpu_build0, cpu_build_end),
++        );
++        // Optional intra-build breakdown (INFINO_DRAIN_BUILD_TIMERS=1): summed
++        // CPU across the parallel per-cell builds, to see whether the build is
++        // train- / assign- / calibrate-bound (the SIMD/GPU decision).
++        if crate::superfile::vector::builder::build_phase_timers::enabled() {
++            let (train_ms, assign_ms, calib_ms) =
++                crate::superfile::vector::builder::build_phase_timers::snapshot_ms();
++            eprintln!(
++                "[supertable drain] cell build phases (summed CPU, {n_cells_total} cells): train {train_ms:.1}ms + assign {assign_ms:.1}ms + calibrate {calib_ms:.1}ms",
++            );
++        }
++    }
+     eprintln!(
+         "[supertable drain] done ({mode}, {} batch(es), budget {} sf): total {:.1}ms; RSS {} -> {} MiB",
+         n_batches,

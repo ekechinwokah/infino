@@ -146,6 +146,12 @@ pub use roaring;
 mod catalog;
 mod error;
 mod runtime_bridge;
+// Process CPU / RSS samplers: benches use `test-helpers`; platform
+// Prometheus uses `metering`. Same module either way — no second copy.
+#[cfg(any(feature = "test-helpers", feature = "metering"))]
+pub mod runtime_metrics;
+#[cfg(not(any(feature = "test-helpers", feature = "metering")))]
+pub(crate) mod runtime_metrics;
 mod utils;
 
 // ---- Curated public surface ----

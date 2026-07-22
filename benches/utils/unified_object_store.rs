@@ -101,6 +101,7 @@ use infino::{
         CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
         SupertableSettings,
     },
+    runtime_metrics::UsageMeter,
     superfile::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
         fts::reader::BoolMode,
@@ -948,6 +949,17 @@ pub(crate) mod diag {
 
         async fn delete(&self, uri: &str) -> Result<(), StorageError> {
             self.inner.delete(uri).await
+        }
+
+        fn object_store_handle(
+            &self,
+            uri: &str,
+        ) -> Option<(Arc<dyn object_store::ObjectStore>, object_store::path::Path)> {
+            self.inner.object_store_handle(uri)
+        }
+
+        fn usage_meter(&self) -> Arc<UsageMeter> {
+            self.inner.usage_meter()
         }
     }
 

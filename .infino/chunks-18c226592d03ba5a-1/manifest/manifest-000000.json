@@ -1,0 +1,26 @@
+{
+  "format_version": "1.0",
+  "manifest_id": 0,
+  "options_hash": "blake3:ae074d148c832168022878e7860e7de230e7f9709fd4bebdebf61a447c02d30a",
+  "schema": "",
+  "id_column": "_id",
+  "fts_columns": [
+    {
+      "column": "content"
+    }
+  ],
+  "vector_columns": [
+    {
+      "column": "embedding",
+      "dim": 384,
+      "n_cent": 1,
+      "rot_seed": 6840227782638526189,
+      "metric": "cosine"
+    }
+  ],
+  "partition_strategy": {
+    "kind": "ingestion_time",
+    "granularity_secs": 86400
+  },
+  "parts": []
+}

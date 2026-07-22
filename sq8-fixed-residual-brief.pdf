@@ -1,0 +1,934 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [7 0 R 9 0 R 11 0 R 13 0 R 15 0 R 17 0 R 19 0 R] /Count 7 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier-Bold /Encoding /WinAnsiEncoding >>
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents 8 0 R >>
+endobj
+8 0 obj
+<< /Length 2937 >>
+stream
+0.960 0.970 0.970 rg
+44.00 66.00 524.00 670.00 re f
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 58.00 682.00 Tm (VECTOR INDEX  /  RERANK PRECISION  /  LIFECYCLE EVIDENCE) Tj ET
+0.080 0.100 0.120 rg
+BT /F2 25.00 Tf 1 0 0 1 58.00 642.00 Tm (Sq8FixedResidual ends) Tj ET
+0.080 0.100 0.120 rg
+BT /F2 25.00 Tf 1 0 0 1 58.00 614.00 Tm (re-quantization drift - and) Tj ET
+0.080 0.100 0.120 rg
+BT /F2 25.00 Tf 1 0 0 1 58.00 586.00 Tm (reveals the next recall problem) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 12.00 Tf 1 0 0 1 58.00 548.00 Tm (The fixed codec solves the compounding mechanism identified in the original) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 12.00 Tf 1 0 0 1 58.00 531.00 Tm (recall brief: rerank bytes no longer change when vectors move between) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 12.00 Tf 1 0 0 1 58.00 514.00 Tm (clusters. It does not solve candidate selection. At 10M vectors it gained) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 12.00 Tf 1 0 0 1 58.00 497.00 Tm (0.5 recall points after drain, then finished at the same 0.955) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 12.00 Tf 1 0 0 1 58.00 480.00 Tm (post-compaction recall as local Sq8Residual.) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 7.20 Tf 1 0 0 1 58.00 448.75 Tm (SCALE) Tj ET
+0.080 0.100 0.120 rg
+BT /F4 7.60 Tf 1 0 0 1 98.00 448.75 Tm (10M + 625K vectors) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 7.20 Tf 1 0 0 1 230.00 448.75 Tm (DIM) Tj ET
+0.080 0.100 0.120 rg
+BT /F4 7.60 Tf 1 0 0 1 260.00 448.75 Tm (1024) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 7.20 Tf 1 0 0 1 330.00 448.75 Tm (METRIC) Tj ET
+0.080 0.100 0.120 rg
+BT /F4 7.60 Tf 1 0 0 1 378.00 448.75 Tm (cosine) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 7.20 Tf 1 0 0 1 58.00 426.75 Tm (METHOD) Tj ET
+0.080 0.100 0.120 rg
+BT /F4 7.60 Tf 1 0 0 1 105.00 426.75 Tm (recall@10 vs exact ground truth) Tj ET
+0.820 0.840 0.850 RG
+0.70 w
+[] 0 d
+58.00 401.75 m 554.00 401.75 l S
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 58.00 358.75 Tm (THE FINDING) Tj ET
+0.080 0.100 0.120 rg
+BT /F2 18.00 Tf 1 0 0 1 58.00 329.75 Tm (Byte portability is solved. The final recall) Tj ET
+0.080 0.100 0.120 rg
+BT /F2 18.00 Tf 1 0 0 1 58.00 309.59 Tm (gap is not.) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 11.00 Tf 1 0 0 1 58.00 284.43 Tm (The fixed run drops from 0.980 after the delta to 0.955 after compaction with the) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 11.00 Tf 1 0 0 1 58.00 268.43 Tm (same logical corpus. Because fixed rerank payloads remain byte-identical through) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 11.00 Tf 1 0 0 1 58.00 252.43 Tm (that fold, the loss must sit above the payload: routing, candidate formation,) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 11.00 Tf 1 0 0 1 58.00 236.43 Tm (maintenance topology, or another compaction-path correctness issue.) Tj ET
+0.820 0.840 0.850 RG
+0.60 w
+[] 0 d
+54.00 35.00 m 558.00 35.00 l S
+0.340 0.380 0.410 rg
+BT /F3 7.50 Tf 1 0 0 1 54.00 21.00 Tm (Infino vector retrieval quality) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 7.50 Tf 1 0 0 1 543.00 21.00 Tm (1) Tj ET
+endstream
+endobj
+9 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents 10 0 R >>
+endobj
+10 0 obj
+<< /Length 5644 >>
+stream
+0.340 0.380 0.410 rg
+BT /F4 7.50 Tf 1 0 0 1 54.00 754.00 Tm (RECALL@10  /  10M + 625K  /  DEFAULT ROUTING) Tj ET
+0.340 0.380 0.410 rg
+BT /F4 7.50 Tf 1 0 0 1 481.50 754.00 Tm (MEASURED ON AZURE) Tj ET
+0.820 0.840 0.850 RG
+0.70 w
+[] 0 d
+54.00 741.00 m 558.00 741.00 l S
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 54.00 706.00 Tm (THE MEASURED RESULT) Tj ET
+0.080 0.100 0.120 rg
+BT /F2 21.00 Tf 1 0 0 1 54.00 677.00 Tm (The codec moves the post-drain rung, not) Tj ET
+0.080 0.100 0.120 rg
+BT /F2 21.00 Tf 1 0 0 1 54.00 653.48 Tm (the final rung) Tj ET
+0.340 0.380 0.410 rg
+BT /F1 10.20 Tf 1 0 0 1 54.00 625.96 Tm (Latest fixed lifecycle versus the closest local-residual baseline. The 10M comparison is) Tj ET
+0.340 0.380 0.410 rg
+BT /F1 10.20 Tf 1 0 0 1 54.00 611.46 Tm (directional, not a strict same-revision A/B; the clean 1M A/B appears later.) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+78.00 366.92 m 536.00 366.92 l S
+0.340 0.380 0.410 rg
+BT /F3 7.20 Tf 1 0 0 1 50.00 363.92 Tm (0.940) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+78.00 434.62 m 536.00 434.62 l S
+0.340 0.380 0.410 rg
+BT /F3 7.20 Tf 1 0 0 1 50.00 431.62 Tm (0.960) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+78.00 502.31 m 536.00 502.31 l S
+0.340 0.380 0.410 rg
+BT /F3 7.20 Tf 1 0 0 1 50.00 499.31 Tm (0.980) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+78.00 570.00 m 536.00 570.00 l S
+0.340 0.380 0.410 rg
+BT /F3 7.20 Tf 1 0 0 1 50.00 567.00 Tm (1.000) Tj ET
+0.630 0.340 0.120 RG
+1.00 w
+[3 3] 0 d
+78.00 536.15 m 536.00 536.15 l S
+0.630 0.340 0.120 rg
+BT /F4 7.20 Tf 1 0 0 1 444.00 542.15 Tm (0.990 acceptance) Tj ET
+0.340 0.380 0.410 rg
+BT /F4 6.40 Tf 1 0 0 1 54.00 326.00 Tm (PRE-DRAIN) Tj ET
+0.340 0.380 0.410 rg
+BT /F4 6.40 Tf 1 0 0 1 206.67 326.00 Tm (POST-DRAIN) Tj ET
+0.340 0.380 0.410 rg
+BT /F4 6.40 Tf 1 0 0 1 359.33 326.00 Tm (POST-DELTA) Tj ET
+0.340 0.380 0.410 rg
+BT /F4 6.40 Tf 1 0 0 1 512.00 326.00 Tm (POST-COMPACT) Tj ET
+0.340 0.380 0.410 RG
+1.70 w [] 0 d
+78.00 366.92 m 230.67 502.31 l 383.33 502.31 l 536.00 417.69 l S
+0.050 0.360 0.370 RG
+2.40 w [] 0 d
+78.00 383.85 m 230.67 519.23 l 383.33 502.31 l 536.00 417.69 l S
+0.340 0.380 0.410 rg
+81.20 366.92 m 81.20 368.69 79.77 370.12 78.00 370.12 c 76.23 370.12 74.80 368.69 74.80 366.92 c 74.80 365.16 76.23 363.72 78.00 363.72 c 79.77 363.72 81.20 365.16 81.20 366.92 c f
+0.340 0.380 0.410 rg
+BT /F4 7.20 Tf 1 0 0 1 66.00 351.92 Tm (0.940) Tj ET
+0.340 0.380 0.410 rg
+233.87 502.31 m 233.87 504.08 232.43 505.51 230.67 505.51 c 228.90 505.51 227.47 504.08 227.47 502.31 c 227.47 500.54 228.90 499.11 230.67 499.11 c 232.43 499.11 233.87 500.54 233.87 502.31 c f
+0.340 0.380 0.410 rg
+BT /F4 7.20 Tf 1 0 0 1 218.67 487.31 Tm (0.980) Tj ET
+0.340 0.380 0.410 rg
+386.53 502.31 m 386.53 504.08 385.10 505.51 383.33 505.51 c 381.57 505.51 380.13 504.08 380.13 502.31 c 380.13 500.54 381.57 499.11 383.33 499.11 c 385.10 499.11 386.53 500.54 386.53 502.31 c f
+0.340 0.380 0.410 rg
+BT /F4 7.20 Tf 1 0 0 1 371.33 487.31 Tm (0.980) Tj ET
+0.340 0.380 0.410 rg
+539.20 417.69 m 539.20 419.46 537.77 420.89 536.00 420.89 c 534.23 420.89 532.80 419.46 532.80 417.69 c 532.80 415.92 534.23 414.49 536.00 414.49 c 537.77 414.49 539.20 415.92 539.20 417.69 c f
+0.340 0.380 0.410 rg
+BT /F4 7.20 Tf 1 0 0 1 524.00 402.69 Tm (0.955) Tj ET
+0.050 0.360 0.370 rg
+82.00 383.85 m 82.00 386.06 80.21 387.85 78.00 387.85 c 75.79 387.85 74.00 386.06 74.00 383.85 c 74.00 381.64 75.79 379.85 78.00 379.85 c 80.21 379.85 82.00 381.64 82.00 383.85 c f
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 66.00 393.85 Tm (0.945) Tj ET
+0.050 0.360 0.370 rg
+234.67 519.23 m 234.67 521.44 232.88 523.23 230.67 523.23 c 228.46 523.23 226.67 521.44 226.67 519.23 c 226.67 517.02 228.46 515.23 230.67 515.23 c 232.88 515.23 234.67 517.02 234.67 519.23 c f
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 218.67 529.23 Tm (0.985) Tj ET
+0.050 0.360 0.370 rg
+387.33 502.31 m 387.33 504.52 385.54 506.31 383.33 506.31 c 381.12 506.31 379.33 504.52 379.33 502.31 c 379.33 500.10 381.12 498.31 383.33 498.31 c 385.54 498.31 387.33 500.10 387.33 502.31 c f
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 371.33 512.31 Tm (0.980) Tj ET
+0.050 0.360 0.370 rg
+540.00 417.69 m 540.00 419.90 538.21 421.69 536.00 421.69 c 533.79 421.69 532.00 419.90 532.00 417.69 c 532.00 415.48 533.79 413.69 536.00 413.69 c 538.21 413.69 540.00 415.48 540.00 417.69 c f
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 524.00 427.69 Tm (0.955) Tj ET
+0.340 0.380 0.410 RG
+1.70 w
+[] 0 d
+82.00 320.00 m 102.00 320.00 l S
+0.340 0.380 0.410 rg
+BT /F3 8.00 Tf 1 0 0 1 109.00 317.00 Tm (Sq8Residual) Tj ET
+0.050 0.360 0.370 RG
+2.40 w
+[] 0 d
+200.00 320.00 m 220.00 320.00 l S
+0.080 0.100 0.120 rg
+BT /F3 8.00 Tf 1 0 0 1 227.00 317.00 Tm (Sq8FixedResidual) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 7.20 Tf 1 0 0 1 78.00 294.00 Tm (X axis: lifecycle state   /   Y axis: recall@10) Tj ET
+0.910 0.950 0.950 rg
+54.00 112.00 504.00 145.00 re f
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 70.00 232.00 Tm (INTERPRETATION) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 10.70 Tf 1 0 0 1 70.00 207.00 Tm (Fixed improves post-drain recall from 0.980 to 0.985, but it does not clear the 0.990) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 10.70 Tf 1 0 0 1 70.00 191.50 Tm (acceptance bar. More importantly, post-delta and post-compact share the same augmented) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 10.70 Tf 1 0 0 1 70.00 176.00 Tm (corpus: the 2.5-point fall across compaction cannot be fixed-grid re-quantization.) Tj ET
+0.820 0.840 0.850 RG
+0.60 w
+[] 0 d
+54.00 35.00 m 558.00 35.00 l S
+0.340 0.380 0.410 rg
+BT /F3 7.50 Tf 1 0 0 1 54.00 21.00 Tm (Infino vector retrieval quality) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 7.50 Tf 1 0 0 1 543.00 21.00 Tm (2) Tj ET
+endstream
+endobj
+11 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents 12 0 R >>
+endobj
+12 0 obj
+<< /Length 4268 >>
+stream
+0.340 0.380 0.410 rg
+BT /F4 7.50 Tf 1 0 0 1 54.00 754.00 Tm (CODEC MECHANISM  /  SAME PAYLOAD) Tj ET
+0.340 0.380 0.410 rg
+BT /F4 7.50 Tf 1 0 0 1 432.00 754.00 Tm (DIFFERENT COORDINATE SYSTEMS) Tj ET
+0.820 0.840 0.850 RG
+0.70 w
+[] 0 d
+54.00 741.00 m 558.00 741.00 l S
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 54.00 706.00 Tm (THE MECHANISM) Tj ET
+0.080 0.100 0.120 rg
+BT /F2 22.00 Tf 1 0 0 1 54.00 677.00 Tm (Same two bytes, different meaning) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 10.80 Tf 1 0 0 1 54.00 650.36 Tm (Both codecs store one unsigned Sq8 code and one signed residual byte per dimension. The) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 10.80 Tf 1 0 0 1 54.00 634.86 Tm (difference is the coordinate system attached to those bytes.) Tj ET
+1.000 1.000 1.000 rg
+0.820 0.840 0.850 RG
+0.80 w
+54.00 355.00 244.00 245.00 re B
+0.910 0.950 0.950 rg
+0.820 0.840 0.850 RG
+0.80 w
+314.00 355.00 244.00 245.00 re B
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 70.00 570.00 Tm (SQ8RESIDUAL  /  LOCAL) Tj ET
+0.080 0.100 0.120 rg
+BT /F2 13.50 Tf 1 0 0 1 70.00 540.00 Tm (A custom ruler per cluster) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 9.40 Tf 1 0 0 1 70.00 505.00 Tm (-) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.40 Tf 1 0 0 1 84.00 505.00 Tm (offset and scale are fitted from each) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.40 Tf 1 0 0 1 84.00 491.00 Tm (cluster's per-dimension range) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 9.40 Tf 1 0 0 1 70.00 470.50 Tm (-) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.40 Tf 1 0 0 1 84.00 470.50 Tm (residual step = local scale / 16) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 9.40 Tf 1 0 0 1 70.00 450.00 Tm (-) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.40 Tf 1 0 0 1 84.00 450.00 Tm (the same byte pair means different real) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.40 Tf 1 0 0 1 84.00 436.00 Tm (values in different clusters) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 9.40 Tf 1 0 0 1 70.00 415.50 Tm (-) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.40 Tf 1 0 0 1 84.00 415.50 Tm (moving a row may require decode, fit, and) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.40 Tf 1 0 0 1 84.00 401.50 Tm (re-encode) Tj ET
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 330.00 570.00 Tm (SQ8FIXEDRESIDUAL  /  PORTABLE) Tj ET
+0.080 0.100 0.120 rg
+BT /F2 13.50 Tf 1 0 0 1 330.00 540.00 Tm (One ruler for every cosine vector) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 9.40 Tf 1 0 0 1 330.00 505.00 Tm (-) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.40 Tf 1 0 0 1 344.00 505.00 Tm (offset = -1 and scale = 2/255 in every) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.40 Tf 1 0 0 1 344.00 491.00 Tm (cluster) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 9.40 Tf 1 0 0 1 330.00 470.50 Tm (-) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.40 Tf 1 0 0 1 344.00 470.50 Tm (residual step = fixed scale / 256) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 9.40 Tf 1 0 0 1 330.00 450.00 Tm (-) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.40 Tf 1 0 0 1 344.00 450.00 Tm (a byte pair has the same meaning in every) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.40 Tf 1 0 0 1 344.00 436.00 Tm (file and cluster) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 9.40 Tf 1 0 0 1 330.00 415.50 Tm (-) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.40 Tf 1 0 0 1 344.00 415.50 Tm (drain, fold, and split copy the rerank) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.40 Tf 1 0 0 1 344.00 401.50 Tm (payload verbatim) Tj ET
+0.980 0.940 0.900 rg
+54.00 130.00 504.00 180.00 re f
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 70.00 282.00 Tm (PRECISION CONTRACT) Tj ET
+0.630 0.340 0.120 rg
+BT /F4 11.00 Tf 1 0 0 1 70.00 250.00 Tm (step = 2 / \(255 x 256\) = 0.00003064) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 10.20 Tf 1 0 0 1 70.00 220.00 Tm (Unit-normalized cosine components lie in [-1, 1]. The fixed representation is an) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 10.20 Tf 1 0 0 1 70.00 205.50 Tm (approximately 65,280-level lattice, not a perfect 65,536-level integer grid, because the) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 10.20 Tf 1 0 0 1 70.00 191.00 Tm (signed residual is symmetric and excludes -128. The tested worst-case reconstruction error) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 10.20 Tf 1 0 0 1 70.00 176.50 Tm (is one fine step.) Tj ET
+0.820 0.840 0.850 RG
+0.60 w
+[] 0 d
+54.00 35.00 m 558.00 35.00 l S
+0.340 0.380 0.410 rg
+BT /F3 7.50 Tf 1 0 0 1 54.00 21.00 Tm (Infino vector retrieval quality) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 7.50 Tf 1 0 0 1 543.00 21.00 Tm (3) Tj ET
+endstream
+endobj
+13 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents 14 0 R >>
+endobj
+14 0 obj
+<< /Length 5024 >>
+stream
+0.340 0.380 0.410 rg
+BT /F4 7.50 Tf 1 0 0 1 54.00 754.00 Tm (LIFECYCLE  /  RERANK PAYLOAD IDENTITY) Tj ET
+0.340 0.380 0.410 rg
+BT /F4 7.50 Tf 1 0 0 1 477.00 754.00 Tm (WHAT FIXED CHANGES) Tj ET
+0.820 0.840 0.850 RG
+0.70 w
+[] 0 d
+54.00 741.00 m 558.00 741.00 l S
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 54.00 706.00 Tm (WHY IT NO LONGER COMPOUNDS) Tj ET
+0.080 0.100 0.120 rg
+BT /F2 21.00 Tf 1 0 0 1 54.00 677.00 Tm (Maintenance rebuilds the index - not the) Tj ET
+0.080 0.100 0.120 rg
+BT /F2 21.00 Tf 1 0 0 1 54.00 653.48 Tm (encoded vector value) Tj ET
+0.340 0.380 0.410 rg
+BT /F1 10.50 Tf 1 0 0 1 54.00 626.96 Tm (Centroids, cluster directories, postings, and row order may still change. Verbatim applies) Tj ET
+0.340 0.380 0.410 rg
+BT /F1 10.50 Tf 1 0 0 1 54.00 611.96 Tm (specifically to each stable ID's rerank code + residual payload.) Tj ET
+0.960 0.970 0.970 rg
+0.820 0.840 0.850 RG
+0.70 w
+54.00 438.00 94.40 118.00 re B
+0.340 0.380 0.410 rg
+BT /F4 6.70 Tf 1 0 0 1 62.00 531.00 Tm (INGEST) Tj ET
+0.080 0.100 0.120 rg
+BT /F3 7.40 Tf 1 0 0 1 62.00 500.00 Tm (encode x1) Tj ET
+0.050 0.360 0.370 rg
+BT /F4 7.40 Tf 1 0 0 1 62.00 469.00 Tm (encode x1) Tj ET
+0.910 0.950 0.950 rg
+0.820 0.840 0.850 RG
+0.70 w
+156.40 438.00 94.40 118.00 re B
+0.340 0.380 0.410 rg
+BT /F4 6.70 Tf 1 0 0 1 164.40 531.00 Tm (DRAIN) Tj ET
+0.630 0.340 0.120 rg
+BT /F3 7.40 Tf 1 0 0 1 164.40 500.00 Tm (may re-quant) Tj ET
+0.050 0.360 0.370 rg
+BT /F4 7.40 Tf 1 0 0 1 164.40 469.00 Tm (copy bytes) Tj ET
+0.910 0.950 0.950 rg
+0.820 0.840 0.850 RG
+0.70 w
+258.80 438.00 94.40 118.00 re B
+0.340 0.380 0.410 rg
+BT /F4 6.70 Tf 1 0 0 1 266.80 531.00 Tm (DELTA FOLD) Tj ET
+0.630 0.340 0.120 rg
+BT /F3 7.40 Tf 1 0 0 1 266.80 500.00 Tm (may re-quant) Tj ET
+0.050 0.360 0.370 rg
+BT /F4 7.40 Tf 1 0 0 1 266.80 469.00 Tm (copy bytes) Tj ET
+0.910 0.950 0.950 rg
+0.820 0.840 0.850 RG
+0.70 w
+361.20 438.00 94.40 118.00 re B
+0.340 0.380 0.410 rg
+BT /F4 6.70 Tf 1 0 0 1 369.20 531.00 Tm (COMPACTION) Tj ET
+0.630 0.340 0.120 rg
+BT /F3 7.40 Tf 1 0 0 1 369.20 500.00 Tm (may re-quant) Tj ET
+0.050 0.360 0.370 rg
+BT /F4 7.40 Tf 1 0 0 1 369.20 469.00 Tm (copy bytes) Tj ET
+0.910 0.950 0.950 rg
+0.820 0.840 0.850 RG
+0.70 w
+463.60 438.00 94.40 118.00 re B
+0.340 0.380 0.410 rg
+BT /F4 6.70 Tf 1 0 0 1 471.60 531.00 Tm (CELL SPLIT) Tj ET
+0.630 0.340 0.120 rg
+BT /F3 7.40 Tf 1 0 0 1 471.60 500.00 Tm (may re-quant) Tj ET
+0.050 0.360 0.370 rg
+BT /F4 7.40 Tf 1 0 0 1 471.60 469.00 Tm (copy bytes) Tj ET
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 54.00 392.00 Tm (WHAT IT FIXES) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 9.60 Tf 1 0 0 1 54.00 366.00 Tm (-) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.60 Tf 1 0 0 1 68.00 366.00 Tm (No per-cluster quantizer fit for fixed) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.60 Tf 1 0 0 1 68.00 352.00 Tm (builds.) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 9.60 Tf 1 0 0 1 54.00 331.50 Tm (-) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.60 Tf 1 0 0 1 68.00 331.50 Tm (No decode/re-encode when a stable ID changes) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.60 Tf 1 0 0 1 68.00 317.50 Tm (cluster.) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 9.60 Tf 1 0 0 1 54.00 297.00 Tm (-) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.60 Tf 1 0 0 1 68.00 297.00 Tm (Byte identity survives mismatched fine widths) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.60 Tf 1 0 0 1 68.00 283.00 Tm (and tombstones.) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 9.60 Tf 1 0 0 1 54.00 262.50 Tm (-) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.60 Tf 1 0 0 1 68.00 262.50 Tm (OPANN split changes geometry without changing) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.60 Tf 1 0 0 1 68.00 248.50 Tm (rerank bytes.) Tj ET
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 322.00 392.00 Tm (WHAT IT DOES NOT FIX) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 9.60 Tf 1 0 0 1 322.00 366.00 Tm (-) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.60 Tf 1 0 0 1 336.00 366.00 Tm (Coarse-cell and fine-centroid selection.) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 9.60 Tf 1 0 0 1 322.00 345.50 Tm (-) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.60 Tf 1 0 0 1 336.00 345.50 Tm (RaBitQ shortlist admission before rerank.) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 9.60 Tf 1 0 0 1 322.00 325.00 Tm (-) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.60 Tf 1 0 0 1 336.00 325.00 Tm (Fragment packing and routing summaries after) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.60 Tf 1 0 0 1 336.00 311.00 Tm (compaction.) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 9.60 Tf 1 0 0 1 322.00 290.50 Tm (-) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.60 Tf 1 0 0 1 336.00 290.50 Tm (Filtered coverage or non-cosine metrics.) Tj ET
+0.910 0.950 0.950 rg
+54.00 100.00 504.00 62.00 re f
+0.080 0.100 0.120 rg
+BT /F2 10.20 Tf 1 0 0 1 70.00 137.00 Tm (The fixed codec removes an irreversible error source. It does not guarantee that) Tj ET
+0.080 0.100 0.120 rg
+BT /F2 10.20 Tf 1 0 0 1 70.00 123.00 Tm (the exact neighbor reaches the reranker.) Tj ET
+0.820 0.840 0.850 RG
+0.60 w
+[] 0 d
+54.00 35.00 m 558.00 35.00 l S
+0.340 0.380 0.410 rg
+BT /F3 7.50 Tf 1 0 0 1 54.00 21.00 Tm (Infino vector retrieval quality) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 7.50 Tf 1 0 0 1 543.00 21.00 Tm (4) Tj ET
+endstream
+endobj
+15 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents 16 0 R >>
+endobj
+16 0 obj
+<< /Length 5744 >>
+stream
+0.340 0.380 0.410 rg
+BT /F4 7.50 Tf 1 0 0 1 54.00 754.00 Tm (CONTROLLED A/B  /  1M X 1024) Tj ET
+0.340 0.380 0.410 rg
+BT /F4 7.50 Tf 1 0 0 1 427.50 754.00 Tm (IDENTICAL CORPUS AND SETTINGS) Tj ET
+0.820 0.840 0.850 RG
+0.70 w
+[] 0 d
+54.00 741.00 m 558.00 741.00 l S
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 54.00 706.00 Tm (QUALITY AND COST) Tj ET
+0.080 0.100 0.120 rg
+BT /F2 22.00 Tf 1 0 0 1 54.00 677.00 Tm (At 1M, the codec change is recall-neutral) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 10.80 Tf 1 0 0 1 54.00 650.36 Tm (Both codecs reached 1.000 recall in every lifecycle state. Warm query latency and) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 10.80 Tf 1 0 0 1 54.00 634.86 Tm (object-store request shape were effectively unchanged.) Tj ET
+0.960 0.970 0.970 rg
+0.820 0.840 0.850 RG
+0.70 w
+54.00 542.00 504.00 28.00 re B
+0.340 0.380 0.410 rg
+BT /F4 7.00 Tf 1 0 0 1 61.00 552.00 Tm (STATE) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+159.00 570.00 m 159.00 542.00 l S
+0.340 0.380 0.410 rg
+BT /F4 7.00 Tf 1 0 0 1 166.00 552.00 Tm (LOCAL RECALL) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+237.00 570.00 m 237.00 542.00 l S
+0.340 0.380 0.410 rg
+BT /F4 7.00 Tf 1 0 0 1 244.00 552.00 Tm (FIXED RECALL) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+315.00 570.00 m 315.00 542.00 l S
+0.340 0.380 0.410 rg
+BT /F4 7.00 Tf 1 0 0 1 322.00 552.00 Tm (LOCAL WARM P50) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+433.00 570.00 m 433.00 542.00 l S
+0.340 0.380 0.410 rg
+BT /F4 7.00 Tf 1 0 0 1 440.00 552.00 Tm (FIXED WARM P50) Tj ET
+1.000 1.000 1.000 rg
+0.820 0.840 0.850 RG
+0.50 w
+54.00 500.00 504.00 42.00 re B
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 61.00 527.00 Tm (Pre-drain) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+159.00 542.00 m 159.00 500.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 166.00 527.00 Tm (1.000) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+237.00 542.00 m 237.00 500.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 244.00 527.00 Tm (1.000) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+315.00 542.00 m 315.00 500.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 322.00 527.00 Tm (34.25 ms) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+433.00 542.00 m 433.00 500.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 440.00 527.00 Tm (34.40 ms) Tj ET
+0.960 0.970 0.970 rg
+0.820 0.840 0.850 RG
+0.50 w
+54.00 458.00 504.00 42.00 re B
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 61.00 485.00 Tm (Post-drain) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+159.00 500.00 m 159.00 458.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 166.00 485.00 Tm (1.000) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+237.00 500.00 m 237.00 458.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 244.00 485.00 Tm (1.000) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+315.00 500.00 m 315.00 458.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 322.00 485.00 Tm (3.66 ms) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+433.00 500.00 m 433.00 458.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 440.00 485.00 Tm (3.62 ms) Tj ET
+1.000 1.000 1.000 rg
+0.820 0.840 0.850 RG
+0.50 w
+54.00 416.00 504.00 42.00 re B
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 61.00 443.00 Tm (Post-delta) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+159.00 458.00 m 159.00 416.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 166.00 443.00 Tm (1.000) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+237.00 458.00 m 237.00 416.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 244.00 443.00 Tm (1.000) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+315.00 458.00 m 315.00 416.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 322.00 443.00 Tm (6.70 ms) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+433.00 458.00 m 433.00 416.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 440.00 443.00 Tm (6.66 ms) Tj ET
+0.960 0.970 0.970 rg
+0.820 0.840 0.850 RG
+0.50 w
+54.00 374.00 504.00 42.00 re B
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 61.00 401.00 Tm (Post-compact) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+159.00 416.00 m 159.00 374.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 166.00 401.00 Tm (1.000) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+237.00 416.00 m 237.00 374.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 244.00 401.00 Tm (1.000) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+315.00 416.00 m 315.00 374.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 322.00 401.00 Tm (2.65 ms) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+433.00 416.00 m 433.00 374.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.80 Tf 1 0 0 1 440.00 401.00 Tm (2.72 ms) Tj ET
+0.960 0.970 0.970 rg
+54.00 238.00 240.00 112.00 re f
+0.910 0.950 0.950 rg
+318.00 238.00 240.00 112.00 re f
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 70.00 322.00 Tm (DRAIN WALL TIME) Tj ET
+0.340 0.380 0.410 rg
+BT /F2 19.00 Tf 1 0 0 1 70.00 286.00 Tm (20.6 s) Tj ET
+0.340 0.380 0.410 rg
+BT /F4 12.00 Tf 1 0 0 1 158.00 286.00 Tm (->) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 19.00 Tf 1 0 0 1 196.00 286.00 Tm (18.6 s) Tj ET
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 334.00 322.00 Tm (COMPACTION WALL TIME) Tj ET
+0.340 0.380 0.410 rg
+BT /F2 19.00 Tf 1 0 0 1 334.00 286.00 Tm (16.4 s) Tj ET
+0.340 0.380 0.410 rg
+BT /F4 12.00 Tf 1 0 0 1 422.00 286.00 Tm (->) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 19.00 Tf 1 0 0 1 460.00 286.00 Tm (11.9 s) Tj ET
+0.340 0.380 0.410 rg
+BT /F1 9.60 Tf 1 0 0 1 54.00 202.00 Tm (These phase timings are directional single observations, not a statistically powered throughput claim.) Tj ET
+0.340 0.380 0.410 rg
+BT /F1 9.60 Tf 1 0 0 1 54.00 188.00 Tm (Both ingest indexes stored 2.07 GiB; both payloads remain 2 bytes per dimension.) Tj ET
+0.820 0.840 0.850 RG
+0.60 w
+[] 0 d
+54.00 35.00 m 558.00 35.00 l S
+0.340 0.380 0.410 rg
+BT /F3 7.50 Tf 1 0 0 1 54.00 21.00 Tm (Infino vector retrieval quality) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 7.50 Tf 1 0 0 1 543.00 21.00 Tm (5) Tj ET
+endstream
+endobj
+17 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents 18 0 R >>
+endobj
+18 0 obj
+<< /Length 4946 >>
+stream
+0.340 0.380 0.410 rg
+BT /F4 7.50 Tf 1 0 0 1 54.00 754.00 Tm (EVIDENCE LEDGER) Tj ET
+0.340 0.380 0.410 rg
+BT /F4 7.50 Tf 1 0 0 1 445.50 754.00 Tm (ESTABLISHED VS UNRESOLVED) Tj ET
+0.820 0.840 0.850 RG
+0.70 w
+[] 0 d
+54.00 741.00 m 558.00 741.00 l S
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 54.00 706.00 Tm (WHAT THE IMPLEMENTATION PROVES) Tj ET
+0.080 0.100 0.120 rg
+BT /F2 21.00 Tf 1 0 0 1 54.00 677.00 Tm (The precision guarantee is stronger than) Tj ET
+0.080 0.100 0.120 rg
+BT /F2 21.00 Tf 1 0 0 1 54.00 653.48 Tm (the recall claim) Tj ET
+0.960 0.970 0.970 rg
+0.820 0.840 0.850 RG
+0.70 w
+54.00 574.00 504.00 28.00 re B
+0.340 0.380 0.410 rg
+BT /F4 7.00 Tf 1 0 0 1 61.00 584.00 Tm (CLAIM) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+159.00 602.00 m 159.00 574.00 l S
+0.340 0.380 0.410 rg
+BT /F4 7.00 Tf 1 0 0 1 166.00 584.00 Tm (EVIDENCE) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+451.00 602.00 m 451.00 574.00 l S
+0.340 0.380 0.410 rg
+BT /F4 7.00 Tf 1 0 0 1 458.00 584.00 Tm (STATUS) Tj ET
+1.000 1.000 1.000 rg
+0.820 0.840 0.850 RG
+0.50 w
+54.00 505.00 504.00 69.00 re B
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 61.00 559.00 Tm (Portable bytes) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+159.00 574.00 m 159.00 505.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 166.00 559.00 Tm (Fixed repack, mismatched-width merge, tombstone rebuild, spill,) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 166.00 548.00 Tm (and OPANN split preserve code + residual bytes.) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+451.00 574.00 m 451.00 505.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 458.00 559.00 Tm (PROVEN) Tj ET
+0.960 0.970 0.970 rg
+0.820 0.840 0.850 RG
+0.50 w
+54.00 450.00 504.00 55.00 re B
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 61.00 490.00 Tm (Same payload) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+159.00 505.00 m 159.00 450.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 166.00 490.00 Tm (Both codecs store [dim u8 code | dim i8 residual], exactly 2) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 166.00 479.00 Tm (bytes per dimension.) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+451.00 505.00 m 451.00 450.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 458.00 490.00 Tm (PROVEN) Tj ET
+1.000 1.000 1.000 rg
+0.820 0.840 0.850 RG
+0.50 w
+54.00 395.00 504.00 55.00 re B
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 61.00 435.00 Tm (Bounded error) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+159.00 450.00 m 159.00 395.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 166.00 435.00 Tm (Fixed step is 2/\(255x256\); round-trip tests bound reconstruction) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 166.00 424.00 Tm (error to one step.) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+451.00 450.00 m 451.00 395.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 458.00 435.00 Tm (PROVEN) Tj ET
+0.960 0.970 0.970 rg
+0.820 0.840 0.850 RG
+0.50 w
+54.00 326.00 504.00 69.00 re B
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 61.00 380.00 Tm (No lifecycle loss) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+159.00 395.00 m 159.00 326.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 166.00 380.00 Tm (Fixed drops from 0.980 post-delta to 0.955 post-compact on the) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 166.00 369.00 Tm (same logical corpus.) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+451.00 395.00 m 451.00 326.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 458.00 380.00 Tm (FALSE AS A COMPLETE) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 458.00 369.00 Tm (CLAIM) Tj ET
+1.000 1.000 1.000 rg
+0.820 0.840 0.850 RG
+0.50 w
+54.00 271.00 504.00 55.00 re B
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 61.00 311.00 Tm (Faster maintenance) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+159.00 326.00 m 159.00 271.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 166.00 311.00 Tm (The 1M fixed run was faster in one drain and one compaction) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 166.00 300.00 Tm (observation.) Tj ET
+0.820 0.840 0.850 RG
+0.50 w
+[] 0 d
+451.00 326.00 m 451.00 271.00 l S
+0.080 0.100 0.120 rg
+BT /F1 8.40 Tf 1 0 0 1 458.00 311.00 Tm (DIRECTIONAL) Tj ET
+0.980 0.940 0.900 rg
+54.00 100.00 504.00 96.00 re f
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 70.00 168.00 Tm (CRITICAL CORRECTION TO THE ORIGINAL BRIEF) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.90 Tf 1 0 0 1 70.00 142.00 Tm (The original diagnosis was right that local quantizers force unnecessary re-quantization. It) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.90 Tf 1 0 0 1 70.00 128.00 Tm (was too strong in claiming that re-quantization, rather than index behavior, was the) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 9.90 Tf 1 0 0 1 70.00 114.00 Tm (production ceiling. Fixed removes the former while the latter remains.) Tj ET
+0.820 0.840 0.850 RG
+0.60 w
+[] 0 d
+54.00 35.00 m 558.00 35.00 l S
+0.340 0.380 0.410 rg
+BT /F3 7.50 Tf 1 0 0 1 54.00 21.00 Tm (Infino vector retrieval quality) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 7.50 Tf 1 0 0 1 543.00 21.00 Tm (6) Tj ET
+endstream
+endobj
+19 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents 20 0 R >>
+endobj
+20 0 obj
+<< /Length 3139 >>
+stream
+0.960 0.970 0.970 rg
+44.00 66.00 524.00 670.00 re f
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 58.00 682.00 Tm (THE DECISION) Tj ET
+0.080 0.100 0.120 rg
+BT /F2 23.00 Tf 1 0 0 1 58.00 646.00 Tm (Keep the safer representation.) Tj ET
+0.080 0.100 0.120 rg
+BT /F2 23.00 Tf 1 0 0 1 58.00 620.24 Tm (Continue the recall investigation.) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 11.70 Tf 1 0 0 1 58.00 592.48 Tm (Keep Sq8FixedResidual as the cosine default because it removes irreversible) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 11.70 Tf 1 0 0 1 58.00 575.48 Tm (maintenance drift at the same payload size and with no measured 1M quality) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 11.70 Tf 1 0 0 1 58.00 558.48 Tm (penalty. Do not claim that it solves the 0.99 recall target.) Tj ET
+0.910 0.950 0.950 rg
+58.00 386.00 470.00 120.00 re f
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 76.00 475.00 Tm (THE NEXT DECISIVE EXPERIMENT) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 10.60 Tf 1 0 0 1 76.00 447.00 Tm (After compaction, attribute every missing exact neighbor across four gates:) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 10.60 Tf 1 0 0 1 76.00 431.80 Tm (selected outer cells, selected fine runs, the RaBitQ shortlist, and fixed rerank) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 10.60 Tf 1 0 0 1 76.00 416.60 Tm (ordering. The first gate that drops the neighbor identifies the real remaining) Tj ET
+0.080 0.100 0.120 rg
+BT /F1 10.60 Tf 1 0 0 1 76.00 401.40 Tm (lever without changing the codec again.) Tj ET
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 58.00 337.00 Tm (ACCEPTANCE STATUS) Tj ET
+0.050 0.360 0.370 rg
+BT /F2 22.00 Tf 1 0 0 1 58.00 300.00 Tm (0.985) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 8.50 Tf 1 0 0 1 132.00 304.00 Tm (post-drain) Tj ET
+0.630 0.340 0.120 rg
+BT /F2 22.00 Tf 1 0 0 1 230.00 300.00 Tm (0.980) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 8.50 Tf 1 0 0 1 304.00 304.00 Tm (post-delta) Tj ET
+0.630 0.340 0.120 rg
+BT /F2 22.00 Tf 1 0 0 1 402.00 300.00 Tm (0.955) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 8.50 Tf 1 0 0 1 476.00 304.00 Tm (post-compact) Tj ET
+0.820 0.840 0.850 RG
+0.70 w
+[] 0 d
+58.00 264.00 m 528.00 264.00 l S
+0.050 0.360 0.370 rg
+BT /F4 7.80 Tf 1 0 0 1 58.00 231.00 Tm (METHOD AND SOURCES) Tj ET
+0.340 0.380 0.410 rg
+BT /F1 9.40 Tf 1 0 0 1 58.00 204.00 Tm (Recall@10 against exact ground truth. Azure object storage. 1024-dimensional cosine vectors.) Tj ET
+0.340 0.380 0.410 rg
+BT /F1 9.40 Tf 1 0 0 1 58.00 190.80 Tm (Twenty benchmark queries. Clean 1M A/B plus a 10M base corpus and 625K normal delta lifecycle.) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 7.40 Tf 1 0 0 1 58.00 133.00 Tm (vec1m_sq8_residual_ab.log) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 7.40 Tf 1 0 0 1 58.00 119.00 Tm (vec1m_sq8_fixed_residual_ab.log) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 7.40 Tf 1 0 0 1 300.00 133.00 Tm (vec10m_user_fine8_normal17_retained.log) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 7.40 Tf 1 0 0 1 300.00 119.00 Tm (vec10m_sq8_fixed_residual_acceptance.log) Tj ET
+0.820 0.840 0.850 RG
+0.60 w
+[] 0 d
+54.00 35.00 m 558.00 35.00 l S
+0.340 0.380 0.410 rg
+BT /F3 7.50 Tf 1 0 0 1 54.00 21.00 Tm (Infino vector retrieval quality) Tj ET
+0.340 0.380 0.410 rg
+BT /F3 7.50 Tf 1 0 0 1 543.00 21.00 Tm (7) Tj ET
+endstream
+endobj
+xref
+0 21
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000162 00000 n 
+0000000259 00000 n 
+0000000361 00000 n 
+0000000456 00000 n 
+0000000556 00000 n 
+0000000712 00000 n 
+0000003701 00000 n 
+0000003858 00000 n 
+0000009555 00000 n 
+0000009713 00000 n 
+0000014034 00000 n 
+0000014192 00000 n 
+0000019269 00000 n 
+0000019427 00000 n 
+0000025224 00000 n 
+0000025382 00000 n 
+0000030381 00000 n 
+0000030539 00000 n 
+trailer
+<< /Size 21 /Root 1 0 R /Info << /Title (Sq8FixedResidual Recall Brief) /Author (Infino) /Subject (Vector retrieval quality) >> >>
+startxref
+33731
+%%EOF
