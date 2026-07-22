@@ -18,7 +18,7 @@
 use std::{
     cell::Cell,
     cmp::Ordering,
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     ops::Range,
     slice,
     sync::{
@@ -1163,6 +1163,429 @@ impl FtsReader {
             }
         }
         Ok(drain_top_k_desc(heap))
+    }
+
+    /// Multi-term OR over resident-routed block selection — the
+    /// multi-term generalization of
+    /// [`Self::bm25_single_term_block_selected`]: instead of walking
+    /// every term's whole merged list, admit (term, block) candidates
+    /// best-first by `resident_bound(t, b) + Σ_{t'≠t} term_max(t')`
+    /// (a true upper bound on any doc in the block: the doc's own
+    /// term contributes at most the block bound, every other term at
+    /// most its term max) and fetch **only admitted blocks**, in
+    /// exponential waves against the live bar. Docs surviving the
+    /// essential gate are scored *exactly*: contributions from terms
+    /// whose covering block wasn't fetched are resolved by
+    /// skip-table-guided probe fetches, batched per wave.
+    ///
+    /// `routed` terms carry a resident block-max row; `unrouted_terms`
+    /// have none (df below the routing floor) — their small lists are
+    /// decoded whole, joined as probe targets, and swept as candidate
+    /// sources at the end under the same bound logic.
+    ///
+    /// Returns `Ok(None)` when a precondition fails (an unrouted term
+    /// is too large to decode whole — stale routing) — the caller
+    /// falls back to the ranged walk.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn bm25_multi_term_or_block_selected(
+        &self,
+        column: &str,
+        k: usize,
+        floor: f32,
+        routed: &[RoutedTermRow<'_>],
+        unrouted_terms: &[&str],
+        live: Option<&SharedFloor>,
+    ) -> Result<Option<Vec<(u32, f32)>>, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        if k == 0 || routed.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let col_meta = &self.columns[column_id as usize];
+        let floor_eff = floor.next_down();
+        let dl_norm_k1 = &col_meta.dl_norm_k1;
+        let term_meta_size = match col_meta.positions {
+            true => TERM_META_POSITIONAL_SIZE,
+            false => TERM_META_SIZE,
+        };
+
+        // ---- Heads: one batched fetch of every routed term's header
+        // + full skip table (offsets + exact bounds for everything
+        // below; the resident rows carry only the quantized bounds).
+        let head_ranges: Vec<(usize, usize)> = routed
+            .iter()
+            .map(|r| {
+                (
+                    r.metadata_offset as usize,
+                    term_meta_size + r.quantized.len() * SKIP_ENTRY_SIZE,
+                )
+            })
+            .collect();
+        let heads = self.fetch_term_postings(&head_ranges).await?;
+        let mut metas: Vec<TermMeta> = Vec::with_capacity(routed.len());
+        for (row, head) in routed.iter().zip(&heads) {
+            let meta = TermMeta::parse(head, 0, col_meta.positions)?;
+            if meta.num_blocks != row.quantized.len() {
+                return Err(FtsError::Read(ReadError::MalformedVersion(format!(
+                    "resident block-max rows ({}) disagree with the skip table ({}) — stale routing",
+                    row.quantized.len(),
+                    meta.num_blocks
+                ))));
+            }
+            metas.push(meta);
+        }
+        let routed_idf_x_k1p1: Vec<f32> = metas
+            .iter()
+            .map(|m| bm25::idf(self.n_docs as u64, m.df) * (bm25::K1 + 1.0))
+            .collect();
+
+        // ---- Unrouted terms: decode whole (they are below the
+        // routing df floor, so a large one means stale routing —
+        // bail to the ranged walk rather than decode a mega list).
+        let unrouted_cursors = self.build_term_cursors(column_id, unrouted_terms).await?;
+        if unrouted_cursors
+            .iter()
+            .any(|c| c.block_count() > UNROUTED_TERM_MAX_BLOCKS)
+        {
+            return Ok(None);
+        }
+        // (docs asc, tfs, idf_x_k1p1, term_max) per unrouted term.
+        let unrouted: Vec<(Vec<u32>, Vec<u32>, f32, f32)> = unrouted_cursors
+            .into_iter()
+            .map(|mut c| {
+                let idf_x_k1p1 = c.idf_x_k1p1;
+                let term_max = c.term_max_bm25;
+                let mut docs = Vec::new();
+                let mut tfs = Vec::new();
+                while !c.is_exhausted() {
+                    docs.push(c.current_doc_id());
+                    tfs.push(c.current_tf());
+                    c.next();
+                }
+                (docs, tfs, idf_x_k1p1, term_max)
+            })
+            .collect();
+
+        // ---- Upper-bound bookkeeping.
+        let dequant = |row: &RoutedTermRow<'_>, q: u8| q as f32 / u8::MAX as f32 * row.scale;
+        let routed_term_max: Vec<f32> = routed
+            .iter()
+            .map(|r| dequant(r, r.quantized.iter().copied().max().unwrap_or(0)))
+            .collect();
+        let total_ub: f32 = routed_term_max.iter().sum::<f32>()
+            + unrouted.iter().map(|(_, _, _, m)| m).sum::<f32>();
+        let routed_others_ub: Vec<f32> = routed_term_max.iter().map(|m| total_ub - m).collect();
+
+        // ---- Per-term candidate order: counting sort by quantized
+        // bound (descending), so only admitted candidates ever pay a
+        // comparison; a cross-term heap merges the per-term streams
+        // by admit key.
+        let per_term_order: Vec<Vec<u32>> = routed
+            .iter()
+            .map(|r| {
+                let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); (u8::MAX as usize) + 1];
+                for (b, &q) in r.quantized.iter().enumerate() {
+                    buckets[q as usize].push(b as u32);
+                }
+                buckets.into_iter().rev().flatten().collect()
+            })
+            .collect();
+        let mut term_pos: Vec<usize> = vec![0; routed.len()];
+        let admit_key = |t: usize, pos: usize| -> Option<f32> {
+            per_term_order[t].get(pos).map(|&b| {
+                dequant(&routed[t], routed[t].quantized[b as usize]) + routed_others_ub[t]
+            })
+        };
+        // Max-heap of (admit_key, term) — term's next block index is
+        // term_pos[t]. f32 keys are finite BM25 sums.
+        let mut cand: BinaryHeap<TopKEntry> = BinaryHeap::new();
+        for t in 0..routed.len() {
+            if let Some(key) = admit_key(t, 0) {
+                cand.push(TopKEntry(key, t as u32));
+            }
+        }
+
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(k.max(1));
+        let live_probe = LiveFloorProbe::new(live);
+        // Decoded blocks: (term, block) -> index into `decoded`.
+        let mut decoded_at: HashMap<(u32, u32), usize> = HashMap::new();
+        let mut decoded: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
+        // Docs already scored exactly (a doc can sit in admitted
+        // blocks of several terms; it must reach the heap once).
+        let mut seen: HashSet<u32> = HashSet::new();
+        // Blocks already candidate-scanned. Distinct from
+        // `decoded_at`: a probe may decode a block for rescoring
+        // *other* docs before admission reaches it — its own docs
+        // still need the candidate scan when it is admitted.
+        let mut scanned: HashSet<(u32, u32)> = HashSet::new();
+
+        // Covering block of `doc` in routed term t, from the raw skip
+        // table (first block whose last_doc_id >= doc), or None when
+        // doc is past the last block.
+        let covering_block = |t: usize, doc: u32| -> Option<u32> {
+            let meta = &metas[t];
+            let head: &[u8] = &heads[t];
+            let (mut lo, mut hi) = (0usize, meta.num_blocks);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let (last, _, _) = meta.skip_entry(head, mid);
+                if last < doc { lo = mid + 1 } else { hi = mid }
+            }
+            (lo < meta.num_blocks).then_some(lo as u32)
+        };
+        // Contribution of routed term t at doc from a decoded block
+        // (None = block not decoded yet).
+        let contrib_decoded = |decoded_at: &HashMap<(u32, u32), usize>,
+                               decoded: &Vec<(Vec<u32>, Vec<u32>)>,
+                               t: usize,
+                               b: u32,
+                               doc: u32|
+         -> Option<f32> {
+            let &slot = decoded_at.get(&(t as u32, b))?;
+            let (docs, tfs) = &decoded[slot];
+            Some(match docs.binary_search(&doc) {
+                Ok(i) => {
+                    bm25::score_with_dl_norm_k1(routed_idf_x_k1p1[t], tfs[i], dl_norm_k1.get(doc))
+                }
+                Err(_) => 0.0,
+            })
+        };
+        // Exact contribution of every unrouted term at doc.
+        let unrouted_contrib = |doc: u32| -> f32 {
+            unrouted
+                .iter()
+                .map(
+                    |(docs, tfs, idf_x_k1p1, _)| match docs.binary_search(&doc) {
+                        Ok(i) => {
+                            bm25::score_with_dl_norm_k1(*idf_x_k1p1, tfs[i], dl_norm_k1.get(doc))
+                        }
+                        Err(_) => 0.0,
+                    },
+                )
+                .sum()
+        };
+
+        let mut wave_cap = BLOCK_SELECT_FIRST_WAVE;
+        loop {
+            // `next_down` on the kth: a candidate tying the kth-best
+            // can still displace it on the ascending-doc-id tie-break,
+            // so gates must not skip score-tied work (`floor_eff` and
+            // the live pull are already tie-safe).
+            let bar = {
+                let kth = (heap.len() >= k).then(|| heap.peek().expect("heap full").0);
+                kth.map_or(f32::NEG_INFINITY, f32::next_down)
+                    .max(floor_eff)
+                    .max(live_probe.checkpoint(floor_eff, kth))
+            };
+            // ---- Admit a wave of candidates best-first.
+            let mut wave: Vec<(usize, u32)> = Vec::new();
+            while wave.len() < wave_cap {
+                let Some(&TopKEntry(key, t)) = cand.peek() else {
+                    break;
+                };
+                if key <= bar {
+                    cand.clear();
+                    break;
+                }
+                cand.pop();
+                let t = t as usize;
+                let b = per_term_order[t][term_pos[t]];
+                term_pos[t] += 1;
+                if let Some(next_key) = admit_key(t, term_pos[t]) {
+                    cand.push(TopKEntry(next_key, t as u32));
+                }
+                if scanned.insert((t as u32, b)) {
+                    wave.push((t, b));
+                }
+            }
+            wave_cap = wave_cap.saturating_mul(BLOCK_SELECT_WAVE_GROWTH);
+            if wave.is_empty() {
+                break;
+            }
+            // ---- Fetch + decode the wave.
+            self.fetch_and_decode_blocks(
+                &wave,
+                routed,
+                &metas,
+                &heads,
+                &mut decoded_at,
+                &mut decoded,
+            )
+            .await?;
+            // ---- Score: essential gate, then exact rescore with
+            // probe fetches for unfetched covering blocks.
+            let mut survivors: Vec<(u32, usize)> = Vec::new();
+            for &(t, b) in &wave {
+                let slot = decoded_at[&(t as u32, b)];
+                let (docs, tfs) = (decoded[slot].0.clone(), decoded[slot].1.clone());
+                for (i, &doc) in docs.iter().enumerate() {
+                    if seen.contains(&doc) {
+                        continue;
+                    }
+                    let essential = bm25::score_with_dl_norm_k1(
+                        routed_idf_x_k1p1[t],
+                        tfs[i],
+                        dl_norm_k1.get(doc),
+                    );
+                    if essential + routed_others_ub[t] <= bar {
+                        continue;
+                    }
+                    seen.insert(doc);
+                    survivors.push((doc, t));
+                }
+            }
+            // Probe fetches: covering blocks the survivors still need.
+            let mut probes: Vec<(usize, u32)> = Vec::new();
+            for &(doc, _) in &survivors {
+                for t in 0..routed.len() {
+                    if let Some(b) = covering_block(t, doc)
+                        && !decoded_at.contains_key(&(t as u32, b))
+                        && !probes.contains(&(t, b))
+                    {
+                        probes.push((t, b));
+                    }
+                }
+            }
+            self.fetch_and_decode_blocks(
+                &probes,
+                routed,
+                &metas,
+                &heads,
+                &mut decoded_at,
+                &mut decoded,
+            )
+            .await?;
+            for (doc, _) in survivors {
+                let mut score = unrouted_contrib(doc);
+                for t in 0..routed.len() {
+                    if let Some(b) = covering_block(t, doc)
+                        && let Some(c) = contrib_decoded(&decoded_at, &decoded, t, b, doc)
+                    {
+                        score += c;
+                    }
+                }
+                if score <= floor_eff {
+                    continue;
+                }
+                let entry = TopKEntry(score, doc);
+                if heap.len() < k {
+                    heap.push(entry);
+                } else if let Some(top) = heap.peek()
+                    // The heap order is inverted (peek = worst kept),
+                    // so "less" means better — including the
+                    // lower-doc-id side of an exact score tie.
+                    && entry < *top
+                {
+                    heap.pop();
+                    heap.push(entry);
+                }
+            }
+        }
+
+        // ---- Unrouted-source sweep: docs living only in the small
+        // lists can still make top-k; same bound logic, probes into
+        // routed terms for exactness.
+        let routed_slack: f32 = routed_term_max.iter().sum();
+        let bar = {
+            let kth = (heap.len() >= k).then(|| heap.peek().expect("heap full").0);
+            kth.map_or(f32::NEG_INFINITY, f32::next_down)
+                .max(floor_eff)
+                .max(live_probe.current())
+        };
+        let mut survivors: Vec<u32> = Vec::new();
+        for (docs, _, _, _) in &unrouted {
+            for &doc in docs {
+                if seen.contains(&doc) {
+                    continue;
+                }
+                if unrouted_contrib(doc) + routed_slack <= bar {
+                    continue;
+                }
+                seen.insert(doc);
+                survivors.push(doc);
+            }
+        }
+        let mut probes: Vec<(usize, u32)> = Vec::new();
+        for &doc in &survivors {
+            for t in 0..routed.len() {
+                if let Some(b) = covering_block(t, doc)
+                    && !decoded_at.contains_key(&(t as u32, b))
+                    && !probes.contains(&(t, b))
+                {
+                    probes.push((t, b));
+                }
+            }
+        }
+        self.fetch_and_decode_blocks(
+            &probes,
+            routed,
+            &metas,
+            &heads,
+            &mut decoded_at,
+            &mut decoded,
+        )
+        .await?;
+        for doc in survivors {
+            let mut score = unrouted_contrib(doc);
+            for t in 0..routed.len() {
+                if let Some(b) = covering_block(t, doc)
+                    && let Some(c) = contrib_decoded(&decoded_at, &decoded, t, b, doc)
+                {
+                    score += c;
+                }
+            }
+            if score <= floor_eff {
+                continue;
+            }
+            let entry = TopKEntry(score, doc);
+            if heap.len() < k {
+                heap.push(entry);
+            } else if let Some(top) = heap.peek()
+                && entry < *top
+            {
+                heap.pop();
+                heap.push(entry);
+            }
+        }
+
+        Ok(Some(drain_top_k_desc(heap)))
+    }
+
+    /// Fetch + decode a batch of (term, block) pairs into the
+    /// kernel's decoded-block table (skipping already-decoded pairs).
+    async fn fetch_and_decode_blocks(
+        &self,
+        pairs: &[(usize, u32)],
+        routed: &[RoutedTermRow<'_>],
+        metas: &[TermMeta],
+        heads: &[Bytes],
+        decoded_at: &mut HashMap<(u32, u32), usize>,
+        decoded: &mut Vec<(Vec<u32>, Vec<u32>)>,
+    ) -> Result<(), FtsError> {
+        let todo: Vec<(usize, u32)> = pairs
+            .iter()
+            .copied()
+            .filter(|&(t, b)| !decoded_at.contains_key(&(t as u32, b)))
+            .collect();
+        if todo.is_empty() {
+            return Ok(());
+        }
+        let ranges: Vec<(usize, usize)> = todo
+            .iter()
+            .map(|&(t, b)| {
+                let (_, off, _) = metas[t].skip_entry(&heads[t], b as usize);
+                let end = metas[t].block_end_in_term(&heads[t], b as usize);
+                (routed[t].metadata_offset as usize + off, end - off)
+            })
+            .collect();
+        let blocks = self.fetch_block_ranges(&ranges).await?;
+        let mut buf_d = vec![0u32; BLOCK_LEN];
+        let mut buf_t = vec![0u32; BLOCK_LEN];
+        for (&(t, b), bytes) in todo.iter().zip(&blocks) {
+            let n = decode_block(bytes, &mut buf_d, &mut buf_t);
+            decoded.push((buf_d[..n].to_vec(), buf_t[..n].to_vec()));
+            decoded_at.insert((t as u32, b), decoded.len() - 1);
+        }
+        Ok(())
     }
 
     /// True postings byte length for a PFOR term. Lengths below the
@@ -5407,6 +5830,23 @@ fn f32_from_order_key(k: u32) -> f32 {
 /// IEEE-754 f32 sign bit, for the order-key mapping above.
 const SIGN_BIT: u32 = 0x8000_0000;
 
+/// A term's resident block-max routing row, borrowed from the
+/// supertable's slow-fts-state for one kernel call: the term's
+/// postings-region offset plus its ceil-quantized 1-byte per-block
+/// BM25 upper bounds.
+pub(crate) struct RoutedTermRow<'a> {
+    pub(crate) metadata_offset: u64,
+    pub(crate) quantized: &'a [u8],
+    pub(crate) scale: f32,
+}
+
+/// Largest block count an *unrouted* term may have before the
+/// multi-term block-selected kernel refuses to decode it whole and
+/// falls back to the ranged walk. Unrouted means df below the
+/// routing floor (1024 docs = 8 blocks); anything past a few times
+/// that is stale routing, not a small list.
+const UNROUTED_TERM_MAX_BLOCKS: usize = 64;
+
 /// Steps between a ranged kernel's live-floor checkpoints (power of
 /// two; checked via mask). Each checkpoint is one atomic read +
 /// (heap-full) one atomic `fetch_max`, so the stride keeps the
@@ -7927,6 +8367,118 @@ mod tests {
                 }
             }
             println!("{variant:>9}: {:>10.2?}/query", total / ITERS);
+        }
+    }
+    /// The multi-term OR block-selected kernel must agree with the
+    /// whole-list walk: same top-k docs and scores on a corpus with
+    /// prunable bounds (tf variance), a mid-df term, and an unrouted
+    /// (sub-floor) rare term, across k values that exercise both the
+    /// pruning path and near-exhaustive admission.
+    #[tokio::test]
+    async fn multi_term_block_selected_matches_whole_walk() {
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        // 5000 docs: "common" everywhere with strong tf variance
+        // (prunable bounds), "mid" on every 3rd doc, "rare" on every
+        // 97th (unrouted small list).
+        for d in 0..5000u32 {
+            let mut text = "common ".repeat(((d % 13) + 1) as usize);
+            if d % 3 == 0 {
+                text.push_str("mid ");
+            }
+            if d % 97 == 0 {
+                text.push_str("rare ");
+            }
+            text.push_str(&format!("filler{d}"));
+            b.add_doc(0, d, &text).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        // Synthesize the resident routing rows the way the
+        // supertable's slow-fts-state does: exact skip bounds,
+        // ceil-quantized to one byte against the term's max bound.
+        let fst_bytes = r.dict_bytes_async().await.expect("dict");
+        let dict = DictReader::open(&fst_bytes).expect("fst");
+        let row_for = |term: &str| -> (u64, Vec<u8>, f32) {
+            let packed = dict.lookup(&make_key("body", term)).expect("term present");
+            let FstValue::Pfor {
+                metadata_offset, ..
+            } = FstValue::unpack(packed)
+            else {
+                panic!("routed test terms are PFOR");
+            };
+            let cursors =
+                futures::executor::block_on(r.build_term_cursors(0, &[term])).expect("cursor");
+            let bounds: Vec<f32> = (0..cursors[0].blocks.len())
+                .map(|i| cursors[0].blocks[i].block_max_bm25)
+                .collect();
+            let scale = bounds.iter().copied().fold(0.0f32, f32::max);
+            let quantized: Vec<u8> = bounds
+                .iter()
+                .map(|&m| match scale > 0.0 {
+                    true => (m / scale * u8::MAX as f32).ceil().min(u8::MAX as f32) as u8,
+                    false => 0,
+                })
+                .collect();
+            (metadata_offset, quantized, scale)
+        };
+        let rows: Vec<(u64, Vec<u8>, f32)> = vec![row_for("common"), row_for("mid")];
+
+        for k in [3usize, 10, 100, 2000] {
+            let expected = r
+                .search_excluding(
+                    "body",
+                    ClauseLists {
+                        musts: &[],
+                        shoulds: &["common", "mid", "rare"],
+                        negatives: &[],
+                        must_phrases: &[],
+                        should_phrases: &[],
+                        negative_phrases: &[],
+                    },
+                    k,
+                    f32::NEG_INFINITY,
+                )
+                .await
+                .expect("whole walk");
+            let routed: Vec<RoutedTermRow<'_>> = rows
+                .iter()
+                .map(|(off, q, scale)| RoutedTermRow {
+                    metadata_offset: *off,
+                    quantized: q,
+                    scale: *scale,
+                })
+                .collect();
+            let got = r
+                .bm25_multi_term_or_block_selected(
+                    "body",
+                    k,
+                    f32::NEG_INFINITY,
+                    &routed,
+                    &["rare"],
+                    None,
+                )
+                .await
+                .expect("kernel")
+                .expect("preconditions hold");
+            // Scores may differ in the last ULP: the whole walk sums
+            // per-term contributions SIMD-packed in groups of four,
+            // the kernel sums sequentially, and f32 addition is not
+            // associative. Docs must match exactly; scores to within
+            // a relative epsilon far below any score gap that could
+            // reorder them.
+            assert_eq!(got.len(), expected.len(), "k={k}");
+            for (i, ((gd, gs), (ed, es))) in got.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(gd, ed, "k={k} doc at rank {i}");
+                let rel = (gs - es).abs() / es.abs().max(f32::MIN_POSITIVE);
+                assert!(
+                    rel < 1e-5,
+                    "k={k} score at rank {i}: got {gs} expected {es}"
+                );
+            }
         }
     }
 }

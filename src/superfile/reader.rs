@@ -53,7 +53,8 @@ use crate::{
         format::{self, footer, kv},
         fts::{
             reader::{
-                self as fts_reader, BoolMode, ClauseLists, FtsCursorCache, FtsReader, SharedFloor,
+                self as fts_reader, BoolMode, ClauseLists, FtsCursorCache, FtsReader,
+                RoutedTermRow, SharedFloor,
             },
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
@@ -1179,6 +1180,25 @@ impl SuperfileReader {
                 cache,
                 live,
             )
+            .await?)
+    }
+
+    /// Multi-term OR over resident-routed block selection — see
+    /// [`FtsReader::bm25_multi_term_or_block_selected`].
+    pub(crate) async fn bm25_multi_term_or_block_selected(
+        &self,
+        column: &str,
+        k: usize,
+        floor: f32,
+        routed: &[RoutedTermRow<'_>],
+        unrouted_terms: &[&str],
+        live: Option<&SharedFloor>,
+    ) -> Result<Option<Vec<(u32, f32)>>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts
+            .bm25_multi_term_or_block_selected(column, k, floor, routed, unrouted_terms, live)
             .await?)
     }
 

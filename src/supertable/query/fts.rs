@@ -91,7 +91,7 @@ use crate::{
         SuperfileReader,
         error::{FtsError, ReadError},
         fts::{
-            reader::{ClauseLists, FtsCursorCache, SharedFloor},
+            reader::{ClauseLists, FtsCursorCache, RoutedTermRow, SharedFloor},
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
     },
@@ -107,7 +107,7 @@ use crate::{
             vector::user_placement_for_scalar_resolve,
         },
         reader_cache::disk::ForegroundQueryGuard,
-        slow_fts_state::SlowFtsState,
+        slow_fts_state::{SlowFtsState, TermBlockMax},
         tombstones::SidecarCache,
     },
 };
@@ -140,6 +140,10 @@ struct UnrankedNegatives {
     terms: Vec<String>,
     phrases: Vec<Vec<String>>,
 }
+
+/// Minimum bare-OR term count for the multi-term block-selected
+/// kernel; a single bare term has its own dedicated selected walk.
+const MULTI_SELECT_MIN_TERMS: usize = 2;
 
 /// Rejection message for a query with negated terms but no positive
 /// anchor (e.g. `-foo`). Shared by the scored and unranked FTS paths so
@@ -307,21 +311,36 @@ async fn bm25_fanout_wave(
         should_arc.len() + should_ph_arc.len(),
         has_negation,
     );
-    // A single bare term whose resident block-max row CAN PRUNE keeps
-    // its file as one un-ranged unit: the block-selected walk visits
-    // (and, cold, fetches) fewer bytes than any parallel full walk.
-    // Flat-bounded or row-less files slice for parallelism instead.
+    // Bare-term shapes whose resident block-max rows CAN PRUNE keep
+    // their file as one un-ranged unit: the block-selected walks
+    // visit (and, cold, fetch) fewer bytes than any parallel full
+    // walk. A single bare term needs its own row prunable; a bare
+    // multi-term OR engages the multi-term admission kernel when at
+    // least one term's row can prune (row-less terms are small and
+    // join as unrouted). Flat-bounded / row-less files slice for
+    // parallelism instead.
     let single_bare_term = match (must_arc.as_slice(), should_arc.as_slice()) {
         _ if has_phrases || has_negation => None,
         ([term], []) | ([], [term]) => Some(term.as_str()),
         _ => None,
     };
+    let multi_bare_or = !has_phrases
+        && !has_negation
+        && must_arc.is_empty()
+        && should_arc.len() >= MULTI_SELECT_MIN_TERMS;
     let (selected_refs, sliceable_refs): (Vec<&Arc<SuperfileEntry>>, Vec<&Arc<SuperfileEntry>>) =
-        match (single_bare_term, routing.as_ref()) {
-            (Some(term), Some(state)) => kept.iter().partition(|e| {
+        match (single_bare_term, multi_bare_or, routing.as_ref()) {
+            (Some(term), _, Some(state)) => kept.iter().partition(|e| {
                 state
                     .term_block_max(e.superfile_id, &column_arc, term)
                     .is_some_and(|row| row.quantized.iter().min() < row.quantized.iter().max())
+            }),
+            (None, true, Some(state)) => kept.iter().partition(|e| {
+                should_arc.iter().any(|term| {
+                    state
+                        .term_block_max(e.superfile_id, &column_arc, term)
+                        .is_some_and(|row| row.quantized.iter().min() < row.quantized.iter().max())
+                })
             }),
             _ => (Vec::new(), kept.iter().collect()),
         };
@@ -420,6 +439,67 @@ async fn bm25_fanout_wave(
                         _ => shared.merge(hits.iter().map(|(_, s)| *s)),
                     }
                     return Ok(hits);
+                }
+            }
+            // Multi-term bare-OR admission: an un-ranged unit whose
+            // file has at least one prunable resident row runs the
+            // (term, block) best-first kernel — fetching only blocks
+            // that can beat the live bar — instead of walking every
+            // term's whole merged list. Falls through to the plain
+            // walk when the kernel declines (stale routing).
+            if range.is_none()
+                && n_terms >= MULTI_SELECT_MIN_TERMS
+                && must_arc.is_empty()
+                && phrase_free
+                && neg_arc.is_empty()
+                && neg_ph_arc.is_empty()
+                && let Some(state) = routing.as_ref()
+            {
+                let rows: Vec<Option<&TermBlockMax>> = should_arc
+                    .iter()
+                    .map(|term| state.term_block_max(suid, &column_arc, term))
+                    .collect();
+                let any_prunable = rows
+                    .iter()
+                    .flatten()
+                    .any(|row| row.quantized.iter().min() < row.quantized.iter().max());
+                if any_prunable {
+                    let mut routed_rows = Vec::new();
+                    let mut unrouted: Vec<&str> = Vec::new();
+                    for (term, row) in should_arc.iter().zip(&rows) {
+                        match row {
+                            Some(row) => routed_rows.push(RoutedTermRow {
+                                metadata_offset: row.metadata_offset,
+                                quantized: &row.quantized,
+                                scale: row.scale,
+                            }),
+                            None => unrouted.push(term.as_str()),
+                        }
+                    }
+                    let live = shared.live_floor();
+                    if let Some(hits) = r
+                        .bm25_multi_term_or_block_selected(
+                            &column_arc,
+                            k,
+                            floor,
+                            &routed_rows,
+                            &unrouted,
+                            Some(&live),
+                        )
+                        .await
+                        .map_err(fts_read_error)?
+                    {
+                        match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
+                            Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
+                                hits.iter()
+                                    .filter(|(d, _)| !bitmap.contains(*d))
+                                    .map(|(_, s)| *s),
+                            ),
+                            Some(Err(_)) => {}
+                            _ => shared.merge(hits.iter().map(|(_, s)| *s)),
+                        }
+                        return Ok(hits);
+                    }
                 }
             }
             let hits = match range {
