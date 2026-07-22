@@ -23,7 +23,9 @@ use std::{
 };
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use serde::Deserialize;
+use tokio::sync::OnceCell;
 
 use crate::superfile::{
     ReadError,
@@ -1183,6 +1185,37 @@ impl FtsReader {
         ))
     }
 
+    /// Build term cursors through a wave's shared prototype cache.
+    /// Sub-range fan-out units of one superfile run identical term
+    /// lists; without sharing, every unit re-fetches each term's full
+    /// postings range and re-parses its skip table — N_units × the
+    /// parse work and N_units × the cold bytes. The first unit to
+    /// need a list builds it once (the batched
+    /// [`Self::build_term_cursors`] path, unchanged); every unit
+    /// walks positional-reset clones. `None` = build uncached (the
+    /// per-superfile, un-ranged shape).
+    async fn build_term_cursors_shared(
+        &self,
+        column_id: u32,
+        terms: &[&str],
+        cache: Option<&FtsCursorCache>,
+    ) -> Result<Vec<TermCursor>, FtsError> {
+        let Some(cache) = cache else {
+            return self.build_term_cursors(column_id, terms).await;
+        };
+        let cell = {
+            let entry = cache
+                .terms
+                .entry(FtsCursorCache::key(column_id, terms))
+                .or_default();
+            Arc::clone(entry.value())
+        };
+        let built = cell
+            .get_or_try_init(|| self.build_term_cursors(column_id, terms))
+            .await?;
+        Ok(built.iter().map(TermCursor::clone_reset).collect())
+    }
+
     /// Build one [`AnyCursor`] per requested atom, preserving input
     /// order: first the `terms`, then the `phrases`. An atom whose
     /// term (or any phrase member) is absent from the column yields
@@ -1191,11 +1224,18 @@ impl FtsReader {
     ///
     /// Multi-token phrases require the column to be positional;
     /// otherwise [`FtsError::PositionsUnavailable`].
+    /// `cache` shares fetched postings / position runs across a
+    /// wave's sub-range units (see [`FtsCursorCache`]); `start_doc`
+    /// is where phrase cursors position themselves at construction —
+    /// a sub-range unit passes its window start so the initial
+    /// verify-seek doesn't walk the shard from doc 0 per unit.
     async fn build_atom_cursors(
         &self,
         column_id: u32,
         terms: &[&str],
         phrases: &[Vec<String>],
+        cache: Option<&FtsCursorCache>,
+        start_doc: u32,
     ) -> Result<Vec<Option<AnyCursor>>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
         if !phrases.is_empty() && !col_meta.positions {
@@ -1205,66 +1245,107 @@ impl FtsReader {
         }
         let mut out: Vec<Option<AnyCursor>> = Vec::with_capacity(terms.len() + phrases.len());
         for term in terms {
-            let mut cursors = self.build_term_cursors(column_id, &[term]).await?;
+            let mut cursors = self
+                .build_term_cursors_shared(column_id, &[term], cache)
+                .await?;
             out.push(cursors.pop().map(AnyCursor::Term));
         }
         for phrase in phrases {
             let member_refs: Vec<&str> = phrase.iter().map(|t| t.as_str()).collect();
-            let cursors = self.build_term_cursors(column_id, &member_refs).await?;
+            let cursors = self
+                .build_term_cursors_shared(column_id, &member_refs, cache)
+                .await?;
             if cursors.len() != member_refs.len() {
                 // A member is absent — the phrase can never match.
                 out.push(None);
                 continue;
             }
-            // Positional extras per member, kept off the term cursors
-            // (whose footprint the term-only kernels depend on): PFOR
-            // members re-parse their metadata header from their own
-            // bytes; an inline (df=1) member recovers its single
-            // position from the FST slot the tf-reinterpretation
-            // dropped during cursor build.
-            let mut positional: Vec<(Option<TermMeta>, Option<u32>)> =
-                Vec::with_capacity(cursors.len());
-            for (cursor, term) in cursors.iter().zip(&member_refs) {
-                match cursor.bytes.is_empty() {
-                    false => {
-                        let term_meta = TermMeta::parse(cursor.bytes.as_ref(), 0, true)?;
-                        positional.push((Some(term_meta), None));
-                    }
-                    true => {
-                        let fst_bytes = self.dict_bytes_async().await?;
-                        let dict = DictReader::open(&fst_bytes).map_err(|e| {
-                            FtsError::Read(ReadError::MalformedVersion(format!(
-                                "FST parse failed: {e}"
-                            )))
-                        })?;
-                        let key = make_key(&col_meta.name, term);
-                        let packed = dict
-                            .lookup(&key)
-                            .expect("inline member cursor was built from this dict");
-                        let position = match FstValue::unpack(packed) {
-                            FstValue::Inline { tf: slot, .. } => slot,
-                            FstValue::Pfor { .. } => {
-                                unreachable!("inline cursor from a PFOR FST value")
-                            }
-                        };
-                        positional.push((None, Some(position)));
-                    }
+            let proto = match cache {
+                Some(cache) => {
+                    let cell = {
+                        let entry = cache
+                            .positions
+                            .entry(FtsCursorCache::key(column_id, &member_refs))
+                            .or_default();
+                        Arc::clone(entry.value())
+                    };
+                    cell.get_or_try_init(|| {
+                        self.build_phrase_positions(column_id, &cursors, &member_refs)
+                    })
+                    .await?
+                    .clone()
                 }
-            }
-            let pos_ranges: Vec<(u64, u32)> = positional
-                .iter()
-                .map(|(term_meta, _)| {
-                    term_meta
-                        .map(|tm| (tm.positions_offset, tm.positions_length))
-                        .unwrap_or((0, 0))
-                })
-                .collect();
-            let positions = self.fetch_term_positions(&pos_ranges).await?;
+                None => {
+                    self.build_phrase_positions(column_id, &cursors, &member_refs)
+                        .await?
+                }
+            };
             out.push(Some(AnyCursor::Phrase(PhraseCursor::new(
-                cursors, positions, positional,
+                cursors,
+                proto.positions,
+                proto.positional,
+                start_doc,
             )?)));
         }
         Ok(out)
+    }
+
+    /// Fetch one phrase's member position runs + positional metadata
+    /// — the [`PhraseCursor::new`] inputs beyond the member cursors.
+    /// Positional extras stay off the term cursors (whose footprint
+    /// the term-only kernels depend on): PFOR members re-parse their
+    /// metadata header from their own bytes; an inline (df=1) member
+    /// recovers its single position from the FST slot the
+    /// tf-reinterpretation dropped during cursor build.
+    async fn build_phrase_positions(
+        &self,
+        column_id: u32,
+        cursors: &[TermCursor],
+        member_refs: &[&str],
+    ) -> Result<PhrasePositionsProto, FtsError> {
+        let col_meta = &self.columns[column_id as usize];
+        let mut positional: Vec<(Option<TermMeta>, Option<u32>)> =
+            Vec::with_capacity(cursors.len());
+        for (cursor, term) in cursors.iter().zip(member_refs) {
+            match cursor.bytes.is_empty() {
+                false => {
+                    let term_meta = TermMeta::parse(cursor.bytes.as_ref(), 0, true)?;
+                    positional.push((Some(term_meta), None));
+                }
+                true => {
+                    let fst_bytes = self.dict_bytes_async().await?;
+                    let dict = DictReader::open(&fst_bytes).map_err(|e| {
+                        FtsError::Read(ReadError::MalformedVersion(format!(
+                            "FST parse failed: {e}"
+                        )))
+                    })?;
+                    let key = make_key(&col_meta.name, term);
+                    let packed = dict
+                        .lookup(&key)
+                        .expect("inline member cursor was built from this dict");
+                    let position = match FstValue::unpack(packed) {
+                        FstValue::Inline { tf: slot, .. } => slot,
+                        FstValue::Pfor { .. } => {
+                            unreachable!("inline cursor from a PFOR FST value")
+                        }
+                    };
+                    positional.push((None, Some(position)));
+                }
+            }
+        }
+        let pos_ranges: Vec<(u64, u32)> = positional
+            .iter()
+            .map(|(term_meta, _)| {
+                term_meta
+                    .map(|tm| (tm.positions_offset, tm.positions_length))
+                    .unwrap_or((0, 0))
+            })
+            .collect();
+        let positions = self.fetch_term_positions(&pos_ranges).await?;
+        Ok(PhrasePositionsProto {
+            positions,
+            positional,
+        })
     }
 
     /// Ranked search over heterogeneous atoms — the walk every
@@ -1519,7 +1600,9 @@ impl FtsReader {
         mode: BoolMode,
     ) -> Result<Vec<u32>, FtsError> {
         let column_id = self.resolve_column_id(column)?;
-        let built = self.build_atom_cursors(column_id, terms, phrases).await?;
+        let built = self
+            .build_atom_cursors(column_id, terms, phrases, None, 0)
+            .await?;
         let atoms: Vec<AnyCursor> = match mode {
             BoolMode::And => {
                 if built.iter().any(Option::is_none) {
@@ -1547,7 +1630,9 @@ impl FtsReader {
         mode: BoolMode,
     ) -> Result<u64, FtsError> {
         let column_id = self.resolve_column_id(column)?;
-        let built = self.build_atom_cursors(column_id, terms, phrases).await?;
+        let built = self
+            .build_atom_cursors(column_id, terms, phrases, None, 0)
+            .await?;
         let atoms: Vec<AnyCursor> = match mode {
             BoolMode::And => {
                 if built.iter().any(Option::is_none) {
@@ -1841,7 +1926,7 @@ impl FtsReader {
         if lists.has_phrases() {
             // Phrase-bearing query: the heterogeneous atom walks.
             let must_atoms = self
-                .build_atom_cursors(column_id, lists.musts, lists.must_phrases)
+                .build_atom_cursors(column_id, lists.musts, lists.must_phrases, None, 0)
                 .await?;
             if must_atoms.iter().any(Option::is_none) {
                 // A must atom can never match in this superfile.
@@ -1849,13 +1934,13 @@ impl FtsReader {
             }
             let must_atoms: Vec<AnyCursor> = must_atoms.into_iter().flatten().collect();
             let should_atoms: Vec<AnyCursor> = self
-                .build_atom_cursors(column_id, lists.shoulds, lists.should_phrases)
+                .build_atom_cursors(column_id, lists.shoulds, lists.should_phrases, None, 0)
                 .await?
                 .into_iter()
                 .flatten()
                 .collect();
             let negative_atoms: Vec<AnyCursor> = self
-                .build_atom_cursors(column_id, lists.negatives, lists.negative_phrases)
+                .build_atom_cursors(column_id, lists.negatives, lists.negative_phrases, None, 0)
                 .await?
                 .into_iter()
                 .flatten()
@@ -2148,6 +2233,10 @@ impl FtsReader {
     /// shards for every negation-free query (negation still forces
     /// the un-ranged walk, mirroring the OR path's v1 rule — the
     /// `lists` must carry no negative atoms).
+    /// `cache` shares per-term fetch + parse work across the wave's
+    /// sub-range units of this superfile (see [`FtsCursorCache`]);
+    /// `None` builds uncached.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn search_clauses_range_with_floor(
         &self,
         column: &str,
@@ -2156,6 +2245,7 @@ impl FtsReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
+        cache: Option<&FtsCursorCache>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         debug_assert!(
             lists.negatives.is_empty() && lists.negative_phrases.is_empty(),
@@ -2171,7 +2261,13 @@ impl FtsReader {
             // windowed to the sub-range (phrase atoms seek with
             // verification, so position work stays inside it).
             let must_atoms = self
-                .build_atom_cursors(column_id, lists.musts, lists.must_phrases)
+                .build_atom_cursors(
+                    column_id,
+                    lists.musts,
+                    lists.must_phrases,
+                    cache,
+                    doc_id_start,
+                )
                 .await?;
             if must_atoms.iter().any(Option::is_none) {
                 // A must atom can never match in this superfile.
@@ -2179,7 +2275,13 @@ impl FtsReader {
             }
             let must_atoms: Vec<AnyCursor> = must_atoms.into_iter().flatten().collect();
             let should_atoms: Vec<AnyCursor> = self
-                .build_atom_cursors(column_id, lists.shoulds, lists.should_phrases)
+                .build_atom_cursors(
+                    column_id,
+                    lists.shoulds,
+                    lists.should_phrases,
+                    cache,
+                    doc_id_start,
+                )
                 .await?
                 .into_iter()
                 .flatten()
@@ -2211,7 +2313,9 @@ impl FtsReader {
                 .await;
         }
         if musts.is_empty() {
-            let cursors = self.build_term_cursors(column_id, shoulds).await?;
+            let cursors = self
+                .build_term_cursors_shared(column_id, shoulds, cache)
+                .await?;
             if cursors.is_empty() {
                 return Ok(Vec::new());
             }
@@ -2225,7 +2329,9 @@ impl FtsReader {
                 floor_eff,
             );
         }
-        let must_cursors = self.build_term_cursors(column_id, musts).await?;
+        let must_cursors = self
+            .build_term_cursors_shared(column_id, musts, cache)
+            .await?;
         if must_cursors.len() != musts.len() {
             return Ok(Vec::new());
         }
@@ -2240,7 +2346,9 @@ impl FtsReader {
                 doc_id_end,
             );
         }
-        let should_cursors = self.build_term_cursors(column_id, shoulds).await?;
+        let should_cursors = self
+            .build_term_cursors_shared(column_id, shoulds, cache)
+            .await?;
         if should_cursors.is_empty() {
             return self.run_and_intersect(
                 column_id,
@@ -4229,10 +4337,15 @@ impl PhraseCursor {
     /// position runs, and their positional metadata — `(term_meta,
     /// inline_position)` per member, exactly one of the two present —
     /// then seek to the first matching doc.
+    /// `start_doc` is where the constructed cursor positions itself
+    /// (first verified match ≥ `start_doc`) — a sub-range unit passes
+    /// its window start so construction doesn't verify-walk the list
+    /// from doc 0; whole-list callers pass 0.
     fn new(
         cursors: Vec<TermCursor>,
         positions: Vec<Bytes>,
         positional: Vec<(Option<TermMeta>, Option<u32>)>,
+        start_doc: u32,
     ) -> Result<Self, FtsError> {
         debug_assert!(cursors.len() >= 2, "single-token phrases degrade to terms");
         debug_assert_eq!(cursors.len(), positions.len());
@@ -4266,7 +4379,7 @@ impl PhraseCursor {
             current_doc: 0,
             current_tf: 0,
         };
-        cursor.seek_match(0, f32::NEG_INFINITY, &NormTable::empty())?;
+        cursor.seek_match(start_doc, f32::NEG_INFINITY, &NormTable::empty())?;
         Ok(cursor)
     }
 
@@ -5134,6 +5247,38 @@ struct BlockMeta {
 /// `current_doc_id() == u32::MAX` is the "exhausted" sentinel; the
 /// WAND loop drops cursors that are exhausted at the top of each
 /// iteration.
+/// One fan-out wave's shared cursor prototypes for a single
+/// superfile. Keyed by `(column_id, joined term list)` — tokenized
+/// terms never contain NUL, so `\0` joins losslessly. Values are
+/// once-built prototype lists; readers hand out
+/// [`TermCursor::clone_reset`] copies. Scoped to one query wave (the
+/// supertable fan-out creates one per superfile per wave), so there
+/// is no eviction concern. Phrase position runs are cached under the
+/// same key space by [`FtsReader::build_atom_cursors`].
+#[derive(Default)]
+pub(crate) struct FtsCursorCache {
+    /// Prototype term-cursor lists (whole batched build result).
+    terms: DashMap<(u32, String), Arc<OnceCell<Vec<TermCursor>>>>,
+    /// Per-phrase member position runs + positional metadata,
+    /// aligned with the phrase's member cursors.
+    positions: DashMap<(u32, String), Arc<OnceCell<PhrasePositionsProto>>>,
+}
+
+/// Cached fetch outputs for one phrase's members: position-run bytes
+/// and the `(term_meta, inline_position)` pair per member — the
+/// inputs `PhraseCursor::new` needs beyond the member cursors.
+#[derive(Clone)]
+struct PhrasePositionsProto {
+    positions: Vec<Bytes>,
+    positional: Vec<(Option<TermMeta>, Option<u32>)>,
+}
+
+impl FtsCursorCache {
+    fn key(column_id: u32, terms: &[&str]) -> (u32, String) {
+        (column_id, terms.join("\0"))
+    }
+}
+
 struct TermCursor {
     /// Precomputed `idf * (K1 + 1)` — the score numerator's
     /// per-cursor constant. Computed once at cursor build so the
@@ -5149,8 +5294,11 @@ struct TermCursor {
     /// the 2-term OR router to detect a rare anchor term (short list),
     /// where WAND+BMW can skip the other term's long list.
     df: u64,
-    /// Per-block metadata.
-    blocks: Vec<BlockMeta>,
+    /// Per-block metadata. Shared (`Arc`) so sub-range fan-out units
+    /// can clone a built cursor without re-parsing the skip table —
+    /// on a merged shard's common term that table runs to thousands
+    /// of entries per term per unit otherwise.
+    blocks: Arc<[BlockMeta]>,
     /// Decoded buffers for the current block. Reused across decodes.
     block_doc_ids: Vec<u32>,
     block_tfs: Vec<u32>,
@@ -5221,7 +5369,7 @@ impl TermCursor {
             idf_x_k1p1: idf * (bm25::K1 + 1.0),
             term_max_bm25,
             df: term_meta.df,
-            blocks,
+            blocks: blocks.into(),
             block_doc_ids: vec![0u32; BLOCK_LEN],
             block_tfs: vec![0u32; BLOCK_LEN],
             block_n: 0,
@@ -5248,7 +5396,7 @@ impl TermCursor {
         let idf_x_k1p1 = idf * (bm25::K1 + 1.0);
         let block_max_bm25 = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
 
-        let blocks = vec![BlockMeta {
+        let blocks: Arc<[BlockMeta]> = Arc::from(vec![BlockMeta {
             last_doc_id: doc_id,
             // No postings-region bytes back this cursor; the decoded
             // buffer is pre-filled below so `decode_current_block` is
@@ -5256,7 +5404,7 @@ impl TermCursor {
             block_byte_offset: 0,
             block_byte_end: 0,
             block_max_bm25,
-        }];
+        }]);
 
         let mut block_doc_ids = vec![0u32; BLOCK_LEN];
         let mut block_tfs = vec![0u32; BLOCK_LEN];
@@ -5285,6 +5433,32 @@ impl TermCursor {
             .slice(block.block_byte_offset..block.block_byte_end);
         self.block_n = decode_block(&bytes, &mut self.block_doc_ids, &mut self.block_tfs);
         self.pos = 0;
+    }
+
+    /// Positional-reset clone for the sub-range fan-out's shared
+    /// cursor prototypes: the parsed skip table (`Arc`) and postings
+    /// bytes (`Bytes`) are shared, the decode buffers are copied.
+    /// Correct only against an **unwalked** prototype (as built by
+    /// [`Self::new`] / [`Self::new_inline`], both positioned at block
+    /// 0 with its decode buffered), so the copied buffers equal what
+    /// a fresh build would decode — inline cursors' pre-filled
+    /// buffers included.
+    fn clone_reset(&self) -> Self {
+        debug_assert_eq!(self.current_block, 0, "prototype cursors are never walked");
+        debug_assert_eq!(self.pos, 0, "prototype cursors are never walked");
+        Self {
+            idf_x_k1p1: self.idf_x_k1p1,
+            term_max_bm25: self.term_max_bm25,
+            df: self.df,
+            blocks: Arc::clone(&self.blocks),
+            block_doc_ids: self.block_doc_ids.clone(),
+            block_tfs: self.block_tfs.clone(),
+            block_n: self.block_n,
+            current_block: 0,
+            pos: 0,
+            inspect_block: 0,
+            bytes: self.bytes.clone(),
+        }
     }
 
     fn is_exhausted(&self) -> bool {
@@ -6791,14 +6965,48 @@ mod tests {
                         start,
                         end,
                         f32::NEG_INFINITY,
+                        None,
                     )
                     .await
                     .expect("ranged walk"),
                 );
             }
+            // Same union through one shared cursor cache — the shape
+            // the supertable wave uses, where every sub-range unit
+            // walks positional-reset clones of once-built prototypes.
+            let cache = FtsCursorCache::default();
+            let mut got_cached = Vec::new();
+            for w in 0..4u32 {
+                let (start, end) = (w * 175, (w + 1) * 175);
+                got_cached.extend(
+                    r.search_clauses_range_with_floor(
+                        "body",
+                        ClauseLists {
+                            musts: &musts,
+                            shoulds: &shoulds,
+                            negatives: &[],
+                            must_phrases: &[],
+                            should_phrases: &[],
+                            negative_phrases: &[],
+                        },
+                        usize::MAX,
+                        start,
+                        end,
+                        f32::NEG_INFINITY,
+                        Some(&cache),
+                    )
+                    .await
+                    .expect("cached ranged walk"),
+                );
+            }
+            got_cached.sort_by_key(|&(d, _)| d);
             expected.sort_by_key(|&(d, _)| d);
             got.sort_by_key(|&(d, _)| d);
             assert_eq!(got, expected, "musts={musts:?} shoulds={shoulds:?}");
+            assert_eq!(
+                got_cached, expected,
+                "cached: musts={musts:?} shoulds={shoulds:?}"
+            );
         }
     }
 
@@ -6881,16 +7089,50 @@ mod tests {
                         start,
                         end,
                         f32::NEG_INFINITY,
+                        None,
                     )
                     .await
                     .expect("ranged walk"),
                 );
             }
+            // Cached pass: member cursors + position runs shared
+            // across the sub-ranges, phrase cursors constructed with
+            // a direct window-start seek.
+            let cache = FtsCursorCache::default();
+            let mut got_cached = Vec::new();
+            for w in 0..4u32 {
+                let (start, end) = (w * 175, (w + 1) * 175);
+                got_cached.extend(
+                    r.search_clauses_range_with_floor(
+                        "body",
+                        ClauseLists {
+                            musts: &musts,
+                            shoulds: &shoulds,
+                            negatives: &[],
+                            must_phrases: &must_phrases,
+                            should_phrases: &should_phrases,
+                            negative_phrases: &[],
+                        },
+                        usize::MAX,
+                        start,
+                        end,
+                        f32::NEG_INFINITY,
+                        Some(&cache),
+                    )
+                    .await
+                    .expect("cached ranged walk"),
+                );
+            }
+            got_cached.sort_by_key(|&(d, _)| d);
             expected.sort_by_key(|&(d, _)| d);
             got.sort_by_key(|&(d, _)| d);
             assert_eq!(
                 got, expected,
                 "musts={musts:?} shoulds={shoulds:?} must_phrases={must_phrases:?} should_phrases={should_phrases:?}"
+            );
+            assert_eq!(
+                got_cached, expected,
+                "cached: musts={musts:?} shoulds={shoulds:?} must_phrases={must_phrases:?} should_phrases={should_phrases:?}"
             );
         }
     }

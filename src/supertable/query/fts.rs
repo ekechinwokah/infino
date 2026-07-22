@@ -81,6 +81,7 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, LargeStringArray};
+use dashmap::DashMap;
 use roaring::RoaringBitmap;
 use tokio::join;
 use tracing::debug;
@@ -93,7 +94,7 @@ use crate::{
         SuperfileReader,
         error::{FtsError, ReadError},
         fts::{
-            reader::ClauseLists,
+            reader::{ClauseLists, FtsCursorCache},
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
     },
@@ -337,6 +338,12 @@ async fn bm25_fanout_wave(
 
     let tombstones = ctx.tombstone_cache.clone();
     let now = Instant::now();
+    // Per-superfile shared cursor prototypes for this wave: sub-range
+    // units of one file run identical term lists, so the first unit
+    // builds each list (fetch + skip-table parse) once and the rest
+    // walk positional-reset clones — without this, N units multiply
+    // both the parse work and the cold posting-bytes fetched.
+    let cursor_caches: Arc<DashMap<Uuid, Arc<FtsCursorCache>>> = Arc::new(DashMap::new());
 
     // One shared fan-out (`query::dispatch::fanout`) — the same
     // orchestrator the vector path uses. It warms the tombstone
@@ -356,6 +363,7 @@ async fn bm25_fanout_wave(
         let shared = Arc::clone(&shared);
         let tombstones = tombstones.clone();
         let routing = routing.clone();
+        let cursor_caches = Arc::clone(&cursor_caches);
         async move {
             // A cross-file floor can suppress score-tied single-term hits
             // according to task completion order. Local BMW still prunes
@@ -417,6 +425,7 @@ async fn bm25_fanout_wave(
                 Some((start, end)) => {
                     let must_refs: Vec<&str> = must_arc.iter().map(|s| s.as_str()).collect();
                     let should_refs: Vec<&str> = should_arc.iter().map(|s| s.as_str()).collect();
+                    let cache = Arc::clone(&*cursor_caches.entry(suid).or_default());
                     r.bm25_search_clauses_range_with_floor(
                         &column_arc,
                         ClauseLists {
@@ -431,6 +440,7 @@ async fn bm25_fanout_wave(
                         start,
                         end,
                         floor,
+                        Some(&cache),
                     )
                     .await
                     .map_err(fts_read_error)?

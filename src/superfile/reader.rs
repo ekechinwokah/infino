@@ -52,7 +52,7 @@ use crate::{
         BytesLazyByteSource, LazyByteSource, LazySubSource, ReadError,
         format::{self, footer, kv},
         fts::{
-            reader::{self as fts_reader, BoolMode, ClauseLists, FtsReader},
+            reader::{self as fts_reader, BoolMode, ClauseLists, FtsCursorCache, FtsReader},
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
         vector::{
@@ -1151,6 +1151,7 @@ impl SuperfileReader {
 
     /// Positive-clause search over a doc-id sub-range — see
     /// [`FtsReader::search_clauses_range_with_floor`].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn bm25_search_clauses_range_with_floor(
         &self,
         column: &str,
@@ -1159,12 +1160,21 @@ impl SuperfileReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
+        cache: Option<&FtsCursorCache>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .search_clauses_range_with_floor(column, lists, k, doc_id_start, doc_id_end, floor)
+            .search_clauses_range_with_floor(
+                column,
+                lists,
+                k,
+                doc_id_start,
+                doc_id_end,
+                floor,
+                cache,
+            )
             .await?)
     }
 
