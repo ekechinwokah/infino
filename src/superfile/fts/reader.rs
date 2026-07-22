@@ -1363,8 +1363,46 @@ impl FtsReader {
                 )
                 .sum()
         };
+        // Covering blocks the survivors still need decoded — the
+        // probe-fetch list shared by the wave and the unrouted sweep.
+        let gather_probes = |survivor_docs: &mut dyn Iterator<Item = u32>,
+                             decoded_at: &HashMap<(u32, u32), usize>|
+         -> Vec<(usize, u32)> {
+            let mut wanted: HashSet<(usize, u32)> = HashSet::new();
+            for doc in survivor_docs {
+                for t in 0..routed.len() {
+                    if let Some(b) = covering_block(t, doc)
+                        && !decoded_at.contains_key(&(t as u32, b))
+                    {
+                        wanted.insert((t, b));
+                    }
+                }
+            }
+            let mut probes: Vec<(usize, u32)> = wanted.into_iter().collect();
+            // Deterministic fetch order (the set iterates hashed).
+            probes.sort_unstable();
+            probes
+        };
+        // Exact full score at doc, once every covering block is
+        // decoded: unrouted contributions + each routed term's.
+        let exact_score = |decoded_at: &HashMap<(u32, u32), usize>,
+                           decoded: &Vec<(Vec<u32>, Vec<u32>)>,
+                           doc: u32|
+         -> f32 {
+            let mut score = unrouted_contrib(doc);
+            for t in 0..routed.len() {
+                if let Some(b) = covering_block(t, doc)
+                    && let Some(c) = contrib_decoded(decoded_at, decoded, t, b, doc)
+                {
+                    score += c;
+                }
+            }
+            score
+        };
 
         let mut wave_cap = BLOCK_SELECT_FIRST_WAVE;
+        let total_blocks: usize = routed.iter().map(|r| r.quantized.len()).sum();
+        let mut admitted_total: usize = 0;
         loop {
             // `next_down` on the kth: a candidate tying the kth-best
             // can still displace it on the ascending-doc-id tie-break,
@@ -1401,6 +1439,17 @@ impl FtsReader {
             if wave.is_empty() {
                 break;
             }
+            // Degenerate-admission bail-out: when the bounds barely
+            // prune (near-flat rows that slipped the engagement
+            // gate), admission approaches a full — but serial and
+            // probe-heavy — walk; the sliced ranged walk is strictly
+            // better. Concede before paying it.
+            admitted_total += wave.len();
+            if total_blocks >= MULTI_SELECT_BAIL_MIN_BLOCKS
+                && admitted_total > total_blocks / MULTI_SELECT_MAX_ADMIT_DENOM
+            {
+                return Ok(None);
+            }
             // ---- Fetch + decode the wave.
             self.fetch_and_decode_blocks(
                 &wave,
@@ -1433,18 +1482,19 @@ impl FtsReader {
                     survivors.push((doc, t));
                 }
             }
-            // Probe fetches: covering blocks the survivors still need.
-            let mut probes: Vec<(usize, u32)> = Vec::new();
-            for &(doc, _) in &survivors {
-                for t in 0..routed.len() {
-                    if let Some(b) = covering_block(t, doc)
-                        && !decoded_at.contains_key(&(t as u32, b))
-                        && !probes.contains(&(t, b))
-                    {
-                        probes.push((t, b));
-                    }
-                }
+            if total_blocks >= MULTI_SELECT_BAIL_MIN_BLOCKS
+                && heap.len() >= k
+                && survivors.len() > MULTI_SELECT_MAX_SURVIVORS_PER_WAVE * k.max(1)
+            {
+                // With a real bar in place the essential gate still
+                // isn't holding (weak bounds) — per-survivor probing
+                // would dominate. Concede to the ranged walk. (A
+                // not-yet-full heap means survivors are seeding, not
+                // degeneracy.)
+                return Ok(None);
             }
+            // Probe fetches: covering blocks the survivors still need.
+            let probes = gather_probes(&mut survivors.iter().map(|&(d, _)| d), &decoded_at);
             self.fetch_and_decode_blocks(
                 &probes,
                 routed,
@@ -1455,29 +1505,11 @@ impl FtsReader {
             )
             .await?;
             for (doc, _) in survivors {
-                let mut score = unrouted_contrib(doc);
-                for t in 0..routed.len() {
-                    if let Some(b) = covering_block(t, doc)
-                        && let Some(c) = contrib_decoded(&decoded_at, &decoded, t, b, doc)
-                    {
-                        score += c;
-                    }
-                }
+                let score = exact_score(&decoded_at, &decoded, doc);
                 if score <= floor_eff {
                     continue;
                 }
-                let entry = TopKEntry(score, doc);
-                if heap.len() < k {
-                    heap.push(entry);
-                } else if let Some(top) = heap.peek()
-                    // The heap order is inverted (peek = worst kept),
-                    // so "less" means better — including the
-                    // lower-doc-id side of an exact score tie.
-                    && entry < *top
-                {
-                    heap.pop();
-                    heap.push(entry);
-                }
+                and_heap_push(&mut heap, k, None, score, doc);
             }
         }
 
@@ -1504,17 +1536,7 @@ impl FtsReader {
                 survivors.push(doc);
             }
         }
-        let mut probes: Vec<(usize, u32)> = Vec::new();
-        for &doc in &survivors {
-            for t in 0..routed.len() {
-                if let Some(b) = covering_block(t, doc)
-                    && !decoded_at.contains_key(&(t as u32, b))
-                    && !probes.contains(&(t, b))
-                {
-                    probes.push((t, b));
-                }
-            }
-        }
+        let probes = gather_probes(&mut survivors.iter().copied(), &decoded_at);
         self.fetch_and_decode_blocks(
             &probes,
             routed,
@@ -1525,26 +1547,11 @@ impl FtsReader {
         )
         .await?;
         for doc in survivors {
-            let mut score = unrouted_contrib(doc);
-            for t in 0..routed.len() {
-                if let Some(b) = covering_block(t, doc)
-                    && let Some(c) = contrib_decoded(&decoded_at, &decoded, t, b, doc)
-                {
-                    score += c;
-                }
-            }
+            let score = exact_score(&decoded_at, &decoded, doc);
             if score <= floor_eff {
                 continue;
             }
-            let entry = TopKEntry(score, doc);
-            if heap.len() < k {
-                heap.push(entry);
-            } else if let Some(top) = heap.peek()
-                && entry < *top
-            {
-                heap.pop();
-                heap.push(entry);
-            }
+            and_heap_push(&mut heap, k, None, score, doc);
         }
 
         Ok(Some(drain_top_k_desc(heap)))
@@ -5840,6 +5847,25 @@ pub(crate) struct RoutedTermRow<'a> {
     pub(crate) scale: f32,
 }
 
+/// Admission budget for the multi-term selected kernel, as a
+/// fraction of the query's total candidate blocks (denominator):
+/// admitting more than 1/4 of everything means the resident bounds
+/// are not pruning and the sliced ranged walk is the better plan.
+const MULTI_SELECT_MAX_ADMIT_DENOM: usize = 4;
+
+/// Total-candidate-block threshold below which the bail-outs never
+/// trip: on a small file even a full kernel walk (probes included)
+/// is cheap, and the exponential waves outgrow any small-file
+/// budget by design. Pathological admission only matters at merged-
+/// shard scale (thousands of blocks per term).
+const MULTI_SELECT_BAIL_MIN_BLOCKS: usize = 2048;
+
+/// Per-wave survivor budget for the multi-term selected kernel, as a
+/// multiple of k: survivors are the docs paying exact-rescore probes,
+/// and a wave producing orders of magnitude more of them than the
+/// heap can hold means the essential gate is not holding.
+const MULTI_SELECT_MAX_SURVIVORS_PER_WAVE: usize = 64;
+
 /// Largest block count an *unrouted* term may have before the
 /// multi-term block-selected kernel refuses to decode it whole and
 /// falls back to the ranged walk. Unrouted means df below the
@@ -8452,7 +8478,7 @@ mod tests {
                     scale: *scale,
                 })
                 .collect();
-            let got = r
+            let got = match r
                 .bm25_multi_term_or_block_selected(
                     "body",
                     k,
@@ -8463,7 +8489,15 @@ mod tests {
                 )
                 .await
                 .expect("kernel")
-                .expect("preconditions hold");
+            {
+                Some(got) => got,
+                None => {
+                    // Large k admits most of the corpus; the kernel
+                    // must concede to the ranged walk, not crawl.
+                    assert!(k >= 100, "kernel declined at small k={k}");
+                    continue;
+                }
+            };
             // Scores may differ in the last ULP: the whole walk sums
             // per-term contributions SIMD-packed in groups of four,
             // the kernel sums sequentially, and f32 addition is not

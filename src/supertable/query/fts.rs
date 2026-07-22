@@ -141,6 +141,28 @@ struct UnrankedNegatives {
     phrases: Vec<Vec<String>>,
 }
 
+/// Raise the wave's global floor with one unit's surviving scores,
+/// tombstone-filtered. Sidecars were prefetched by the dispatcher, so
+/// the bitmap lookup is an in-memory hit; on a cache miss/error we
+/// simply don't merge (a lower floor is always safe).
+fn merge_unit_scores(
+    shared: &SharedTopK,
+    tombstones: &Option<Arc<SidecarCache>>,
+    suid: Uuid,
+    now: Instant,
+    hits: &[(u32, f32)],
+) {
+    match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
+        Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
+            hits.iter()
+                .filter(|(d, _)| !bitmap.contains(*d))
+                .map(|(_, s)| *s),
+        ),
+        Some(Err(_)) => {}
+        _ => shared.merge(hits.iter().map(|(_, s)| *s)),
+    }
+}
+
 /// Minimum bare-OR term count for the multi-term block-selected
 /// kernel; a single bare term has its own dedicated selected walk.
 const MULTI_SELECT_MIN_TERMS: usize = 2;
@@ -429,15 +451,7 @@ async fn bm25_fanout_wave(
                         )
                         .await
                         .map_err(fts_read_error)?;
-                    match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
-                        Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
-                            hits.iter()
-                                .filter(|(d, _)| !bitmap.contains(*d))
-                                .map(|(_, s)| *s),
-                        ),
-                        Some(Err(_)) => {}
-                        _ => shared.merge(hits.iter().map(|(_, s)| *s)),
-                    }
+                    merge_unit_scores(&shared, &tombstones, suid, now, &hits);
                     return Ok(hits);
                 }
             }
@@ -459,11 +473,12 @@ async fn bm25_fanout_wave(
                     .iter()
                     .map(|term| state.term_block_max(suid, &column_arc, term))
                     .collect();
-                let any_prunable = rows
-                    .iter()
-                    .flatten()
-                    .any(|row| row.quantized.iter().min() < row.quantized.iter().max());
-                if any_prunable {
+                let engage = rows.iter().flatten().count() > 0
+                    && rows
+                        .iter()
+                        .flatten()
+                        .all(|row| row.quantized.iter().min() < row.quantized.iter().max());
+                if engage {
                     let mut routed_rows = Vec::new();
                     let mut unrouted: Vec<&str> = Vec::new();
                     for (term, row) in should_arc.iter().zip(&rows) {
@@ -489,15 +504,7 @@ async fn bm25_fanout_wave(
                         .await
                         .map_err(fts_read_error)?
                     {
-                        match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
-                            Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
-                                hits.iter()
-                                    .filter(|(d, _)| !bitmap.contains(*d))
-                                    .map(|(_, s)| *s),
-                            ),
-                            Some(Err(_)) => {}
-                            _ => shared.merge(hits.iter().map(|(_, s)| *s)),
-                        }
+                        merge_unit_scores(&shared, &tombstones, suid, now, &hits);
                         return Ok(hits);
                     }
                 }
@@ -551,20 +558,7 @@ async fn bm25_fanout_wave(
                     .map_err(fts_read_error)?
                 }
             };
-            // Raise the global floor with this unit's surviving
-            // scores. Sidecars were prefetched by the dispatcher,
-            // so the bitmap lookup is an in-memory hit; on a cache
-            // miss/error we simply don't merge (a lower floor is
-            // always safe).
-            match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
-                Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
-                    hits.iter()
-                        .filter(|(d, _)| !bitmap.contains(*d))
-                        .map(|(_, s)| *s),
-                ),
-                Some(Err(_)) => {}
-                _ => shared.merge(hits.iter().map(|(_, s)| *s)),
-            }
+            merge_unit_scores(&shared, &tombstones, suid, now, &hits);
             Ok(hits)
         }
     };
