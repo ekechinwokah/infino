@@ -20,6 +20,7 @@ use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap},
     ops::Range,
+    slice,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering as AtomicOrdering},
@@ -28,6 +29,7 @@ use std::{
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use futures::future::try_join_all;
 use serde::Deserialize;
 use tokio::sync::OnceCell;
 
@@ -1193,11 +1195,12 @@ impl FtsReader {
     /// Sub-range fan-out units of one superfile run identical term
     /// lists; without sharing, every unit re-fetches each term's full
     /// postings range and re-parses its skip table — N_units × the
-    /// parse work and N_units × the cold bytes. The first unit to
-    /// need a list builds it once (the batched
-    /// [`Self::build_term_cursors`] path, unchanged); every unit
-    /// walks positional-reset clones. `None` = build uncached (the
-    /// per-superfile, un-ranged shape).
+    /// parse work and N_units × the cold bytes. Each **term** is its
+    /// own once-cell, so racing units build *different* terms
+    /// concurrently (a single whole-list cell serialized the build
+    /// behind one unit — measured 15-30% slower than no cache at
+    /// all); every unit walks positional-reset clones. `None` =
+    /// build uncached (the per-superfile, un-ranged shape).
     async fn build_term_cursors_shared(
         &self,
         column_id: u32,
@@ -1207,17 +1210,31 @@ impl FtsReader {
         let Some(cache) = cache else {
             return self.build_term_cursors(column_id, terms).await;
         };
-        let cell = {
-            let entry = cache
-                .terms
-                .entry(FtsCursorCache::key(column_id, terms))
-                .or_default();
-            Arc::clone(entry.value())
-        };
-        let built = cell
-            .get_or_try_init(|| self.build_term_cursors(column_id, terms))
-            .await?;
-        Ok(built.iter().map(TermCursor::clone_reset).collect())
+        // All term cells polled concurrently (`try_join_all`), so a
+        // unit blocked on a term another unit is building still
+        // initializes the terms nobody has claimed yet — the build
+        // parallelizes across the racing units.
+        let cells: Vec<_> = terms
+            .iter()
+            .map(|term| {
+                let entry = cache
+                    .terms
+                    .entry(FtsCursorCache::key(column_id, slice::from_ref(term)))
+                    .or_default();
+                Arc::clone(entry.value())
+            })
+            .collect();
+        let built = try_join_all(terms.iter().zip(&cells).map(|(term, cell)| async move {
+            // A one-term build: zero cursors = FST miss (the caller
+            // applies polarity semantics), one = the prototype.
+            cell.get_or_try_init(|| self.build_term_cursors(column_id, slice::from_ref(term)))
+                .await
+        }))
+        .await?;
+        Ok(built
+            .iter()
+            .flat_map(|protos| protos.iter().map(TermCursor::clone_reset))
+            .collect())
     }
 
     /// Build one [`AnyCursor`] per requested atom, preserving input
@@ -7815,5 +7832,101 @@ mod tests {
             .expect("search over lazy reader");
         let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
         assert!(ids.contains(&0) && ids.contains(&1));
+    }
+    /// Diagnostic, not a gate — run explicitly with `--ignored
+    /// --nocapture`. Times 8 concurrent sub-range walks of a wide OR
+    /// over one in-memory blob, with and without the shared cursor
+    /// cache, isolating the cache's effect on warm ranged walks from
+    /// all supertable machinery.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "diagnostic; run with -- --ignored --nocapture"]
+    async fn diag_ranged_cache_walk_cost() {
+        use std::time::Instant;
+
+        /// Corpus size — large enough that skip tables have hundreds
+        /// of blocks per term.
+        const DOCS: u32 = 400_000;
+        /// Number of concurrent sub-range units.
+        const UNITS: u32 = 8;
+        /// Timed iterations per variant.
+        const ITERS: u32 = 30;
+
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for d in 0..DOCS {
+            let text = format!(
+                "alpha{} beta gamma{} delta epsilon{} zeta eta theta iota kappa filler{d}",
+                d % 3,
+                d % 5,
+                d % 2
+            );
+            b.add_doc(0, d, &text).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = Arc::new(FtsReader::open(blob, json).expect("open"));
+        let terms: Vec<&str> = vec![
+            "alpha0", "beta", "gamma0", "delta", "epsilon0", "zeta", "eta", "theta", "iota",
+            "kappa",
+        ];
+
+        // Variants: uncached / fresh cache per query / prebuilt cache
+        // (build cost excluded — isolates clone+walk).
+        for variant in ["uncached", "fresh", "prebuilt"] {
+            let prebuilt = Arc::new(FtsCursorCache::default());
+            if variant == "prebuilt" {
+                let refs: Vec<&str> = terms.to_vec();
+                r.build_term_cursors_shared(0, &refs, Some(&prebuilt))
+                    .await
+                    .expect("prebuild");
+            }
+            // Warmup + timed loop.
+            let mut total = std::time::Duration::ZERO;
+            for it in 0..(ITERS + 3) {
+                let cache = match variant {
+                    "prebuilt" => Arc::clone(&prebuilt),
+                    _ => Arc::new(FtsCursorCache::default()),
+                };
+                let use_cache = variant != "uncached";
+                let t = Instant::now();
+                let mut handles = Vec::new();
+                for u in 0..UNITS {
+                    let r = Arc::clone(&r);
+                    let cache = Arc::clone(&cache);
+                    let terms: Vec<String> = terms.iter().map(|s| s.to_string()).collect();
+                    handles.push(tokio::spawn(async move {
+                        let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+                        let (start, end) = (u * (DOCS / UNITS), (u + 1) * (DOCS / UNITS));
+                        r.search_clauses_range_with_floor(
+                            "body",
+                            ClauseLists {
+                                musts: &[],
+                                shoulds: &refs,
+                                negatives: &[],
+                                must_phrases: &[],
+                                should_phrases: &[],
+                                negative_phrases: &[],
+                            },
+                            10,
+                            start,
+                            end,
+                            f32::NEG_INFINITY,
+                            use_cache.then_some(cache.as_ref()),
+                            None,
+                        )
+                        .await
+                        .expect("ranged")
+                    }));
+                }
+                for h in handles {
+                    h.await.expect("join");
+                }
+                if it >= 3 {
+                    total += t.elapsed();
+                }
+            }
+            println!("{variant:>9}: {:>10.2?}/query", total / ITERS);
+        }
     }
 }
