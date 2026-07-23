@@ -1076,11 +1076,14 @@ const VECTOR_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
 // byte-target shards to one-per-drain-worker): scaled ~2x from the
 // 2-shard pins; tighten to measured+2 from the first Azure run on
 // the new layout.
+// Measured+2 on the one-shard-per-worker layout (7 shards at 1M,
+// Azure, 2026-07-23). The 10M column stays x3-scaled provisional
+// until the first 10M run on this topology.
 const FTS_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
     ("pre-drain", 130, 390),
-    ("post-drain", 70, 210),
-    ("post-delta", 86, 258),
-    ("post-compact", 70, 210),
+    ("post-drain", 80, 240),
+    ("post-delta", 94, 282),
+    ("post-compact", 30, 90),
 ];
 /// Second (steady) cold FTS query, tight at the exact 1M
 /// measurements (same runs as [`FTS_COLD_GET_CEILINGS_FIRST`]):
@@ -1090,9 +1093,9 @@ const FTS_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
 /// at 1M; post-delta 22 with the undrained tail).
 const FTS_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
     ("pre-drain", 128, 384),
-    ("post-drain", 32, 48),
-    ("post-delta", 48, 72),
-    ("post-compact", 32, 48),
+    ("post-drain", 3, 9),
+    ("post-delta", 22, 66),
+    ("post-compact", 5, 15),
 ];
 /// SQL scans are user-only in every state. 1M measured (first full
 /// SQL lifecycle after the settle-stall fixes): first cold 8 GETs
