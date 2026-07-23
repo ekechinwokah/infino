@@ -421,7 +421,7 @@ async fn bm25_fanout_wave(
             (Some(term), _, Some(state)) => kept.iter().partition(|e| {
                 state
                     .term_block_max(e.superfile_id, &column_arc, term)
-                    .is_some_and(|row| row.quantized.iter().min() < row.quantized.iter().max())
+                    .is_some_and(row_can_prune)
             }),
             // Mirror the kernel's engagement gate exactly (>= 1 row
             // present AND every present row prunable): a file that can
@@ -534,10 +534,14 @@ async fn bm25_fanout_wave(
                 let term = must_arc.first().or_else(|| should_arc.first());
                 if let Some(term) = term
                     && let Some(row) = state.term_block_max(suid, &column_arc, term)
-                    // Flat bounds can't prune: the ranged parallel
-                    // walk (sub-range units) beats a serial selected
-                    // walk that must visit everything anyway.
-                    && row.quantized.iter().min() < row.quantized.iter().max()
+                    // Near-flat bounds can't prune: the ranged
+                    // parallel walk (sub-range units) beats a serial
+                    // selected walk that must visit ~everything
+                    // anyway. Same spread bar as the partition above
+                    // and the multi-term gates — the two MUST agree
+                    // or a file parks on a unit that degrades to the
+                    // single-threaded whole-shard walk.
+                    && row_can_prune(row)
                 {
                     let hits = r
                         .bm25_single_term_block_selected(&column_arc, k, floor, &row.as_row())
@@ -2243,7 +2247,9 @@ mod tests {
     use datafusion::prelude::{col, lit};
     use tokio::runtime::Builder;
 
-    use super::{BoolMode, FanOut, build_work_units, fanout_for, hits_id_score_batch};
+    use super::{
+        BoolMode, FanOut, build_work_units, dispatch::open_reader, fanout_for, hits_id_score_batch,
+    };
     use crate::{
         config::{CompactionSettings, DEFAULT_STALE_SEAL_TIMEOUT_MS},
         storage::{LocalFsStorageProvider, StorageProvider},
@@ -3797,6 +3803,16 @@ mod tests {
             w.commit().expect("commit");
         }
         st.drain_vectors_to_cells_sync().expect("drain");
+        // One tombstone per commit before compacting: partially
+        // deleted inputs are the shape whose merge once repacked rows
+        // out of id order.
+        for c in 0..COMMITS {
+            let doc = c * PER + 5;
+            let stats = st
+                .delete(col("body").eq(lit(format!("uniq{doc} common filler"))))
+                .expect("delete");
+            assert_eq!(stats.n_tombstoned(), 1, "commit {c}");
+        }
         st.optimize(&OptimizeOptions::compact(PLACEMENT_TEST_COMPACTION))
             .expect("optimize");
 
@@ -3877,6 +3893,37 @@ mod tests {
                 "row {r} text {:?} not a valid doc",
                 body.value(r)
             );
+        }
+
+        // The merged user file must stay id-ordered even though its
+        // inputs carried tombstones — the per-file tie cap and the
+        // placement bisection both lean on the table's time/id-order
+        // contract, and the old deleted-first input packing broke
+        // exactly this.
+        let manifest = reader.manifest();
+        for entry in manifest.get_all_superfiles() {
+            let sf = block_on(open_reader(
+                &manifest.options.store,
+                manifest.options.disk_cache.as_ref(),
+                manifest.options.storage.as_ref(),
+                entry,
+                true,
+            ))
+            .expect("open user superfile");
+            let batch = sf.get_record_batch(None).expect("rows");
+            let idx = batch.schema().index_of("_id").expect("_id column");
+            let ids = batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("_id decimal");
+            for r in 1..ids.len() {
+                assert!(
+                    ids.value(r - 1) < ids.value(r),
+                    "user file {} `_id` column must ascend at row {r}",
+                    entry.superfile_id
+                );
+            }
         }
 
         // token_match and exact_match must honor the same placement +

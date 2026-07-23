@@ -1112,10 +1112,13 @@ impl FtsReader {
             false => order.len(),
         };
         while next < order.len() {
+            // `next_down` on the kth: a candidate tying the kth-best
+            // can still displace it on the ascending-doc-id tie-break,
+            // so gates must not skip score-tied blocks.
             let bar = match heap.len() >= k {
                 true => {
                     let TopKEntry(min_score, _) = heap.peek().expect("heap full");
-                    min_score.max(floor_eff)
+                    min_score.next_down().max(floor_eff)
                 }
                 false => floor_eff,
             };
@@ -1150,7 +1153,7 @@ impl FtsReader {
                 let bar = match heap.len() >= k {
                     true => {
                         let TopKEntry(min_score, _) = heap.peek().expect("heap full");
-                        min_score.max(floor_eff)
+                        min_score.next_down().max(floor_eff)
                     }
                     false => floor_eff,
                 };
@@ -1165,14 +1168,7 @@ impl FtsReader {
                     if score <= floor_eff {
                         continue;
                     }
-                    if heap.len() < k {
-                        heap.push(TopKEntry(score, doc_id));
-                    } else if let Some(TopKEntry(min_score, _)) = heap.peek()
-                        && score > *min_score
-                    {
-                        heap.pop();
-                        heap.push(TopKEntry(score, doc_id));
-                    }
+                    and_heap_push(&mut heap, k, None, score, doc_id);
                 }
             }
         }
@@ -1443,7 +1439,7 @@ impl FtsReader {
             let mut survivors: Vec<(u32, usize)> = Vec::new();
             for &(t, b) in &wave {
                 let slot = decoded_at[&(t as u32, b)];
-                let (docs, tfs) = (decoded[slot].0.clone(), decoded[slot].1.clone());
+                let (docs, tfs) = (&decoded[slot].0, &decoded[slot].1);
                 for (i, &doc) in docs.iter().enumerate() {
                     if seen.contains(&doc) {
                         continue;
@@ -1817,7 +1813,7 @@ impl FtsReader {
             let mut survivors: Vec<u32> = Vec::new();
             for &(t, b) in &wave {
                 let slot = decoded_at[&(t as u32, b)];
-                let (docs, tfs) = (decoded[slot].0.clone(), decoded[slot].1.clone());
+                let (docs, tfs) = (&decoded[slot].0, &decoded[slot].1);
                 for (i, &doc) in docs.iter().enumerate() {
                     let essential = bm25::score_with_dl_norm_k1(
                         routed_idf_x_k1p1[t],
@@ -3125,10 +3121,13 @@ impl FtsReader {
         cache: Option<&FtsCursorCache>,
         live: Option<&SharedFloor>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        debug_assert!(
-            lists.negatives.is_empty() && lists.negative_phrases.is_empty(),
-            "the ranged fan-out never carries negation"
-        );
+        // A real error, not a debug assert: dropping negation in a
+        // release build would return docs the query excludes.
+        if !lists.negatives.is_empty() || !lists.negative_phrases.is_empty() {
+            return Err(FtsError::DispatchInvariant(
+                "ranged fan-out unit carries negation".into(),
+            ));
+        }
         let column_id = self.resolve_column_id(column)?;
         if lists.no_positive_atoms() || k == 0 || doc_id_start >= doc_id_end {
             return Ok(Vec::new());
@@ -3922,10 +3921,14 @@ impl FtsReader {
         doc_id_end: u32,
         live: Option<&SharedFloor>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        debug_assert!(
-            !must_cursors.is_empty() && !should_cursors.is_empty(),
-            "dispatch routes empty-side shapes to the AND/OR kernels"
-        );
+        // A real error, not a debug assert: an empty side would score
+        // the wrong shape silently in release (dispatch routes
+        // empty-side shapes to the AND/OR kernels).
+        if must_cursors.is_empty() || should_cursors.is_empty() {
+            return Err(FtsError::DispatchInvariant(
+                "mixed must/should kernel needs both sides non-empty".into(),
+            ));
+        }
         if doc_id_start >= doc_id_end {
             return Ok(Vec::new());
         }

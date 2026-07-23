@@ -175,7 +175,7 @@ use crate::{
             part::{self as part_mod, PartId},
         },
         query::{dispatch::open_reader, vector::stable_ids_by_local_for_routing},
-        reader_cache::{DiskCacheStore, disk::mmap_readonly_bytes},
+        reader_cache::{DiskCacheStore, SuperfileReaderCache, disk::mmap_readonly_bytes},
         slow_vector_state,
         slow_vector_state::{CentroidSection, fetch_centroid_section},
     },
@@ -3428,6 +3428,42 @@ async fn generate_bigram_terms(
     Ok(out)
 }
 
+/// Extend the drained watermark to cover everything up to
+/// `drained_max`: versions are drained in birth order, so the covered
+/// set is always one contiguous prefix — the invariant both drain
+/// commit paths must stamp identically.
+fn extend_drained_prefix(new_drained: &mut DrainedVersionRanges, drained_max: u64) {
+    let lo = new_drained.prefix_end().map(|end| end + 1).unwrap_or(0);
+    new_drained.insert_range(lo.min(drained_max), drained_max);
+}
+
+/// Reuse a fully-resident cached reader for `uri`, else fetch the
+/// whole object and open it resident. Drain merges read raw index
+/// bytes synchronously, which a lazy/promoted (sparse) reader cannot
+/// serve. One definition for every drain path — the copies had
+/// already drifted apart in their error strings.
+async fn resident_reader_or_fetch(
+    store: &Arc<dyn SuperfileReaderCache>,
+    storage: Option<&Arc<dyn StorageProvider>>,
+    uri: &SuperfileUri,
+) -> Result<Arc<SuperfileReader>, BuildError> {
+    if let Ok(r) = store.reader(uri)
+        && r.is_fully_resident()
+    {
+        return Ok(r);
+    }
+    let storage = storage.ok_or_else(|| {
+        BuildError::Store("drain requires storage to load source superfiles".into())
+    })?;
+    let (bytes, _) = storage
+        .get(&uri.storage_path())
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+    Ok(Arc::new(
+        SuperfileReader::open(bytes).map_err(|e| BuildError::Store(e.to_string()))?,
+    ))
+}
+
 async fn drain_fts_text_shards(
     user_inner: &Arc<SupertableInner>,
     hidden_inner: &Arc<SupertableInner>,
@@ -3509,19 +3545,7 @@ async fn drain_fts_text_shards(
         let mut fold_readers: Vec<Arc<SuperfileReader>> = Vec::with_capacity(old_base.len());
         let hidden_store = hidden_inner.options.store.clone();
         for entry in &old_base {
-            let reader = match hidden_store.reader(&entry.uri) {
-                Ok(r) if r.is_fully_resident() => r,
-                _ => {
-                    let (bytes, _) = storage
-                        .get(&entry.uri.storage_path())
-                        .await
-                        .map_err(|e| BuildError::Store(e.to_string()))?;
-                    Arc::new(
-                        SuperfileReader::open(bytes)
-                            .map_err(|e| BuildError::Store(e.to_string()))?,
-                    )
-                }
-            };
+            let reader = resident_reader_or_fetch(&hidden_store, Some(storage), &entry.uri).await?;
             fold_readers.push(reader);
         }
         let mut fold_remaps: Vec<Vec<Option<u32>>> = Vec::with_capacity(fold_readers.len());
@@ -3626,36 +3650,28 @@ async fn drain_fts_text_shards(
         // Open the batch's user superfiles fully resident (reuse a
         // resident cached reader when present — drain just opened many
         // of these for the vector pass).
-        let readers: Vec<Arc<SuperfileReader>> = stream::iter(batch.iter().map(|entry| {
-            let entry = Arc::clone(entry);
-            let store = Arc::clone(&store);
-            let user_storage = user_storage.clone();
-            async move {
-                match store.reader(&entry.uri) {
-                    Ok(r) if r.is_fully_resident() => Ok(r),
-                    _ => {
-                        let user_storage = user_storage.as_ref().ok_or_else(|| {
-                            BuildError::Store(
-                                "text drain requires storage to load user superfiles".into(),
-                            )
-                        })?;
-                        let (bytes, _) = user_storage
-                            .get(&entry.uri.storage_path())
-                            .await
-                            .map_err(|e| BuildError::Store(e.to_string()))?;
-                        Ok::<_, BuildError>(Arc::new(
-                            SuperfileReader::open(bytes)
-                                .map_err(|e| BuildError::Store(e.to_string()))?,
-                        ))
+        // `buffered`, NOT `buffer_unordered`: the loop below pairs each
+        // reader with its entry's tombstone bitmap + stable ids by
+        // index, and shard-local doc ids must be assigned in source
+        // commit order — a completion-ordered collect would silently
+        // remap docs to the wrong `_id`s whenever opens finish out of
+        // order (e.g. one non-resident file in a resident batch).
+        let readers: Vec<Arc<SuperfileReader>> =
+            stream::iter(
+                batch.iter().map(|entry| {
+                    let entry = Arc::clone(entry);
+                    let store = Arc::clone(&store);
+                    let user_storage = user_storage.clone();
+                    async move {
+                        resident_reader_or_fetch(&store, user_storage.as_ref(), &entry.uri).await
                     }
-                }
-            }
-        }))
-        .buffer_unordered(drain_read_concurrency())
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, BuildError>>()?;
+                }),
+            )
+            .buffered(drain_read_concurrency())
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, BuildError>>()?;
 
         // Per source: tombstone-filtered remap into the merged doc
         // space + surviving stable ids (in remap order).
@@ -4142,7 +4158,9 @@ async fn drain_fts_only(
         budget,
     )
     .await?
-    .expect("fts columns checked by the caller");
+    .ok_or_else(|| {
+        BuildError::Store("text drain returned no outcome despite configured FTS columns".into())
+    })?;
 
     let text_routing = match outcome.fts_state.files.is_empty() {
         true => None,
@@ -4158,8 +4176,7 @@ async fn drain_fts_only(
         .map(|entry| entry.birth_version)
         .max()
         .unwrap_or(0);
-    let lo = new_drained.prefix_end().map(|end| end + 1).unwrap_or(0);
-    new_drained.insert_range(lo.min(drained_max), drained_max);
+    extend_drained_prefix(&mut new_drained, drained_max);
     let list_metadata = CommitListMetadata {
         partition_strategy: None,
         drained_ranges: Some(new_drained),
@@ -4564,24 +4581,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     // Fully-resident only: the splice reads real vector bytes
                     // synchronously, which a promoted hybrid reader (sparse
                     // vector region) cannot serve.
-                    let reader = match store.reader(&entry.uri) {
-                        Ok(r) if r.is_fully_resident() => r,
-                        _ => {
-                            let storage = storage_opt.as_ref().ok_or_else(|| {
-                                BuildError::Store(
-                                    "drain requires storage to load user superfiles".into(),
-                                )
-                            })?;
-                            let (bytes, _) = storage
-                                .get(&entry.uri.storage_path())
-                                .await
-                                .map_err(|e| BuildError::Store(e.to_string()))?;
-                            Arc::new(
-                                SuperfileReader::open(bytes)
-                                    .map_err(|e| BuildError::Store(e.to_string()))?,
-                            )
-                        }
-                    };
+                    let reader =
+                        resident_reader_or_fetch(&store, storage_opt.as_ref(), &entry.uri).await?;
                     let stable_ids = stable_ids_by_local_for_routing(&manifest, &entry, &reader)
                         .await
                         .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -5129,8 +5130,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .flat_map(|(versions, _)| versions.iter().copied())
             .max()
             .unwrap_or(0);
-        let lo = new_drained.prefix_end().map(|end| end + 1).unwrap_or(0);
-        new_drained.insert_range(lo.min(drained_max), drained_max);
+        extend_drained_prefix(&mut new_drained, drained_max);
         // Grid + drained watermark must land in the same OCC attempt as the
         // shard membership append — never ArcSwap.store them beforehand
         // (contention refresh would drop the stamps; readers would also see

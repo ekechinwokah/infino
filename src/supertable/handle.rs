@@ -2379,6 +2379,232 @@ mod tests {
         assert_eq!(rows[0].num_rows(), 1);
     }
 
+    /// Regression for the text drain's batch-open pairing: readers
+    /// must line up with their entries by INDEX even when opens
+    /// complete out of order. Three single-doc commits, a tombstone
+    /// on the first; that file's cached reader is suppressed and its
+    /// storage GET delayed so its open finishes LAST. A
+    /// completion-ordered collect (`buffer_unordered`, the bug) pairs
+    /// entry 0's tombstone bitmap with a later file's reader — the
+    /// merge then silently drops a LIVE doc and keeps the deleted one
+    /// (doc counts match, so no guard fires); the order-preserving
+    /// `buffered` keeps the pairing.
+    #[test]
+    fn text_drain_pairs_readers_with_entries_under_reordered_opens() {
+        use std::{ops::Range, sync::Mutex, time::Duration};
+
+        use arrow_array::{Array, LargeStringArray};
+        use async_trait::async_trait;
+        use bytes::Bytes;
+
+        use crate::{
+            storage::{ObjectMeta, StorageError},
+            superfile::fts::reader::BoolMode,
+            supertable::reader_cache::{ReaderCacheError, SuperfileReaderCache},
+        };
+
+        /// How long the slow file's GET lags the others — enough to
+        /// invert completion order against microsecond LocalFs reads.
+        const REORDER_DELAY: Duration = Duration::from_millis(150);
+
+        /// Suppresses cache hits for chosen uris so the drain takes
+        /// the storage-fetch path (where reordering can happen).
+        struct HidingCache {
+            inner: Arc<dyn SuperfileReaderCache>,
+            hidden: Mutex<HashSet<SuperfileUri>>,
+        }
+        impl SuperfileReaderCache for HidingCache {
+            fn reader(
+                &self,
+                uri: &SuperfileUri,
+            ) -> Result<Arc<crate::superfile::SuperfileReader>, ReaderCacheError> {
+                if self.hidden.lock().expect("lock").contains(uri) {
+                    return Err(ReaderCacheError::NotFound { uri: *uri });
+                }
+                self.inner.reader(uri)
+            }
+            fn insert(&self, uri: SuperfileUri, bytes: Bytes) -> Result<(), ReaderCacheError> {
+                self.inner.insert(uri, bytes)
+            }
+            fn resident_bytes(&self) -> usize {
+                self.inner.resident_bytes()
+            }
+            fn remove(&self, uri: &SuperfileUri) {
+                self.inner.remove(uri);
+            }
+        }
+
+        /// Delays `get` for one path so that open completes last.
+        #[derive(Debug)]
+        struct DelayedGet {
+            inner: Arc<dyn StorageProvider>,
+            slow_path: Mutex<Option<String>>,
+        }
+        #[async_trait]
+        impl StorageProvider for DelayedGet {
+            async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+                self.inner.head(uri).await
+            }
+            async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+                let slow = self.slow_path.lock().expect("lock").clone();
+                if let Some(p) = slow
+                    && uri.contains(&p)
+                {
+                    tokio::time::sleep(REORDER_DELAY).await;
+                }
+                self.inner.get(uri).await
+            }
+            async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+                self.inner.get_range(uri, range).await
+            }
+            async fn put_atomic(
+                &self,
+                uri: &str,
+                bytes: Bytes,
+            ) -> Result<Option<String>, StorageError> {
+                self.inner.put_atomic(uri, bytes).await
+            }
+            async fn put_if_match(
+                &self,
+                uri: &str,
+                bytes: Bytes,
+                e: Option<&str>,
+            ) -> Result<Option<String>, StorageError> {
+                self.inner.put_if_match(uri, bytes, e).await
+            }
+            async fn put_multipart(
+                &self,
+                uri: &str,
+            ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
+                self.inner.put_multipart(uri).await
+            }
+            async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+                self.inner.delete(uri).await
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let delayed = Arc::new(DelayedGet {
+            inner: Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider")),
+            slow_path: Mutex::new(None),
+        });
+        let storage: Arc<dyn StorageProvider> = Arc::clone(&delayed) as _;
+        let mut options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(Arc::clone(&storage))
+        .with_writer_pool(Arc::clone(&pool))
+        // One batch spanning all three files — the pairing under test
+        // only exists inside a multi-file batch (the options default
+        // of 1 file per batch can never mispair).
+        .with_drain_batch_superfiles(3);
+        let hiding = Arc::new(HidingCache {
+            inner: Arc::clone(&options.store),
+            hidden: Mutex::new(HashSet::new()),
+        });
+        options.store = Arc::clone(&hiding) as _;
+        let st = Supertable::create(options).expect("create");
+
+        // Three single-doc commits: equal doc counts keep the drain's
+        // length guard silent under mispairing.
+        for text in ["alpha zero", "bravo one", "charlie two"] {
+            let titles = LargeStringArray::from(vec![text]);
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(titles) as Arc<dyn Array>],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+            drop(w);
+        }
+
+        // Tombstone the OLDEST file's doc: under mispairing its
+        // bitmap lands on a different reader, so the merge drops a
+        // live doc and keeps this deleted one.
+        let stats = st
+            .delete(datafusion::prelude::col("title").eq(datafusion::prelude::lit("alpha zero")))
+            .expect("delete");
+        assert_eq!(stats.n_tombstoned(), 1);
+
+        // Pre-drain (user path): each survivor's stable id.
+        let id_of = |term: &str| -> i128 {
+            let rows = st
+                .reader()
+                .bm25_search("title", term, 10, BoolMode::Or, None)
+                .expect("bm25");
+            assert_eq!(rows[0].num_rows(), 1, "{term} matches one doc");
+            rows[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Decimal128Array>()
+                .expect("_id column")
+                .value(0)
+        };
+        let expected: Vec<(&str, i128)> = ["bravo", "charlie"]
+            .into_iter()
+            .map(|t| (t, id_of(t)))
+            .collect();
+
+        // Hide all three user files from the reader cache and delay
+        // the OLDEST one's GET: its open completes last, so a
+        // completion-ordered collect would pair it with the wrong
+        // entry (and both later entries shift accordingly).
+        let user_entries: Vec<Arc<SuperfileEntry>> = st.reader().manifest().superfiles.to_vec();
+        assert_eq!(user_entries.len(), 3);
+        let oldest = user_entries
+            .iter()
+            .min_by_key(|e| e.id_min)
+            .expect("nonempty");
+        *delayed.slow_path.lock().expect("lock") = Some(oldest.uri.storage_path());
+        hiding
+            .hidden
+            .lock()
+            .expect("lock")
+            .extend(user_entries.iter().map(|e| e.uri));
+
+        st.drain_vectors_to_cells_sync().expect("text-only drain");
+
+        hiding.hidden.lock().expect("lock").clear();
+        *delayed.slow_path.lock().expect("lock") = None;
+
+        // Post-drain (hidden route): the tombstoned doc is gone and
+        // each survivor keeps its stable id.
+        assert_eq!(
+            st.reader()
+                .count("title", "alpha", BoolMode::Or)
+                .expect("count"),
+            0,
+            "tombstoned doc's vocabulary must not survive the merge"
+        );
+        for (term, id) in expected {
+            assert_eq!(
+                id_of(term),
+                id,
+                "{term}'s stable id survived the drain merge"
+            );
+        }
+    }
+
     /// The drain also builds TEXT superfiles — term-range shards of the
     /// merged inverted index — in the same commit as the vector cells:
     /// entries carry FTS summaries + tagged TermShard keys, the merged
