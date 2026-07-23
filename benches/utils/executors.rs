@@ -340,8 +340,12 @@ pub mod fts {
             mode: BoolMode::Or,
         },
         FtsQuery {
+            // Doc 0's unique token — df=1 at EVERY corpus scale. A
+            // mid-corpus id (the old doc0500000) matches nothing below
+            // 1M docs, so small-scale runs would time a prune-to-empty
+            // no-op and trip the cold battery's >0-hits assertion.
             name: "single_df1",
-            terms: &["doc0500000"],
+            terms: &["doc0000000"],
             mode: BoolMode::Or,
         },
         FtsQuery {

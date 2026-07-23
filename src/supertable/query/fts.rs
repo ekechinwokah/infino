@@ -4202,3 +4202,76 @@ mod tests {
         watchdog.join().expect("watchdog");
     }
 }
+
+#[cfg(test)]
+mod cold_read_probe {
+    use std::sync::Arc;
+
+    use arrow_array::{LargeStringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use tempfile::TempDir;
+
+    use super::BoolMode;
+    use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
+        superfile::builder::FtsConfig,
+        supertable::{Supertable, SupertableOptions},
+        test_helpers::default_tokenizer as tok,
+    };
+
+    /// PROBE: does a df=1 bare-term search on a freshly OPENED consumer
+    /// (new process-equivalent: new handle, new reader cache) read any
+    /// bytes from the storage provider?
+    #[test]
+    fn df1_cold_search_reads_storage_probe() {
+        const COMMITS: u32 = 2;
+        const PER: u32 = 300;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "body",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let dir = TempDir::new_in("/mnt/scratch/tmp").expect("tempdir");
+        let provider = Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let storage: Arc<dyn StorageProvider> = provider.clone();
+        let mk_options = || {
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "body".into(),
+                    positions: false,
+                }],
+                vec![],
+                Some(tok()),
+            )
+            .expect("options")
+            .with_storage(storage.clone())
+        };
+        let st = Supertable::create(mk_options()).expect("create");
+        for c in 0..COMMITS {
+            let texts: Vec<String> = (0..PER)
+                .map(|i| format!("uniq{} common filler", c * PER + i))
+                .collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(LargeStringArray::from(texts)) as _],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        drop(st);
+
+        let consumer = Supertable::open(mk_options()).expect("reopen");
+        let before = provider.usage_meter().snapshot();
+        let rows = consumer
+            .bm25_search("body", "uniq0", 10, BoolMode::Or, None)
+            .expect("df1 search");
+        let io = provider.usage_meter().snapshot().since(&before);
+        let hits: usize = rows.iter().map(|b| b.num_rows()).sum();
+        eprintln!("PROBE df1: {} hit(s), {} GET during search", hits, io.get_count);
+        assert_eq!(hits, 1, "df1 term matches exactly one doc");
+    }
+}

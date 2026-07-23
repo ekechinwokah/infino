@@ -2336,6 +2336,7 @@ pub mod fts {
             mode: infino::superfile::fts::reader::BoolMode,
         ) -> usize {
             let before = self.meter.snapshot();
+            let proc_before = infino::runtime_metrics::UsageMeter::process_default().snapshot();
             let rows: usize = self
                 .consumer
                 .reader()
@@ -2345,11 +2346,15 @@ pub mod fts {
                 .map(|b| b.num_rows())
                 .sum();
             let io = self.meter.snapshot().since(&before);
+            let proc_io = infino::runtime_metrics::UsageMeter::process_default()
+                .snapshot()
+                .since(&proc_before);
             eprintln!(
-                "[supertable_fts]   cold search I/O: {} GET ({} down), {} hit(s)",
+                "[supertable_fts]   cold search I/O: {} GET ({} down), {} hit(s)                  [process meter: {} GET]",
                 io.get_count,
                 rss::fmt_bytes(io.get_bytes),
                 rows,
+                proc_io.get_count,
             );
             rows
         }
