@@ -4297,9 +4297,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // The global cell grid is owned by the USER manifest (bootstrapped at the
     // first commit). The hidden cell index is the derived copy this drain writes.
     let Some(gvi) = user_inner.manifest.load_full().get_global_vector_index() else {
-        // FTS-only tables never train a grid; their hidden sibling holds
-        // text superfiles alone, drained by the text half by itself.
-        if user_inner.options.fts_columns.is_empty() {
+        // Tables with no vector grid (FTS-only or scalar-index-only)
+        // still drain: their hidden sibling holds text superfiles
+        // alone, drained by the text half by itself.
+        if user_inner.options.fts_columns.is_empty()
+            && user_inner.options.scalar_index_columns.is_empty()
+        {
             return Ok(());
         }
         return drain_fts_only(&user_inner, &hidden_inner).await;

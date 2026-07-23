@@ -447,6 +447,13 @@ pub mod kv {
 /// internal namespace separate even if we add more KV keys later.
 pub const RESERVED_PREFIX: &str = "inf.";
 
+/// Shard-column namespace for drain-injected scalar-index
+/// dictionaries (`inf.sidx.<user column>`). Deliberately under
+/// [`RESERVED_PREFIX`] so user tables can never claim it; the
+/// superfile builder admits it only under an explicit internal
+/// opt-in ([`crate::superfile::builder::BuilderOptions`]).
+pub const SCALAR_INDEX_PREFIX: &str = "inf.sidx.";
+
 /// Reserved separator byte inside FST keys (`<column>\x1F<term>`). User
 /// column names must not contain this byte. ASCII Unit Separator (U+001F)
 /// is below every printable ASCII char so prefix iteration over a column's

@@ -52,7 +52,7 @@ use datafusion::scalar::ScalarValue;
 /// text shards: `inf.sidx.<user column>`. It builds on the options
 /// layer's reserved `inf.` prefix — user column names can never start
 /// with it — so index columns cannot collide with user FTS columns.
-pub(crate) const SCALAR_INDEX_COLUMN_PREFIX: &str = "inf.sidx.";
+pub(crate) use crate::superfile::format::SCALAR_INDEX_PREFIX as SCALAR_INDEX_COLUMN_PREFIX;
 
 /// The hidden-blob column name carrying `column`'s scalar index.
 pub(crate) fn scalar_index_column_name(column: &str) -> String {

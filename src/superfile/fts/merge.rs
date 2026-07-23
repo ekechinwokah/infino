@@ -159,10 +159,12 @@ pub(crate) async fn merge_fts_blobs<W: Write>(
         // Merged per-doc lengths: scatter each source's raw doc-length
         // array through its remap. Docs absent from the column keep 0.
         let mut merged_dl: Vec<u32> = vec![0; n_docs_merged as usize];
+        let mut column_in_sources = false;
         for s in sources {
             if !s.reader.fts_columns().any(|c| c == name) {
                 continue;
             }
+            column_in_sources = true;
             let src_dl = s
                 .reader
                 .column_doc_lengths_raw(name)
@@ -172,6 +174,24 @@ pub(crate) async fn merge_fts_blobs<W: Write>(
             for (local, &dl) in src_dl.iter().enumerate() {
                 if let Some(merged) = s.doc_id_remap[local] {
                     merged_dl[merged as usize] = dl;
+                }
+            }
+        }
+        // A synthetic-only column (no source carries it — scalar-index
+        // values injected for the first time) derives its doc lengths
+        // from the synthetic postings: each (doc, tf) IS the column's
+        // token stream for that doc. Without this the column's avgdl
+        // is 0 and the reader builds the empty norm table reserved for
+        // truly empty columns — which token_match then indexes into.
+        // Source-backed columns never mix synthetic tf into dl: text
+        // bigrams are derived data and must not perturb the
+        // unigram-normalized BM25 lengths.
+        if !column_in_sources {
+            for syn in synthetic.iter().filter(|s| s.column == *name) {
+                for term in &syn.terms {
+                    for &(doc, tf) in &term.pairs {
+                        merged_dl[doc as usize] += tf;
+                    }
                 }
             }
         }

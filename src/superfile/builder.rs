@@ -545,7 +545,19 @@ impl SuperfileBuilder {
         //    schema-name-vs-vector collision).
         let mut seen_logical: HashSet<&str> = HashSet::new();
         for fc in &opts.fts_columns {
-            check_user_column_name(&fc.column)?;
+            // Drain-injected scalar-index dictionaries are the one
+            // legitimate reserved-namespace tenant, admitted only on
+            // internal prebuilt shard builds — user-facing builds
+            // still reject the whole `inf.` prefix. The separator ban
+            // applies to every name unconditionally.
+            match opts.prebuilt_fts && fc.column.starts_with(format::SCALAR_INDEX_PREFIX) {
+                true => {
+                    if fc.column.as_bytes().contains(&format::FST_SEPARATOR) {
+                        return Err(BuildError::ReservedSeparatorInColumnName(fc.column.clone()));
+                    }
+                }
+                false => check_user_column_name(&fc.column)?,
+            }
             if !seen_logical.insert(fc.column.as_str()) {
                 return Err(BuildError::DuplicateLogicalName(fc.column.clone()));
             }
