@@ -51,6 +51,14 @@ pub enum BuildError {
     #[error("vector column {column:?} not found in schema")]
     VectorColumnMissing { column: String },
 
+    #[error("scalar-index column {column:?} not found in schema")]
+    ScalarIndexColumnMissing { column: String },
+
+    #[error(
+        "scalar-index column {column:?} has unsupported type {actual} —          supported: integers, floats, Utf8/LargeUtf8, Boolean,          Date32/Date64, Timestamp, Decimal128"
+    )]
+    ScalarIndexColumnUnsupportedType { column: String, actual: String },
+
     #[error("vector column {column:?} must be FixedSizeList<Float32, {dim}>; found {actual}")]
     VectorColumnNotFixedSizeList {
         column: String,

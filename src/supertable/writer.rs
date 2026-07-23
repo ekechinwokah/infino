@@ -51,7 +51,7 @@
 use std::sync::Mutex as StdMutex;
 use std::{
     cmp,
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
     env, fmt, fs,
     fs::File,
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
@@ -176,6 +176,7 @@ use crate::{
         },
         query::{dispatch::open_reader, vector::stable_ids_by_local_for_routing},
         reader_cache::{DiskCacheStore, disk::mmap_readonly_bytes},
+        scalar_index::{encode_array_value, is_scalar_index_column, scalar_index_column_name},
         slow_vector_state,
         slow_vector_state::{CentroidSection, fetch_centroid_section},
     },
@@ -3438,7 +3439,8 @@ async fn drain_fts_text_shards(
     batch_budget: usize,
 ) -> Result<Option<TextDrainOutcome>, BuildError> {
     let fts_columns = &user_inner.options.fts_columns;
-    if fts_columns.is_empty() {
+    let scalar_index_columns = &user_inner.options.scalar_index_columns;
+    if fts_columns.is_empty() && scalar_index_columns.is_empty() {
         return Ok(None);
     }
     let text_t0 = time::Instant::now();
@@ -3455,14 +3457,33 @@ async fn drain_fts_text_shards(
         .cloned()
         .collect();
 
-    let merge_columns: Vec<MergeColumn> = fts_columns
+    // Scalar-index columns ride the text shards as extra dictionary
+    // columns under the reserved `inf.sidx.` namespace: each batch
+    // injects its (encoded value → merged doc) postings as synthetic
+    // terms, and from then on they merge forward as ordinary source
+    // entries — never dropped (hex-armored keys carry no separator,
+    // and unlike bigrams they cannot be regenerated from the shard's
+    // own postings, so they must survive every fold).
+    let shard_fts_configs: Vec<FtsConfig> = fts_columns
+        .iter()
+        .cloned()
+        .chain(scalar_index_columns.iter().map(|c| FtsConfig {
+            column: scalar_index_column_name(c),
+            positions: false,
+        }))
+        .collect();
+    let merge_columns: Vec<MergeColumn> = shard_fts_configs
         .iter()
         .map(|fc| MergeColumn {
             name: fc.column.clone(),
             positions: fc.positions,
+            // User text columns: drain-generated bigram synthetics
+            // are derived data, regenerated fresh each merge. Scalar
+            // index columns are source-of-truth (see above).
+            drop_separator_terms: !is_scalar_index_column(&fc.column),
         })
         .collect();
-    let columns_json = fts_columns_json(fts_columns);
+    let columns_json = fts_columns_json(&shard_fts_configs);
 
     // Deterministic source order: merged ids must be monotone within a
     // source and disjoint ascending across sources (the merge encoder
@@ -3661,13 +3682,20 @@ async fn drain_fts_text_shards(
         // space + surviving stable ids (in remap order).
         let mut remaps: Vec<Vec<Option<u32>>> = Vec::with_capacity(readers.len());
         for (entry, reader) in batch.iter().zip(&readers) {
-            let fts = reader.fts().ok_or_else(|| {
-                BuildError::Store(format!(
+            // Text columns require the source's FTS blob; a
+            // scalar-only table has none — its doc count comes from
+            // the manifest and every dictionary entry is injected
+            // synthetically below.
+            if !fts_columns.is_empty() && reader.fts().is_none() {
+                return Err(BuildError::Store(format!(
                     "user superfile {} lacks an FTS blob despite configured FTS columns",
                     entry.superfile_id
-                ))
-            })?;
-            let n_local = fts.n_docs() as usize;
+                )));
+            }
+            let n_local = match reader.fts() {
+                Some(fts) => fts.n_docs() as usize,
+                None => entry.n_docs as usize,
+            };
             let stable_ids = stable_ids_by_local_for_routing(user_manifest, entry, reader)
                 .await
                 .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -3713,14 +3741,55 @@ async fn drain_fts_text_shards(
             remaps.push(remap);
         }
 
+        // Scalar-index synthetic terms for this batch: per indexed
+        // column, encode each live row's value and collect
+        // (merged doc, tf=1) postings per key. BTreeMap keeps keys
+        // ascending (the union requires it); pushes happen in source
+        // order then local order, which is exactly merged-doc order,
+        // so each posting list arrives sorted.
+        let mut scalar_synthetics: Vec<SyntheticTerms> = Vec::new();
+        for column in scalar_index_columns {
+            let mut by_key: BTreeMap<Vec<u8>, Vec<(u32, u32)>> = BTreeMap::new();
+            for (reader, remap) in readers.iter().zip(&remaps) {
+                if remap.is_empty() {
+                    continue;
+                }
+                let locals: Vec<u32> = (0..remap.len() as u32).collect();
+                let rows = reader
+                    .take_by_local_doc_ids(&locals, &[column.as_str()])
+                    .map_err(|e| BuildError::Store(format!("scalar index read: {e}")))?;
+                let array = rows.column(0);
+                for (local, merged) in remap.iter().enumerate() {
+                    let Some(merged) = merged else { continue };
+                    let Some(key) = encode_array_value(array.as_ref(), local) else {
+                        continue;
+                    };
+                    by_key.entry(key).or_default().push((*merged, 1));
+                }
+            }
+            scalar_synthetics.push(SyntheticTerms {
+                column: scalar_index_column_name(column),
+                terms: by_key
+                    .into_iter()
+                    .map(|(term, pairs)| SyntheticTerm {
+                        term,
+                        pairs,
+                        runs: Vec::new(),
+                    })
+                    .collect(),
+            });
+        }
+
         // Merge just this batch into its own run; the tier cascade
         // (push_text_run) bounds how often any posting byte re-merges.
         let merge_sources: Vec<MergeSource<'_>> = readers
             .iter()
             .zip(&remaps)
-            .map(|(reader, remap)| MergeSource {
-                reader: reader.fts().expect("checked above"),
-                doc_id_remap: remap,
+            .filter_map(|(reader, remap)| {
+                reader.fts().map(|fts| MergeSource {
+                    reader: fts,
+                    doc_id_remap: remap,
+                })
             })
             .collect();
 
@@ -3735,7 +3804,7 @@ async fn drain_fts_text_shards(
             &merge_columns,
             batch_live,
             None,
-            &[],
+            &scalar_synthetics,
             &mut next_file,
         )
         .await?;
@@ -3901,7 +3970,7 @@ async fn drain_fts_text_shards(
         let opts = BuilderOptions::new(
             scalar_schema.clone(),
             id_column.clone(),
-            fts_columns.clone(),
+            shard_fts_configs.clone(),
             vec![],
             None,
         )
@@ -7745,6 +7814,7 @@ mod tests {
         let columns = [MergeColumn {
             name: "body".into(),
             positions: false,
+            drop_separator_terms: true,
         }];
 
         let dir = TempDir::new().expect("tempdir");

@@ -259,6 +259,16 @@ pub struct SupertableOptions {
     /// `FixedSizeList<Float32, dim>` with matching `list_size`.
     /// May be empty.
     pub vector_columns: Vec<VectorConfig>,
+    /// Scalar columns indexed in the hidden supertable's
+    /// **scalar-index family**: at drain time each column's
+    /// `(order-preserving-encoded value, _id)` pairs are merged into
+    /// value-organized shards so equality / IN / range predicates
+    /// resolve to `_id` sets with a dictionary probe instead of a
+    /// full-table scan fan-out. Set via
+    /// [`Self::with_scalar_index_columns`] (validated there). May be
+    /// empty (no scalar index — scans keep today's stats-pruned
+    /// path).
+    pub scalar_index_columns: Vec<String>,
     /// Shared tokenizer for all FTS columns. Required iff
     /// `fts_columns` is non-empty.
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
@@ -622,6 +632,7 @@ impl SupertableOptions {
             id_column,
             fts_columns,
             vector_columns,
+            scalar_index_columns: Vec::new(),
             tokenizer,
             reader_pool,
             writer_pool,
@@ -701,6 +712,41 @@ impl SupertableOptions {
     /// Rejects names that already appear in the user schema
     /// (same check as construction) by returning
     /// [`BuildError::IdColumnReserved`].
+    /// Declare scalar-index columns (see
+    /// [`Self::scalar_index_columns`]). Validated here with the same
+    /// construction-time contract as `new`'s fts/vector checks: each
+    /// column must exist in the schema, carry a supported orderable
+    /// type, appear once, and not already be claimed by the id
+    /// column, an FTS column, or a vector column.
+    pub fn with_scalar_index_columns(mut self, columns: Vec<String>) -> Result<Self, BuildError> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for column in &columns {
+            check_user_column_name(column)?;
+            if *column == self.id_column
+                || self.fts_columns.iter().any(|fc| &fc.column == column)
+                || self.vector_columns.iter().any(|vc| &vc.column == column)
+                || !seen.insert(column.as_str())
+            {
+                return Err(BuildError::DuplicateLogicalName(column.clone()));
+            }
+            let idx =
+                self.schema
+                    .index_of(column)
+                    .map_err(|_| BuildError::ScalarIndexColumnMissing {
+                        column: column.clone(),
+                    })?;
+            let dt = self.schema.field(idx).data_type();
+            if !scalar_index_type_supported(dt) {
+                return Err(BuildError::ScalarIndexColumnUnsupportedType {
+                    column: column.clone(),
+                    actual: format!("{dt:?}"),
+                });
+            }
+        }
+        self.scalar_index_columns = columns;
+        Ok(self)
+    }
+
     pub fn with_id_column(mut self, name: impl Into<String>) -> Result<Self, BuildError> {
         let name = name.into();
         if self.schema.fields().iter().any(|f| f.name() == &name) {
@@ -1169,6 +1215,33 @@ impl fmt::Debug for SupertableOptions {
 /// — mirrored here so the typed error surfaces at the
 /// supertable-options layer before any `SuperfileBuilder` is
 /// constructed downstream.
+/// Whether `dt` can serve as a scalar-index key: a total
+/// order-preserving byte encoding exists for it (see
+/// `supertable::scalar_index`). Nested, binary, and interval types are
+/// out of scope for v1.
+fn scalar_index_type_supported(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Boolean
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Timestamp(_, _)
+            | DataType::Decimal128(_, _)
+    )
+}
+
 fn check_user_column_name(name: &str) -> Result<(), BuildError> {
     if name.contains(RESERVED_SEPARATOR) {
         return Err(BuildError::ReservedSeparatorInColumnName(name.to_string()));

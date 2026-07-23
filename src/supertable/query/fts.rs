@@ -111,6 +111,7 @@ use crate::{
             },
         },
         reader_cache::disk::ForegroundQueryGuard,
+        scalar_index::scalar_index_column_name,
         slow_fts_state::{SlowFtsState, TermBlockMax},
         tombstones::SidecarCache,
     },
@@ -169,6 +170,13 @@ fn merge_unit_scores(
 
 /// Minimum bare-OR term count for the multi-term block-selected
 /// kernel; a single bare term has its own dedicated selected walk.
+/// Summed-df ceiling for a scalar-index id lookup: past this many
+/// matching rows the predicate is unselective enough that resolving
+/// ids (posting decode + stub id reads) would rival the scan it is
+/// meant to prune, so the lookup declines and the caller keeps its
+/// stats-pruned plan.
+const SCALAR_INDEX_LOOKUP_MAX_IDS: u64 = 65_536;
+
 const MULTI_SELECT_MIN_TERMS: usize = 2;
 /// Minimum quantized block-bound spread for a resident row to count
 /// as prunable at routing time. Bounds are ceil-quantized to u8
@@ -1411,6 +1419,92 @@ impl SupertableReader {
         feature = "detailed-tracing",
         tracing::instrument(skip_all, fields(column = column, mode = ?mode))
     )]
+    /// Resolve the stable `_id`s of every DRAINED row whose indexed
+    /// scalar `column` equals one of `keys` (order-preserving encoded
+    /// + hex-armored dictionary keys — see `supertable::scalar_index`).
+    ///
+    /// This is the unranked exact-term match run against the hidden
+    /// text shards' `inf.sidx.<column>` dictionary column, feeding the
+    /// wave PRE-TOKENIZED (index keys must never pass through a user
+    /// tokenizer). The undrained tail is deliberately NOT covered —
+    /// the caller keeps its stats-pruned scan for tail files — and
+    /// post-epoch deletes are identity-filtered here.
+    ///
+    /// Returns `None` (caller falls back to the plain scan) when the
+    /// hidden epoch has no text shards, or when the keys' summed df
+    /// exceeds [`SCALAR_INDEX_LOOKUP_MAX_IDS`] — an unselective
+    /// predicate would resolve more ids than the scan it is meant to
+    /// prune would read.
+    pub(crate) async fn scalar_index_ids(
+        &self,
+        column: &str,
+        keys: &[String],
+    ) -> Result<Option<Vec<i128>>, QueryError> {
+        if keys.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let Some(route) = self.hidden_text_route().await? else {
+            return Ok(None);
+        };
+        let index_column = scalar_index_column_name(column);
+        let prune_leaf = PruneLeaf::TermPresence {
+            column: index_column.clone(),
+            terms: keys.to_vec(),
+            mode: BoolMode::Or,
+        };
+        let text_entries = Self::text_shards_pruned(&route, &prune_leaf).await?;
+        if text_entries.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let column_arc = Arc::new(index_column);
+        // df cap before any posting decode: the dictionary knows each
+        // key's df per shard (an absent key reads as 0).
+        let hidden_manifest = route.hidden_reader.manifest();
+        let mut total_df: u64 = 0;
+        for entry in &text_entries {
+            let reader = dispatch::open_reader(
+                &hidden_manifest.options.store,
+                hidden_manifest.options.disk_cache.as_ref(),
+                hidden_manifest.options.storage.as_ref(),
+                entry,
+                true,
+            )
+            .await?;
+            if reader.fts().is_some() {
+                for key in keys {
+                    total_df = total_df.saturating_add(
+                        reader
+                            .term_df(column_arc.as_str(), key)
+                            .await
+                            .map_err(fts_read_error)?,
+                    );
+                }
+            }
+            if total_df > SCALAR_INDEX_LOOKUP_MAX_IDS {
+                return Ok(None);
+            }
+        }
+        let hits = token_match_wave(
+            &route.hidden_reader,
+            text_entries,
+            Arc::clone(&column_arc),
+            Arc::new(keys.to_vec()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            BoolMode::Or,
+        )
+        .await?;
+        let mut ids: Vec<i128> = hits
+            .into_iter()
+            .filter_map(|hit| hit.stable_id)
+            .filter(|id| route.deleted.binary_search(id).is_err())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(Some(ids))
+    }
+
     pub(crate) async fn token_match_async(
         &self,
         column: &str,

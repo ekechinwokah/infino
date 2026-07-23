@@ -57,6 +57,15 @@ pub(crate) struct MergeColumn {
     /// sources' positional flag for this column (the format never
     /// mixes strides within a column).
     pub positions: bool,
+    /// Whether source terms containing [`FST_SEPARATOR`] are DERIVED
+    /// data to drop before the union. True for text columns: their
+    /// separator-embedding terms are drain-generated bigrams that the
+    /// caller regenerates fresh each merge. False for scalar-index
+    /// columns: their terms are opaque order-preserving value
+    /// encodings whose bytes may legitimately contain the separator,
+    /// and they are source-of-truth — dropping them would lose rows
+    /// from the index.
+    pub drop_separator_terms: bool,
 }
 
 /// One drain-generated synthetic term (an adjacent-pair bigram):
@@ -140,7 +149,11 @@ pub(crate) async fn merge_fts_blobs<W: Write>(
     let mut merged_runs: Vec<u8> = Vec::new();
 
     for &orig_idx in &work {
-        let MergeColumn { name, positions } = &columns[orig_idx];
+        let MergeColumn {
+            name,
+            positions,
+            drop_separator_terms,
+        } = &columns[orig_idx];
         let col_name_bytes = name.as_bytes();
 
         // Merged per-doc lengths: scatter each source's raw doc-length
@@ -176,12 +189,23 @@ pub(crate) async fn merge_fts_blobs<W: Write>(
         // simplification).
         let mut entries: Vec<Vec<(Vec<u8>, u64)>> = Vec::with_capacity(sources.len());
         for s in sources {
+            // A source may not carry this column at all (a
+            // synthetic-only column — e.g. scalar-index values being
+            // injected for the first time): same guard as the
+            // doc-length scatter above.
+            if !s.reader.fts_columns().any(|c| c == name) {
+                entries.push(Vec::new());
+                continue;
+            }
             let mut source_entries = s.reader.column_term_entries(name).map_err(map_source_err)?;
-            // Synthetic terms are derived data — drop any prior
-            // generation carried by a source so the union never mixes
-            // stale bigrams with the caller's fresh stream (see
-            // [`SyntheticTerms`]).
-            source_entries.retain(|(term, _)| !term.contains(&FST_SEPARATOR));
+            if *drop_separator_terms {
+                // Text columns: separator-embedding terms are derived
+                // data (drain-generated bigrams) — drop any prior
+                // generation so the union never mixes stale bigrams
+                // with the caller's fresh stream (see
+                // [`SyntheticTerms`]).
+                source_entries.retain(|(term, _)| !term.contains(&FST_SEPARATOR));
+            }
             entries.push(source_entries);
         }
         let mut cursors: Vec<usize> = vec![0; sources.len()];
@@ -426,6 +450,7 @@ mod tests {
         let columns = [MergeColumn {
             name: "body".into(),
             positions: true,
+            drop_separator_terms: true,
         }];
 
         // Hand-built synthetic stream mirroring what the drain
@@ -561,6 +586,7 @@ mod tests {
             &[MergeColumn {
                 name: "body".into(),
                 positions: false,
+                drop_separator_terms: true,
             }],
             4,
             None,
@@ -651,6 +677,7 @@ mod tests {
             &[MergeColumn {
                 name: "body".into(),
                 positions: false,
+                drop_separator_terms: true,
             }],
             1,
             Some((&lo, &hi)),
@@ -709,6 +736,7 @@ mod tests {
             &[MergeColumn {
                 name: "body".into(),
                 positions: true,
+                drop_separator_terms: true,
             }],
             2,
             None,
