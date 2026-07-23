@@ -2038,7 +2038,7 @@ mod tests {
     use datafusion::prelude::{col, lit};
     use tokio::runtime::Builder;
 
-    use super::{BoolMode, FanOut, build_work_units, fanout_for};
+    use super::{BoolMode, FanOut, build_work_units, fanout_for, hits_id_score_batch};
     use crate::{
         config::{CompactionSettings, DEFAULT_STALE_SEAL_TIMEOUT_MS},
         storage::{LocalFsStorageProvider, StorageProvider},
@@ -3243,6 +3243,30 @@ mod tests {
                     .bm25_search("title", "uniqterm", 10, BoolMode::Or, None)
                     .expect("query");
                 assert_eq!(hits[0].num_rows(), 1);
+            }),
+        );
+        // Decomposition through the REAL bridge (the test-local
+        // `block_on` builds a runtime per call, a ~20µs artifact on
+        // the route/prune rows below): async kernel alone, then the
+        // id+score batch build — their gap to the full call is the
+        // sync→async bridge + guard overhead.
+        time(
+            "POST-DRAIN kernel via real bridge",
+            Box::new(|| {
+                let hits = reader
+                    .block_on(reader.bm25_search_async("title", "uniqterm", 10, BoolMode::Or))
+                    .expect("query");
+                assert_eq!(hits.len(), 1);
+            }),
+        );
+        let kernel_hits = reader
+            .block_on(reader.bm25_search_async("title", "uniqterm", 10, BoolMode::Or))
+            .expect("query");
+        time(
+            "POST-DRAIN hits_id_score_batch alone",
+            Box::new(|| {
+                let batch = hits_id_score_batch(&reader, &kernel_hits).expect("batch");
+                assert_eq!(batch.num_rows(), 1);
             }),
         );
         time(

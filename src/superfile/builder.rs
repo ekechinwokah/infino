@@ -290,8 +290,16 @@ impl BuilderOptions {
     }
 
     /// See [`BuilderOptions::prebuilt_fts`].
+    ///
+    /// Also drops parquet compression: a prebuilt-FTS build's parquet
+    /// part is the id-only stub — high-entropy Snowflake ids that zstd
+    /// barely shrinks, and the pages every post-drain hit's stable-id
+    /// resolution reads back on the query path. Uncompressed pages
+    /// make that resolution a plain copy instead of a per-query zstd
+    /// decode.
     pub(crate) fn with_prebuilt_fts(mut self) -> Self {
         self.prebuilt_fts = true;
+        self.compression = Compression::UNCOMPRESSED;
         self
     }
 
