@@ -1961,12 +1961,26 @@ impl Supertable {
             .exact_match(column, value)
             .map_err(|e| InfinoError::from(e).with_context("exact_match", None))?;
         let batch = self
-            .block_on_query(resolve_hits_named(
-                &reader,
-                &hits,
-                projection,
-                "exact_match",
-            ))
+            .block_on_query(async {
+                // Bare projection: `_id` + score straight from the
+                // stable-id stamps — same fast path as `bm25_search`.
+                let id_column = reader.options().id_column.as_str();
+                if projection_is_id_score_only(projection, id_column) {
+                    return hits_id_score_batch(&reader, &hits);
+                }
+                // Hidden text-shard hits carry no scalar data; relocate
+                // them to their user-table placement by stable `_id`
+                // before the decode — this pass was missing here (only
+                // `bm25_search`/`token_match` had it), so scalar
+                // projections mis-resolved hidden hits.
+                let hits = match reader.hidden_epoch_has_text() {
+                    true => user_placement_for_scalar_resolve(&reader, &hits).await?,
+                    false => hits,
+                };
+                resolve_hits_named(&reader, &hits, projection, "exact_match")
+                    .await
+                    .map_err(|e| QueryError::Execute(e.to_string()))
+            })
             .map_err(|e| InfinoError::Query(e.to_string()).with_context("exact_match", None))?;
         Ok(vec![batch])
     }
@@ -3635,6 +3649,41 @@ mod tests {
                 body.value(r)
             );
         }
+
+        // token_match and exact_match must honor the same placement +
+        // fast-path contracts (exact_match historically skipped the
+        // placement pass entirely, mis-resolving hidden hits under a
+        // scalar projection).
+        let expect_body = |rows: &Vec<RecordBatch>, label: &str| {
+            assert_eq!(rows[0].num_rows(), 1, "{label} matches one doc");
+            let body = rows[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("body col");
+            assert_eq!(body.value(0), "uniq7 common filler", "{label}");
+        };
+        let rows = st
+            .token_match(
+                "body",
+                "uniq7",
+                BoolMode::Or,
+                Some(&["_id", "body", "score"]),
+            )
+            .expect("token_match scalar");
+        expect_body(&rows, "token_match");
+        let rows = st
+            .exact_match(
+                "body",
+                "uniq7 common filler",
+                Some(&["_id", "body", "score"]),
+            )
+            .expect("exact_match scalar");
+        expect_body(&rows, "exact_match");
+        let bare = st
+            .exact_match("body", "uniq7 common filler", None)
+            .expect("exact_match bare");
+        assert_eq!(bare[0].num_rows(), 1);
     }
 
     /// SCRATCH (uncommitted): merged-shard BM25 statistics audit.
