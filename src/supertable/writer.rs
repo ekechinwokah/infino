@@ -3185,6 +3185,118 @@ struct TextDrainOutcome {
 /// posting, so `postings_length < floor / 8` proves `df < floor`.
 const PFOR_MIN_BITS_PER_POSTING_DENOM: u64 = 8;
 
+/// Fan-in for the tiered text-run merge: a tier merges once it holds
+/// this many runs. Each source costs the union its term-entry vec and
+/// decode buffers, so the fan-in bounds merge memory while keeping the
+/// number of times a posting byte is re-merged to
+/// `log_FANIN(batches)` — the chained fold it replaces re-merged the
+/// whole prefix every batch (O(batches²) bytes; 10M docs ≈ 160
+/// batches made the drain's text pass hours instead of minutes).
+const TEXT_MERGE_FANIN: usize = 16;
+
+/// One intermediate text-merge run: a batch's (or a tier merge's)
+/// merged FTS blob covering the contiguous global doc range
+/// `[base, base + n_docs)`, in batch order.
+struct TextRun {
+    path: PathBuf,
+    n_docs: u32,
+    base: u64,
+}
+
+/// K-way merge `runs` (contiguous, base-ordered) into one run at
+/// `out_path`, deleting the inputs. Remaps are pure offsets: run k's
+/// local ids shift by the docs of the runs before it.
+async fn merge_text_runs(
+    runs: &[TextRun],
+    merge_columns: &[MergeColumn],
+    columns_json: &str,
+    out_path: &Path,
+) -> Result<TextRun, BuildError> {
+    let base = runs[0].base;
+    let total: u64 = runs.iter().map(|r| r.n_docs as u64).sum();
+    if total > u32::MAX as u64 {
+        return Err(BuildError::Store(
+            "hidden text index exceeds u32 doc-id space".into(),
+        ));
+    }
+    let mut mmaps = Vec::with_capacity(runs.len());
+    for run in runs {
+        mmaps.push(
+            mmap_readonly_bytes(&run.path)
+                .map_err(|error| BuildError::Store(format!("text run mmap: {error}")))?,
+        );
+    }
+    let mut readers = Vec::with_capacity(runs.len());
+    for bytes in &mmaps {
+        readers.push(
+            FtsReader::open(bytes.clone(), columns_json)
+                .map_err(|e| BuildError::Store(e.to_string()))?,
+        );
+    }
+    let mut remaps: Vec<Vec<Option<u32>>> = Vec::with_capacity(runs.len());
+    let mut offset: u32 = 0;
+    for (run, reader) in runs.iter().zip(&readers) {
+        debug_assert_eq!(run.n_docs, reader.n_docs(), "run doc count drifted");
+        remaps.push((0..reader.n_docs()).map(|l| Some(offset + l)).collect());
+        offset += run.n_docs;
+    }
+    let sources: Vec<MergeSource<'_>> = readers
+        .iter()
+        .zip(&remaps)
+        .map(|(reader, remap)| MergeSource {
+            reader,
+            doc_id_remap: remap,
+        })
+        .collect();
+    let mut out = BufWriter::new(
+        File::create(out_path)
+            .map_err(|error| BuildError::Store(format!("text run create: {error}")))?,
+    );
+    merge_fts_blobs(&sources, merge_columns, total as u32, None, &[], &mut out).await?;
+    out.flush()
+        .map_err(|error| BuildError::Store(format!("text run flush: {error}")))?;
+    drop(out);
+    drop(readers);
+    drop(mmaps);
+    for run in runs {
+        let _ = fs::remove_file(&run.path);
+    }
+    Ok(TextRun {
+        path: out_path.to_path_buf(),
+        n_docs: total as u32,
+        base,
+    })
+}
+
+/// Push `run` onto tier 0 and cascade: any tier reaching
+/// [`TEXT_MERGE_FANIN`] merges into one run on the tier above.
+async fn push_text_run(
+    tiers: &mut Vec<Vec<TextRun>>,
+    run: TextRun,
+    run_seq: &mut usize,
+    scratch: &Path,
+    merge_columns: &[MergeColumn],
+    columns_json: &str,
+) -> Result<(), BuildError> {
+    if tiers.is_empty() {
+        tiers.push(Vec::new());
+    }
+    tiers[0].push(run);
+    let mut t = 0usize;
+    while tiers[t].len() >= TEXT_MERGE_FANIN {
+        let batch: Vec<TextRun> = tiers[t].drain(..).collect();
+        let out = scratch.join(format!("fts_text_run_{run_seq}.bin"));
+        *run_seq += 1;
+        let merged = merge_text_runs(&batch, merge_columns, columns_json, &out).await?;
+        if tiers.len() == t + 1 {
+            tiers.push(Vec::new());
+        }
+        tiers[t + 1].push(merged);
+        t += 1;
+    }
+    Ok(())
+}
+
 async fn generate_bigram_terms(
     final_reader: &FtsReader,
     fts_columns: &[FtsConfig],
@@ -3426,9 +3538,12 @@ async fn drain_fts_text_shards(
     let mut id_min = i128::MAX;
     let mut id_max = i128::MIN;
 
-    // Chained intermediate: (path, byte length) of the merge-so-far.
-    let mut intermediate: Option<(PathBuf, u64)> = None;
-    let mut chain_step = 0usize;
+    // Tiered merge runs (LSM-style): each batch merges to its own
+    // run; a tier merges once it holds TEXT_MERGE_FANIN runs. Every
+    // posting byte is re-merged log_FANIN(batches) times instead of
+    // once per subsequent batch.
+    let mut tiers: Vec<Vec<TextRun>> = Vec::new();
+    let mut run_seq = 0usize;
     let now = time::Instant::now();
     let store = user_inner.options.store.clone();
     // Sources are USER superfiles: fall back to the user table's own
@@ -3441,6 +3556,8 @@ async fn drain_fts_text_shards(
     // deleted since that epoch (the resident deleted set).
     if !old_base.is_empty() {
         let fold_t0 = time::Instant::now();
+        let fold_base = n_docs_merged;
+        let mut fold_live: u32 = 0;
         let mut fold_readers: Vec<Arc<SuperfileReader>> = Vec::with_capacity(old_base.len());
         let hidden_store = hidden_inner.options.store.clone();
         for entry in &old_base {
@@ -3483,7 +3600,8 @@ async fn drain_fts_text_shards(
                         "hidden text index exceeds u32 doc-id space".into(),
                     ));
                 }
-                remap.push(Some(n_docs_merged as u32));
+                remap.push(Some(fold_live));
+                fold_live += 1;
                 n_docs_merged += 1;
                 id_min = id_min.min(id);
                 id_max = id_max.max(id);
@@ -3506,16 +3624,16 @@ async fn drain_fts_text_shards(
                     })
             })
             .collect::<Result<_, BuildError>>()?;
-        let next_path = scratch.join(format!("fts_text_intermediate_{chain_step}.bin"));
-        chain_step += 1;
-        let mut next_file =
-            BufWriter::new(File::create(&next_path).map_err(|error| {
-                BuildError::Store(format!("text intermediate create: {error}"))
-            })?);
+        let next_path = scratch.join(format!("fts_text_run_{run_seq}.bin"));
+        run_seq += 1;
+        let mut next_file = BufWriter::new(
+            File::create(&next_path)
+                .map_err(|error| BuildError::Store(format!("text run create: {error}")))?,
+        );
         merge_fts_blobs(
             &merge_sources,
             &merge_columns,
-            n_docs_merged as u32,
+            fold_live,
             None,
             &[],
             &mut next_file,
@@ -3523,26 +3641,40 @@ async fn drain_fts_text_shards(
         .await?;
         next_file
             .flush()
-            .map_err(|error| BuildError::Store(format!("text intermediate flush: {error}")))?;
+            .map_err(|error| BuildError::Store(format!("text run flush: {error}")))?;
         drop(next_file);
         let next_len = fs::metadata(&next_path)
-            .map_err(|error| BuildError::Store(format!("text intermediate stat: {error}")))?
+            .map_err(|error| BuildError::Store(format!("text run stat: {error}")))?
             .len();
-        intermediate = Some((next_path, next_len));
         eprintln!(
             "[supertable drain] text fold: {} prior shard(s) -> {} live doc(s) \
-             ({} deleted since the epoch), intermediate {:.1} MiB, {:.1}ms",
+             ({} deleted since the epoch), run {:.1} MiB, {:.1}ms",
             old_base.len(),
-            n_docs_merged,
+            fold_live,
             deleted.len(),
             next_len as f64 / (1u64 << 20) as f64,
             fold_t0.elapsed().as_secs_f64() * 1e3,
         );
+        push_text_run(
+            &mut tiers,
+            TextRun {
+                path: next_path,
+                n_docs: fold_live,
+                base: fold_base,
+            },
+            &mut run_seq,
+            scratch,
+            &merge_columns,
+            &columns_json,
+        )
+        .await?;
     }
 
     let n_text_batches = ordered.len().div_ceil(batch_budget.max(1));
     for (batch_idx, batch) in ordered.chunks(batch_budget.max(1)).enumerate() {
         let batch_t0 = time::Instant::now();
+        let batch_base = n_docs_merged;
+        let mut batch_live: u32 = 0;
         // Open the batch's user superfiles fully resident (reuse a
         // resident cached reader when present — drain just opened many
         // of these for the vector pass).
@@ -3620,7 +3752,8 @@ async fn drain_fts_text_shards(
                         "hidden text index exceeds u32 doc-id space".into(),
                     ));
                 }
-                remap.push(Some(n_docs_merged as u32));
+                remap.push(Some(batch_live));
+                batch_live += 1;
                 n_docs_merged += 1;
                 let id = stable_ids[local as usize];
                 id_min = id_min.min(id);
@@ -3632,40 +3765,27 @@ async fn drain_fts_text_shards(
             remaps.push(remap);
         }
 
-        // Merge (previous intermediate + this batch) → next
-        // intermediate. The intermediate rides first with an identity
-        // remap so already-assigned ids keep their order.
-        let prev = intermediate.take();
-        let (prev_bytes, prev_reader, identity);
-        let mut merge_sources: Vec<MergeSource<'_>> = Vec::with_capacity(batch.len() + 1);
-        if let Some((path, _)) = &prev {
-            prev_bytes = mmap_readonly_bytes(path)
-                .map_err(|error| BuildError::Store(format!("text intermediate mmap: {error}")))?;
-            prev_reader = FtsReader::open(prev_bytes.clone(), &columns_json)
-                .map_err(|e| BuildError::Store(e.to_string()))?;
-            identity = (0..prev_reader.n_docs()).map(Some).collect::<Vec<_>>();
-            merge_sources.push(MergeSource {
-                reader: &prev_reader,
-                doc_id_remap: &identity,
-            });
-        }
-        for (reader, remap) in readers.iter().zip(&remaps) {
-            merge_sources.push(MergeSource {
+        // Merge just this batch into its own run; the tier cascade
+        // (push_text_run) bounds how often any posting byte re-merges.
+        let merge_sources: Vec<MergeSource<'_>> = readers
+            .iter()
+            .zip(&remaps)
+            .map(|(reader, remap)| MergeSource {
                 reader: reader.fts().expect("checked above"),
                 doc_id_remap: remap,
-            });
-        }
+            })
+            .collect();
 
-        let next_path = scratch.join(format!("fts_text_intermediate_{chain_step}.bin"));
-        chain_step += 1;
-        let mut next_file =
-            BufWriter::new(File::create(&next_path).map_err(|error| {
-                BuildError::Store(format!("text intermediate create: {error}"))
-            })?);
+        let next_path = scratch.join(format!("fts_text_run_{run_seq}.bin"));
+        run_seq += 1;
+        let mut next_file = BufWriter::new(
+            File::create(&next_path)
+                .map_err(|error| BuildError::Store(format!("text run create: {error}")))?,
+        );
         merge_fts_blobs(
             &merge_sources,
             &merge_columns,
-            n_docs_merged as u32,
+            batch_live,
             None,
             &[],
             &mut next_file,
@@ -3673,18 +3793,14 @@ async fn drain_fts_text_shards(
         .await?;
         next_file
             .flush()
-            .map_err(|error| BuildError::Store(format!("text intermediate flush: {error}")))?;
+            .map_err(|error| BuildError::Store(format!("text run flush: {error}")))?;
         drop(next_file);
         let next_len = fs::metadata(&next_path)
-            .map_err(|error| BuildError::Store(format!("text intermediate stat: {error}")))?
+            .map_err(|error| BuildError::Store(format!("text run stat: {error}")))?
             .len();
-        if let Some((old_path, _)) = prev {
-            let _ = fs::remove_file(old_path);
-        }
-        intermediate = Some((next_path, next_len));
         eprintln!(
             "[supertable drain] text batch {}/{} ({} sf): {} live doc(s) so far, \
-             intermediate {:.1} MiB, {:.1}ms",
+             run {:.1} MiB, {:.1}ms",
             batch_idx + 1,
             n_text_batches,
             batch.len(),
@@ -3692,6 +3808,19 @@ async fn drain_fts_text_shards(
             next_len as f64 / (1u64 << 20) as f64,
             batch_t0.elapsed().as_secs_f64() * 1e3,
         );
+        push_text_run(
+            &mut tiers,
+            TextRun {
+                path: next_path,
+                n_docs: batch_live,
+                base: batch_base,
+            },
+            &mut run_seq,
+            scratch,
+            &merge_columns,
+            &columns_json,
+        )
+        .await?;
     }
     ids_writer
         .flush()
@@ -3709,7 +3838,26 @@ async fn drain_fts_text_shards(
             fts_state: SlowFtsState::default(),
         }));
     }
-    let (final_path, _) = intermediate.expect("n_docs_merged > 0 implies a merge ran");
+    // Final: flatten remaining runs in base order; a single survivor
+    // is the final blob directly, else one last k-way merge.
+    let mut all_runs: Vec<TextRun> = tiers.into_iter().flatten().collect();
+    all_runs.sort_unstable_by_key(|r| r.base);
+    let final_path = match all_runs.len() {
+        0 => unreachable!("n_docs_merged > 0 implies at least one run"),
+        1 => all_runs.pop().expect("one run").path,
+        _ => {
+            let final_t0 = time::Instant::now();
+            let out = scratch.join("fts_text_final.bin");
+            let merged = merge_text_runs(&all_runs, &merge_columns, &columns_json, &out).await?;
+            eprintln!(
+                "[supertable drain] text final merge: {} run(s) -> {} live doc(s), {:.1}ms",
+                all_runs.len(),
+                merged.n_docs,
+                final_t0.elapsed().as_secs_f64() * 1e3,
+            );
+            merged.path
+        }
+    };
     let final_bytes = mmap_readonly_bytes(&final_path)
         .map_err(|error| BuildError::Store(format!("text final mmap: {error}")))?;
     let final_reader = FtsReader::open(final_bytes, &columns_json)
@@ -7668,6 +7816,89 @@ pub(crate) fn read_vector_layout_from_bytes(bytes: &Bytes) -> VectorLayout {
 
 #[cfg(test)]
 mod tests {
+    /// 17 two-doc runs exceed [`TEXT_MERGE_FANIN`], forcing one tier
+    /// cascade; the surviving runs' final merge must equal a flat
+    /// merge of the same sources — global doc ids in base order, term
+    /// dfs intact, per-run unique terms at their shifted ids.
+    #[tokio::test]
+    async fn tiered_text_runs_merge_equals_flat_merge() {
+        use tempfile::TempDir;
+
+        use crate::superfile::fts::{
+            builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
+        };
+
+        /// Runs pushed — one more than the fan-in.
+        const RUNS: usize = TEXT_MERGE_FANIN + 1;
+        const DOCS_PER_RUN: u32 = 2;
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let columns = [MergeColumn {
+            name: "body".into(),
+            positions: false,
+        }];
+
+        let dir = TempDir::new().expect("tempdir");
+        let mut tiers: Vec<Vec<TextRun>> = Vec::new();
+        let mut run_seq = 1000usize; // distinct from run file names below
+        for i in 0..RUNS {
+            let tok = Arc::new(AsciiLowerTokenizer);
+            let mut b = FtsBuilder::new(tok);
+            b.register_column("body".into(), false).expect("register");
+            b.add_doc(0, 0, &format!("common uniq{i}")).expect("doc0");
+            b.add_doc(0, 1, "common filler").expect("doc1");
+            let blob = b.finish().expect("finish");
+            let path = dir.path().join(format!("seed_run_{i}.bin"));
+            std::fs::write(&path, &blob).expect("write run");
+            push_text_run(
+                &mut tiers,
+                TextRun {
+                    path,
+                    n_docs: DOCS_PER_RUN,
+                    base: (i as u64) * DOCS_PER_RUN as u64,
+                },
+                &mut run_seq,
+                dir.path(),
+                &columns,
+                json,
+            )
+            .await
+            .expect("push run");
+        }
+        // One cascade fired: tier 0 holds the overflow run, tier 1 the
+        // merged fan-in.
+        assert_eq!(tiers.len(), 2, "one cascade expected");
+        assert_eq!(tiers[0].len(), 1);
+        assert_eq!(tiers[1].len(), 1);
+
+        let mut all: Vec<TextRun> = tiers.into_iter().flatten().collect();
+        all.sort_unstable_by_key(|r| r.base);
+        let out = dir.path().join("final.bin");
+        let merged = merge_text_runs(&all, &columns, json, &out)
+            .await
+            .expect("final merge");
+        assert_eq!(merged.n_docs, (RUNS as u32) * DOCS_PER_RUN);
+
+        let bytes = mmap_readonly_bytes(&merged.path).expect("mmap final");
+        let reader = FtsReader::open(bytes, json).expect("open final");
+        assert_eq!(reader.n_docs(), (RUNS as u32) * DOCS_PER_RUN);
+        let common_df = futures::executor::block_on(reader.term_df("body", "common")).expect("df");
+        assert_eq!(common_df, (RUNS as u64) * DOCS_PER_RUN as u64);
+        // Each run's unique term must land at its shifted global id
+        // (doc 0 of run i → global 2i): search returns exactly it.
+        for i in [0usize, TEXT_MERGE_FANIN - 1, TEXT_MERGE_FANIN] {
+            let term = format!("uniq{i}");
+            let hits = futures::executor::block_on(reader.search(
+                "body",
+                &[term.as_str()],
+                3,
+                crate::superfile::fts::reader::BoolMode::Or,
+            ))
+            .expect("search");
+            assert_eq!(hits.len(), 1, "uniq{i}");
+            assert_eq!(hits[0].0, (i as u32) * DOCS_PER_RUN, "uniq{i} doc id");
+        }
+    }
+
     use std::{
         sync::Arc,
         time::{Duration, Instant},
