@@ -91,7 +91,9 @@ use crate::{
         SuperfileReader,
         error::{FtsError, ReadError},
         fts::{
-            reader::{ClauseLists, FtsCursorCache, RoutedTermRow, SharedFloor},
+            reader::{
+                ClauseLists, FtsCursorCache, OR_WINDOW_DOMINANCE_MULT, RoutedTermRow, SharedFloor,
+            },
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
     },
@@ -168,6 +170,49 @@ fn merge_unit_scores(
 /// Minimum bare-OR term count for the multi-term block-selected
 /// kernel; a single bare term has its own dedicated selected walk.
 const MULTI_SELECT_MIN_TERMS: usize = 2;
+/// Minimum quantized block-bound spread for a resident row to count
+/// as prunable at routing time. Bounds are ceil-quantized to u8
+/// against the term's own max, so spread is in 1/255ths of that max;
+/// below ~6% the top-k bar cannot separate the band — the admission
+/// kernel would admit most blocks and bail mid-flight into a
+/// single-threaded whole-file walk, strictly worse than the ranged
+/// parallel union that routing displaced (measured as the entire
+/// post-drain broad-OR gap: ten/forty_term_or 12/39 ms vs 2.1/6.2
+/// pre-drain).
+const MULTI_SELECT_MIN_ROW_SPREAD: u8 = 16;
+
+/// Whether a resident block-max row can actually prune a broad-OR
+/// walk: present bounds with at least [`MULTI_SELECT_MIN_ROW_SPREAD`]
+/// of variance. Shared by the wave partition and the kernel
+/// engagement gate — the two MUST agree, or a file that can never
+/// engage loses its ranged slicing to a fallback that runs the union
+/// on one thread.
+fn row_can_prune(row: &TermBlockMax) -> bool {
+    let min = row.quantized.iter().min().copied().unwrap_or(0);
+    let max = row.quantized.iter().max().copied().unwrap_or(0);
+    max - min >= MULTI_SELECT_MIN_ROW_SPREAD
+}
+
+/// Resident-row mirror of the reader's windowed-union dispatch: block
+/// selection wins a bare multi-term OR only when some routed term
+/// DOMINATES the score upper bounds
+/// (`max > OR_WINDOW_DOMINANCE_MULT × avg`). All-prunable-but-UNIFORM
+/// rows pass the engagement gate, then the kernel's bail thresholds
+/// fire and the un-ranged fallback walks the shard serially — the
+/// same 1-vs-8-threads cliff the any-vs-all gate fix closed for
+/// never-engaging files. Each row's `scale` is its term's exact max
+/// block bound, so no dequantization is needed.
+fn rows_have_dominant_ub<'a>(rows: impl Iterator<Item = &'a TermBlockMax>) -> bool {
+    let mut total = 0.0f32;
+    let mut max = 0.0f32;
+    let mut n = 0usize;
+    for row in rows {
+        total += row.scale;
+        max = max.max(row.scale);
+        n += 1;
+    }
+    n > 0 && max > OR_WINDOW_DOMINANCE_MULT * (total / n as f32)
+}
 
 /// Rejection message for a query with negated terms but no positive
 /// anchor (e.g. `-foo`). Shared by the scored and unranked FTS paths so
@@ -373,9 +418,8 @@ async fn bm25_fanout_wave(
                     .filter_map(|term| state.term_block_max(e.superfile_id, &column_arc, term))
                     .collect();
                 !rows.is_empty()
-                    && rows
-                        .iter()
-                        .all(|row| row.quantized.iter().min() < row.quantized.iter().max())
+                    && rows.iter().all(|row| row_can_prune(row))
+                    && rows_have_dominant_ub(rows.iter().copied())
             }),
             _ => (Vec::new(), kept.iter().collect()),
         };
@@ -487,10 +531,7 @@ async fn bm25_fanout_wave(
                     .map(|term| state.term_block_max(suid, &column_arc, term))
                     .collect();
                 let engage = rows.iter().flatten().count() > 0
-                    && rows
-                        .iter()
-                        .flatten()
-                        .all(|row| row.quantized.iter().min() < row.quantized.iter().max());
+                    && rows.iter().flatten().all(|row| row_can_prune(row));
                 if engage {
                     let mut routed_rows = Vec::new();
                     let mut unrouted: Vec<&str> = Vec::new();

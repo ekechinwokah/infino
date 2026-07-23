@@ -183,7 +183,7 @@ const OR_WINDOW_MIN_TERMS: usize = 3;
 /// ~1.0× the average (MaxScore can't prune them → windowed wins); a
 /// dominant rare term sits well above it (MaxScore prunes hard → it stays
 /// on MaxScore). Calibrated on the 1M tier.
-const OR_WINDOW_DOMINANCE_MULT: f32 = 1.5;
+pub(crate) const OR_WINDOW_DOMINANCE_MULT: f32 = 1.5;
 
 /// Largest `k` for which a 2-term OR routes to WAND+BMW instead of
 /// MaxScore. WAND's pivot pruning needs a high top-k threshold to skip
