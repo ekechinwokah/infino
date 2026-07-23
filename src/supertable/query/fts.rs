@@ -91,9 +91,7 @@ use crate::{
         SuperfileReader,
         error::{FtsError, ReadError},
         fts::{
-            reader::{
-                ClauseLists, FtsCursorCache, OR_WINDOW_DOMINANCE_MULT, RoutedTermRow, SharedFloor,
-            },
+            reader::{ClauseLists, FtsCursorCache, OR_WINDOW_DOMINANCE_MULT, SharedFloor},
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
     },
@@ -542,14 +540,7 @@ async fn bm25_fanout_wave(
                     && row.quantized.iter().min() < row.quantized.iter().max()
                 {
                     let hits = r
-                        .bm25_single_term_block_selected(
-                            &column_arc,
-                            k,
-                            floor,
-                            row.metadata_offset,
-                            &row.quantized,
-                            row.scale,
-                        )
+                        .bm25_single_term_block_selected(&column_arc, k, floor, &row.as_row())
                         .await
                         .map_err(fts_read_error)?;
                     merge_unit_scores(&shared, &tombstones, suid, now, &hits);
@@ -581,11 +572,7 @@ async fn bm25_fanout_wave(
                     let mut unrouted: Vec<&str> = Vec::new();
                     for (term, row) in should_arc.iter().zip(&rows) {
                         match row {
-                            Some(row) => routed_rows.push(RoutedTermRow {
-                                metadata_offset: row.metadata_offset,
-                                quantized: &row.quantized,
-                                scale: row.scale,
-                            }),
+                            Some(row) => routed_rows.push(row.as_row()),
                             None => unrouted.push(term.as_str()),
                         }
                     }
@@ -647,11 +634,7 @@ async fn bm25_fanout_wave(
                     let mut unrouted_musts: Vec<&str> = Vec::new();
                     for (term, row) in must_arc.iter().zip(&must_rows) {
                         match row {
-                            Some(row) => routed_musts.push(RoutedTermRow {
-                                metadata_offset: row.metadata_offset,
-                                quantized: &row.quantized,
-                                scale: row.scale,
-                            }),
+                            Some(row) => routed_musts.push(row.as_row()),
                             None => unrouted_musts.push(term.as_str()),
                         }
                     }
@@ -659,11 +642,7 @@ async fn bm25_fanout_wave(
                     let mut unrouted_shoulds: Vec<&str> = Vec::new();
                     for (term, row) in should_arc.iter().zip(&should_rows) {
                         match row {
-                            Some(row) => routed_shoulds.push(RoutedTermRow {
-                                metadata_offset: row.metadata_offset,
-                                quantized: &row.quantized,
-                                scale: row.scale,
-                            }),
+                            Some(row) => routed_shoulds.push(row.as_row()),
                             None => unrouted_shoulds.push(term.as_str()),
                         }
                     }
