@@ -425,13 +425,18 @@ pub struct FtsSettings {
     pub block_max_df_floor: u32,
     /// Adjacent-pair (bigram) synthetic terms are emitted into the
     /// drain-merged text shards when BOTH members' document frequency
-    /// is at or above this floor. Phrases over common members are the
-    /// shapes whose verification cannot be pruned from per-member
-    /// statistics (member tf says nothing about phrase tf), so the
-    /// pair's own postings carry the exact phrase tf instead; phrases
-    /// with a rare member are already cheap through the rare member's
-    /// leapfrog and don't pay the storage. `0` disables emission.
-    pub bigram_member_df_floor: u32,
+    /// is at or above this many permille of the merged corpus.
+    /// Phrases over near-universal members are the shapes whose
+    /// verification cannot be pruned from per-member statistics
+    /// (member tf says nothing about phrase tf), so the pair's own
+    /// postings carry the exact phrase tf instead; phrases with any
+    /// less-common member already prune through that member's
+    /// leapfrog and don't pay the storage. Relative, not absolute: on
+    /// zipf-shaped corpora an absolute floor admits most of the
+    /// vocabulary and the pair space explodes (measured 3 GiB of
+    /// extra shard bytes at 1M docs with a 1024-doc floor). `0`
+    /// disables emission.
+    pub bigram_member_df_permille: u32,
 }
 
 /// Default [`FtsSettings::text_shard_target_mb`].
@@ -439,17 +444,18 @@ const DEFAULT_FTS_TEXT_SHARD_TARGET_MB: u64 = 256;
 /// Default [`FtsSettings::block_max_df_floor`] — ~8 posting blocks at
 /// the 128-doc block length.
 const DEFAULT_FTS_BLOCK_MAX_DF_FLOOR: u32 = 1024;
-/// Default [`FtsSettings::bigram_member_df_floor`] — same threshold as
-/// the block-max slab: members below it prune fine without pair
-/// postings.
-const DEFAULT_FTS_BIGRAM_MEMBER_DF_FLOOR: u32 = 1024;
+/// Default [`FtsSettings::bigram_member_df_permille`] — 200‰ (one doc
+/// in five): only the zipf head qualifies, which is exactly where
+/// phrase verification loses its pruning; below it the unigram walk
+/// stays fast on its own.
+const DEFAULT_FTS_BIGRAM_MEMBER_DF_PERMILLE: u32 = 200;
 
 impl Default for FtsSettings {
     fn default() -> Self {
         Self {
             text_shard_target_mb: DEFAULT_FTS_TEXT_SHARD_TARGET_MB,
             block_max_df_floor: DEFAULT_FTS_BLOCK_MAX_DF_FLOOR,
-            bigram_member_df_floor: DEFAULT_FTS_BIGRAM_MEMBER_DF_FLOOR,
+            bigram_member_df_permille: DEFAULT_FTS_BIGRAM_MEMBER_DF_PERMILLE,
         }
     }
 }

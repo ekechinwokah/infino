@@ -3183,11 +3183,13 @@ struct TextDrainOutcome {
 async fn generate_bigram_terms(
     final_reader: &FtsReader,
     fts_columns: &[FtsConfig],
-    member_df_floor: u32,
+    member_df_permille: u32,
+    n_docs_merged: u32,
 ) -> Result<Vec<SyntheticTerms>, BuildError> {
-    if member_df_floor == 0 {
+    if member_df_permille == 0 || n_docs_merged == 0 {
         return Ok(Vec::new());
     }
+    let member_df_floor = ((n_docs_merged as u64 * member_df_permille as u64) / 1000).max(1) as u32;
     let mut out: Vec<SyntheticTerms> = Vec::new();
     let mut pairs: Vec<(u32, u32)> = Vec::new();
     let mut pos_buf: Vec<u32> = Vec::new();
@@ -3242,49 +3244,48 @@ async fn generate_bigram_terms(
         if anchors.is_empty() {
             continue;
         }
-        // Group by bigram key in lex order. Sorting by term INDEX pair
-        // is not lex order of the key bytes, so sort by materialized
-        // key; anchors within a key stay (doc, pos) ascending.
-        let mut keyed: Vec<(Vec<u8>, u32, u32)> = anchors
-            .into_iter()
-            .map(|(t1, t2, doc, pos)| {
-                let a = &common_terms[t1 as usize];
-                let b = &common_terms[t2 as usize];
-                let mut key = Vec::with_capacity(a.len() + 1 + b.len());
-                key.extend_from_slice(a);
-                key.push(FST_SEPARATOR);
-                key.extend_from_slice(b);
-                (key, doc, pos)
-            })
-            .collect();
-        keyed.sort_unstable();
+        // Group by (t1, t2) as plain integers — materializing a key
+        // Vec per anchor was measured at gigabytes of allocator churn
+        // at 1M docs. Term-INDEX order is not lex order of the key
+        // bytes, so the grouped terms sort once at the end by their
+        // materialized keys (one key per distinct pair, not per
+        // anchor).
+        anchors.sort_unstable();
         let mut terms: Vec<SyntheticTerm> = Vec::new();
         let mut i = 0usize;
-        while i < keyed.len() {
-            let key_end = keyed[i..]
+        while i < anchors.len() {
+            let (t1, t2, _, _) = anchors[i];
+            let pair_end = anchors[i..]
                 .iter()
-                .position(|(k, _, _)| k != &keyed[i].0)
+                .position(|&(a, b, _, _)| (a, b) != (t1, t2))
                 .map(|off| i + off)
-                .unwrap_or(keyed.len());
+                .unwrap_or(anchors.len());
+            let a = &common_terms[t1 as usize];
+            let b = &common_terms[t2 as usize];
+            let mut key = Vec::with_capacity(a.len() + 1 + b.len());
+            key.extend_from_slice(a);
+            key.push(FST_SEPARATOR);
+            key.extend_from_slice(b);
             let mut term = SyntheticTerm {
-                term: keyed[i].0.clone(),
+                term: key,
                 pairs: Vec::new(),
                 runs: Vec::new(),
             };
             let mut j = i;
-            while j < key_end {
-                let doc = keyed[j].1;
+            while j < pair_end {
+                let doc = anchors[j].2;
                 pos_buf.clear();
-                while j < key_end && keyed[j].1 == doc {
-                    pos_buf.push(keyed[j].2);
+                while j < pair_end && anchors[j].2 == doc {
+                    pos_buf.push(anchors[j].3);
                     j += 1;
                 }
                 term.pairs.push((doc, pos_buf.len() as u32));
                 encode_run(&mut term.runs, &pos_buf);
             }
             terms.push(term);
-            i = key_end;
+            i = pair_end;
         }
+        terms.sort_unstable_by(|x, y| x.term.cmp(&y.term));
         out.push(SyntheticTerms {
             column: fc.column.clone(),
             terms,
@@ -3685,7 +3686,8 @@ async fn drain_fts_text_shards(
     let synthetic = generate_bigram_terms(
         &final_reader,
         fts_columns,
-        config::global().fts.bigram_member_df_floor,
+        config::global().fts.bigram_member_df_permille,
+        n_docs_merged as u32,
     )
     .await?;
 
