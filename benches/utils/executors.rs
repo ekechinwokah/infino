@@ -809,6 +809,16 @@ pub mod fts {
                 let (rows, search_wall, search_cpu) =
                     cpu::timed(|| guard.bm25_rows(column, &query, k, mode));
                 cold.push_search(search_wall, search_cpu);
+                // Every battery shape matches at least one doc by
+                // construction. A zero-hit result here means the cold
+                // window silently answered nothing (e.g. a prune bug) —
+                // its timing would masquerade as an impossibly fast cold
+                // query, so fail loudly instead of recording it.
+                assert!(
+                    rows > 0,
+                    "cold battery shape {} returned 0 hits on a fresh consumer",
+                    q.name
+                );
                 std::hint::black_box(rows);
                 drop(guard);
             }

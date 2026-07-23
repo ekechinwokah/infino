@@ -444,6 +444,44 @@ fn slow_state_stored_bytes(table: &Supertable) -> Option<u64> {
     listed_bytes_under(table, SLOW_VECTOR_STATE_PREFIX)
 }
 
+/// Steady-state PRICED capacity for a lifecycle consumer: the live
+/// object-store LIST when available (user + hidden superfiles,
+/// manifests, pointers, slow-CAS state), else the user + hidden
+/// superfile sums. `built.total_index_bytes` is ingest-time user-only —
+/// the drain writes the hidden index (per-cell IVF or merged text
+/// shards) as a second on-storage copy AFTER ingest, so pricing the
+/// ingest-time number silently under-bills storage.
+fn priced_stored_bytes(
+    log_prefix: &str,
+    consumer: &Supertable,
+    built: &supertable::IngestResult,
+) -> Option<u64> {
+    let user_stored = on_storage_bytes(consumer);
+    let hidden_stored = consumer
+        .vector_index_table()
+        .map(|h| on_storage_bytes(h))
+        .unwrap_or(0);
+    let slow_state_stored = consumer
+        .vector_index_table()
+        .and_then(|h| slow_state_stored_bytes(h))
+        .unwrap_or(0);
+    let summed = user_stored + hidden_stored + slow_state_stored;
+    let priced = live_stored_bytes(consumer)
+        .filter(|&bytes| bytes > 0)
+        .unwrap_or(summed);
+    eprintln!(
+        "[{log_prefix}] on-storage footprint (steady state): user {} + hidden index {} + slow \
+         state {} = {} (ingest-time user-only was {}); PRICED live total (listed) {}",
+        rss::fmt_bytes(user_stored),
+        rss::fmt_bytes(hidden_stored),
+        rss::fmt_bytes(slow_state_stored),
+        rss::fmt_bytes(summed),
+        rss::fmt_bytes(built.total_index_bytes),
+        rss::fmt_bytes(priced),
+    );
+    Some(priced)
+}
+
 /// The LIVE stored bytes for the table, LISTed from the object store and
 /// filtered to what the CURRENT manifests reference: live superfiles
 /// (user + hidden), manifest lists/parts/siblings, pointers, and slow-CAS
@@ -1872,6 +1910,11 @@ pub mod fts {
         let mut delta_stats = None;
         let mut compaction_stats = None;
         let mut routing_states: Vec<RoutingStateStat> = Vec::new();
+        // Steady-state priced capacity (user + hidden text shards +
+        // slow-CAS routing state), measured post-optimize on the live
+        // lifecycle consumer — `built.total_index_bytes` is ingest-time
+        // user-only and would hide the hidden index's second copy.
+        let mut priced_stored: Option<u64> = None;
         let (warm_post, cold_post) = if run_lifecycle {
             let delta_batch = supertable::fts_delta_batch(
                 corpus
@@ -1901,6 +1944,10 @@ pub mod fts {
                         lifecycle_meter,
                         &built,
                     ));
+                    if matches!(phase, TextLifecyclePhase::Compacted) {
+                        priced_stored =
+                            priced_stored_bytes("supertable_fts", lifecycle_consumer, &built);
+                    }
                     let (anchor_suffix, note) = match phase {
                         // Battery emitters cover only the mutated
                         // states; pre-drain batteries already ran.
@@ -2042,7 +2089,7 @@ pub mod fts {
                         compaction_stats,
                         &routing_states,
                     ),
-                    None,
+                    priced_stored,
                 );
             }
         }
@@ -2243,17 +2290,39 @@ pub mod fts {
     /// window as cost-model cold (`measure_cold_store`) and SQL cold —
     /// no `open_all_superfiles`. Timed search is the first
     /// `bm25_search`, which opens prune survivors itself.
+    ///
+    /// The provider is meter-wrapped and each timed search logs its
+    /// foreground GET count — a cold search that touches no storage is
+    /// either a legitimately manifest-answerable shape or a broken cold
+    /// window, and the log makes the difference visible per shape
+    /// instead of leaving it to plausibility arguments.
     struct SupertableColdGuard {
         _cache_dir: TempDir,
         consumer: Supertable,
+        meter: storage_meter::MeteredStorage,
     }
 
     impl SupertableColdGuard {
         fn open(built: &supertable::IngestResult) -> Self {
-            let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
+            let meter = storage_meter::wrap(Arc::clone(&built.storage));
+            let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
+                meter.provider(),
+                Some(
+                    built
+                        .total_index_bytes
+                        .saturating_mul(SHARED_CONSUMER_CACHE_INDEX_FACTOR),
+                ),
+            );
+            let opts = tiers::consumer_options(
+                supertable::options_for(Modality::Fts, None),
+                meter.provider(),
+                cache,
+            );
+            let consumer = tiers::open_consumer(opts);
             Self {
                 _cache_dir: cache_dir,
                 consumer,
+                meter,
             }
         }
     }
@@ -2266,13 +2335,23 @@ pub mod fts {
             k: usize,
             mode: infino::superfile::fts::reader::BoolMode,
         ) -> usize {
-            self.consumer
+            let before = self.meter.snapshot();
+            let rows: usize = self
+                .consumer
                 .reader()
                 .bm25_search(column, query, k, mode, None)
                 .expect("cold bm25_search")
                 .iter()
                 .map(|b| b.num_rows())
-                .sum()
+                .sum();
+            let io = self.meter.snapshot().since(&before);
+            eprintln!(
+                "[supertable_fts]   cold search I/O: {} GET ({} down), {} hit(s)",
+                io.get_count,
+                rss::fmt_bytes(io.get_bytes),
+                rows,
+            );
+            rows
         }
 
         fn bm25_rows_fetched(
@@ -4629,6 +4708,10 @@ pub mod sql {
         let mut delta_stats = None;
         let mut compaction_stats = None;
         let mut routing_states: Vec<RoutingStateStat> = Vec::new();
+        // Same steady-state priced capacity as FTS (SQL tables have no
+        // hidden index, but the live LIST still prices manifests and any
+        // sibling state the summed ingest number misses).
+        let mut priced_stored: Option<u64> = None;
         let (warm_sets_post, cold_post) = if run_lifecycle {
             let delta_batch = supertable::sql_delta_batch(
                 corpus
@@ -4655,6 +4738,10 @@ pub mod sql {
                         lifecycle_meter,
                         &built,
                     ));
+                    if matches!(phase, TextLifecyclePhase::Compacted) {
+                        priced_stored =
+                            priced_stored_bytes("supertable_sql", lifecycle_consumer, &built);
+                    }
                     let (suffix, warm_note, cold_note) = match phase {
                         TextLifecyclePhase::PreDrain => return,
                         TextLifecyclePhase::Drained => (
@@ -4816,7 +4903,7 @@ pub mod sql {
                     compaction_stats,
                     &routing_states,
                 ),
-                None,
+                priced_stored,
             );
         }
 
