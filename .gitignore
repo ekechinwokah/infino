@@ -20,3 +20,9 @@ infino-python/dist/
 infino-python/python/infino/*.so
 **/__pycache__/
 **/.pytest_cache/
+
+# Local engine state a repo-root demo/test run writes; never commit tables.
+.infino/
+
+# Local agent/editor tooling (worktrees, settings, skills).
+.claude/
