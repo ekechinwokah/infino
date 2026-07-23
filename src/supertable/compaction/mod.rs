@@ -478,7 +478,7 @@ impl Supertable {
         let wal_store = WalStore::new(storage.clone());
 
         // Resolve input Arc<SuperfileEntry> from the snapshot.
-        let inputs: Vec<Arc<SuperfileEntry>> = job
+        let mut inputs: Vec<Arc<SuperfileEntry>> = job
             .inputs
             .iter()
             .map(|id| {
@@ -490,6 +490,13 @@ impl Supertable {
                     .ok_or(CompactionError::SuperfileNotFound(*id))
             })
             .collect::<Result<_, _>>()?;
+        // Merge in stable-id order, not job-selection order (which packs
+        // most-deleted first): inputs have disjoint id ranges, so
+        // id_min-ascending concatenation keeps the merged file's rows
+        // time/id-ordered — the user table's ordering contract, and what
+        // lets scalar placement bisect a gapped merged file's `_id`
+        // column instead of decoding it whole.
+        inputs.sort_by_key(|e| e.id_min);
 
         let opts = Arc::clone(&inner.options);
         let max_retries = opts.max_commit_retries.max(1);

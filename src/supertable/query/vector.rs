@@ -116,6 +116,14 @@ use crate::{
 /// Candidate growth when a deleted row occupies a current top-k slot.
 const DELETE_REFILL_GROWTH_FACTOR: usize = 2;
 
+/// Round cap for the batched `_id` bisection over an id-sorted gapped
+/// user superfile (`bisect_locals_for_ids_sorted`). Each round halves
+/// every unresolved id's row range, so ceil(log2(u32::MAX)) = 32 rounds
+/// always suffice; the slack guards the loop against a bookkeeping bug
+/// ever spinning it, after which the caller falls back to the full
+/// `_id`-column read.
+const ID_BISECT_MAX_ROUNDS: usize = 40;
+
 test_visible! {
 /// Fallback fine-probe scale for untagged (pre-grid) user manifests, and
 /// the widest explicit coarse sweep benches exercise. The routed user path
@@ -698,32 +706,65 @@ async fn lookup_user_placements_by_id(
         }
     }
 
-    let decoded = try_join_all(gapped.into_iter().map(|entry| async move {
-        let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
-        // Cell-packed user files carry stable ids inline in Parquet row order.
-        // Read each compact cell region once instead of decoding the full
-        // Parquet `_id` column to place a top-k scalar projection.
-        let ids = read_ids_for_locals(manifest, &entry, &locals, id_column, true).await?;
-        Ok::<_, QueryError>((entry, ids))
-    }))
-    .await?;
     let mut requested: HashMap<i128, Vec<usize>> = HashMap::new();
     for (index, &id) in user_row_ids.iter().enumerate() {
         if placements[index].is_none() {
             requested.entry(id).or_default().push(index);
         }
     }
-    for (entry, ids) in decoded {
-        for (local, id) in ids.into_iter().enumerate() {
+    let requested_ref = &requested;
+    let located = try_join_all(gapped.into_iter().map(|entry| async move {
+        let mut wanted: Vec<i128> = requested_ref
+            .keys()
+            .copied()
+            .filter(|&id| id >= entry.id_min && id <= entry.id_max)
+            .collect();
+        wanted.sort_unstable();
+        // Append-ordered user files — including compaction merges of
+        // them, which concatenate inputs in manifest (time) order —
+        // keep `_id` ascending in Parquet row order even when commit
+        // boundaries gap the id span. Locate the top-k ids by batched
+        // bisection over targeted `_id` page probes instead of
+        // decoding the whole column (a merged 1M-row file costs ~60 ms
+        // per query the other way). Cell-packed (MultiCellIvf) carries
+        // are not id-ordered and keep the one-shot full read, served
+        // from their inline stable-id region.
+        let pairs = if entry.vector_layout == VectorLayout::MultiCellIvf {
+            None
+        } else {
+            bisect_locals_for_ids_sorted(manifest, &entry, &wanted, id_column).await?
+        };
+        // A complete bisection is trusted (every match probed its own
+        // row). Anything less — a decline, or ids left unlocated (a
+        // legacy merge predating id-ordered compaction inputs is only
+        // piecewise sorted) — takes the always-correct full read.
+        let pairs = match pairs {
+            Some(pairs) if pairs.len() == wanted.len() => pairs,
+            _ => {
+                let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
+                let ids = read_ids_for_locals(manifest, &entry, &locals, id_column, true).await?;
+                ids.into_iter()
+                    .enumerate()
+                    .filter(|(_, id)| wanted.binary_search(id).is_ok())
+                    .map(|(local, id)| {
+                        u32::try_from(local).map(|local| (id, local)).map_err(|_| {
+                            QueryError::Execute(format!(
+                                "local_doc_id out of range in user superfile {:?}",
+                                entry.uri
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        Ok::<_, QueryError>((entry, pairs))
+    }))
+    .await?;
+    for (entry, pairs) in located {
+        for (id, local) in pairs {
             let Some(indexes) = requested.get(&id) else {
                 continue;
             };
-            let local = u32::try_from(local).map_err(|_| {
-                QueryError::Execute(format!(
-                    "local_doc_id out of range in user superfile {:?}",
-                    entry.uri
-                ))
-            })?;
             for &index in indexes {
                 if placements[index].is_none() {
                     placements[index] = Some((Arc::clone(&entry), local));
@@ -741,6 +782,83 @@ async fn lookup_user_placements_by_id(
             })
         })
         .collect()
+}
+
+/// Locate `wanted` stable ids (ascending, deduped) in an id-sorted
+/// gapped user superfile by batched binary search over targeted `_id`
+/// page probes: every round reads ONE batch of pivot rows (at most one
+/// per unresolved id) and halves each id's remaining row range, so the
+/// whole top-k placement costs O(k · log n) row probes instead of a
+/// full-column decode.
+///
+/// Sortedness is asserted per round, not assumed: pivot rows are read
+/// in ascending row order, so their values must be ascending too. Any
+/// violation (or a spent round budget) returns `Ok(None)` and the
+/// caller falls back to the full `_id`-column read — the bisection can
+/// be wrong only by declining, never by mis-placing.
+///
+/// Ids absent from the file simply stay unlocated (their range
+/// empties); the caller's "no user superfile owns id" contract is
+/// unchanged.
+async fn bisect_locals_for_ids_sorted(
+    manifest: &ManifestSnapshot,
+    entry: &SuperfileEntry,
+    wanted: &[i128],
+    id_column: &str,
+) -> Result<Option<Vec<(i128, u32)>>, QueryError> {
+    if wanted.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let n_docs = entry.n_docs as u32;
+    if n_docs == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    // Per wanted id: half-open unresolved row range [lo, hi).
+    let mut bounds: Vec<(u32, u32)> = vec![(0, n_docs); wanted.len()];
+    let mut out: Vec<(i128, u32)> = Vec::with_capacity(wanted.len());
+    for _ in 0..ID_BISECT_MAX_ROUNDS {
+        let mut pivots: Vec<u32> = bounds
+            .iter()
+            .filter(|(lo, hi)| lo < hi)
+            .map(|&(lo, hi)| lo + (hi - lo) / 2)
+            .collect();
+        if pivots.is_empty() {
+            return Ok(Some(out));
+        }
+        pivots.sort_unstable();
+        pivots.dedup();
+        let values = read_ids_for_locals(manifest, entry, &pivots, id_column, false).await?;
+        if values.len() != pivots.len() || !values.is_sorted() {
+            // Row order is not id order (or the probe under-delivered):
+            // this file doesn't satisfy the sorted contract — decline.
+            return Ok(None);
+        }
+        let value_at = |local: u32| -> i128 {
+            let slot = pivots
+                .binary_search(&local)
+                .expect("pivot probed this round");
+            values[slot]
+        };
+        for (slot, &id) in wanted.iter().enumerate() {
+            let (lo, hi) = bounds[slot];
+            if lo >= hi {
+                continue;
+            }
+            let mid = lo + (hi - lo) / 2;
+            let value = value_at(mid);
+            match value.cmp(&id) {
+                Ordering::Equal => {
+                    out.push((id, mid));
+                    bounds[slot] = (mid, mid);
+                }
+                Ordering::Less => bounds[slot] = (mid + 1, hi),
+                Ordering::Greater => bounds[slot] = (lo, mid),
+            }
+        }
+    }
+    // Ranges halve every round, so a spent budget means bookkeeping
+    // broke — decline to the always-correct full read.
+    Ok(None)
 }
 
 /// Extract the `_id` column (column 0, Decimal128) of `batch` as `Vec<i128>`.
@@ -920,7 +1038,7 @@ async fn hidden_hits_user_ids(
     Ok(ids)
 }
 
-fn projection_is_id_score_only(projection: Option<&[&str]>, id_column: &str) -> bool {
+pub(crate) fn projection_is_id_score_only(projection: Option<&[&str]>, id_column: &str) -> bool {
     match projection {
         None => true,
         Some(names) => names == [id_column, SCORE_COLUMN] || names == [SCORE_COLUMN, id_column],

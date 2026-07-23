@@ -104,7 +104,9 @@ use crate::{
             exec::common::{resolve_hits_named, take_rows_byte_source},
             prune::{PruneLeaf, select_superfiles},
             skip::{fts_bloom_skip, fts_prefix_skip},
-            vector::user_placement_for_scalar_resolve,
+            vector::{
+                hits_id_score_batch, projection_is_id_score_only, user_placement_for_scalar_resolve,
+            },
         },
         reader_cache::disk::ForegroundQueryGuard,
         slow_fts_state::{SlowFtsState, TermBlockMax},
@@ -1528,6 +1530,18 @@ impl SupertableReader {
         let _foreground = ForegroundQueryGuard::enter();
         self.block_on(async {
             let hits = self.bm25_search_async(column, query, k, mode).await?;
+            // Bare projection needs no scalar decode: every hit already
+            // carries its stable `_id` (the waves stamp and require it),
+            // so build `_id` + `score` directly — the vector path's
+            // fast-path contract. Skipping the placement pass below
+            // matters: relocating hidden hits into a merged user file
+            // with a gapped id span decodes that file's whole `_id`
+            // column per query (~60 ms flat post-compact at 1M).
+            let id_column = self.options().id_column.as_str();
+            if projection_is_id_score_only(projection, id_column) {
+                let batch = hits_id_score_batch(self, &hits)?;
+                return Ok(vec![batch]);
+            }
             // Hidden text-shard hits carry no scalar data; relocate them
             // to their user-table placement by stable `_id` before the
             // decode (user-table hits pass through unchanged). Gated on
@@ -1899,6 +1913,15 @@ impl Supertable {
             .map_err(|e| InfinoError::from(e).with_context("token_match", None))?;
         let batch = self
             .block_on_query(async {
+                // Bare projection: build `_id` + `score` directly from the
+                // stable-id stamps, skipping the placement pass — same
+                // fast-path contract as `bm25_search` (a gapped merged
+                // user file makes the pass decode its whole `_id` column
+                // per query).
+                let id_column = reader.options().id_column.as_str();
+                if projection_is_id_score_only(projection, id_column) {
+                    return hits_id_score_batch(&reader, &hits);
+                }
                 // Hidden text-shard hits carry no scalar data; relocate
                 // them to their user-table placement by stable `_id`
                 // before the decode. Gated on the same probe the route
@@ -2003,6 +2026,7 @@ mod tests {
 
     use super::{BoolMode, FanOut, build_work_units, fanout_for};
     use crate::{
+        config::{CompactionSettings, DEFAULT_STALE_SEAL_TIMEOUT_MS},
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             SuperfileReader,
@@ -3246,22 +3270,10 @@ mod tests {
             }),
         );
     }
-    /// SCRATCH (uncommitted): full-path profile target. LocalFs
-    /// supertable, 1M docs, drained; loops warm ten-term OR through
-    /// the public bm25_search so `perf` sees the whole hidden route.
-    #[test]
-    #[ignore = "scratch profiling target"]
-    fn diag_supertable_ten_term_profile() {
-        use std::time::Instant;
-
-        use tempfile::TempDir;
-
-        use crate::supertable::storage::LocalFsStorageProvider;
-
-        const DOCS: u32 = 1_000_000;
-        const COMMITS: u32 = 16;
-        const WARM_ITERS: u32 = 2000;
-
+    /// SCRATCH: shared corpus for the warm-profile diags — a LocalFs
+    /// supertable with `docs` ten-term docs appended across `commits`
+    /// commits. Returns the tempdir (keep it alive) and the handle.
+    fn build_ten_term_profile_table(docs: u32, commits: u32) -> (tempfile::TempDir, Supertable) {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "body",
             DataType::LargeUtf8,
@@ -3273,8 +3285,8 @@ mod tests {
                 .build()
                 .expect("pool"),
         );
-        let dir = TempDir::new_in("/mnt/scratch/tmp").expect("tempdir");
-        let storage: Arc<dyn crate::storage::StorageProvider> =
+        let dir = tempfile::TempDir::new_in("/mnt/scratch/tmp").expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st = Supertable::create(
             SupertableOptions::new(
@@ -3292,8 +3304,8 @@ mod tests {
         )
         .expect("create");
 
-        let per = DOCS / COMMITS;
-        for c in 0..COMMITS {
+        let per = docs / commits;
+        for c in 0..commits {
             let texts: Vec<String> = (0..per)
                 .map(|i| {
                     let d = c * per + i;
@@ -3313,8 +3325,24 @@ mod tests {
             let mut w = st.writer().expect("writer");
             w.append(&batch).expect("append");
             w.commit().expect("commit");
-            println!("commit {}/{COMMITS}", c + 1);
+            println!("commit {}/{commits}", c + 1);
         }
+        (dir, st)
+    }
+
+    /// SCRATCH (uncommitted): full-path profile target. LocalFs
+    /// supertable, 1M docs, drained; loops warm ten-term OR through
+    /// the public bm25_search so `perf` sees the whole hidden route.
+    #[test]
+    #[ignore = "scratch profiling target"]
+    fn diag_supertable_ten_term_profile() {
+        use std::time::Instant;
+
+        const DOCS: u32 = 1_000_000;
+        const COMMITS: u32 = 16;
+        const WARM_ITERS: u32 = 2000;
+
+        let (_dir, st) = build_ten_term_profile_table(DOCS, COMMITS);
         let t = Instant::now();
         st.drain_vectors_to_cells_sync().expect("drain");
         println!("drain done in {:?}", t.elapsed());
@@ -3335,6 +3363,278 @@ mod tests {
                 .expect("query");
         }
         println!("warm ten-term OR: {:?}/query", t.elapsed() / WARM_ITERS);
+    }
+
+    /// SCRATCH (uncommitted): post-compact warm profile. Same corpus
+    /// as [`diag_supertable_ten_term_profile`], but after the drain it
+    /// runs a full `optimize()` (compact + gc) and re-times the warm
+    /// loop — reproducing the bench's post-compact flat ~60 ms/query
+    /// tax locally if the mechanism is structural rather than store-
+    /// or budget-dependent. Also probes the undrained tail directly:
+    /// post-optimize it must be empty (the merged file inherits the
+    /// oldest drained birth_version); a non-empty tail means wave 2
+    /// re-walks the merged corpus on every query.
+    #[test]
+    #[ignore = "scratch profiling target"]
+    fn diag_post_compact_warm_profile() {
+        use std::{slice, time::Instant};
+
+        use crate::config::OptimizeOptions;
+
+        const DOCS: u32 = 1_000_000;
+        const COMMITS: u32 = 16;
+        const ITERS: usize = 50;
+
+        let (_dir, st) = build_ten_term_profile_table(DOCS, COMMITS);
+        let t = Instant::now();
+        st.drain_vectors_to_cells_sync().expect("drain");
+        println!("drain done in {:?}", t.elapsed());
+
+        let query = "t0w0 t1x t2y0 t3z t4a0 t5b t6c t7d t8e t9f";
+        let warm_window = |label: &str| {
+            let reader = st.reader();
+            for _ in 0..10 {
+                reader
+                    .bm25_search("body", query, 10, BoolMode::Or, None)
+                    .expect("query");
+            }
+            let mut samples: Vec<u128> = (0..ITERS)
+                .map(|_| {
+                    let t = Instant::now();
+                    reader
+                        .bm25_search("body", query, 10, BoolMode::Or, None)
+                        .expect("query");
+                    t.elapsed().as_micros()
+                })
+                .collect();
+            samples.sort_unstable();
+            println!(
+                "{label}: p50 {}µs p90 {}µs min {}µs max {}µs",
+                samples[ITERS / 2],
+                samples[ITERS * 9 / 10],
+                samples[0],
+                samples[ITERS - 1],
+            );
+        };
+
+        warm_window("POST-DRAIN warm ten_term_or");
+
+        // Mirror the bench lifecycle exactly: an undrained delta batch
+        // lands between the drain and the optimize, so optimize's
+        // inner drain extends the watermark right before compaction
+        // stamps merged birth_versions.
+        let delta_texts: Vec<String> = (0..1000u32)
+            .map(|i| {
+                let d = DOCS + i;
+                format!(
+                    "t0w{} t1x t2y{} t3z t4a{} t5b t6c t7d t8e t9f fill{d}",
+                    d % 3,
+                    d % 5,
+                    d % 2
+                )
+            })
+            .collect();
+        let schema = st.schema();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(LargeStringArray::from(delta_texts)) as _],
+        )
+        .expect("delta batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("delta append");
+        w.commit().expect("delta commit");
+        println!("delta committed (1000 docs, undrained)");
+
+        let t = Instant::now();
+        st.optimize(&OptimizeOptions::default()).expect("optimize");
+        println!("optimize done in {:?}", t.elapsed());
+        println!(
+            "post-optimize user superfiles: {}",
+            st.reader().manifest().get_all_superfiles().len()
+        );
+
+        // Watermark probe: the merged user file must stay on the
+        // drained side of the two-wave split.
+        let reader = st.reader();
+        let route = block_on(reader.hidden_text_route())
+            .expect("route")
+            .expect("hidden epoch present");
+        let tail = block_on(reader.undrained_tail_pruned(
+            &route,
+            "body",
+            slice::from_ref(&"t1x".to_string()),
+            BoolMode::Or,
+        ))
+        .expect("tail prune");
+        println!(
+            "post-optimize undrained tail: {} entries, birth versions {:?}",
+            tail.len(),
+            tail.iter().map(|e| e.birth_version).collect::<Vec<_>>(),
+        );
+
+        println!("PROFILE_NOW pid={}", std::process::id());
+        warm_window("POST-COMPACT warm ten_term_or");
+        warm_window("POST-COMPACT warm ten_term_or (2nd window)");
+    }
+
+    /// Aggressive compaction settings for the placement regression
+    /// test below: 1 MB target + 1% fill floor force a merge job for
+    /// any handful of small commits.
+    const PLACEMENT_TEST_COMPACTION: CompactionSettings = CompactionSettings {
+        target_superfile_size_mb: 1,
+        min_fill_percent: 1,
+        max_memory_mb: 64,
+        stale_seal_timeout_ms: DEFAULT_STALE_SEAL_TIMEOUT_MS,
+    };
+
+    /// Post-compact placement regression: compaction merges several
+    /// commits into ONE user superfile whose stable-id span is gapped
+    /// (Snowflake ids jump between commits), knocking scalar placement
+    /// off the `id_min + local` arithmetic path. Guards two fixes:
+    /// the bare projection must skip the placement pass entirely
+    /// (vector-parity fast path — before it, every projection-`None`
+    /// query decoded the merged file's whole `_id` column, the flat
+    /// +60 ms/query post-compact tax at 1M), and scalar projections
+    /// must locate rows through the sorted-`_id` bisection — both
+    /// checked against ground truth (the row text names its doc).
+    #[test]
+    fn post_compact_gapped_placement_and_bare_projection() {
+        use arrow_array::Float32Array;
+        use tempfile::TempDir;
+
+        use crate::config::OptimizeOptions;
+
+        const COMMITS: u32 = 4;
+        const PER: u32 = 300;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "body",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new_in("/mnt/scratch/tmp").expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "body".into(),
+                    positions: false,
+                }],
+                vec![],
+                Some(tok()),
+            )
+            .expect("options")
+            .with_storage(storage)
+            .with_writer_pool(pool),
+        )
+        .expect("create");
+
+        for c in 0..COMMITS {
+            let texts: Vec<String> = (0..PER)
+                .map(|i| {
+                    let d = c * PER + i;
+                    format!("uniq{d} common filler")
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(LargeStringArray::from(texts)) as _],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain");
+        st.optimize(&OptimizeOptions::compact(PLACEMENT_TEST_COMPACTION))
+            .expect("optimize");
+
+        let reader = st.reader();
+        assert!(reader.hidden_epoch_has_text(), "text shards must exist");
+        let user_files = reader.manifest().get_all_superfiles().len();
+        assert!(
+            user_files < COMMITS as usize,
+            "compaction must have merged user files (got {user_files})"
+        );
+
+        // Scalar projection: placement must locate each hit's row in
+        // the merged gapped file — the body text names its doc, so a
+        // mis-placement returns another row's text.
+        for d in [0u32, 1, PER - 1, PER, 2 * PER + 7, COMMITS * PER - 1] {
+            let term = format!("uniq{d}");
+            let rows = st
+                .bm25_search(
+                    "body",
+                    &term,
+                    3,
+                    BoolMode::Or,
+                    Some(&["_id", "body", "score"]),
+                )
+                .expect("scalar search");
+            assert_eq!(rows[0].num_rows(), 1, "term {term} matches one doc");
+            let body = rows[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("body col");
+            assert_eq!(body.value(0), format!("uniq{d} common filler"));
+
+            // Bare projection must agree with the scalar path on `_id`
+            // and score (it takes the stamp-only fast path).
+            let bare = st
+                .bm25_search("body", &term, 3, BoolMode::Or, None)
+                .expect("bare search");
+            assert_eq!(bare[0].num_rows(), 1);
+            let id_of = |b: &RecordBatch, col: usize| {
+                b.column(col)
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("_id col")
+                    .value(0)
+            };
+            assert_eq!(id_of(&bare[0], 0), id_of(&rows[0], 0), "term {term}");
+            let score_of = |b: &RecordBatch, col: usize| {
+                b.column(col)
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .expect("score col")
+                    .value(0)
+            };
+            assert_eq!(score_of(&bare[0], 1), score_of(&rows[0], 2));
+        }
+
+        // Multi-hit scalar projection: every returned row's text must
+        // pair with its own doc (exercises multi-id bisection).
+        let rows = st
+            .bm25_search(
+                "body",
+                "common",
+                10,
+                BoolMode::Or,
+                Some(&["_id", "body", "score"]),
+            )
+            .expect("multi search");
+        assert_eq!(rows[0].num_rows(), 10);
+        let body = rows[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("body col");
+        for r in 0..10 {
+            assert!(
+                body.value(r).starts_with("uniq") && body.value(r).ends_with("common filler"),
+                "row {r} text {:?} not a valid doc",
+                body.value(r)
+            );
+        }
     }
 
     /// SCRATCH (uncommitted): merged-shard BM25 statistics audit.
