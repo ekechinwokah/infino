@@ -464,7 +464,8 @@ pub struct FtsSettings {
 /// text shard multiplies a cold multi-term query's dictionary and
 /// posting fan (measured at 10M: 8 shards x ~39 GETs = 312 first-cold
 /// data GETs vs 134 on the pre-index path — a defect; ~2 shards puts
-/// it well under). Kernel parallelism is unaffected: large shards
+/// it well under; steady-cold stays ~4x below the pre-index
+/// path). Kernel parallelism is unaffected: large shards
 /// are sliced into ranged sub-units by the wave planner.
 const DEFAULT_FTS_TEXT_SHARD_TARGET_MB: u64 = 2048;
 /// Default [`FtsSettings::block_max_df_floor`] — ~8 posting blocks at
