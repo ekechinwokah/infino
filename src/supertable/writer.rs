@@ -3180,6 +3180,11 @@ struct TextDrainOutcome {
 /// the merge drops synthetic terms from its sources, so every
 /// drain/fold regenerates a consistent set from the surviving
 /// unigrams.
+/// Conservative bytes-per-posting divisor for the pre-decode df bound
+/// in [`generate_bigram_terms`]: PFOR never packs below ~1 bit per
+/// posting, so `postings_length < floor / 8` proves `df < floor`.
+const PFOR_MIN_BITS_PER_POSTING_DENOM: u64 = 8;
+
 async fn generate_bigram_terms(
     final_reader: &FtsReader,
     fts_columns: &[FtsConfig],
@@ -3204,6 +3209,23 @@ async fn generate_bigram_terms(
             .column_term_entries(&fc.column)
             .map_err(|e| BuildError::Store(e.to_string()))?
         {
+            // Pre-decode df bound: PFOR spends well over
+            // 1 bit/posting, so a list shorter than floor/8 bytes
+            // proves df < floor without decoding it — this skips the
+            // corpus's long tail (measured: the census dominated the
+            // generation pass when it decoded every singleton).
+            match FstValue::unpack(packed) {
+                FstValue::Inline { .. } => continue,
+                FstValue::Pfor {
+                    postings_length, ..
+                } => {
+                    if (postings_length as u64)
+                        < (member_df_floor as u64) / PFOR_MIN_BITS_PER_POSTING_DENOM
+                    {
+                        continue;
+                    }
+                }
+            }
             let runs = final_reader
                 .decode_term_postings(true, packed, &mut pairs)
                 .await

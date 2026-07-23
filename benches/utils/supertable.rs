@@ -1027,15 +1027,16 @@ const VECTOR_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
 /// Per-state `(label, <5M ceiling, 5M-20M ceiling)` on the FIRST cold
 /// FTS query's data GETs, calibrated on the 1M Azure lifecycle:
 /// pre-drain 128 measured (one posting fetch per surviving user file);
-/// post-drain/post-compact 26 (merged-shard open + routed posting
-/// blocks); post-delta 34 (26 hidden + 8 undrained tail). The mid
-/// column is a provisional 3x of the small tier until a 10M lifecycle
-/// calibrates it.
+/// post-drain/post-compact 26 pre-bigram, 43 with the drain-emitted
+/// pair terms (their postings and block-max rows join the cold fan);
+/// post-delta adds the ~8-GET undrained tail. The mid column is a
+/// provisional 3x of the small tier until a 10M lifecycle calibrates
+/// it.
 const FTS_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
     ("pre-drain", 160, 480),
-    ("post-drain", 40, 120),
-    ("post-delta", 52, 156),
-    ("post-compact", 40, 120),
+    ("post-drain", 56, 168),
+    ("post-delta", 68, 204),
+    ("post-compact", 56, 168),
 ];
 /// Second (steady) cold FTS query: pre-drain re-fetches per file
 /// (128 measured); drained states serve from the merged shard
