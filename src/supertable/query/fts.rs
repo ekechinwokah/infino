@@ -4378,6 +4378,200 @@ mod tests {
         done.store(true, std::sync::atomic::Ordering::Relaxed);
         watchdog.join().expect("watchdog");
     }
+    /// The unranked surface — `token_match` / `count` / `exact_match` /
+    /// `bm25_search_prefix` — across both routing eras: the user path
+    /// (pre-drain) and the hidden text shards + tail two-wave path
+    /// (post-drain), including negation, must clauses, phrases (the
+    /// positions-enabled walk), and the Supertable-level Arrow
+    /// wrappers. These paths carry their own wave kernels and were
+    /// exercised only incidentally before.
+    #[test]
+    fn unranked_surface_covers_both_routing_eras() {
+        use crate::config::OptimizeOptions;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "body",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .expect("pool"),
+        );
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "body".into(),
+                    // Positions on: phrase atoms take the verified walk.
+                    positions: true,
+                }],
+                vec![],
+                Some(tok()),
+            )
+            .expect("options")
+            .with_storage(storage)
+            .with_writer_pool(pool),
+        )
+        .expect("create");
+
+        for texts in [
+            vec!["alpha beta gamma", "alpha delta", "beta gamma delta"],
+            vec!["alpha beta delta", "gamma delta", "alpha beta gamma delta"],
+        ] {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(LargeStringArray::from(texts)) as _],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        // The same battery must hold in both eras; the drain flips the
+        // route from per-user-file to hidden shards + empty tail.
+        let assert_battery = |era: &str| {
+            let r = st.reader();
+            // token_match: Or / And / negation / must clause / phrase.
+            assert_eq!(
+                r.token_match("body", "alpha", BoolMode::Or)
+                    .expect("tm")
+                    .len(),
+                4,
+                "{era}: bare term"
+            );
+            assert_eq!(
+                r.token_match("body", "alpha beta", BoolMode::And)
+                    .expect("tm")
+                    .len(),
+                3,
+                "{era}: AND tokens"
+            );
+            assert_eq!(
+                r.token_match("body", "alpha -delta", BoolMode::Or)
+                    .expect("tm")
+                    .len(),
+                1,
+                "{era}: negation excludes"
+            );
+            assert_eq!(
+                r.token_match("body", "+gamma beta", BoolMode::Or)
+                    .expect("tm")
+                    .len(),
+                4,
+                "{era}: must clause drives the match set"
+            );
+            assert_eq!(
+                r.token_match("body", "\"alpha beta\"", BoolMode::Or)
+                    .expect("tm")
+                    .len(),
+                3,
+                "{era}: phrase atom (adjacent, ordered)"
+            );
+            assert_eq!(
+                r.token_match("body", "\"beta alpha\"", BoolMode::Or)
+                    .expect("tm")
+                    .len(),
+                0,
+                "{era}: reversed phrase matches nothing"
+            );
+            // count: O(1)-df path and the negation-forced walk.
+            assert_eq!(r.count("body", "delta", BoolMode::Or).expect("count"), 5);
+            assert_eq!(
+                r.count("body", "delta -alpha", BoolMode::Or)
+                    .expect("count"),
+                2,
+                "{era}: negation-forced count walk"
+            );
+            // exact_match: whole stored value, and a near-miss.
+            assert_eq!(
+                r.exact_match("body", "alpha delta").expect("exact").len(),
+                1,
+                "{era}: exact value"
+            );
+            assert_eq!(
+                r.exact_match("body", "alpha  delta").expect("exact").len(),
+                0,
+                "{era}: whitespace-different value is no exact match"
+            );
+            // prefix expansion: del* -> delta.
+            assert_eq!(
+                r.bm25_search_prefix("body", "del", 10)
+                    .expect("prefix")
+                    .len(),
+                5,
+                "{era}: prefix expansion"
+            );
+            // Supertable-level Arrow wrappers (bare + scalar projection).
+            let rows = st
+                .token_match("body", "alpha", BoolMode::Or, None)
+                .expect("tm rows");
+            assert_eq!(rows[0].num_rows(), 4, "{era}: token_match rows");
+            let rows = st
+                .exact_match("body", "gamma delta", Some(&["_id", "body", "score"]))
+                .expect("exact rows");
+            assert_eq!(rows[0].num_rows(), 1, "{era}: exact_match rows");
+            let body = rows[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("body col");
+            assert_eq!(body.value(0), "gamma delta", "{era}: projected text");
+        };
+
+        assert_battery("pre-drain");
+        st.drain_vectors_to_cells_sync().expect("drain");
+        assert_battery("post-drain");
+
+        // A delete must drop out of every unranked path post-drain
+        // (HDEL identity filtering on the hidden route).
+        let stats = st
+            .delete(col("body").eq(lit("alpha delta")))
+            .expect("delete");
+        assert_eq!(stats.n_tombstoned(), 1);
+        let r = st.reader();
+        assert_eq!(
+            r.token_match("body", "alpha", BoolMode::Or)
+                .expect("tm")
+                .len(),
+            3
+        );
+        assert_eq!(r.count("body", "delta", BoolMode::Or).expect("count"), 4);
+        assert_eq!(
+            r.exact_match("body", "alpha delta").expect("exact").len(),
+            0
+        );
+
+        // Optimize (drain + compact) keeps the battery honest over the
+        // folded topology too.
+        st.optimize(&OptimizeOptions::compact(PLACEMENT_TEST_COMPACTION))
+            .expect("optimize");
+        let r = st.reader();
+        assert_eq!(
+            r.token_match("body", "alpha", BoolMode::Or)
+                .expect("tm")
+                .len(),
+            3
+        );
+        assert_eq!(
+            r.token_match("body", "\"alpha beta\"", BoolMode::Or)
+                .expect("tm")
+                .len(),
+            3,
+            "post-compact: phrase survives the fold"
+        );
+        assert_eq!(
+            r.count("body", "delta -alpha", BoolMode::Or)
+                .expect("count"),
+            2
+        );
+    }
 }
 
 #[cfg(test)]

@@ -2243,6 +2243,49 @@ mod tests {
         assert_eq!(or, vec![0, 2]);
     }
 
+    /// The thin search wrappers that only ride the supertable fan-out
+    /// in production: ranged pretokenized OR (± floor), the
+    /// multi-column combiner, and the page-index parquet metadata
+    /// load. Each delegates to a covered kernel; this pins the
+    /// wrapper seams themselves.
+    #[tokio::test]
+    async fn search_wrapper_surfaces_answer_on_a_small_superfile() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open(bytes).expect("open");
+
+        // Ranged pretokenized OR: docs 0..2 excludes doc 2's "rust".
+        let ranged = r
+            .bm25_search_or_range_pretokenized("title", &["rust"], 10, 0, 2)
+            .await
+            .expect("ranged or");
+        assert_eq!(ranged.iter().map(|&(d, _)| d).collect::<Vec<_>>(), vec![0]);
+        // With a floor above every score, the same window is empty.
+        let floored = r
+            .bm25_search_or_range_pretokenized_with_floor("title", &["rust"], 10, 0, 4, f32::MAX)
+            .await
+            .expect("floored");
+        assert!(floored.is_empty());
+
+        // Multi-column combiner (single column, weight 1 — the
+        // combiner path itself is what's under test here).
+        let multi = r
+            .bm25_search_multi(&[("title", 1.0)], "rust system", 10, BoolMode::Or)
+            .await
+            .expect("multi");
+        assert_eq!(
+            multi.first().map(|&(d, _)| d),
+            Some(2),
+            "doc 2 has both terms"
+        );
+
+        // Page-index metadata load (the scan path's lazy variant).
+        let meta = r
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("page-index metadata");
+        assert!(meta.num_row_groups() >= 1);
+    }
+
     #[tokio::test]
     async fn term_df_counts_documents() {
         let bytes = build_simple_fts_only_superfile();
