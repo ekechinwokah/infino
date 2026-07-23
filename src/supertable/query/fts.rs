@@ -359,12 +359,23 @@ async fn bm25_fanout_wave(
                     .term_block_max(e.superfile_id, &column_arc, term)
                     .is_some_and(|row| row.quantized.iter().min() < row.quantized.iter().max())
             }),
+            // Mirror the kernel's engagement gate exactly (>= 1 row
+            // present AND every present row prunable): a file that can
+            // never engage must keep its ranged parallel slicing — the
+            // any-prunable form parked near-flat merged shards on one
+            // un-ranged unit whose whole-file fallback ran the union
+            // single-threaded (measured: the entire post-drain
+            // broad-OR gap; ten/forty_term_or 12/39 ms vs 2.1/6.2
+            // pre-drain).
             (None, true, Some(state)) => kept.iter().partition(|e| {
-                should_arc.iter().any(|term| {
-                    state
-                        .term_block_max(e.superfile_id, &column_arc, term)
-                        .is_some_and(|row| row.quantized.iter().min() < row.quantized.iter().max())
-                })
+                let rows: Vec<_> = should_arc
+                    .iter()
+                    .filter_map(|term| state.term_block_max(e.superfile_id, &column_arc, term))
+                    .collect();
+                !rows.is_empty()
+                    && rows
+                        .iter()
+                        .all(|row| row.quantized.iter().min() < row.quantized.iter().max())
             }),
             _ => (Vec::new(), kept.iter().collect()),
         };
