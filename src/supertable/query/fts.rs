@@ -4271,7 +4271,10 @@ mod cold_read_probe {
             .expect("df1 search");
         let io = provider.usage_meter().snapshot().since(&before);
         let hits: usize = rows.iter().map(|b| b.num_rows()).sum();
-        eprintln!("PROBE df1: {} hit(s), {} GET during search", hits, io.get_count);
+        eprintln!(
+            "PROBE df1: {} hit(s), {} GET during search",
+            hits, io.get_count
+        );
         assert_eq!(hits, 1, "df1 term matches exactly one doc");
     }
 }

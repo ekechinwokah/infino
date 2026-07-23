@@ -34,7 +34,8 @@
 
 use std::{collections::HashSet, future::Future, sync::Arc, time::Instant};
 
-use arrow_array::Decimal128Array;
+use arrow_array::{Decimal128Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 use futures::future::try_join_all;
 use roaring::RoaringBitmap;
 use tracing::trace;
@@ -52,8 +53,9 @@ use crate::{
         error::QueryError,
         handle::SupertableReader,
         manifest::SuperfileEntry,
+        options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
-            exec::common::{stamp_stable_ids, take_rows_byte_source, take_rows_object_store},
+            exec::common::{take_rows_byte_source, take_rows_object_store},
             superfile_reader::superfile_reader,
             vector::row_id_from_manifest_entry,
         },
@@ -317,21 +319,87 @@ pub(crate) async fn attach_stable_ids_to_hits(
     hits: &mut [SuperfileHit],
 ) -> Result<(), QueryError> {
     // Arithmetic-capable files were stamped at tag time ([`tag_hits`]);
-    // only hits from cell-packed / gapped-span files arrive unresolved. Fill
-    // them through the shared, cache-backed id resolution: inline id / span
-    // arithmetic where possible, else a `_id`-column read via the decoded
-    // scalar cache (so a warm reader decodes each superfile's `_id` column
-    // once, not once per query). This replaces a per-superfile
-    // `take_by_local_doc_ids`, whose scattered per-query Parquet page reads
-    // dominated large-k scored latency on real corpora.
-    stamp_stable_ids(table_reader, hits)
-        .await
-        .map_err(|e| QueryError::Execute(e.to_string()))?;
-    if let Some(missing) = hits.iter().find(|h| h.stable_id.is_none()) {
-        return Err(QueryError::Execute(format!(
-            "hit {:?}/{} missing stable _id after search-wave stamping",
-            missing.superfile, missing.local_doc_id
-        )));
+    // only hits from cell-packed / gapped-span files arrive unresolved. On
+    // such tables that is EVERY hit, so this must not copy hits: process
+    // contiguous same-file runs in place (unranked hits arrive file-grouped
+    // from the fan-out; ranked top-k interleaves, but is top-k-sized). Per
+    // run: one manifest lookup, one reader open, one in-place stamp via the
+    // single id-resolution ladder ([`attach_stable_ids`]: span arithmetic →
+    // resident id pages → targeted hit-row take). The decoded-scalar cache
+    // fronts the ladder — a repeated top-k (same file, same locals) stamps
+    // from memory with no read at all, which keeps large-k scored repeats
+    // off the per-query Parquet decode — while a cache miss keeps the
+    // ladder's targeted I/O shape. Routing misses through the generic
+    // scalar resolver instead used to storm the block cache with duplicate
+    // concurrent page fetches on 100MB+ hidden text shards (~15 MiB per
+    // cold attach where the ladder reads ~3 MiB).
+    let manifest = Arc::clone(table_reader.manifest());
+    let store = Arc::clone(&manifest.options.store);
+    let disk_cache = manifest.options.disk_cache.clone();
+    let storage = manifest.options.storage.clone();
+    let decoded_cache = table_reader.decoded_scalar_cache();
+    let id_column = manifest.options.id_column.clone();
+    let mut start = 0usize;
+    while start < hits.len() {
+        if hits[start].stable_id.is_some() {
+            start += 1;
+            continue;
+        }
+        let uri = hits[start].superfile;
+        let mut end = start + 1;
+        while end < hits.len() && hits[end].superfile == uri && hits[end].stable_id.is_none() {
+            end += 1;
+        }
+        let locals: Vec<u32> = hits[start..end].iter().map(|h| h.local_doc_id).collect();
+        if let Some(batch) = decoded_cache.get(uri, &locals, &[id_column.as_str()]) {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| QueryError::Execute("cached _id column not Decimal128".into()))?;
+            for (hit, id) in hits[start..end].iter_mut().zip(ids.values()) {
+                hit.stable_id = Some(*id);
+            }
+            start = end;
+            continue;
+        }
+        let entry = manifest
+            .lookup_superfile_entry(uri)
+            .await
+            .map_err(QueryError::ManifestLoad)?
+            .ok_or_else(|| {
+                QueryError::Execute(format!("hit superfile {uri:?} missing from manifest"))
+            })?;
+        // FTS post-topk id stamp — allow fill (same modality as the search).
+        let reader =
+            open_reader(&store, disk_cache.as_ref(), storage.as_ref(), &entry, true).await?;
+        attach_stable_ids(&reader, &entry, &mut hits[start..end], true).await?;
+        if let Some(missing) = hits[start..end].iter().find(|h| h.stable_id.is_none()) {
+            return Err(QueryError::Execute(format!(
+                "hit {uri:?}/{} missing stable _id after search-wave stamping",
+                missing.local_doc_id
+            )));
+        }
+        // Seed the decoded-scalar cache with the stamped run (same key and
+        // batch shape `resolve_columns` uses), so identical repeat lookups
+        // by this or the row-resolution path are answered from memory.
+        let stamped: Vec<i128> = hits[start..end]
+            .iter()
+            .map(|h| h.stable_id.expect("stamped above"))
+            .collect();
+        if let Ok(array) = Decimal128Array::from(stamped)
+            .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
+        {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                id_column.as_str(),
+                DataType::Decimal128(DECIMAL128_PRECISION, DECIMAL128_SCALE),
+                false,
+            )]));
+            if let Ok(batch) = RecordBatch::try_new(schema, vec![Arc::new(array)]) {
+                decoded_cache.insert(uri, &locals, &[id_column.as_str()], batch);
+            }
+        }
+        start = end;
     }
     Ok(())
 }

@@ -9,6 +9,8 @@
 
 use std::time::Instant;
 
+use infino::storage::io_counters;
+
 use crate::{
     cpu,
     storage_meter::{ColdStoreSplit, MeteredStorage, ObjectStoreMeter},
@@ -68,11 +70,26 @@ pub fn measure_cold_store<C>(
     let n = n_steady.clamp(1, STEADY_COLD_SAMPLES);
     let mut steady: Vec<(f64, Option<f64>, ObjectStoreMeter)> = Vec::with_capacity(n);
     for i in 0..n {
+        // Per-op timeline for the steady windows (INFINO_IO_TIMELINE=1):
+        // dumps every object-store op's uri/offset/len so a GET-count
+        // regression can be attributed to the exact reads, not inferred.
+        io_counters::timeline_reset();
         let cpu0 = cpu::process_cpu_ns();
         let started = Instant::now();
         run_steady(&consumer, i);
         let wall_s = started.elapsed().as_secs_f64();
         let cpu_s = cpu::cpu_seconds_since(cpu0);
+        for span in io_counters::timeline_take() {
+            eprintln!(
+                "[cold-timeline] steady[{i}] {} {} off={} len={} {}us{}",
+                span.op,
+                span.uri,
+                span.off,
+                span.len,
+                span.end_us.saturating_sub(span.start_us),
+                if span.background { " (bg)" } else { "" },
+            );
+        }
         let now = meter.snapshot();
         steady.push((wall_s, cpu_s, now.since(&window_start)));
         window_start = now;
