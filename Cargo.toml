@@ -360,6 +360,14 @@ name = "supertable"
 path = "tests/supertable/main.rs"
 bench = false
 
+# Standalone: multi-shard hidden-text correctness. Own process so it
+# can pin a tiny fts.text_shard_target_mb via cwd config without
+# leaking the knob into other tests.
+[[test]]
+name = "supertable_text_multishard"
+path = "tests/supertable_text_multishard.rs"
+bench = false
+
 # The one and only benchmark binary. Everything — the tier × modality
 # matrix and the standalone diagnostics (scale / tombstone / update /
 # sql-diag / object-store) — is selected by positional tokens at runtime,

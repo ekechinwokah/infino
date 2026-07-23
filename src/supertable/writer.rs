@@ -54,7 +54,7 @@ use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
     env, fmt, fs,
     fs::File,
-    io::{self, BufReader, BufWriter, Read, Write},
+    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     marker::PhantomData,
     mem,
     path::{Path, PathBuf},
@@ -3119,17 +3119,6 @@ fn text_shard_target_bytes() -> u64 {
     config::global().fts.text_shard_target_mb * BYTES_PER_MIB
 }
 
-/// Planned byte size of a df=1 inline term (no posting region bytes;
-/// FST entry only). Shard planning reads sizes off FST values, and
-/// inline terms carry no `postings_length` — this stand-in keeps them
-/// from planning as zero-width.
-const TEXT_PLAN_INLINE_BYTES: u64 = 32;
-
-/// Upper key bound for the last text shard. FST keys are
-/// `<utf8 column>\x1F<utf8 term>` and `0xFF` never occurs in UTF-8, so
-/// a single `0xFF` byte sorts above every real key.
-const TEXT_KEY_UPPER_SENTINEL: &[u8] = &[0xFF];
-
 /// Everything the text drain hands back for the epoch's single OCC
 /// commit: uploaded shard entries to append, the previous epoch's text
 /// entries to remove, and the deferred store/cache inserts applied
@@ -3437,47 +3426,6 @@ async fn generate_bigram_terms(
         });
     }
     Ok(out)
-}
-
-/// Remap one column's synthetic terms into a shard's dense doc space,
-/// dropping docs the shard does not reference and keeping position
-/// runs aligned pair-for-pair (the same discipline the merge applies
-/// to source postings).
-fn remap_synthetic_terms(
-    synthetic: &[SyntheticTerms],
-    dense_remap: &[Option<u32>],
-) -> Vec<SyntheticTerms> {
-    synthetic
-        .iter()
-        .map(|col| SyntheticTerms {
-            column: col.column.clone(),
-            terms: col
-                .terms
-                .iter()
-                .filter_map(|t| {
-                    let mut pairs = Vec::with_capacity(t.pairs.len());
-                    let mut runs = Vec::with_capacity(t.runs.len());
-                    let mut at = 0usize;
-                    for &(doc, tf) in &t.pairs {
-                        let run_start = at;
-                        skip_run(&t.runs, &mut at, tf)?;
-                        if let Some(mapped) = dense_remap[doc as usize] {
-                            pairs.push((mapped, tf));
-                            runs.extend_from_slice(&t.runs[run_start..at]);
-                        }
-                    }
-                    match pairs.is_empty() {
-                        true => None,
-                        false => Some(SyntheticTerm {
-                            term: t.term.clone(),
-                            pairs,
-                            runs,
-                        }),
-                    }
-                })
-                .collect(),
-        })
-        .collect()
 }
 
 async fn drain_fts_text_shards(
@@ -3838,178 +3786,115 @@ async fn drain_fts_text_shards(
             fts_state: SlowFtsState::default(),
         }));
     }
-    // Final: flatten remaining runs in base order; a single survivor
-    // is the final blob directly, else one last k-way merge.
+    // Doc-partitioned shards: group the final runs (contiguous,
+    // base-ordered doc ranges) by cumulative byte size — every shard
+    // is a COMPLETE index over its doc slice. Term-range partitioning
+    // was measured wrong at multi-shard scale: any query shape that
+    // needs several keys in one walk (AND intersections, OR scoring,
+    // k>=3 phrase chains) silently loses matches or splits scores
+    // when its keys land in different shards, because kernels run per
+    // shard. Doc slices keep every shape correct with the existing
+    // kernels; rare terms still route to few shards via the per-shard
+    // blooms, and common terms' fan-out cost is posting bytes, not
+    // dictionary probes. idf becomes per-shard (each shard's header
+    // n_docs is its slice) — the standard per-segment trade, matching
+    // the undrained tail's per-file idf scope.
     let mut all_runs: Vec<TextRun> = tiers.into_iter().flatten().collect();
     all_runs.sort_unstable_by_key(|r| r.base);
-    let final_path = match all_runs.len() {
-        0 => unreachable!("n_docs_merged > 0 implies at least one run"),
-        1 => all_runs.pop().expect("one run").path,
-        _ => {
-            let final_t0 = time::Instant::now();
-            let out = scratch.join("fts_text_final.bin");
-            let merged = merge_text_runs(&all_runs, &merge_columns, &columns_json, &out).await?;
-            eprintln!(
-                "[supertable drain] text final merge: {} run(s) -> {} live doc(s), {:.1}ms",
-                all_runs.len(),
-                merged.n_docs,
-                final_t0.elapsed().as_secs_f64() * 1e3,
-            );
-            merged.path
-        }
-    };
-    let final_bytes = mmap_readonly_bytes(&final_path)
-        .map_err(|error| BuildError::Store(format!("text final mmap: {error}")))?;
-    let final_reader = FtsReader::open(final_bytes, &columns_json)
-        .map_err(|e| BuildError::Store(e.to_string()))?;
-    // Bigram synthetic terms, generated once from the final unigram
-    // postings (final merged doc ids); each shard remaps its slice.
-    let synthetic = generate_bigram_terms(
-        &final_reader,
-        fts_columns,
-        config::global().fts.bigram_member_df_permille,
-        n_docs_merged as u32,
-    )
-    .await?;
-
-    // Shard boundaries: walk the merged FST in key order (columns in
-    // lex name order — the FST key order), accumulating each term's
-    // postings bytes off its FST value, cutting at the size target.
-    let mut columns_lex: Vec<&FtsConfig> = fts_columns.iter().collect();
-    columns_lex.sort_unstable_by(|a, b| a.column.cmp(&b.column));
-    let mut bounds: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut lo: Vec<u8> = Vec::new(); // empty key sorts below every real key
-    let mut running: u64 = 0;
-    for fc in &columns_lex {
-        for (term, packed) in final_reader
-            .column_term_entries(&fc.column)
-            .map_err(|e| BuildError::Store(e.to_string()))?
-        {
-            let planned = match FstValue::unpack(packed) {
-                FstValue::Pfor {
-                    postings_length, ..
-                } => postings_length as u64,
-                FstValue::Inline { .. } => TEXT_PLAN_INLINE_BYTES,
-            };
-            if running > 0 && running + planned > text_shard_target_bytes() {
-                let mut cut = fc.column.as_bytes().to_vec();
-                cut.push(FST_SEPARATOR);
-                cut.extend_from_slice(&term);
-                bounds.push((lo, cut.clone()));
-                lo = cut;
-                running = 0;
+    let mut groups: Vec<Vec<TextRun>> = Vec::new();
+    {
+        let mut current: Vec<TextRun> = Vec::new();
+        let mut current_bytes: u64 = 0;
+        for run in all_runs {
+            let run_bytes = fs::metadata(&run.path)
+                .map_err(|error| BuildError::Store(format!("text run stat: {error}")))?
+                .len();
+            if !current.is_empty() && current_bytes + run_bytes > text_shard_target_bytes() {
+                groups.push(mem::take(&mut current));
+                current_bytes = 0;
             }
-            running += planned;
+            current_bytes += run_bytes;
+            current.push(run);
+        }
+        if !current.is_empty() {
+            groups.push(current);
         }
     }
-    bounds.push((lo, TEXT_KEY_UPPER_SENTINEL.to_vec()));
 
-    // Each shard gets a DENSE doc space: only the docs its term range
-    // references get shard-local ids, so dl arrays and the `_id` stub
-    // scale with the shard's own postings — not the corpus. Dense ids
-    // are assigned in merged-id order, keeping every term's remapped
-    // postings sorted (the merge encoder's contract).
-    let mut referenced = vec![false; n_docs_merged as usize];
-    let mut dense_remap: Vec<Option<u32>> = Vec::with_capacity(n_docs_merged as usize);
     let scalar_schema = hidden_inner.options.scalar_schema();
     let id_column = hidden_inner.options.id_column.clone();
-    let mut prepared: Vec<PreparedSuperfile> = Vec::with_capacity(bounds.len());
-    let mut fts_state_files: Vec<FileBlockMax> = Vec::with_capacity(bounds.len());
-    for (shard_id, (b_lo, b_hi)) in bounds.iter().enumerate() {
-        // Pass 1: mark the merged ids this shard's terms reference.
-        referenced.iter_mut().for_each(|r| *r = false);
-        {
-            let mut pairs: Vec<(u32, u32)> = Vec::new();
-            let mut key_buf: Vec<u8> = Vec::new();
-            for fc in &columns_lex {
-                let positional = fc.positions;
-                for (term, packed) in final_reader
-                    .column_term_entries(&fc.column)
-                    .map_err(|e| BuildError::Store(e.to_string()))?
-                {
-                    key_buf.clear();
-                    key_buf.extend_from_slice(fc.column.as_bytes());
-                    key_buf.push(FST_SEPARATOR);
-                    key_buf.extend_from_slice(&term);
-                    if key_buf.as_slice() < b_lo.as_slice() || key_buf.as_slice() >= b_hi.as_slice()
-                    {
-                        continue;
-                    }
-                    final_reader
-                        .decode_term_postings(positional, packed, &mut pairs)
-                        .await
-                        .map_err(|e| BuildError::Store(e.to_string()))?;
-                    for &(doc, _) in &pairs {
-                        referenced[doc as usize] = true;
-                    }
-                }
-            }
-            // Synthetic bigram terms reference docs too: a bigram key
-            // can fall in this shard's range while neither member
-            // does, so its docs must join the dense doc space.
-            for syn_col in &synthetic {
-                for syn in &syn_col.terms {
-                    key_buf.clear();
-                    key_buf.extend_from_slice(syn_col.column.as_bytes());
-                    key_buf.push(FST_SEPARATOR);
-                    key_buf.extend_from_slice(&syn.term);
-                    if key_buf.as_slice() < b_lo.as_slice() || key_buf.as_slice() >= b_hi.as_slice()
-                    {
-                        continue;
-                    }
-                    for &(doc, _) in &syn.pairs {
-                        referenced[doc as usize] = true;
-                    }
-                }
-            }
-        }
-        // Dense remap in merged-id order + this shard's doc count.
-        dense_remap.clear();
-        let mut shard_docs: u32 = 0;
-        for &hit in &referenced {
-            match hit {
-                true => {
-                    dense_remap.push(Some(shard_docs));
-                    shard_docs += 1;
-                }
-                false => dense_remap.push(None),
-            }
-        }
-        if shard_docs == 0 {
-            return Err(BuildError::Store(format!(
-                "text shard {shard_id} references no docs — planner emitted an empty slice"
-            )));
-        }
-
-        let blob_path = scratch.join(format!("fts_text_shard_{shard_id}.blob"));
-        let mut blob_file = BufWriter::new(
-            File::create(&blob_path)
-                .map_err(|error| BuildError::Store(format!("text shard blob create: {error}")))?,
+    let mut prepared: Vec<PreparedSuperfile> = Vec::with_capacity(groups.len());
+    let mut fts_state_files: Vec<FileBlockMax> = Vec::with_capacity(groups.len());
+    let n_groups = groups.len();
+    for (shard_id, group) in groups.iter().enumerate() {
+        let group_base = group.first().expect("groups are non-empty").base;
+        let shard_docs: u32 = group.iter().map(|r| r.n_docs).sum();
+        debug_assert!(
+            group
+                .windows(2)
+                .all(|w| w[0].base + w[0].n_docs as u64 == w[1].base),
+            "group runs must cover a contiguous doc range"
         );
-        let shard_synthetic = remap_synthetic_terms(&synthetic, &dense_remap);
-        merge_fts_blobs(
-            &[MergeSource {
-                reader: &final_reader,
-                doc_id_remap: &dense_remap,
-            }],
-            &merge_columns,
+        // Merge the group's runs into the shard's dense doc space
+        // (0..shard_docs, base-ordered); a single run IS that space.
+        let inter_path = match group.len() {
+            1 => group[0].path.clone(),
+            _ => {
+                let out = scratch.join(format!("fts_text_group_{shard_id}.bin"));
+                merge_text_runs(group, &merge_columns, &columns_json, &out)
+                    .await?
+                    .path
+            }
+        };
+        let inter_bytes = mmap_readonly_bytes(&inter_path)
+            .map_err(|error| BuildError::Store(format!("text group mmap: {error}")))?;
+        let inter_reader = FtsReader::open(inter_bytes, &columns_json)
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+        // Bigram synthetic terms per shard, generated from the shard's
+        // own unigram postings — already in shard doc space, so no
+        // remap; folds regenerate them like every derived term.
+        let synthetic = generate_bigram_terms(
+            &inter_reader,
+            fts_columns,
+            config::global().fts.bigram_member_df_permille,
             shard_docs,
-            Some((b_lo, b_hi)),
-            &shard_synthetic,
-            &mut blob_file,
         )
         .await?;
-        blob_file
-            .flush()
-            .map_err(|error| BuildError::Store(format!("text shard blob flush: {error}")))?;
-        drop(blob_file);
+        let blob_path;
+        if synthetic.iter().all(|s| s.terms.is_empty()) {
+            blob_path = inter_path.clone();
+        } else {
+            blob_path = scratch.join(format!("fts_text_shard_{shard_id}.blob"));
+            let mut blob_file =
+                BufWriter::new(File::create(&blob_path).map_err(|error| {
+                    BuildError::Store(format!("text shard blob create: {error}"))
+                })?);
+            let identity: Vec<Option<u32>> = (0..shard_docs).map(Some).collect();
+            merge_fts_blobs(
+                &[MergeSource {
+                    reader: &inter_reader,
+                    doc_id_remap: &identity,
+                }],
+                &merge_columns,
+                shard_docs,
+                None,
+                &synthetic,
+                &mut blob_file,
+            )
+            .await?;
+            blob_file
+                .flush()
+                .map_err(|error| BuildError::Store(format!("text shard blob flush: {error}")))?;
+        }
+        drop(inter_reader);
         let blob_len = fs::metadata(&blob_path)
             .map_err(|error| BuildError::Store(format!("text shard blob stat: {error}")))?
             .len();
         eprintln!(
-            "[supertable drain] text shard {}/{}: blob {:.1} MiB sliced, building superfile...",
+            "[supertable drain] text shard {}/{}: {} doc(s), blob {:.1} MiB, building superfile...",
             shard_id + 1,
-            bounds.len(),
+            n_groups,
+            shard_docs,
             blob_len as f64 / (1u64 << 20) as f64,
         );
 
@@ -4027,8 +3912,11 @@ async fn drain_fts_text_shards(
             File::open(&ids_path)
                 .map_err(|error| BuildError::Store(format!("text ids spill open: {error}")))?,
         );
-        // Stub = the shard's OWN docs' stable ids, selected from the
-        // merged-order spill by the reference bitmap.
+        ids_reader
+            .seek(SeekFrom::Start(group_base * STABLE_ID_BYTES as u64))
+            .map_err(|error| BuildError::Store(format!("text ids spill seek: {error}")))?;
+        // Stub = the shard's doc slice of the merged-order id spill —
+        // a contiguous window starting at the group's base.
         let mut shard_id_min = i128::MAX;
         let mut shard_id_max = i128::MIN;
         let mut batch_ids: Vec<i128> = Vec::with_capacity(DRAIN_ID_BATCH_ROWS);
@@ -4053,13 +3941,10 @@ async fn drain_fts_text_shards(
             builder.add_batch_ids_only(&scalar)?;
             Ok(())
         };
-        for &hit in referenced.iter() {
+        for _ in 0..shard_docs {
             ids_reader
                 .read_exact(&mut encoded)
                 .map_err(|error| BuildError::Store(format!("text ids spill read: {error}")))?;
-            if !hit {
-                continue;
-            }
             let id = i128::from_le_bytes(encoded);
             shard_id_min = shard_id_min.min(id);
             shard_id_max = shard_id_max.max(id);
@@ -4088,6 +3973,12 @@ async fn drain_fts_text_shards(
         let bytes = mmap_readonly_bytes(output.path())
             .map_err(|error| BuildError::Store(format!("text shard mmap: {error}")))?;
         let _ = fs::remove_file(&blob_path);
+        if blob_path != inter_path {
+            let _ = fs::remove_file(&inter_path);
+        }
+        for run in group {
+            let _ = fs::remove_file(&run.path);
+        }
         let shard_bytes = bytes.clone();
 
         let shard = ShardOutput {
@@ -4100,9 +3991,10 @@ async fn drain_fts_text_shards(
         let p = prepare_superfile(hidden_inner, shard)?
             .ok_or_else(|| BuildError::Store("text shard prepared with zero docs".into()))?;
         let entry = finish_superfile_entry(p.entry, Some(shard_id as u32))?;
-        // Pre-stamp the tagged TermShard key: the drain owns term-range
-        // shard assignment, and the tag makes the key legible under any
-        // table strategy (the commit path accepts exactly this shape).
+        // Pre-stamp the tagged TermShard key with the shard's ordinal
+        // (doc-range order): the drain owns shard assignment, and the
+        // tag makes the key legible under any table strategy (the
+        // commit path accepts exactly this shape).
         let entry = Arc::new(SuperfileEntry {
             partition_key: encode_partition_key(&PartitionKey::TermShard(shard_id as u32)),
             ..(*entry).clone()
@@ -4131,7 +4023,6 @@ async fn drain_fts_text_shards(
             bytes_for_cache: p.bytes_for_cache,
         });
     }
-    let _ = fs::remove_file(&final_path);
     let _ = fs::remove_file(&ids_path);
     let n_shards = prepared.len();
 
