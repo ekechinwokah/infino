@@ -9260,6 +9260,141 @@ mod tests {
         }
     }
 
+    /// The AND kernel's decline and edge paths: k=0, no musts, a
+    /// must absent from the dictionary (empty intersection), a stale
+    /// routing row (block-count mismatch errors loudly), and an
+    /// oversized unrouted list (declines to the walk).
+    #[tokio::test]
+    async fn multi_term_and_block_selected_edge_paths() {
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        // 10K docs so `common` spans > UNROUTED_TERM_MAX_BLOCKS
+        // posting blocks — the oversized-unrouted decline must trip.
+        for d in 0..10_000u32 {
+            let mut text = "common ".repeat(((d % 13) + 1) as usize);
+            if d % 97 == 0 {
+                text.push_str("rare ");
+            }
+            text.push_str(&format!("filler{d}"));
+            b.add_doc(0, d, &text).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let fst_bytes = r.dict_bytes_async().await.expect("dict");
+        let dict = DictReader::open(&fst_bytes).expect("fst");
+        let packed = dict
+            .lookup(&make_key("body", "common"))
+            .expect("term present");
+        let FstValue::Pfor {
+            metadata_offset, ..
+        } = FstValue::unpack(packed)
+        else {
+            panic!("common is PFOR");
+        };
+        let cursors = r.build_term_cursors(0, &["common"]).await.expect("cursor");
+        let n_blocks = cursors[0].blocks.len();
+        let quantized: Vec<u8> = vec![u8::MAX; n_blocks];
+        let routed = [RoutedTermRow {
+            metadata_offset,
+            quantized: &quantized,
+            scale: 1.0,
+        }];
+
+        // k = 0 short-circuits empty.
+        let got = r
+            .bm25_multi_term_and_block_selected(
+                "body",
+                0,
+                f32::NEG_INFINITY,
+                &routed,
+                &[],
+                &[],
+                &[],
+                None,
+            )
+            .await
+            .expect("k0");
+        assert_eq!(got, Some(Vec::new()));
+
+        // No musts at all: not an AND shape — decline.
+        let got = r
+            .bm25_multi_term_and_block_selected(
+                "body",
+                5,
+                f32::NEG_INFINITY,
+                &[],
+                &[],
+                &routed,
+                &[],
+                None,
+            )
+            .await
+            .expect("no musts");
+        assert!(got.is_none());
+
+        // A must absent from the dictionary empties the intersection.
+        let got = r
+            .bm25_multi_term_and_block_selected(
+                "body",
+                5,
+                f32::NEG_INFINITY,
+                &routed,
+                &["nosuchterm"],
+                &[],
+                &[],
+                None,
+            )
+            .await
+            .expect("absent must")
+            .expect("engaged");
+        assert!(got.is_empty(), "absent must ⇒ empty intersection");
+
+        // Stale routing (wrong block count) must error loudly, never
+        // mis-address posting bytes.
+        let stale_q: Vec<u8> = vec![u8::MAX; n_blocks + 3];
+        let stale = [RoutedTermRow {
+            metadata_offset,
+            quantized: &stale_q,
+            scale: 1.0,
+        }];
+        let err = r
+            .bm25_multi_term_and_block_selected(
+                "body",
+                5,
+                f32::NEG_INFINITY,
+                &stale,
+                &[],
+                &[],
+                &[],
+                None,
+            )
+            .await;
+        assert!(err.is_err(), "stale routing rows must be an error");
+
+        // An oversized "unrouted" must (common here) declines to the
+        // walk instead of decoding a mega list.
+        let got = r
+            .bm25_multi_term_and_block_selected(
+                "body",
+                5,
+                f32::NEG_INFINITY,
+                &[],
+                &["common", "rare"],
+                &[],
+                &[],
+                None,
+            )
+            .await
+            .expect("oversized unrouted");
+        assert!(
+            got.is_none(),
+            "an unrouted term over the block cap must decline"
+        );
+    }
+
     /// SCRATCH (uncommitted): attribute the post-drain broad-OR gap.
     /// Same corpus as (A) one merged blob walked in 8 sub-ranges vs
     /// (B) 16 per-file blobs walked whole — the pre/post-drain shapes
