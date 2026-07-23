@@ -1063,27 +1063,33 @@ const VECTOR_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
     ("post-compact", 1, 5),
 ];
 /// Per-state `(label, <5M ceiling, 5M-20M ceiling)` on the FIRST cold
-/// FTS query's data GETs, calibrated on the 1M Azure lifecycle:
-/// pre-drain 128 measured (one posting fetch per surviving user file);
-/// post-drain/post-compact 26 pre-bigram, 43 with the drain-emitted
-/// pair terms (their postings and block-max rows join the cold fan);
-/// post-delta adds the ~8-GET undrained tail. The mid column is a
-/// provisional 3x of the small tier until a 10M lifecycle calibrates
-/// it.
+/// FTS query's data GETs. TIGHT gates at the exact 1M measurements
+/// (2026-07-23, post attach-ladder + per-file tie cap; identical
+/// across three lifecycle runs): pre-drain 130 (one coalesced posting
+/// fetch per surviving user file + bloom-FPR stragglers), post-drain /
+/// post-compact 22 (merged shard: dict slices + bigram postings +
+/// top-k id pages), post-delta 30 (+ the undrained-tail file). Any
+/// increase is a cost regression: a change that deliberately trades
+/// GETs for latency must loosen these consciously, in its own PR.
+/// The mid column stays a provisional 3x of the small tier until a
+/// 10M lifecycle calibrates it.
 const FTS_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
-    ("pre-drain", 160, 480),
-    ("post-drain", 56, 168),
-    ("post-delta", 68, 204),
-    ("post-compact", 56, 168),
+    ("pre-drain", 130, 390),
+    ("post-drain", 22, 66),
+    ("post-delta", 30, 90),
+    ("post-compact", 22, 66),
 ];
-/// Second (steady) cold FTS query: pre-drain re-fetches per file
-/// (128 measured); drained states serve from the merged shard
-/// (8 measured; 15 seen while two shard generations overlap).
+/// Second (steady) cold FTS query, tight at the exact 1M
+/// measurements (same runs as [`FTS_COLD_GET_CEILINGS_FIRST`]):
+/// pre-drain re-fetches one posting range per file (128); drained
+/// states serve from the merged shard with the top-k id-page reads
+/// capped by the per-file tie bound (12; post-delta 20 with the
+/// undrained tail).
 const FTS_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
-    ("pre-drain", 160, 480),
-    ("post-drain", 20, 60),
+    ("pre-drain", 128, 384),
+    ("post-drain", 12, 36),
     ("post-delta", 20, 60),
-    ("post-compact", 24, 72),
+    ("post-compact", 12, 36),
 ];
 /// SQL scans are user-only in every state. 1M measured (first full
 /// SQL lifecycle after the settle-stall fixes): first cold 8 GETs
