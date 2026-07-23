@@ -139,7 +139,7 @@ use crate::{
         fts::{
             fst_value::FstValue,
             merge::{MergeColumn, MergeSource, SyntheticTerm, SyntheticTerms, merge_fts_blobs},
-            positions::{decode_run, encode_run, skip_run},
+            positions::{decode_run, encode_run},
             reader::FtsReader,
         },
         reader::vector_layout_from_kv,
