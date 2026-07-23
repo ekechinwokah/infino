@@ -1557,6 +1557,384 @@ impl FtsReader {
         Ok(Some(drain_top_k_desc(heap)))
     }
 
+    /// AND / must+should sibling of
+    /// [`Self::bm25_multi_term_or_block_selected`]: the **rarest must
+    /// drives**. An AND hit is a subset of every must's postings, so
+    /// candidates come only from the driver — its blocks fetched
+    /// best-first by bound — and each surviving candidate probes the
+    /// other terms' covering blocks; a doc absent from ANY must is
+    /// discarded unscored. Shoulds contribute score through the same
+    /// probes but never gate. This replaces the plain walk's
+    /// full-list leapfrog, whose fetch bill is the SUM of every
+    /// must's posting bytes (multi-MiB for common∧common) instead of
+    /// the intersection's.
+    ///
+    /// `None` = declined (no musts, an oversized unrouted list, or
+    /// degenerate admission) — the caller falls back to the plain
+    /// walk. Tie contract matches the OR kernel: bars compare via
+    /// `next_down`, pushes go through [`and_heap_push`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn bm25_multi_term_and_block_selected(
+        &self,
+        column: &str,
+        k: usize,
+        floor: f32,
+        routed_musts: &[RoutedTermRow<'_>],
+        unrouted_must_terms: &[&str],
+        routed_shoulds: &[RoutedTermRow<'_>],
+        unrouted_should_terms: &[&str],
+        live: Option<&SharedFloor>,
+    ) -> Result<Option<Vec<(u32, f32)>>, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        if k == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        if routed_musts.is_empty() && unrouted_must_terms.is_empty() {
+            return Ok(None);
+        }
+        let col_meta = &self.columns[column_id as usize];
+        let floor_eff = floor.next_down();
+        let dl_norm_k1 = &col_meta.dl_norm_k1;
+        let term_meta_size = match col_meta.positions {
+            true => TERM_META_POSITIONAL_SIZE,
+            false => TERM_META_SIZE,
+        };
+
+        // One shared head/meta/decoded table over every routed term;
+        // the first `n_routed_musts` entries are the required ones.
+        let routed: Vec<RoutedTermRow<'_>> = routed_musts
+            .iter()
+            .chain(routed_shoulds)
+            .map(|r| RoutedTermRow {
+                metadata_offset: r.metadata_offset,
+                quantized: r.quantized,
+                scale: r.scale,
+            })
+            .collect();
+        let n_routed_musts = routed_musts.len();
+        let head_ranges: Vec<(usize, usize)> = routed
+            .iter()
+            .map(|r| {
+                (
+                    r.metadata_offset as usize,
+                    term_meta_size + r.quantized.len() * SKIP_ENTRY_SIZE,
+                )
+            })
+            .collect();
+        let heads = self.fetch_term_postings(&head_ranges).await?;
+        let mut metas: Vec<TermMeta> = Vec::with_capacity(routed.len());
+        for (row, head) in routed.iter().zip(&heads) {
+            let meta = TermMeta::parse(head, 0, col_meta.positions)?;
+            if meta.num_blocks != row.quantized.len() {
+                return Err(FtsError::Read(ReadError::MalformedVersion(format!(
+                    "resident block-max rows ({}) disagree with the skip table ({}) — stale routing",
+                    row.quantized.len(),
+                    meta.num_blocks
+                ))));
+            }
+            metas.push(meta);
+        }
+        let routed_idf_x_k1p1: Vec<f32> = metas
+            .iter()
+            .map(|m| bm25::idf(self.n_docs as u64, m.df) * (bm25::K1 + 1.0))
+            .collect();
+
+        // Unrouted lists (below the routing df floor) decode whole —
+        // an oversized one means stale routing; decline.
+        let decode_whole =
+            |cursors: Vec<TermCursor>| -> Option<Vec<(Vec<u32>, Vec<u32>, f32, f32)>> {
+                if cursors
+                    .iter()
+                    .any(|c| c.block_count() > UNROUTED_TERM_MAX_BLOCKS)
+                {
+                    return None;
+                }
+                Some(
+                    cursors
+                        .into_iter()
+                        .map(|mut c| {
+                            let idf_x_k1p1 = c.idf_x_k1p1;
+                            let term_max = c.term_max_bm25;
+                            let mut docs = Vec::new();
+                            let mut tfs = Vec::new();
+                            while !c.is_exhausted() {
+                                docs.push(c.current_doc_id());
+                                tfs.push(c.current_tf());
+                                c.next();
+                            }
+                            (docs, tfs, idf_x_k1p1, term_max)
+                        })
+                        .collect(),
+                )
+            };
+        let Some(unrouted_musts) = decode_whole(
+            self.build_term_cursors(column_id, unrouted_must_terms)
+                .await?,
+        ) else {
+            return Ok(None);
+        };
+        let Some(unrouted_shoulds) = decode_whole(
+            self.build_term_cursors(column_id, unrouted_should_terms)
+                .await?,
+        ) else {
+            return Ok(None);
+        };
+        // A must term absent from this file's dictionary ⇒ the whole
+        // intersection is empty here.
+        if unrouted_musts.len() != unrouted_must_terms.len() {
+            return Ok(Some(Vec::new()));
+        }
+
+        // ---- Upper bounds.
+        let dequant = |row: &RoutedTermRow<'_>, q: u8| q as f32 / u8::MAX as f32 * row.scale;
+        let routed_term_max: Vec<f32> = routed
+            .iter()
+            .map(|r| dequant(r, r.quantized.iter().copied().max().unwrap_or(0)))
+            .collect();
+        let total_ub: f32 = routed_term_max.iter().sum::<f32>()
+            + unrouted_musts.iter().map(|(_, _, _, m)| m).sum::<f32>()
+            + unrouted_shoulds.iter().map(|(_, _, _, m)| m).sum::<f32>();
+
+        let covering_block = |t: usize, doc: u32| -> Option<u32> {
+            let meta = &metas[t];
+            let head: &[u8] = &heads[t];
+            let (mut lo, mut hi) = (0usize, meta.num_blocks);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let (last, _, _) = meta.skip_entry(head, mid);
+                if last < doc { lo = mid + 1 } else { hi = mid }
+            }
+            (lo < meta.num_blocks).then_some(lo as u32)
+        };
+        // Routed contribution at doc from a decoded block; `None` when
+        // the doc is absent from the term (an AND killer for musts, a
+        // zero for shoulds).
+        let contrib_decoded = |decoded_at: &HashMap<(u32, u32), usize>,
+                               decoded: &Vec<(Vec<u32>, Vec<u32>)>,
+                               t: usize,
+                               b: u32,
+                               doc: u32|
+         -> Option<f32> {
+            let &slot = decoded_at.get(&(t as u32, b))?;
+            let (docs, tfs) = &decoded[slot];
+            match docs.binary_search(&doc) {
+                Ok(i) => Some(bm25::score_with_dl_norm_k1(
+                    routed_idf_x_k1p1[t],
+                    tfs[i],
+                    dl_norm_k1.get(doc),
+                )),
+                Err(_) => None,
+            }
+        };
+        let list_contrib = |list: &(Vec<u32>, Vec<u32>, f32, f32), doc: u32| -> Option<f32> {
+            let (docs, tfs, idf_x_k1p1, _) = list;
+            match docs.binary_search(&doc) {
+                Ok(i) => Some(bm25::score_with_dl_norm_k1(
+                    *idf_x_k1p1,
+                    tfs[i],
+                    dl_norm_k1.get(doc),
+                )),
+                Err(_) => None,
+            }
+        };
+        // Full AND score at doc once probes are decoded: `None` when
+        // any must is absent. Shoulds add when present.
+        let exact_and_score = |decoded_at: &HashMap<(u32, u32), usize>,
+                               decoded: &Vec<(Vec<u32>, Vec<u32>)>,
+                               doc: u32|
+         -> Option<f32> {
+            let mut score = 0.0f32;
+            for (t, _) in routed.iter().enumerate() {
+                let c = covering_block(t, doc)
+                    .and_then(|b| contrib_decoded(decoded_at, decoded, t, b, doc));
+                match c {
+                    Some(c) => score += c,
+                    None if t < n_routed_musts => return None,
+                    None => {}
+                }
+            }
+            for list in &unrouted_musts {
+                score += list_contrib(list, doc)?;
+            }
+            for list in &unrouted_shoulds {
+                score += list_contrib(list, doc).unwrap_or(0.0);
+            }
+            Some(score)
+        };
+        let gather_probes = |survivor_docs: &mut dyn Iterator<Item = u32>,
+                             decoded_at: &HashMap<(u32, u32), usize>|
+         -> Vec<(usize, u32)> {
+            let mut wanted: HashSet<(usize, u32)> = HashSet::new();
+            for doc in survivor_docs {
+                for t in 0..routed.len() {
+                    if let Some(b) = covering_block(t, doc)
+                        && !decoded_at.contains_key(&(t as u32, b))
+                    {
+                        wanted.insert((t, b));
+                    }
+                }
+            }
+            let mut probes: Vec<(usize, u32)> = wanted.into_iter().collect();
+            probes.sort_unstable();
+            probes
+        };
+
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(k.max(1));
+        let live_probe = LiveFloorProbe::new(live);
+        let mut decoded_at: HashMap<(u32, u32), usize> = HashMap::new();
+        let mut decoded: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
+
+        // ---- Small-driver path: some must is below the routing df
+        // floor. Its whole (tiny) list IS the candidate set — one
+        // probe wave settles everything (the rare∧common shape).
+        let small_driver = unrouted_musts
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (docs, _, _, _))| docs.len());
+        if let Some((d_idx, driver)) = small_driver {
+            let bar = {
+                let kth = (heap.len() >= k).then(|| heap.peek().expect("heap full").0);
+                kth.map_or(f32::NEG_INFINITY, f32::next_down)
+                    .max(floor_eff)
+                    .max(live_probe.checkpoint(floor_eff, None))
+            };
+            let rest_ub = total_ub - driver.3;
+            let mut survivors: Vec<u32> = Vec::new();
+            for (i, &doc) in driver.0.iter().enumerate() {
+                let essential =
+                    bm25::score_with_dl_norm_k1(driver.2, driver.1[i], dl_norm_k1.get(doc));
+                if essential + rest_ub <= bar {
+                    continue;
+                }
+                // Every other unrouted must gates for free (resident).
+                let others_ok = unrouted_musts
+                    .iter()
+                    .enumerate()
+                    .all(|(j, list)| j == d_idx || list_contrib(list, doc).is_some());
+                if others_ok {
+                    survivors.push(doc);
+                }
+            }
+            let probes = gather_probes(&mut survivors.iter().copied(), &decoded_at);
+            self.fetch_and_decode_blocks(
+                &probes,
+                &routed,
+                &metas,
+                &heads,
+                &mut decoded_at,
+                &mut decoded,
+            )
+            .await?;
+            for doc in survivors {
+                if let Some(score) = exact_and_score(&decoded_at, &decoded, doc)
+                    && score > floor_eff
+                {
+                    and_heap_push(&mut heap, k, None, score, doc);
+                }
+            }
+            return Ok(Some(drain_top_k_desc(heap)));
+        }
+
+        // ---- All musts routed: the min-df routed must drives; its
+        // blocks admit best-first by (block bound + rest UB), and each
+        // wave's survivors pay presence probes into the other musts.
+        let driver_t = (0..n_routed_musts)
+            .min_by_key(|&t| metas[t].df)
+            .expect("routed musts are non-empty on this path");
+        let rest_ub = total_ub - routed_term_max[driver_t];
+        let driver_order: Vec<u32> = {
+            let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); (u8::MAX as usize) + 1];
+            for (b, &q) in routed[driver_t].quantized.iter().enumerate() {
+                buckets[q as usize].push(b as u32);
+            }
+            buckets.into_iter().rev().flatten().collect()
+        };
+        let mut driver_pos = 0usize;
+        let mut wave_cap = BLOCK_SELECT_FIRST_WAVE;
+        let driver_blocks = driver_order.len();
+        let mut admitted_total = 0usize;
+        loop {
+            let bar = {
+                let kth = (heap.len() >= k).then(|| heap.peek().expect("heap full").0);
+                kth.map_or(f32::NEG_INFINITY, f32::next_down)
+                    .max(floor_eff)
+                    .max(live_probe.checkpoint(floor_eff, kth))
+            };
+            let mut wave: Vec<(usize, u32)> = Vec::new();
+            while wave.len() < wave_cap && driver_pos < driver_blocks {
+                let b = driver_order[driver_pos];
+                let key =
+                    dequant(&routed[driver_t], routed[driver_t].quantized[b as usize]) + rest_ub;
+                if key <= bar {
+                    driver_pos = driver_blocks;
+                    break;
+                }
+                driver_pos += 1;
+                wave.push((driver_t, b));
+            }
+            wave_cap = wave_cap.saturating_mul(BLOCK_SELECT_WAVE_GROWTH);
+            if wave.is_empty() {
+                break;
+            }
+            admitted_total += wave.len();
+            if driver_blocks >= MULTI_SELECT_BAIL_MIN_BLOCKS
+                && admitted_total > driver_blocks / MULTI_SELECT_MAX_ADMIT_DENOM
+            {
+                return Ok(None);
+            }
+            self.fetch_and_decode_blocks(
+                &wave,
+                &routed,
+                &metas,
+                &heads,
+                &mut decoded_at,
+                &mut decoded,
+            )
+            .await?;
+            let mut survivors: Vec<u32> = Vec::new();
+            for &(t, b) in &wave {
+                let slot = decoded_at[&(t as u32, b)];
+                let (docs, tfs) = (decoded[slot].0.clone(), decoded[slot].1.clone());
+                for (i, &doc) in docs.iter().enumerate() {
+                    let essential = bm25::score_with_dl_norm_k1(
+                        routed_idf_x_k1p1[t],
+                        tfs[i],
+                        dl_norm_k1.get(doc),
+                    );
+                    if essential + rest_ub <= bar {
+                        continue;
+                    }
+                    survivors.push(doc);
+                }
+            }
+            if driver_blocks >= MULTI_SELECT_BAIL_MIN_BLOCKS
+                && heap.len() >= k
+                && survivors.len() > MULTI_SELECT_MAX_SURVIVORS_PER_WAVE * k.max(1)
+            {
+                return Ok(None);
+            }
+            let probes = gather_probes(&mut survivors.iter().copied(), &decoded_at);
+            self.fetch_and_decode_blocks(
+                &probes,
+                &routed,
+                &metas,
+                &heads,
+                &mut decoded_at,
+                &mut decoded,
+            )
+            .await?;
+            for doc in survivors {
+                if let Some(score) = exact_and_score(&decoded_at, &decoded, doc)
+                    && score > floor_eff
+                {
+                    and_heap_push(&mut heap, k, None, score, doc);
+                }
+            }
+        }
+
+        Ok(Some(drain_top_k_desc(heap)))
+    }
+
     /// Fetch + decode a batch of (term, block) pairs into the
     /// kernel's decoded-block table (skipping already-decoded pairs).
     async fn fetch_and_decode_blocks(
@@ -8703,6 +9081,185 @@ mod tests {
             }
         }
     }
+    /// The AND / must+should block-selected kernel must agree with
+    /// the whole-list walk on docs and scores: the all-routed driver
+    /// path (common∧mid), the small-unrouted-driver path
+    /// (rare∧common — the shape whose plain walk fetches the whole
+    /// common list), and musts mixed with shoulds, across k values
+    /// exercising pruning and near-exhaustive admission.
+    #[tokio::test]
+    async fn multi_term_and_block_selected_matches_whole_walk() {
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for d in 0..5000u32 {
+            let mut text = "common ".repeat(((d % 13) + 1) as usize);
+            if d % 3 == 0 {
+                text.push_str("mid ");
+            }
+            if d % 97 == 0 {
+                text.push_str("rare ");
+            }
+            text.push_str(&format!("filler{d}"));
+            b.add_doc(0, d, &text).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let fst_bytes = r.dict_bytes_async().await.expect("dict");
+        let dict = DictReader::open(&fst_bytes).expect("fst");
+        let row_for = |term: &str| -> (u64, Vec<u8>, f32) {
+            let packed = dict.lookup(&make_key("body", term)).expect("term present");
+            let FstValue::Pfor {
+                metadata_offset, ..
+            } = FstValue::unpack(packed)
+            else {
+                panic!("routed test terms are PFOR");
+            };
+            let cursors =
+                futures::executor::block_on(r.build_term_cursors(0, &[term])).expect("cursor");
+            let bounds: Vec<f32> = (0..cursors[0].blocks.len())
+                .map(|i| cursors[0].blocks[i].block_max_bm25)
+                .collect();
+            let scale = bounds.iter().copied().fold(0.0f32, f32::max);
+            let quantized: Vec<u8> = bounds
+                .iter()
+                .map(|&m| match scale > 0.0 {
+                    true => (m / scale * u8::MAX as f32).ceil().min(u8::MAX as f32) as u8,
+                    false => 0,
+                })
+                .collect();
+            (metadata_offset, quantized, scale)
+        };
+        let common = row_for("common");
+        let mid = row_for("mid");
+        let as_routed = |rows: &[&(u64, Vec<u8>, f32)]| -> Vec<(u64, Vec<u8>, f32)> {
+            rows.iter().map(|(o, q, s)| (*o, q.clone(), *s)).collect()
+        };
+
+        // (musts_routed, musts_unrouted, shoulds_routed, shoulds_unrouted)
+        let shapes: Vec<(
+            Vec<(u64, Vec<u8>, f32)>,
+            Vec<&str>,
+            Vec<(u64, Vec<u8>, f32)>,
+            Vec<&str>,
+            Vec<&str>,
+            Vec<&str>,
+        )> = vec![
+            // common ∧ mid — both routed; mid (min df) drives.
+            (
+                as_routed(&[&common, &mid]),
+                vec![],
+                vec![],
+                vec![],
+                vec!["common", "mid"],
+                vec![],
+            ),
+            // rare ∧ common — the small unrouted must drives; the
+            // plain walk's full common fetch is exactly what this
+            // path avoids.
+            (
+                as_routed(&[&common]),
+                vec!["rare"],
+                vec![],
+                vec![],
+                vec!["common", "rare"],
+                vec![],
+            ),
+            // +mid common rare — one routed must, a routed should,
+            // and an unrouted should contributing score only.
+            (
+                as_routed(&[&mid]),
+                vec![],
+                as_routed(&[&common]),
+                vec!["rare"],
+                vec!["mid"],
+                vec!["common", "rare"],
+            ),
+        ];
+        for (
+            routed_musts_raw,
+            unrouted_musts,
+            routed_shoulds_raw,
+            unrouted_shoulds,
+            must_terms,
+            should_terms,
+        ) in &shapes
+        {
+            for k in [3usize, 10, 100, 2000] {
+                let expected = r
+                    .search_excluding(
+                        "body",
+                        ClauseLists {
+                            musts: must_terms,
+                            shoulds: should_terms,
+                            negatives: &[],
+                            must_phrases: &[],
+                            should_phrases: &[],
+                            negative_phrases: &[],
+                        },
+                        k,
+                        f32::NEG_INFINITY,
+                    )
+                    .await
+                    .expect("whole walk");
+                let routed_musts: Vec<RoutedTermRow<'_>> = routed_musts_raw
+                    .iter()
+                    .map(|(off, q, scale)| RoutedTermRow {
+                        metadata_offset: *off,
+                        quantized: q,
+                        scale: *scale,
+                    })
+                    .collect();
+                let routed_shoulds: Vec<RoutedTermRow<'_>> = routed_shoulds_raw
+                    .iter()
+                    .map(|(off, q, scale)| RoutedTermRow {
+                        metadata_offset: *off,
+                        quantized: q,
+                        scale: *scale,
+                    })
+                    .collect();
+                let got = match r
+                    .bm25_multi_term_and_block_selected(
+                        "body",
+                        k,
+                        f32::NEG_INFINITY,
+                        &routed_musts,
+                        unrouted_musts,
+                        &routed_shoulds,
+                        unrouted_shoulds,
+                        None,
+                    )
+                    .await
+                    .expect("kernel")
+                {
+                    Some(got) => got,
+                    None => {
+                        assert!(
+                            k >= 100,
+                            "kernel declined at small k={k} for musts {must_terms:?}"
+                        );
+                        continue;
+                    }
+                };
+                assert_eq!(
+                    got.len(),
+                    expected.len(),
+                    "k={k} musts {must_terms:?} shoulds {should_terms:?}"
+                );
+                for (i, ((gd, gs), (ed, es))) in got.iter().zip(expected.iter()).enumerate() {
+                    assert_eq!(gd, ed, "k={k} musts {must_terms:?} doc at rank {i}");
+                    let rel = (gs - es).abs() / es.abs().max(f32::MIN_POSITIVE);
+                    assert!(
+                        rel < 1e-5,
+                        "k={k} musts {must_terms:?} score at rank {i}: got {gs} expected {es}"
+                    );
+                }
+            }
+        }
+    }
+
     /// SCRATCH (uncommitted): attribute the post-drain broad-OR gap.
     /// Same corpus as (A) one merged blob walked in 8 sub-ranges vs
     /// (B) 16 per-file blobs walked whole — the pre/post-drain shapes

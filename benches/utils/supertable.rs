@@ -1074,21 +1074,21 @@ const VECTOR_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
 /// 10M lifecycle calibrates it.
 const FTS_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
     ("pre-drain", 130, 390),
-    ("post-drain", 22, 66),
-    ("post-delta", 30, 90),
-    ("post-compact", 22, 66),
+    ("post-drain", 32, 96),
+    ("post-delta", 40, 120),
+    ("post-compact", 32, 96),
 ];
 /// Second (steady) cold FTS query, tight at the exact 1M
 /// measurements (same runs as [`FTS_COLD_GET_CEILINGS_FIRST`]):
 /// pre-drain re-fetches one posting range per file (128); drained
-/// states serve from the merged shard with the top-k id-page reads
-/// capped by the per-file tie bound (12; post-delta 20 with the
-/// undrained tail).
+/// states serve from the doc-partitioned shards with the top-k
+/// id-page reads capped by the per-file tie bound (14 on two shards
+/// at 1M; post-delta 22 with the undrained tail).
 const FTS_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
     ("pre-drain", 128, 384),
-    ("post-drain", 12, 36),
-    ("post-delta", 20, 60),
-    ("post-compact", 12, 36),
+    ("post-drain", 14, 42),
+    ("post-delta", 22, 66),
+    ("post-compact", 14, 42),
 ];
 /// SQL scans are user-only in every state. 1M measured (first full
 /// SQL lifecycle after the settle-stall fixes): first cold 8 GETs

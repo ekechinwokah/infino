@@ -1202,6 +1202,37 @@ impl SuperfileReader {
             .await?)
     }
 
+    /// Must / must+should BM25 over resident-routed block selection —
+    /// see [`FtsReader::bm25_multi_term_and_block_selected`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn bm25_multi_term_and_block_selected(
+        &self,
+        column: &str,
+        k: usize,
+        floor: f32,
+        routed_musts: &[RoutedTermRow<'_>],
+        unrouted_must_terms: &[&str],
+        routed_shoulds: &[RoutedTermRow<'_>],
+        unrouted_should_terms: &[&str],
+        live: Option<&SharedFloor>,
+    ) -> Result<Option<Vec<(u32, f32)>>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts
+            .bm25_multi_term_and_block_selected(
+                column,
+                k,
+                floor,
+                routed_musts,
+                unrouted_must_terms,
+                routed_shoulds,
+                unrouted_should_terms,
+                live,
+            )
+            .await?)
+    }
+
     /// Single-term BM25 over resident-routed block selection — see
     /// [`FtsReader::bm25_single_term_block_selected`].
     #[allow(clippy::too_many_arguments)]

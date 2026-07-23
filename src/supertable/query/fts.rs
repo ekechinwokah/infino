@@ -397,8 +397,21 @@ async fn bm25_fanout_wave(
         && !has_negation
         && must_arc.is_empty()
         && should_arc.len() >= MULTI_SELECT_MIN_TERMS;
+    // Must shapes with more than one positive atom: the AND kernel's
+    // presence probes prune regardless of bound spread (an AND hit
+    // must sit in EVERY must's postings), so any resident row among
+    // the query's terms is enough to keep the file un-ranged. A lone
+    // bare must is the single-term shape above.
+    let must_selected = !has_phrases
+        && !has_negation
+        && !must_arc.is_empty()
+        && must_arc.len() + should_arc.len() >= MULTI_SELECT_MIN_TERMS;
     let (selected_refs, sliceable_refs): (Vec<&Arc<SuperfileEntry>>, Vec<&Arc<SuperfileEntry>>) =
-        match (single_bare_term, multi_bare_or, routing.as_ref()) {
+        match (
+            single_bare_term,
+            multi_bare_or || must_selected,
+            routing.as_ref(),
+        ) {
             (Some(term), _, Some(state)) => kept.iter().partition(|e| {
                 state
                     .term_block_max(e.superfile_id, &column_arc, term)
@@ -413,13 +426,21 @@ async fn bm25_fanout_wave(
             // broad-OR gap; ten/forty_term_or 12/39 ms vs 2.1/6.2
             // pre-drain).
             (None, true, Some(state)) => kept.iter().partition(|e| {
-                let rows: Vec<_> = should_arc
+                let rows: Vec<_> = must_arc
                     .iter()
+                    .chain(should_arc.iter())
                     .filter_map(|term| state.term_block_max(e.superfile_id, &column_arc, term))
                     .collect();
-                !rows.is_empty()
-                    && rows.iter().all(|row| row_can_prune(row))
-                    && rows_have_dominant_ub(rows.iter().copied())
+                if must_selected {
+                    // AND engagement: at least one resident row — the
+                    // driver's presence probes do the pruning, so flat
+                    // bounds don't disqualify.
+                    !rows.is_empty()
+                } else {
+                    !rows.is_empty()
+                        && rows.iter().all(|row| row_can_prune(row))
+                        && rows_have_dominant_ub(rows.iter().copied())
+                }
             }),
             _ => (Vec::new(), kept.iter().collect()),
         };
@@ -557,6 +578,74 @@ async fn bm25_fanout_wave(
                             floor,
                             &routed_rows,
                             &unrouted,
+                            Some(&live),
+                        )
+                        .await
+                        .map_err(fts_read_error)?
+                    {
+                        merge_unit_scores(&shared, &tombstones, suid, now, &hits);
+                        return Ok(hits);
+                    }
+                }
+            }
+            // Must / must+should admission: the rarest must drives
+            // the block-selected AND kernel, fetching the
+            // intersection's blocks instead of every must's whole
+            // posting list. Any resident row engages (presence
+            // probing prunes without bound spread); the kernel
+            // declines back to the plain walk on stale routing or
+            // degenerate admission.
+            if range.is_none()
+                && !must_arc.is_empty()
+                && must_arc.len() + should_arc.len() >= MULTI_SELECT_MIN_TERMS
+                && phrase_free
+                && neg_arc.is_empty()
+                && neg_ph_arc.is_empty()
+                && let Some(state) = routing.as_ref()
+            {
+                let must_rows: Vec<Option<&TermBlockMax>> = must_arc
+                    .iter()
+                    .map(|term| state.term_block_max(suid, &column_arc, term))
+                    .collect();
+                let should_rows: Vec<Option<&TermBlockMax>> = should_arc
+                    .iter()
+                    .map(|term| state.term_block_max(suid, &column_arc, term))
+                    .collect();
+                if must_rows.iter().chain(should_rows.iter()).flatten().count() > 0 {
+                    let mut routed_musts = Vec::new();
+                    let mut unrouted_musts: Vec<&str> = Vec::new();
+                    for (term, row) in must_arc.iter().zip(&must_rows) {
+                        match row {
+                            Some(row) => routed_musts.push(RoutedTermRow {
+                                metadata_offset: row.metadata_offset,
+                                quantized: &row.quantized,
+                                scale: row.scale,
+                            }),
+                            None => unrouted_musts.push(term.as_str()),
+                        }
+                    }
+                    let mut routed_shoulds = Vec::new();
+                    let mut unrouted_shoulds: Vec<&str> = Vec::new();
+                    for (term, row) in should_arc.iter().zip(&should_rows) {
+                        match row {
+                            Some(row) => routed_shoulds.push(RoutedTermRow {
+                                metadata_offset: row.metadata_offset,
+                                quantized: &row.quantized,
+                                scale: row.scale,
+                            }),
+                            None => unrouted_shoulds.push(term.as_str()),
+                        }
+                    }
+                    let live = shared.live_floor();
+                    if let Some(hits) = r
+                        .bm25_multi_term_and_block_selected(
+                            &column_arc,
+                            k,
+                            floor,
+                            &routed_musts,
+                            &unrouted_musts,
+                            &routed_shoulds,
+                            &unrouted_shoulds,
                             Some(&live),
                         )
                         .await
