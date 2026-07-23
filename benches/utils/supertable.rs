@@ -1046,16 +1046,26 @@ const FTS_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
     ("post-delta", 20, 60),
     ("post-compact", 24, 72),
 ];
-/// SQL scans are user-only in every state. 1M measured: first cold 8
-/// GETs, steady cold 208 (the per-file scan fan-out the scalar-index
-/// family is designed to collapse). Post-delta/post-compact rows are
-/// intentionally absent until the post-drain aggregate hang is fixed
-/// and a full SQL lifecycle calibrates them.
-const SQL_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] =
-    &[("pre-drain", 16, 48), ("post-drain", 16, 48)];
+/// SQL scans are user-only in every state. 1M measured (first full
+/// SQL lifecycle after the settle-stall fixes): first cold 8 GETs
+/// (10 post-compact), steady cold 208 — except POST-COMPACT, where
+/// the one big merged user file defeats file-level pruning and the
+/// steady scan pays 592 GET / 18.5 MiB (~3x GETs, ~13x bytes): the
+/// strongest measured motivation for the scalar-index family. Its
+/// ceiling encodes today's behavior, not the target.
+const SQL_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
+    ("pre-drain", 16, 48),
+    ("post-drain", 16, 48),
+    ("post-delta", 16, 48),
+    ("post-compact", 20, 60),
+];
 /// See [`SQL_COLD_GET_CEILINGS_FIRST`].
-const SQL_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] =
-    &[("pre-drain", 260, 780), ("post-drain", 260, 780)];
+const SQL_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
+    ("pre-drain", 260, 780),
+    ("post-drain", 260, 780),
+    ("post-delta", 260, 780),
+    ("post-compact", 740, 2220),
+];
 /// Ceiling for `label` + `n_docs` out of one of the two gate tables,
 /// when one applies to that state at this scale.
 fn cold_data_get_ceiling(table: &[(&str, u64, u64)], label: &str, n_docs: usize) -> Option<u64> {
