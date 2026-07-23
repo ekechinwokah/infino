@@ -120,8 +120,15 @@ impl Drop for ForegroundQueryGuard {
 /// Pause this URI's background full-object fill while a caller besides the
 /// cache entry holds its lazy reader (`strong_count > 1`). Unrelated URIs
 /// are unaffected — that is the per-URI quiescence contract.
-fn reader_blocks_background_fill(reader: &Weak<SuperfileReader>) -> bool {
-    reader.strong_count() > 1
+fn reader_blocks_background_fill(store: &DiskCacheStore, reader: &Weak<SuperfileReader>) -> bool {
+    // A registered settle waiter overrides the yield-to-readers
+    // politeness: the waiter blocks until this fill completes, and
+    // some callers (the SQL provider's per-provider scan cache) hold
+    // their readers for the provider's whole lifetime — pausing until
+    // they release would deadlock the settle against the fill.
+    // Captured live (gdb thread dump) as the SQL post-drain battery
+    // stall surviving the failed-fill rollback fix.
+    reader.strong_count() > 1 && store.n_promotion_waiters.load(Ordering::Acquire) == 0
 }
 
 /// Errors surfaced by [`DiskCacheStore::reader`].
@@ -2064,7 +2071,7 @@ async fn wait_for_reader_quiescence(
     reader: &Weak<SuperfileReader>,
 ) -> bool {
     loop {
-        while reader_blocks_background_fill(reader) {
+        while reader_blocks_background_fill(store, reader) {
             if background_store_abandoned(store) {
                 return false;
             }
@@ -2077,7 +2084,7 @@ async fn wait_for_reader_quiescence(
         if reader.strong_count() == 0 {
             return false;
         }
-        if !reader_blocks_background_fill(reader) {
+        if !reader_blocks_background_fill(store, reader) {
             return !background_store_abandoned(store);
         }
     }
@@ -2149,7 +2156,7 @@ async fn cold_fetch_to_disk_cancelable(
             if reader.strong_count() == 0 {
                 return Ok(BackgroundFillOutcome::Abandoned);
             }
-            if reader_blocks_background_fill(reader) {
+            if reader_blocks_background_fill(store, reader) {
                 return Ok(BackgroundFillOutcome::Paused);
             }
             let chunk_idx = next_chunk;
@@ -2192,7 +2199,7 @@ async fn cold_fetch_to_disk_cancelable(
         if reader.strong_count() == 0 {
             return Ok(BackgroundFillOutcome::Abandoned);
         }
-        if reader_blocks_background_fill(reader) {
+        if reader_blocks_background_fill(store, reader) {
             return Ok(BackgroundFillOutcome::Paused);
         }
         tokio::select! {
@@ -2203,7 +2210,7 @@ async fn cold_fetch_to_disk_cancelable(
                 if reader.strong_count() == 0 {
                     return Ok(BackgroundFillOutcome::Abandoned);
                 }
-                if reader_blocks_background_fill(reader) {
+                if reader_blocks_background_fill(store, reader) {
                     return Ok(BackgroundFillOutcome::Paused);
                 }
             }
@@ -2225,7 +2232,7 @@ async fn cold_fetch_to_disk_cancelable(
     if reader.strong_count() == 0 {
         return Ok(BackgroundFillOutcome::Abandoned);
     }
-    if reader_blocks_background_fill(reader) {
+    if reader_blocks_background_fill(store, reader) {
         return Ok(BackgroundFillOutcome::Paused);
     }
     spawn_blocking(move || file.sync_all())
@@ -2810,6 +2817,35 @@ mod tests {
             !store.is_cached(&uri),
             "failed fill must evict its entry for a cold retry"
         );
+    }
+
+    /// A settle waiter must force fills through even while another
+    /// caller still holds the lazy reader — the SQL provider caches
+    /// readers for its whole provider lifetime, so without the waiter
+    /// override the fill politely pauses forever and the settle burns
+    /// its entire timeout (the second half of the SQL post-drain
+    /// battery stall; the first was the failed-fill latch).
+    #[tokio::test]
+    async fn settle_waiter_forces_fill_through_held_reader() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+
+        // Lazy open, holding the reader like a provider scan cache.
+        let held = store
+            .reader_with_hints(&uri, None, None, true)
+            .await
+            .expect("lazy open");
+
+        store
+            .wait_until_fills_settled(Duration::from_secs(30))
+            .await
+            .expect("settle must complete despite the held reader");
+        assert!(
+            store.is_mmap_promoted(&uri),
+            "fill must promote under a registered settle waiter"
+        );
+        drop(held);
     }
 
     // ----- warm insert path (insert_warm + cold-free path) -----
