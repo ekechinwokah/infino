@@ -3429,7 +3429,7 @@ mod tests {
                 .build()
                 .expect("pool"),
         );
-        let dir = tempfile::TempDir::new_in("/mnt/scratch/tmp").expect("tempdir");
+        let dir = tempfile::TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st = Supertable::create(
@@ -3662,7 +3662,7 @@ mod tests {
                 .build()
                 .expect("pool"),
         );
-        let dir = TempDir::new_in("/mnt/scratch/tmp").expect("tempdir");
+        let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st = Supertable::create(
@@ -3841,7 +3841,7 @@ mod tests {
                 .build()
                 .expect("pool"),
         );
-        let dir = TempDir::new_in("/mnt/scratch/tmp").expect("tempdir");
+        let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st = Supertable::create(
@@ -3975,7 +3975,7 @@ mod tests {
                 .build()
                 .expect("pool"),
         );
-        let dir = TempDir::new_in("/mnt/scratch/tmp").expect("tempdir");
+        let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn crate::storage::StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st = Supertable::create(
@@ -4069,7 +4069,7 @@ mod tests {
                 .build()
                 .expect("pool"),
         );
-        let dir = TempDir::new_in("/mnt/scratch/tmp").expect("tempdir");
+        let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn crate::storage::StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st = Supertable::create(
@@ -4163,7 +4163,7 @@ mod tests {
                 .build()
                 .expect("pool"),
         );
-        let dir = TempDir::new_in("/mnt/scratch/tmp").expect("tempdir");
+        let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn crate::storage::StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st = Supertable::create(
@@ -4263,7 +4263,7 @@ mod cold_read_probe {
             DataType::LargeUtf8,
             false,
         )]));
-        let dir = TempDir::new_in("/mnt/scratch/tmp").expect("tempdir");
+        let dir = TempDir::new().expect("tempdir");
         let provider = Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let storage: Arc<dyn StorageProvider> = provider.clone();
         let mk_options = || {
@@ -4341,7 +4341,7 @@ mod tie_cap_probe {
             DataType::LargeUtf8,
             false,
         )]));
-        let dir = TempDir::new_in("/mnt/scratch/tmp").expect("tempdir");
+        let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
         let st = Supertable::create(
