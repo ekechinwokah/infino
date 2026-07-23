@@ -1879,10 +1879,23 @@ impl FtsReader {
                 let Some(next) = doc.checked_add(1) else {
                     break;
                 };
+                // Tie-aware local bar: this walk visits docs in
+                // ascending id order, so a future doc can never win
+                // the equal-score tie-break against an incumbent
+                // (`and_heap_push` displaces only on a SMALLER doc
+                // id) — it must beat the kth strictly. `next_up`
+                // encodes that, letting the atoms' exact upper-bound
+                // gates skip score-tied candidates without position
+                // work (a drained shard's compressed global-idf band
+                // is exactly this shape). The floor PUBLISHED to
+                // other units stays the exact kth; the PULLED global
+                // floor is already next_down-adjusted so cross-unit
+                // ties keep verifying.
                 let bar = match heap.len() >= k {
                     true => {
                         let kth = heap.peek().expect("heap len == k").0;
-                        kth.max(live_probe.checkpoint(floor_eff, Some(kth)))
+                        kth.next_up()
+                            .max(live_probe.checkpoint(floor_eff, Some(kth)))
                     }
                     false => live_probe.checkpoint(floor_eff, None),
                 };
@@ -1905,10 +1918,16 @@ impl FtsReader {
         };
         let mut target = doc_id_start;
         'docs: loop {
+            // Same tie-aware local bar as the union walk above: future
+            // docs (ascending ids) must beat the kth strictly, so
+            // `next_up(kth)` lets the exact upper-bound gates skip
+            // score-tied candidates; published/pulled floors keep
+            // their exact / next_down forms for cross-unit ties.
             let bar = match heap.len() >= k {
                 true => {
                     let kth = heap.peek().expect("heap len == k").0;
-                    kth.max(live_probe.checkpoint(floor_eff, Some(kth)))
+                    kth.next_up()
+                        .max(live_probe.checkpoint(floor_eff, Some(kth)))
                 }
                 false => live_probe.checkpoint(floor_eff, None),
             };
