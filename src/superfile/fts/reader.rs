@@ -1680,6 +1680,94 @@ impl FtsReader {
     /// is where phrase cursors position themselves at construction —
     /// a sub-range unit passes its window start so the initial
     /// verify-seek doesn't walk the shard from doc 0 per unit.
+    /// Try to rewrite one phrase onto its drain-emitted bigram terms:
+    /// `Ok(Some(atom))` when EVERY adjacent pair exists in this blob
+    /// (a two-term phrase becomes the pair's plain term cursor; longer
+    /// phrases become a phrase atom over the k-1 pair cursors, whose
+    /// chained anchors verify under the existing member-i-at-p+i
+    /// walk). `Ok(None)` = no rewrite (pre-bigram shard, user file, or
+    /// a below-floor member) — the caller takes the unigram walk.
+    ///
+    /// Scoring keeps the phrase contract exactly: idf = Σ member
+    /// UNIGRAM idfs (each read via a 20-byte header fetch), tf = pair
+    /// tf (k=2, where pair tf IS the verified phrase tf) or verified
+    /// chain anchors (k>2) — so rewritten and fallback paths return
+    /// identical scores.
+    async fn build_bigram_phrase_atom(
+        &self,
+        column_id: u32,
+        member_refs: &[&str],
+        cache: Option<&FtsCursorCache>,
+        start_doc: u32,
+    ) -> Result<Option<AnyCursor>, FtsError> {
+        if member_refs.len() < 2 {
+            return Ok(None);
+        }
+        let bigrams: Vec<String> = member_refs
+            .windows(2)
+            .map(|w| {
+                let mut key = String::with_capacity(w[0].len() + 1 + w[1].len());
+                key.push_str(w[0]);
+                key.push(FST_SEPARATOR as char);
+                key.push_str(w[1]);
+                key
+            })
+            .collect();
+        let bigram_refs: Vec<&str> = bigrams.iter().map(String::as_str).collect();
+        let mut cursors = self
+            .build_term_cursors_shared(column_id, &bigram_refs, cache)
+            .await?;
+        if cursors.len() != bigram_refs.len() {
+            return Ok(None);
+        }
+        let column = self.columns[column_id as usize].name.clone();
+        let mut idf_x_k1p1 = 0.0f32;
+        for member in member_refs {
+            let df = self.term_df(&column, member).await?;
+            if df == 0 {
+                // A pair without its member is impossible in a
+                // well-formed blob; decline to the unigram walk, which
+                // resolves the absence per polarity.
+                return Ok(None);
+            }
+            idf_x_k1p1 += bm25::idf(self.n_docs as u64, df) * (bm25::K1 + 1.0);
+        }
+        if cursors.len() == 1 {
+            let cursor = cursors
+                .pop()
+                .expect("one pair cursor")
+                .with_idf_x_k1p1(idf_x_k1p1);
+            return Ok(Some(AnyCursor::Term(cursor)));
+        }
+        let proto = match cache {
+            Some(cache) => {
+                let cell = {
+                    let entry = cache
+                        .positions
+                        .entry(FtsCursorCache::key(column_id, &bigram_refs))
+                        .or_default();
+                    Arc::clone(entry.value())
+                };
+                cell.get_or_try_init(|| {
+                    self.build_phrase_positions(column_id, &cursors, &bigram_refs)
+                })
+                .await?
+                .clone()
+            }
+            None => {
+                self.build_phrase_positions(column_id, &cursors, &bigram_refs)
+                    .await?
+            }
+        };
+        Ok(Some(AnyCursor::Phrase(PhraseCursor::new(
+            cursors,
+            proto.positions,
+            proto.positional,
+            start_doc,
+            Some(idf_x_k1p1),
+        )?)))
+    }
+
     async fn build_atom_cursors(
         &self,
         column_id: u32,
@@ -1703,6 +1791,18 @@ impl FtsReader {
         }
         for phrase in phrases {
             let member_refs: Vec<&str> = phrase.iter().map(|t| t.as_str()).collect();
+            // Bigram fast path: when the blob carries drain-emitted
+            // adjacent-pair terms for every step of this phrase, the
+            // pair postings hold the exact phrase tf — candidates
+            // shrink from member co-occurrence to pair occurrence,
+            // which is the pruning correct global idf took away.
+            if let Some(atom) = self
+                .build_bigram_phrase_atom(column_id, &member_refs, cache, start_doc)
+                .await?
+            {
+                out.push(Some(atom));
+                continue;
+            }
             let cursors = self
                 .build_term_cursors_shared(column_id, &member_refs, cache)
                 .await?;
@@ -1736,6 +1836,7 @@ impl FtsReader {
                 proto.positions,
                 proto.positional,
                 start_doc,
+                None,
             )?)));
         }
         Ok(out)
@@ -4843,6 +4944,29 @@ struct PhraseCursor {
     current_tf: u32,
 }
 
+impl TermCursor {
+    /// Rebind this cursor's scoring constant to `idf_x_k1p1` (the
+    /// phrase contract's Σ member-unigram idfs), rescaling the bounds
+    /// that were computed against the term's own idf. Used by the
+    /// bigram phrase rewrite, where a pair term's postings carry the
+    /// exact phrase tf but its stored block maxes are pair-idf-scaled.
+    fn with_idf_x_k1p1(mut self, idf_x_k1p1: f32) -> Self {
+        let factor = idf_x_k1p1 / self.idf_x_k1p1;
+        self.idf_x_k1p1 = idf_x_k1p1;
+        self.term_max_bm25 *= factor;
+        self.blocks = self
+            .blocks
+            .iter()
+            .map(|b| BlockMeta {
+                block_max_bm25: b.block_max_bm25 * factor,
+                ..*b
+            })
+            .collect::<Vec<_>>()
+            .into();
+        self
+    }
+}
+
 impl PhraseCursor {
     /// Build from member cursors (query order), their fetched
     /// position runs, and their positional metadata — `(term_meta,
@@ -4852,11 +4976,17 @@ impl PhraseCursor {
     /// (first verified match ≥ `start_doc`) — a sub-range unit passes
     /// its window start so construction doesn't verify-walk the list
     /// from doc 0; whole-list callers pass 0.
+    /// `idf_x_k1p1_override` rebinds the phrase's scoring constant —
+    /// the bigram rewrite passes Σ member-unigram idfs so chained-pair
+    /// members (whose own idfs are pair idfs) still score under the
+    /// phrase contract. Bounds scale through the same constant, so
+    /// they stay upper bounds.
     fn new(
         cursors: Vec<TermCursor>,
         positions: Vec<Bytes>,
         positional: Vec<(Option<TermMeta>, Option<u32>)>,
         start_doc: u32,
+        idf_x_k1p1_override: Option<f32>,
     ) -> Result<Self, FtsError> {
         debug_assert!(cursors.len() >= 2, "single-token phrases degrade to terms");
         debug_assert_eq!(cursors.len(), positions.len());
@@ -4883,9 +5013,13 @@ impl PhraseCursor {
                 }
             })
             .collect();
+        let (idf_x_k1p1, term_max_bm25) = match idf_x_k1p1_override {
+            Some(over) => (over, over / (bm25::K1 + 1.0) * min_scaled_bound),
+            None => (idf_sum * (bm25::K1 + 1.0), idf_sum * min_scaled_bound),
+        };
         let mut cursor = Self {
-            idf_x_k1p1: idf_sum * (bm25::K1 + 1.0),
-            term_max_bm25: idf_sum * min_scaled_bound,
+            idf_x_k1p1,
+            term_max_bm25,
             members,
             current_doc: 0,
             current_tf: 0,

@@ -138,7 +138,8 @@ use crate::{
         },
         fts::{
             fst_value::FstValue,
-            merge::{MergeColumn, MergeSource, merge_fts_blobs},
+            merge::{MergeColumn, MergeSource, SyntheticTerm, SyntheticTerms, merge_fts_blobs},
+            positions::{decode_run, encode_run, skip_run},
             reader::FtsReader,
         },
         reader::vector_layout_from_kv,
@@ -3166,6 +3167,173 @@ struct TextDrainOutcome {
 /// `sources` are the undrained user superfiles. Returns `None` when
 /// the user table has no FTS columns.
 #[allow(clippy::too_many_arguments)]
+/// Generate adjacent-pair (bigram) synthetic terms from the FINAL
+/// merged intermediate's unigram postings: for every positional
+/// column, tee `(doc, position, term)` triples for members at/above
+/// the configured df floor, sort by `(doc, position)`, and scan for
+/// adjacent pairs. Postings come out in the final merged doc space;
+/// the per-shard slice remaps them alongside the source postings.
+///
+/// Bigrams carry the exact phrase tf for their pair, which is what
+/// per-member statistics can never provide — the pruning phrase
+/// queries lost when scoring went correctly global. Derived data:
+/// the merge drops synthetic terms from its sources, so every
+/// drain/fold regenerates a consistent set from the surviving
+/// unigrams.
+async fn generate_bigram_terms(
+    final_reader: &FtsReader,
+    fts_columns: &[FtsConfig],
+    member_df_floor: u32,
+) -> Result<Vec<SyntheticTerms>, BuildError> {
+    if member_df_floor == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<SyntheticTerms> = Vec::new();
+    let mut pairs: Vec<(u32, u32)> = Vec::new();
+    let mut pos_buf: Vec<u32> = Vec::new();
+    for fc in fts_columns {
+        if !fc.positions {
+            continue;
+        }
+        // Tee triples for common members only.
+        let mut common_terms: Vec<Vec<u8>> = Vec::new();
+        let mut triples: Vec<(u32, u32, u32)> = Vec::new();
+        for (term, packed) in final_reader
+            .column_term_entries(&fc.column)
+            .map_err(|e| BuildError::Store(e.to_string()))?
+        {
+            let runs = final_reader
+                .decode_term_postings(true, packed, &mut pairs)
+                .await
+                .map_err(|e| BuildError::Store(e.to_string()))?
+                .ok_or_else(|| {
+                    BuildError::Store("positional column term without position runs".into())
+                })?;
+            if (pairs.len() as u32) < member_df_floor {
+                continue;
+            }
+            let term_idx = common_terms.len() as u32;
+            common_terms.push(term);
+            let mut at = 0usize;
+            for &(doc, tf) in &pairs {
+                pos_buf.clear();
+                decode_run(&runs, &mut at, tf, &mut pos_buf).ok_or_else(|| {
+                    BuildError::Store("position runs truncated during bigram tee".into())
+                })?;
+                for &p in &pos_buf {
+                    triples.push((doc, p, term_idx));
+                }
+            }
+        }
+        if common_terms.is_empty() {
+            continue;
+        }
+        triples.sort_unstable();
+        // Adjacent-position scan → (bigram members, doc, anchor).
+        let mut anchors: Vec<(u32, u32, u32, u32)> = Vec::new(); // (t1, t2, doc, pos)
+        for w in triples.windows(2) {
+            let (d1, p1, t1) = w[0];
+            let (d2, p2, t2) = w[1];
+            if d1 == d2 && p2 == p1 + 1 {
+                anchors.push((t1, t2, d1, p1));
+            }
+        }
+        drop(triples);
+        if anchors.is_empty() {
+            continue;
+        }
+        // Group by bigram key in lex order. Sorting by term INDEX pair
+        // is not lex order of the key bytes, so sort by materialized
+        // key; anchors within a key stay (doc, pos) ascending.
+        let mut keyed: Vec<(Vec<u8>, u32, u32)> = anchors
+            .into_iter()
+            .map(|(t1, t2, doc, pos)| {
+                let a = &common_terms[t1 as usize];
+                let b = &common_terms[t2 as usize];
+                let mut key = Vec::with_capacity(a.len() + 1 + b.len());
+                key.extend_from_slice(a);
+                key.push(FST_SEPARATOR);
+                key.extend_from_slice(b);
+                (key, doc, pos)
+            })
+            .collect();
+        keyed.sort_unstable();
+        let mut terms: Vec<SyntheticTerm> = Vec::new();
+        let mut i = 0usize;
+        while i < keyed.len() {
+            let key_end = keyed[i..]
+                .iter()
+                .position(|(k, _, _)| k != &keyed[i].0)
+                .map(|off| i + off)
+                .unwrap_or(keyed.len());
+            let mut term = SyntheticTerm {
+                term: keyed[i].0.clone(),
+                pairs: Vec::new(),
+                runs: Vec::new(),
+            };
+            let mut j = i;
+            while j < key_end {
+                let doc = keyed[j].1;
+                pos_buf.clear();
+                while j < key_end && keyed[j].1 == doc {
+                    pos_buf.push(keyed[j].2);
+                    j += 1;
+                }
+                term.pairs.push((doc, pos_buf.len() as u32));
+                encode_run(&mut term.runs, &pos_buf);
+            }
+            terms.push(term);
+            i = key_end;
+        }
+        out.push(SyntheticTerms {
+            column: fc.column.clone(),
+            terms,
+        });
+    }
+    Ok(out)
+}
+
+/// Remap one column's synthetic terms into a shard's dense doc space,
+/// dropping docs the shard does not reference and keeping position
+/// runs aligned pair-for-pair (the same discipline the merge applies
+/// to source postings).
+fn remap_synthetic_terms(
+    synthetic: &[SyntheticTerms],
+    dense_remap: &[Option<u32>],
+) -> Vec<SyntheticTerms> {
+    synthetic
+        .iter()
+        .map(|col| SyntheticTerms {
+            column: col.column.clone(),
+            terms: col
+                .terms
+                .iter()
+                .filter_map(|t| {
+                    let mut pairs = Vec::with_capacity(t.pairs.len());
+                    let mut runs = Vec::with_capacity(t.runs.len());
+                    let mut at = 0usize;
+                    for &(doc, tf) in &t.pairs {
+                        let run_start = at;
+                        skip_run(&t.runs, &mut at, tf)?;
+                        if let Some(mapped) = dense_remap[doc as usize] {
+                            pairs.push((mapped, tf));
+                            runs.extend_from_slice(&t.runs[run_start..at]);
+                        }
+                    }
+                    match pairs.is_empty() {
+                        true => None,
+                        false => Some(SyntheticTerm {
+                            term: t.term.clone(),
+                            pairs,
+                            runs,
+                        }),
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 async fn drain_fts_text_shards(
     user_inner: &Arc<SupertableInner>,
     hidden_inner: &Arc<SupertableInner>,
@@ -3315,6 +3483,7 @@ async fn drain_fts_text_shards(
             &merge_columns,
             n_docs_merged as u32,
             None,
+            &[],
             &mut next_file,
         )
         .await?;
@@ -3464,6 +3633,7 @@ async fn drain_fts_text_shards(
             &merge_columns,
             n_docs_merged as u32,
             None,
+            &[],
             &mut next_file,
         )
         .await?;
@@ -3510,6 +3680,14 @@ async fn drain_fts_text_shards(
         .map_err(|error| BuildError::Store(format!("text final mmap: {error}")))?;
     let final_reader = FtsReader::open(final_bytes, &columns_json)
         .map_err(|e| BuildError::Store(e.to_string()))?;
+    // Bigram synthetic terms, generated once from the final unigram
+    // postings (final merged doc ids); each shard remaps its slice.
+    let synthetic = generate_bigram_terms(
+        &final_reader,
+        fts_columns,
+        config::global().fts.bigram_member_df_floor,
+    )
+    .await?;
 
     // Shard boundaries: walk the merged FST in key order (columns in
     // lex name order — the FST key order), accumulating each term's
@@ -3583,6 +3761,24 @@ async fn drain_fts_text_shards(
                     }
                 }
             }
+            // Synthetic bigram terms reference docs too: a bigram key
+            // can fall in this shard's range while neither member
+            // does, so its docs must join the dense doc space.
+            for syn_col in &synthetic {
+                for syn in &syn_col.terms {
+                    key_buf.clear();
+                    key_buf.extend_from_slice(syn_col.column.as_bytes());
+                    key_buf.push(FST_SEPARATOR);
+                    key_buf.extend_from_slice(&syn.term);
+                    if key_buf.as_slice() < b_lo.as_slice() || key_buf.as_slice() >= b_hi.as_slice()
+                    {
+                        continue;
+                    }
+                    for &(doc, _) in &syn.pairs {
+                        referenced[doc as usize] = true;
+                    }
+                }
+            }
         }
         // Dense remap in merged-id order + this shard's doc count.
         dense_remap.clear();
@@ -3607,6 +3803,7 @@ async fn drain_fts_text_shards(
             File::create(&blob_path)
                 .map_err(|error| BuildError::Store(format!("text shard blob create: {error}")))?,
         );
+        let shard_synthetic = remap_synthetic_terms(&synthetic, &dense_remap);
         merge_fts_blobs(
             &[MergeSource {
                 reader: &final_reader,
@@ -3615,6 +3812,7 @@ async fn drain_fts_text_shards(
             &merge_columns,
             shard_docs,
             Some((b_lo, b_hi)),
+            &shard_synthetic,
             &mut blob_file,
         )
         .await?;

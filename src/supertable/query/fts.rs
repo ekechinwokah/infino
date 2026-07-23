@@ -3710,6 +3710,138 @@ mod tests {
         assert_eq!(bare[0].num_rows(), 1);
     }
 
+    /// End-to-end bigram flow through the drain: the merged text
+    /// shards must carry drain-generated adjacent-pair terms (members
+    /// above the df floor), and post-drain phrase queries — which
+    /// rewrite onto those pair postings — must return the planted
+    /// ground truth: exact phrase counts and the highest-phrase-tf doc
+    /// on top.
+    #[test]
+    fn drained_shards_carry_bigrams_and_phrase_results_match() {
+        use tempfile::TempDir;
+
+        /// Docs in the corpus; members reach df ≥ the default 1024
+        /// bigram floor.
+        const DOCS: u32 = 3000;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "body",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new_in("/mnt/scratch/tmp").expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "body".into(),
+                    positions: true,
+                }],
+                vec![],
+                Some(tok()),
+            )
+            .expect("options")
+            .with_storage(storage)
+            .with_writer_pool(pool),
+        )
+        .expect("create");
+
+        // Three commits; adjacency planted in every 2nd doc, members
+        // present-but-separated in every 3rd, one doc with phrase
+        // tf = 3 (the top hit by contract), filler for dl variance.
+        let mut expected_matches: u64 = 0;
+        for c in 0..3u32 {
+            let texts: Vec<String> = (0..DOCS / 3)
+                .map(|i| {
+                    let d = c * (DOCS / 3) + i;
+                    let mut t = String::new();
+                    if d == 7 {
+                        t.push_str("quick brown quick brown quick brown ");
+                    } else if d % 2 == 0 {
+                        t.push_str("quick brown ");
+                    } else if d % 3 == 0 {
+                        t.push_str("quick sep brown ");
+                    }
+                    t.push_str(&format!("fill{d} tail"));
+                    t
+                })
+                .collect();
+            expected_matches += texts.iter().filter(|t| t.contains("quick brown")).count() as u64;
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(LargeStringArray::from(texts)) as _],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        // (a) The text shards carry the pair term with the exact
+        // adjacency df.
+        let vit = st
+            .reader()
+            .vector_index_table()
+            .cloned()
+            .expect("hidden sibling");
+        let hidden_reader = vit.pinned_reader();
+        let hidden_store = vit.inner().options.store.clone();
+        let mut bigram_df: u64 = 0;
+        for entry in hidden_reader.manifest().get_all_superfiles() {
+            if entry.fts_summary.is_empty() || !entry.vector_summary.is_empty() {
+                continue;
+            }
+            let reader = hidden_store.reader(&entry.uri).expect("shard reader");
+            let fts = reader.fts().expect("text shard has FTS");
+            bigram_df += block_on(fts.term_df("body", "quick\u{1f}brown")).expect("df");
+        }
+        assert_eq!(
+            bigram_df, expected_matches,
+            "drain must emit the pair term with adjacency df"
+        );
+
+        // (b) Post-drain phrase semantics against planted truth.
+        let phrase = "\"quick brown\"";
+        let count = st.count("body", phrase, BoolMode::Or).expect("count");
+        assert_eq!(count, expected_matches);
+        let hits = st
+            .reader()
+            .bm25_search("body", phrase, 3, BoolMode::Or, None)
+            .expect("phrase search");
+        assert_eq!(hits[0].num_rows(), 3);
+        // Highest phrase tf wins under the contract; doc 7 planted 3
+        // occurrences. Verify by materializing its text.
+        let top = st
+            .bm25_search(
+                "body",
+                phrase,
+                1,
+                BoolMode::Or,
+                Some(&["_id", "body", "score"]),
+            )
+            .expect("top hit");
+        let body = top[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("body col");
+        assert!(
+            body.value(0)
+                .starts_with("quick brown quick brown quick brown"),
+            "top hit must be the tf=3 doc, got {:?}",
+            body.value(0)
+        );
+    }
+
     /// SCRATCH (uncommitted): merged-shard BM25 statistics audit.
     /// Near-universal terms make idf ~= gap/N, so any df/n_docs/avgdl
     /// accounting drift in the drain shows up as a ratio shift

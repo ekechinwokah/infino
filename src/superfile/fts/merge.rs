@@ -59,6 +59,30 @@ pub(crate) struct MergeColumn {
     pub positions: bool,
 }
 
+/// One drain-generated synthetic term (an adjacent-pair bigram):
+/// postings arrive already in the MERGED doc space, ascending, with
+/// position runs holding the pair's anchor positions in the shared
+/// run encoding. The term bytes embed [`FST_SEPARATOR`] between the
+/// members — a byte no tokenizer emits, so synthetic keys can never
+/// collide with real terms.
+pub(crate) struct SyntheticTerm {
+    pub term: Vec<u8>,
+    pub pairs: Vec<(u32, u32)>,
+    pub runs: Vec<u8>,
+}
+
+/// A lex-ordered batch of [`SyntheticTerm`]s for one column, merged
+/// into the union alongside the real sources' terms. Synthetic terms
+/// are DERIVED data: [`merge_fts_blobs`] drops any source term
+/// containing [`FST_SEPARATOR`], so re-merging shards never carries a
+/// stale generation forward — the caller regenerates from the final
+/// unigram postings instead.
+pub(crate) struct SyntheticTerms {
+    pub column: String,
+    /// Strictly ascending by `term`.
+    pub terms: Vec<SyntheticTerm>,
+}
+
 /// Merge the sources' postings for `columns` into one FTS blob
 /// written to `w`, keeping only terms whose full FST key
 /// (`<column>\x1F<term>`) falls in the half-open `key_bounds` range
@@ -72,6 +96,7 @@ pub(crate) async fn merge_fts_blobs<W: Write>(
     columns: &[MergeColumn],
     n_docs_merged: u32,
     key_bounds: Option<(&[u8], &[u8])>,
+    synthetic: &[SyntheticTerms],
     mut w: W,
 ) -> Result<(), BuildError> {
     for s in sources {
@@ -151,12 +176,27 @@ pub(crate) async fn merge_fts_blobs<W: Write>(
         // simplification).
         let mut entries: Vec<Vec<(Vec<u8>, u64)>> = Vec::with_capacity(sources.len());
         for s in sources {
-            entries.push(s.reader.column_term_entries(name).map_err(map_source_err)?);
+            let mut source_entries = s.reader.column_term_entries(name).map_err(map_source_err)?;
+            // Synthetic terms are derived data — drop any prior
+            // generation carried by a source so the union never mixes
+            // stale bigrams with the caller's fresh stream (see
+            // [`SyntheticTerms`]).
+            source_entries.retain(|(term, _)| !term.contains(&FST_SEPARATOR));
+            entries.push(source_entries);
         }
         let mut cursors: Vec<usize> = vec![0; sources.len()];
+        let syn_terms: &[SyntheticTerm] = synthetic
+            .iter()
+            .find(|s| s.column == *name)
+            .map(|s| s.terms.as_slice())
+            .unwrap_or(&[]);
+        let mut syn_cursor = 0usize;
 
         loop {
-            // Smallest un-consumed term across sources.
+            // Smallest un-consumed term across sources + the synthetic
+            // stream. Synthetic keys embed FST_SEPARATOR, which no
+            // tokenizer emits, so a synthetic term never ties a source
+            // term.
             let mut min_term: Option<&[u8]> = None;
             for (i, e) in entries.iter().enumerate() {
                 if let Some((term, _)) = e.get(cursors[i])
@@ -164,6 +204,53 @@ pub(crate) async fn merge_fts_blobs<W: Write>(
                 {
                     min_term = Some(term);
                 }
+            }
+            if let Some(syn) = syn_terms.get(syn_cursor)
+                && min_term.map(|m| syn.term.as_slice() < m).unwrap_or(true)
+            {
+                // Synthetic head wins: emit it directly (postings are
+                // already merged-space and sorted) and continue.
+                let syn = &syn_terms[syn_cursor];
+                syn_cursor += 1;
+                let in_bounds = key_bounds
+                    .map(|(lo, hi)| {
+                        key_buf.clear();
+                        key_buf.extend_from_slice(col_name_bytes);
+                        key_buf.push(FST_SEPARATOR);
+                        key_buf.extend_from_slice(&syn.term);
+                        key_buf.as_slice() >= lo && key_buf.as_slice() < hi
+                    })
+                    .unwrap_or(true);
+                if !in_bounds || syn.pairs.is_empty() {
+                    continue;
+                }
+                let term_str = from_utf8(&syn.term).map_err(|_| {
+                    BuildError::Io(Error::new(
+                        ErrorKind::InvalidData,
+                        "synthetic term is not valid UTF-8",
+                    ))
+                })?;
+                let term_positions =
+                    positions.then_some((&mut positions_sink, syn.runs.as_slice()));
+                encode_and_emit_term(
+                    term_str,
+                    &syn.pairs,
+                    col_name_bytes,
+                    &merged_dl,
+                    avgdl,
+                    n_docs_merged,
+                    &mut key_buf,
+                    &mut postings_writer,
+                    &mut postings_crc_acc,
+                    &mut postings_len,
+                    None,
+                    Some(&mut fst_streaming),
+                    term_positions,
+                    &mut finish_profile,
+                    &mut term_scratch,
+                )?;
+                n_terms_total_usize += 1;
+                continue;
             }
             let Some(term) = min_term else { break };
             let term = term.to_vec();
@@ -302,11 +389,136 @@ mod tests {
     use crate::superfile::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
         fts::{
-            builder::FtsBuilder, positions::decode_run, reader::BoolMode,
+            builder::FtsBuilder,
+            positions::decode_run,
+            reader::{BoolMode, ClauseLists},
             tokenize::AsciiLowerTokenizer,
         },
         reader::SuperfileReader,
     };
+
+    /// Synthetic bigram terms must round-trip through the merge: the
+    /// pair term lands in the FST interleaved in lex order, its
+    /// postings carry the pair tf, its anchor positions decode, and a
+    /// phrase query through the rewrite returns exactly the unigram
+    /// walk's docs and scores (the phrase contract: idf = Σ member
+    /// idfs, tf = pair occurrences).
+    #[tokio::test]
+    async fn synthetic_bigrams_round_trip_and_match_unigram_walk() {
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), true).expect("register");
+        // Doc 0: one "quick brown" at position 0; doc 1: members
+        // non-adjacent; doc 2: pair twice (positions 0 and 3).
+        b.add_doc(0, 0, "quick brown fox").expect("add");
+        b.add_doc(0, 1, "quick sly brown").expect("add");
+        b.add_doc(0, 2, "quick brown x quick brown").expect("add");
+        let src = FtsReader::open(
+            Bytes::from(b.finish().expect("finish")),
+            r#"[{"name":"body","tokenizer":"ascii_lower","positions":true}]"#,
+        )
+        .expect("open src");
+        let identity: Vec<Option<u32>> = (0..3).map(Some).collect();
+        let sources = [MergeSource {
+            reader: &src,
+            doc_id_remap: &identity,
+        }];
+        let columns = [MergeColumn {
+            name: "body".into(),
+            positions: true,
+        }];
+
+        // Hand-built synthetic stream mirroring what the drain
+        // generator derives from the postings above.
+        let mut bigram_key = b"quick".to_vec();
+        bigram_key.push(FST_SEPARATOR);
+        bigram_key.extend_from_slice(b"brown");
+        let mut runs = Vec::new();
+        crate::superfile::fts::positions::encode_run(&mut runs, &[0]);
+        crate::superfile::fts::positions::encode_run(&mut runs, &[0, 3]);
+        let synthetic = [SyntheticTerms {
+            column: "body".into(),
+            terms: vec![SyntheticTerm {
+                term: bigram_key.clone(),
+                pairs: vec![(0, 1), (2, 2)],
+                runs,
+            }],
+        }];
+
+        let mut with_bigrams = Vec::new();
+        merge_fts_blobs(&sources, &columns, 3, None, &synthetic, &mut with_bigrams)
+            .await
+            .expect("merge with bigrams");
+        let mut without_bigrams = Vec::new();
+        merge_fts_blobs(&sources, &columns, 3, None, &[], &mut without_bigrams)
+            .await
+            .expect("merge without bigrams");
+
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower","positions":true}]"#;
+        let with_r = FtsReader::open(Bytes::from(with_bigrams), json).expect("open");
+        let without_r = FtsReader::open(Bytes::from(without_bigrams), json).expect("open");
+
+        // The pair term exists with the pair df; a stale synthetic
+        // term in a SOURCE would have been dropped (derived data).
+        let key_str = String::from_utf8(bigram_key).expect("utf8");
+        assert_eq!(with_r.term_df("body", &key_str).await.expect("df"), 2);
+        assert_eq!(without_r.term_df("body", &key_str).await.expect("df"), 0);
+
+        // Phrase query: rewritten path (with) vs unigram walk
+        // (without) — identical docs and scores.
+        let phrase = vec!["quick".to_string(), "brown".to_string()];
+        let lists = ClauseLists {
+            musts: &[],
+            shoulds: &[],
+            negatives: &[],
+            must_phrases: &[],
+            should_phrases: std::slice::from_ref(&phrase),
+            negative_phrases: &[],
+        };
+        let got = with_r
+            .search_excluding("body", lists, 10, f32::NEG_INFINITY)
+            .await
+            .expect("bigram search");
+        let lists = ClauseLists {
+            musts: &[],
+            shoulds: &[],
+            negatives: &[],
+            must_phrases: &[],
+            should_phrases: std::slice::from_ref(&phrase),
+            negative_phrases: &[],
+        };
+        let expected = without_r
+            .search_excluding("body", lists, 10, f32::NEG_INFINITY)
+            .await
+            .expect("unigram search");
+        assert_eq!(got.len(), 2, "docs 0 and 2 match");
+        assert_eq!(got.len(), expected.len());
+        for ((gd, gs), (ed, es)) in got.iter().zip(expected.iter()) {
+            assert_eq!(gd, ed);
+            let rel = (gs - es).abs() / es.abs().max(f32::MIN_POSITIVE);
+            assert!(rel < 1e-6, "score mismatch: {gs} vs {es}");
+        }
+
+        // Re-merging the bigram-carrying blob with a FRESH synthetic
+        // stream must not duplicate: source synthetic terms drop.
+        let remerge_sources = [MergeSource {
+            reader: &with_r,
+            doc_id_remap: &identity,
+        }];
+        let mut remerged = Vec::new();
+        merge_fts_blobs(
+            &remerge_sources,
+            &columns,
+            3,
+            None,
+            &synthetic,
+            &mut remerged,
+        )
+        .await
+        .expect("re-merge");
+        let remerged_r = FtsReader::open(Bytes::from(remerged), json).expect("open");
+        assert_eq!(remerged_r.term_df("body", &key_str).await.expect("df"), 2);
+    }
 
     /// Two positionless sources with an overlapping vocabulary and a
     /// tombstoned doc. Source-local → merged: src0 = [0, dropped, 1],
@@ -352,6 +564,7 @@ mod tests {
             }],
             4,
             None,
+            &[],
             &mut out,
         )
         .await
@@ -441,6 +654,7 @@ mod tests {
             }],
             1,
             Some((&lo, &hi)),
+            &[],
             &mut out,
         )
         .await
@@ -498,6 +712,7 @@ mod tests {
             }],
             2,
             None,
+            &[],
             &mut out,
         )
         .await
