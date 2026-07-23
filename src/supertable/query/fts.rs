@@ -105,7 +105,8 @@ use crate::{
             prune::{PruneLeaf, select_superfiles},
             skip::{fts_bloom_skip, fts_prefix_skip},
             vector::{
-                hits_id_score_batch, projection_is_id_score_only, user_placement_for_scalar_resolve,
+                hits_id_score_batch, lookup_user_placements_by_id, projection_is_id_score_only,
+                user_placement_for_scalar_resolve,
             },
         },
         reader_cache::disk::ForegroundQueryGuard,
@@ -325,6 +326,33 @@ impl SharedTopK {
 /// Ingredients of the hidden-text query route, present when the
 /// hidden sibling's current epoch holds text shards (term-range
 /// slices of the merged inverted index).
+/// Scalar-index refinement of a SQL scan (see
+/// [`SupertableReader::scalar_index_scan_candidates`]): matching
+/// locals per drained user file, plus the epoch watermark that says
+/// which files the map covers.
+pub(crate) struct ScalarIndexScanCandidates {
+    pub(crate) by_file: HashMap<Uuid, RoaringBitmap>,
+    pub(crate) drained: DrainedVersionRanges,
+}
+
+/// Intersection of two sorted, deduped id lists.
+fn intersect_sorted_ids(a: &[i128], b: &[i128]) -> Vec<i128> {
+    let mut out = Vec::with_capacity(a.len().min(b.len()));
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            Ordering::Less => i += 1,
+            Ordering::Greater => j += 1,
+            Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
 struct HiddenTextRoute {
     /// Reader whose store/options open the hidden table's superfiles.
     hidden_reader: SupertableReader,
@@ -1517,6 +1545,52 @@ impl SupertableReader {
         ids.sort_unstable();
         ids.dedup();
         Ok(Some(ids))
+    }
+
+    /// Per-file scan candidates for a conjunction of scalar-index
+    /// equality predicates, resolved over the DRAINED corpus: each
+    /// predicate's keys look up to stable ids, the conjunction
+    /// intersects them, and the ids place back to user-file locals
+    /// through the id-resolution ladder. A drained survivor absent
+    /// from `by_file` holds no matching live row and can be skipped
+    /// without opening it; undrained (tail) files are NOT covered and
+    /// keep their stats-pruned scan. `None` = the index declined
+    /// (no shards yet, every predicate unselective, or an
+    /// unplaceable id) — the caller scans exactly as before.
+    pub(crate) async fn scalar_index_scan_candidates(
+        &self,
+        predicates: &[(String, Vec<String>)],
+    ) -> Result<Option<ScalarIndexScanCandidates>, QueryError> {
+        let mut ids: Option<Vec<i128>> = None;
+        for (column, keys) in predicates {
+            // A declining predicate drops out of the conjunction: the
+            // remaining ones still bound the match set from above.
+            let Some(col_ids) = self.scalar_index_ids(column, keys).await? else {
+                continue;
+            };
+            ids = Some(match ids {
+                None => col_ids,
+                Some(prev) => intersect_sorted_ids(&prev, &col_ids),
+            });
+        }
+        let Some(ids) = ids else {
+            return Ok(None);
+        };
+        let Some(route) = self.hidden_text_route().await? else {
+            return Ok(None);
+        };
+        let drained = route.drained;
+        // An unplaceable id (a file swapped mid-flight) declines the
+        // whole refinement — pruning is an optimization and must never
+        // convert a placement race into a query error.
+        let Ok(placements) = lookup_user_placements_by_id(self.manifest(), &ids).await else {
+            return Ok(None);
+        };
+        let mut by_file: HashMap<Uuid, RoaringBitmap> = HashMap::new();
+        for (entry, local) in placements {
+            by_file.entry(entry.superfile_id).or_default().insert(local);
+        }
+        Ok(Some(ScalarIndexScanCandidates { by_file, drained }))
     }
 
     pub(crate) async fn token_match_async(

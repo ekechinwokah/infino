@@ -105,16 +105,19 @@ use crate::{
     },
     supertable::{
         SuperfileEntry,
+        handle::WeakReader,
         manifest::{ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts},
         options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         query::{
             candidate::CandidatePlan,
             df_object_store::SuperfileObjectStore,
+            fts::ScalarIndexScanCandidates,
             prune::{PruneLeaf, select_superfiles},
             skip::{ScalarOp, ScalarPredicate},
             superfile_reader::superfile_reader,
         },
         reader_cache::{DiskCacheStore, SuperfileReaderCache},
+        scalar_index::exprs_to_scalar_index_keys,
         tombstones::SidecarCache,
     },
 };
@@ -224,6 +227,11 @@ pub(crate) struct SupertableProvider {
     /// Exact table-level low-cardinality frequencies, merged lazily per
     /// column from this provider's immutable manifest snapshot.
     scalar_value_counts: Arc<DashMap<String, Option<Arc<ScalarValueCounts>>>>,
+    /// Hidden scalar-index lookup seam, weak so a cached
+    /// `SessionContext` never keeps the consumer alive (the TVFs'
+    /// `WeakReader` precedent). `None` (or a failed upgrade) skips
+    /// index refinement — the scan stays exactly as it was.
+    scalar_lookup: Option<WeakReader>,
 }
 
 /// Manual `Debug` (required by `TableProvider`): the cache /
@@ -276,6 +284,7 @@ impl SupertableProvider {
         store: Arc<dyn SuperfileReaderCache>,
         disk_cache: Option<Arc<DiskCacheStore>>,
         tombstone_cache: Option<Arc<SidecarCache>>,
+        scalar_lookup: Option<WeakReader>,
     ) -> Self {
         let seq = STORE_URL_SEQ.fetch_add(1, atomic::Ordering::Relaxed);
         let store_url = ObjectStoreUrl::parse(format!("{SUPERFILE_STORE_URL_PREFIX}{seq}/"))
@@ -293,6 +302,7 @@ impl SupertableProvider {
             scan_store: Arc::new(SuperfileObjectStore::new()),
             scan_metas: Arc::new(DashMap::new()),
             scalar_value_counts: Arc::new(DashMap::new()),
+            scalar_lookup,
         }
     }
 
@@ -307,6 +317,7 @@ impl SupertableProvider {
             Arc::clone(&self.store),
             self.disk_cache.clone(),
             self.tombstone_cache.clone(),
+            self.scalar_lookup.clone(),
         );
         restricted.segment_filter = Some(segments);
         restricted.prepared_scan_files = Arc::clone(&self.prepared_scan_files);
@@ -425,6 +436,30 @@ impl SupertableProvider {
         }
 
         Ok(survivors)
+    }
+
+    /// Scalar-index scan refinement for this filter list, or `None`
+    /// when it cannot apply: no indexed conjuncts, no lookup seam, the
+    /// consumer already dropped, or the index itself declined.
+    async fn scalar_scan_candidates(
+        &self,
+        filters: &[Expr],
+    ) -> DfResult<Option<ScalarIndexScanCandidates>> {
+        let indexed = &self.manifest.options.scalar_index_columns;
+        if indexed.is_empty() {
+            return Ok(None);
+        }
+        let predicates = exprs_to_scalar_index_keys(filters, indexed);
+        if predicates.is_empty() {
+            return Ok(None);
+        }
+        let Some(reader) = self.scalar_lookup.as_ref().and_then(WeakReader::upgrade) else {
+            return Ok(None);
+        };
+        reader
+            .scalar_index_scan_candidates(&predicates)
+            .await
+            .map_err(|e| DataFusionError::Execution(e.to_string()))
     }
 
     /// The set of FTS-indexed column names — used by the candidate
@@ -751,6 +786,23 @@ impl TableProvider for SupertableProvider {
         // path FTS search uses); see `select_survivors`. Survivors go to
         // DataFusion.
         let survivor_entries = self.select_survivors(filters).await?;
+
+        // Scalar-index refinement: equality / IN conjuncts on indexed
+        // columns resolve to per-file matching locals over the drained
+        // corpus. A drained survivor with no matching rows drops here
+        // — before it is even opened; tail files (outside the drained
+        // watermark) always keep their stats-pruned scan. Declines
+        // (`None`) change nothing.
+        let scalar_candidates = self.scalar_scan_candidates(filters).await?;
+        let survivor_entries: Vec<Arc<SuperfileEntry>> = match &scalar_candidates {
+            Some(c) => survivor_entries
+                .into_iter()
+                .filter(|e| {
+                    !c.drained.contains(e.birth_version) || c.by_file.contains_key(&e.superfile_id)
+                })
+                .collect(),
+            None => survivor_entries,
+        };
         let survivors: Vec<&Arc<SuperfileEntry>> = survivor_entries.iter().collect();
 
         // Nothing survived (empty table, or every superfile pruned):
@@ -842,6 +894,23 @@ impl TableProvider for SupertableProvider {
                 None => Arc::new(RoaringBitmap::new()),
             };
 
+            // Scalar-index locals bound this file's rows exactly (the
+            // index covers every live drained row); intersect with any
+            // FTS-derived candidate set.
+            let candidates = match &scalar_candidates {
+                Some(c) if c.drained.contains(entry.birth_version) => {
+                    let scalar_rows = c
+                        .by_file
+                        .get(&entry.superfile_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    Some(match candidates {
+                        Some(fts_rows) => fts_rows & scalar_rows,
+                        None => scalar_rows,
+                    })
+                }
+                _ => candidates,
+            };
             superfiles.push(SuperfileScan {
                 prepared,
                 candidates,
@@ -2143,6 +2212,7 @@ mod tests {
             st.options().store.clone(),
             st.options().disk_cache.clone(),
             reader.tombstone_cache.clone(),
+            None,
         );
         let rt = runtime::Builder::new_multi_thread()
             .enable_all()
@@ -2193,6 +2263,7 @@ mod tests {
             st.options().store.clone(),
             st.options().disk_cache.clone(),
             reader.tombstone_cache.clone(),
+            None,
         );
         let rt = runtime::Builder::new_multi_thread()
             .enable_all()
@@ -2370,6 +2441,7 @@ mod tests {
             st.options().store.clone(),
             st.options().disk_cache.clone(),
             reader.tombstone_cache.clone(),
+            None,
         );
 
         let stats = provider.statistics().expect("statistics");

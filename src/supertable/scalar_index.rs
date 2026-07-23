@@ -46,7 +46,11 @@ use arrow_array::{
     TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
-use datafusion::scalar::ScalarValue;
+use datafusion::{
+    logical_expr::{BinaryExpr, Operator, expr::InList},
+    prelude::Expr,
+    scalar::ScalarValue,
+};
 
 /// Reserved column-name prefix for scalar-index columns inside hidden
 /// text shards: `inf.sidx.<user column>`. It builds on the options
@@ -252,6 +256,70 @@ pub(crate) fn encode_literal(value: &ScalarValue) -> Option<Vec<u8>> {
 
 /// The UTF-8 form of an encoded key, as the dictionary APIs take
 /// term strings. Hex keys are ASCII by construction.
+/// Extract the scalar-index-answerable conjuncts from a pushed-down
+/// filter list: `col = lit` (either operand order) and
+/// `col IN (lit, ...)` on indexed columns, as
+/// `(column, dictionary keys)`. Anything else — ranges, negations,
+/// non-literal operands, unsupported literal types — is skipped;
+/// skipping only forgoes pruning (the scan re-verifies every filter),
+/// never correctness.
+pub(crate) fn exprs_to_scalar_index_keys(
+    filters: &[Expr],
+    indexed: &[String],
+) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let mut push = |column: &str, lits: Vec<&ScalarValue>| {
+        if !indexed.iter().any(|c| c == column) {
+            return;
+        }
+        let mut keys = Vec::with_capacity(lits.len());
+        for lit in lits {
+            let Some(key) = encode_literal(lit) else {
+                // One un-encodable literal poisons the whole conjunct:
+                // a partial key set would under-approximate the match
+                // set and skip rows the predicate accepts.
+                return;
+            };
+            keys.push(key_to_term(key));
+        }
+        out.push((column.to_string(), keys));
+    };
+    for filter in filters {
+        match filter {
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::Eq,
+                right,
+            }) => match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(c), Expr::Literal(v, _)) | (Expr::Literal(v, _), Expr::Column(c)) => {
+                    push(c.name(), vec![v]);
+                }
+                _ => {}
+            },
+            Expr::InList(InList {
+                expr,
+                list,
+                negated: false,
+            }) => {
+                if let Expr::Column(c) = expr.as_ref() {
+                    let lits: Option<Vec<&ScalarValue>> = list
+                        .iter()
+                        .map(|e| match e {
+                            Expr::Literal(v, _) => Some(v),
+                            _ => None,
+                        })
+                        .collect();
+                    if let Some(lits) = lits {
+                        push(c.name(), lits);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 pub(crate) fn key_to_term(key: Vec<u8>) -> String {
     String::from_utf8(key).expect("hex keys are ASCII")
 }

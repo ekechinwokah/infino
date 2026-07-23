@@ -2742,6 +2742,50 @@ mod tests {
             Some(vec![]),
             "tail rows stay outside the index until the next drain"
         );
+
+        // SQL scans over the same state must agree exactly with a
+        // plain scan whatever the index prunes: drained matches
+        // survive the refinement, drained non-matches don't resurface,
+        // post-drain deletes stay gone, and the TAIL row (price 42,
+        // outside the index) MUST still be found — the sharpest edge
+        // of the two-wave contract.
+        let titles_where = |predicate: &str| -> Vec<String> {
+            let rows = st
+                .reader()
+                .query_sql(&format!(
+                    "SELECT title FROM supertable WHERE {predicate} ORDER BY title"
+                ))
+                .expect("sql");
+            rows.iter()
+                .flat_map(|b| {
+                    let any = b.column(0).as_any();
+                    let values: Vec<String> =
+                        match any.downcast_ref::<arrow_array::StringViewArray>() {
+                            Some(col) => (0..col.len()).map(|i| col.value(i).to_string()).collect(),
+                            None => {
+                                let col = any
+                                    .downcast_ref::<arrow_array::LargeStringArray>()
+                                    .expect("title col");
+                                (0..col.len()).map(|i| col.value(i).to_string()).collect()
+                            }
+                        };
+                    values
+                })
+                .collect()
+        };
+        assert_eq!(
+            titles_where("price = 42"),
+            vec!["row4"],
+            "row1 deleted post-drain, row2 pre-drain, row4 is undrained tail"
+        );
+        assert_eq!(titles_where("price = 10"), vec!["row0"]);
+        assert_eq!(titles_where("price IN (7, 10)"), vec!["row0", "row3"]);
+        assert_eq!(titles_where("price = 99"), Vec::<String>::new());
+        assert_eq!(
+            titles_where("price = 7 AND title = 'row3'"),
+            vec!["row3"],
+            "non-indexed conjuncts still verify on the refined rows"
+        );
     }
 
     /// A scalar-only table (no FTS columns) still gets the hidden

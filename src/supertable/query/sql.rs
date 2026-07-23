@@ -69,7 +69,7 @@ use crate::{
     memory::budgeted_session_context,
     supertable::{
         error::QueryError,
-        handle::{Supertable, SupertableReader},
+        handle::{Supertable, SupertableReader, WeakReader},
         options::SupertableOptions,
         query::{
             covered_agg::CoveredAggregateRewrite,
@@ -315,6 +315,7 @@ impl SupertableReader {
             store,
             disk_cache,
             reader.tombstone_cache.clone(),
+            Some(WeakReader::from_reader(&reader)),
         );
 
         // Gate SQL heap on the connection budget (shared across contexts, so
@@ -413,6 +414,7 @@ impl Supertable {
             store,
             disk_cache,
             reader.tombstone_cache.clone(),
+            Some(WeakReader::from_reader(&reader)),
         );
         ctx.register_table(name, Arc::new(provider))
             .map_err(|e| QueryError::Plan(e.to_string()))?;

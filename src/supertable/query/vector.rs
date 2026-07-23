@@ -677,7 +677,7 @@ pub(crate) struct PreparedGlobalAllow {
 /// read concurrently and each `_id` column is decoded at most once for the
 /// entire top-k. The previous per-hit lookup could decode the same full column
 /// twice per hit: once to identify its owner and again to locate its row.
-async fn lookup_user_placements_by_id(
+pub(crate) async fn lookup_user_placements_by_id(
     manifest: &ManifestSnapshot,
     user_row_ids: &[i128],
 ) -> Result<Vec<(Arc<SuperfileEntry>, u32)>, QueryError> {
