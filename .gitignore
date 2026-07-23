@@ -26,3 +26,11 @@ infino-python/python/infino/*.so
 
 # Local agent/editor tooling (worktrees, settings, skills).
 .claude/
+
+# Per-cwd engine config override (bench-box tuning) and local agent/editor state.
+/infino.yaml
+/.mcp.json
+
+# Scratch diffs and documents never belong in the repo.
+/diff.*
+*.pdf
