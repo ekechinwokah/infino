@@ -1202,25 +1202,6 @@ impl SuperfileReader {
             .await?)
     }
 
-    /// Single-bare-phrase bound-ordered block selection — see
-    /// [`FtsReader::bm25_phrase_block_selected`].
-    pub(crate) async fn bm25_phrase_block_selected(
-        &self,
-        column: &str,
-        phrase: &[String],
-        k: usize,
-        floor: f32,
-        cache: Option<&FtsCursorCache>,
-        live: Option<&SharedFloor>,
-    ) -> Result<Option<Vec<(u32, f32)>>, ReadError> {
-        let fts = self
-            .fts()
-            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(fts
-            .bm25_phrase_block_selected(column, phrase, k, floor, cache, live)
-            .await?)
-    }
-
     /// Single-term BM25 over resident-routed block selection — see
     /// [`FtsReader::bm25_single_term_block_selected`].
     #[allow(clippy::too_many_arguments)]
