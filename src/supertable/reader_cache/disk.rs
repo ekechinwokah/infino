@@ -120,15 +120,27 @@ impl Drop for ForegroundQueryGuard {
 /// Pause this URI's background full-object fill while a caller besides the
 /// cache entry holds its lazy reader (`strong_count > 1`). Unrelated URIs
 /// are unaffected — that is the per-URI quiescence contract.
-fn reader_blocks_background_fill(store: &DiskCacheStore, reader: &Weak<SuperfileReader>) -> bool {
-    // A registered settle waiter overrides the yield-to-readers
-    // politeness: the waiter blocks until this fill completes, and
-    // some callers (the SQL provider's per-provider scan cache) hold
-    // their readers for the provider's whole lifetime — pausing until
-    // they release would deadlock the settle against the fill.
-    // Captured live (gdb thread dump) as the SQL post-drain battery
-    // stall surviving the failed-fill rollback fix.
-    reader.strong_count() > 1 && store.n_promotion_waiters.load(Ordering::Acquire) == 0
+fn reader_blocks_background_fill(
+    store: &DiskCacheStore,
+    uri: &SuperfileUri,
+    reader: &Weak<SuperfileReader>,
+) -> bool {
+    // A registered waiter overrides the yield-to-readers politeness:
+    // the waiter blocks until this fill completes, and some callers
+    // (the SQL provider's per-provider scan cache) hold their readers
+    // for the provider's whole lifetime — pausing until they release
+    // would deadlock the wait against the fill. Captured live (gdb
+    // thread dump) as the SQL post-drain battery stall surviving the
+    // failed-fill rollback fix. The override is scoped: a promotion
+    // waiter on THIS uri, or a store-wide settle waiter — a waiter on
+    // some other uri must not release this fill through its held
+    // reader (that raced the per-URI politeness contract flakily).
+    let waited_on = store
+        .promotion_waiters_by_uri
+        .get(uri)
+        .is_some_and(|n| *n > 0)
+        || store.n_settle_waiters.load(Ordering::Acquire) > 0;
+    reader.strong_count() > 1 && !waited_on
 }
 
 /// Errors surfaced by [`DiskCacheStore::reader`].
@@ -274,7 +286,11 @@ pub struct DiskCacheStore {
     /// promotion. A waiter means promotion is now latency-critical,
     /// so the background task may start even if a lazy reader Arc is
     /// still held by the waiter.
-    n_promotion_waiters: AtomicU64,
+    promotion_waiters_by_uri: DashMap<SuperfileUri, u64>,
+    /// Store-wide settle waiters (wait_until_fills_settled): unlike a
+    /// per-URI promotion wait, a settle waiter needs EVERY in-flight
+    /// fill released through held readers.
+    n_settle_waiters: AtomicU64,
     /// Callback for "which URIs are currently pinned" — feeds
     /// the eviction policy.
     ///
@@ -342,7 +358,8 @@ impl DiskCacheStore {
             n_cold_fetches: AtomicU64::new(0),
             n_evictions: AtomicU64::new(0),
             n_madvise_calls: AtomicU64::new(0),
-            n_promotion_waiters: AtomicU64::new(0),
+            promotion_waiters_by_uri: DashMap::new(),
+            n_settle_waiters: AtomicU64::new(0),
             pinned_fn: std::sync::Mutex::new(pinned_fn),
             prefetch_semaphore,
         });
@@ -707,7 +724,7 @@ impl DiskCacheStore {
         uri: &SuperfileUri,
         timeout: Duration,
     ) -> Result<(), DiskCacheError> {
-        let _guard = PromotionWaitGuard::new(&self.n_promotion_waiters);
+        let _guard = PromotionWaitGuard::new(&self.promotion_waiters_by_uri, *uri);
         let start = Instant::now();
         while start.elapsed() < timeout {
             if self.is_mmap_promoted(uri) {
@@ -731,7 +748,7 @@ impl DiskCacheStore {
         self: &Arc<Self>,
         timeout: Duration,
     ) -> Result<(), DiskCacheError> {
-        let _guard = PromotionWaitGuard::new(&self.n_promotion_waiters);
+        let _guard = SettleWaitGuard::new(&self.n_settle_waiters);
         let start = Instant::now();
         loop {
             let pending = self.cached.iter().any(|entry| {
@@ -1907,16 +1924,41 @@ impl<'a> Drop for Reservation<'a> {
     }
 }
 
-struct PromotionWaitGuard<'a>(&'a AtomicU64);
+struct PromotionWaitGuard<'a> {
+    waiters: &'a DashMap<SuperfileUri, u64>,
+    uri: SuperfileUri,
+}
 
 impl<'a> PromotionWaitGuard<'a> {
+    fn new(waiters: &'a DashMap<SuperfileUri, u64>, uri: SuperfileUri) -> Self {
+        *waiters.entry(uri).or_insert(0) += 1;
+        Self { waiters, uri }
+    }
+}
+
+impl Drop for PromotionWaitGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(mut n) = self.waiters.get_mut(&self.uri) {
+            *n = n.saturating_sub(1);
+            let empty = *n == 0;
+            drop(n);
+            if empty {
+                self.waiters.remove_if(&self.uri, |_, n| *n == 0);
+            }
+        }
+    }
+}
+
+struct SettleWaitGuard<'a>(&'a AtomicU64);
+
+impl<'a> SettleWaitGuard<'a> {
     fn new(counter: &'a AtomicU64) -> Self {
         counter.fetch_add(1, Ordering::AcqRel);
         Self(counter)
     }
 }
 
-impl Drop for PromotionWaitGuard<'_> {
+impl Drop for SettleWaitGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
@@ -2039,6 +2081,7 @@ fn background_store_abandoned(store: &Arc<DiskCacheStore>) -> bool {
 
 async fn wait_for_lazy_foreground_release(
     store: &Weak<DiskCacheStore>,
+    uri: &SuperfileUri,
     reader: &Weak<SuperfileReader>,
 ) -> Option<Arc<DiskCacheStore>> {
     loop {
@@ -2046,7 +2089,11 @@ async fn wait_for_lazy_foreground_release(
             return None;
         }
         if let Some(strong) = store.upgrade()
-            && strong.n_promotion_waiters.load(Ordering::Acquire) > 0
+            && (strong
+                .promotion_waiters_by_uri
+                .get(uri)
+                .is_some_and(|n| *n > 0)
+                || strong.n_settle_waiters.load(Ordering::Acquire) > 0)
         {
             return Some(strong);
         }
@@ -2068,10 +2115,11 @@ async fn wait_for_lazy_foreground_release(
 /// strong-count. A grace re-check covers the open→query handoff.
 async fn wait_for_reader_quiescence(
     store: &Arc<DiskCacheStore>,
+    uri: &SuperfileUri,
     reader: &Weak<SuperfileReader>,
 ) -> bool {
     loop {
-        while reader_blocks_background_fill(store, reader) {
+        while reader_blocks_background_fill(store, uri, reader) {
             if background_store_abandoned(store) {
                 return false;
             }
@@ -2084,7 +2132,7 @@ async fn wait_for_reader_quiescence(
         if reader.strong_count() == 0 {
             return false;
         }
-        if !reader_blocks_background_fill(store, reader) {
+        if !reader_blocks_background_fill(store, uri, reader) {
             return !background_store_abandoned(store);
         }
     }
@@ -2099,6 +2147,7 @@ enum BackgroundFillOutcome {
 
 async fn cold_fetch_to_disk_cancelable(
     store: &Arc<DiskCacheStore>,
+    uri: &SuperfileUri,
     reader: &Weak<SuperfileReader>,
     fetch_storage: &Arc<dyn StorageProvider>,
     storage_uri: &str,
@@ -2156,7 +2205,7 @@ async fn cold_fetch_to_disk_cancelable(
             if reader.strong_count() == 0 {
                 return Ok(BackgroundFillOutcome::Abandoned);
             }
-            if reader_blocks_background_fill(store, reader) {
+            if reader_blocks_background_fill(store, uri, reader) {
                 return Ok(BackgroundFillOutcome::Paused);
             }
             let chunk_idx = next_chunk;
@@ -2199,7 +2248,7 @@ async fn cold_fetch_to_disk_cancelable(
         if reader.strong_count() == 0 {
             return Ok(BackgroundFillOutcome::Abandoned);
         }
-        if reader_blocks_background_fill(store, reader) {
+        if reader_blocks_background_fill(store, uri, reader) {
             return Ok(BackgroundFillOutcome::Paused);
         }
         tokio::select! {
@@ -2210,7 +2259,7 @@ async fn cold_fetch_to_disk_cancelable(
                 if reader.strong_count() == 0 {
                     return Ok(BackgroundFillOutcome::Abandoned);
                 }
-                if reader_blocks_background_fill(store, reader) {
+                if reader_blocks_background_fill(store, uri, reader) {
                     return Ok(BackgroundFillOutcome::Paused);
                 }
             }
@@ -2232,7 +2281,7 @@ async fn cold_fetch_to_disk_cancelable(
     if reader.strong_count() == 0 {
         return Ok(BackgroundFillOutcome::Abandoned);
     }
-    if reader_blocks_background_fill(store, reader) {
+    if reader_blocks_background_fill(store, uri, reader) {
         return Ok(BackgroundFillOutcome::Paused);
     }
     spawn_blocking(move || file.sync_all())
@@ -2270,7 +2319,7 @@ async fn lazy_background_fill(
     fetch_storage: Arc<dyn StorageProvider>,
     skip_vec: Option<(u64, u64)>,
 ) -> Result<(), DiskCacheError> {
-    let Some(store) = wait_for_lazy_foreground_release(&store, &reader).await else {
+    let Some(store) = wait_for_lazy_foreground_release(&store, &uri, &reader).await else {
         return Ok(());
     };
     let tmp = store.tmp_path(&uri);
@@ -2296,12 +2345,13 @@ async fn lazy_background_fill(
     // the unfinished chunks rather than a re-download of the whole object.
     let mut filled: Vec<bool> = Vec::new();
     loop {
-        if !wait_for_reader_quiescence(&store, &reader).await {
+        if !wait_for_reader_quiescence(&store, &uri, &reader).await {
             rollback_lazy_background_fill(&store, &uri, &tmp);
             return Ok(());
         }
         match cold_fetch_to_disk_cancelable(
             &store,
+            &uri,
             &reader,
             &fetch_storage,
             &storage_uri,
@@ -3566,8 +3616,10 @@ mod tests {
         let signal_weak = Arc::downgrade(&signal_reader);
         let fill = spawn(async move {
             let mut filled = Vec::new();
+            let fill_uri = SuperfileUri::new_v4();
             let outcome = cold_fetch_to_disk_cancelable(
                 &fill_store,
+                &fill_uri,
                 &signal_weak,
                 &fill_storage,
                 &storage_uri,
@@ -3615,8 +3667,8 @@ mod tests {
             .await
             .expect_err("must time out");
         assert!(matches!(err, DiskCacheError::SuperfileOpen(_)));
-        // Guard restored the waiter counter.
-        assert_eq!(store.n_promotion_waiters.load(Ordering::Acquire), 0);
+        // Guard restored the waiter map (slot removed when it drains).
+        assert!(store.promotion_waiters_by_uri.is_empty());
     }
 
     // ----- eviction + budget -----

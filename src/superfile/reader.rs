@@ -1235,21 +1235,18 @@ impl SuperfileReader {
 
     /// Single-term BM25 over resident-routed block selection — see
     /// [`FtsReader::bm25_single_term_block_selected`].
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn bm25_single_term_block_selected(
         &self,
         column: &str,
         k: usize,
         floor: f32,
-        metadata_offset: u64,
-        quantized: &[u8],
-        scale: f32,
+        row: &RoutedTermRow<'_>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .bm25_single_term_block_selected(column, k, floor, metadata_offset, quantized, scale)
+            .bm25_single_term_block_selected(column, k, floor, row)
             .await?)
     }
 

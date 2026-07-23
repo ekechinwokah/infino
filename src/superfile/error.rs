@@ -206,6 +206,14 @@ pub enum FtsError {
 
     #[error("read error: {0}")]
     Read(#[from] ReadError),
+
+    /// An internal dispatch invariant was violated — a caller routed
+    /// a query shape to a kernel that cannot serve it. Always a bug;
+    /// surfaced as an error rather than a debug-only assert so
+    /// release builds fail loud instead of returning silently wrong
+    /// results (e.g. dropped negation).
+    #[error("internal dispatch invariant violated: {0}")]
+    DispatchInvariant(String),
 }
 
 /// Errors specific to vector query execution.

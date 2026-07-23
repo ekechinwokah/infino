@@ -1108,27 +1108,48 @@ pub(crate) async fn user_placement_for_scalar_resolve(
         .vector_index_table()
         .and_then(|vit| vit.pinned_reader().hidden_deleted_ids().ok());
     let mut out: Vec<Option<SuperfileHit>> = vec![None; hits.len()];
-    let mut placement_requests: Vec<(usize, i128)> = Vec::new();
+    // Hits cluster on a handful of superfiles: resolve each distinct
+    // entry once, and batch the hidden-id resolution into ONE call
+    // instead of a serialized one-element await per hit.
+    let mut entry_cache: HashMap<SuperfileUri, Option<Arc<SuperfileEntry>>> = HashMap::new();
+    let mut resolved: Vec<(usize, i128)> = Vec::new();
+    let mut hidden_pending: Vec<usize> = Vec::new();
     for (i, hit) in hits.iter().enumerate() {
-        if let Some(user_entry) = user_manifest
-            .lookup_superfile_entry(hit.superfile)
-            .await
-            .map_err(QueryError::ManifestLoad)?
+        let user_entry = match entry_cache.get(&hit.superfile) {
+            Some(cached) => cached.clone(),
+            None => {
+                let entry = user_manifest
+                    .lookup_superfile_entry(hit.superfile)
+                    .await
+                    .map_err(QueryError::ManifestLoad)?;
+                entry_cache.insert(hit.superfile, entry.clone());
+                entry
+            }
+        };
+        if let Some(user_entry) = user_entry
             && !(user_entry.vector_layout == VectorLayout::MultiCellIvf && hit.stable_id.is_some())
         {
             out[i] = Some(*hit);
             continue;
         }
-        let user_row_id = if let Some(id) = hit.stable_id {
-            id
-        } else if let Some(ref hm) = hidden_manifest {
-            hidden_hits_user_ids(hm, std::slice::from_ref(hit), id_column).await?[0]
-        } else {
+        match hit.stable_id {
+            Some(id) => resolved.push((i, id)),
+            None => hidden_pending.push(i),
+        }
+    }
+    if !hidden_pending.is_empty() {
+        let Some(ref hm) = hidden_manifest else {
             return Err(QueryError::Execute(format!(
                 "hit superfile {:?} missing from manifests",
-                hit.superfile
+                hits[hidden_pending[0]].superfile
             )));
         };
+        let pending: Vec<SuperfileHit> = hidden_pending.iter().map(|&i| hits[i]).collect();
+        let ids = hidden_hits_user_ids(hm, &pending, id_column).await?;
+        resolved.extend(hidden_pending.into_iter().zip(ids));
+    }
+    let mut placement_requests: Vec<(usize, i128)> = Vec::new();
+    for (i, user_row_id) in resolved {
         if deleted
             .as_ref()
             .is_some_and(|d| d.binary_search(&user_row_id).is_ok())

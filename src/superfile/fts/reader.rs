@@ -947,10 +947,14 @@ impl FtsReader {
         &self,
         column: &str,
         df_floor: u32,
-    ) -> Result<Vec<(Vec<u8>, u64, Vec<f32>)>, FtsError> {
+    ) -> Result<Vec<ResidentTermSkip>, FtsError> {
         let positional = match self.column_id_by_name.get(column) {
             Some(&id) => self.columns[id as usize].positions,
             None => return Ok(Vec::new()),
+        };
+        let term_meta_size = match positional {
+            true => TERM_META_POSITIONAL_SIZE,
+            false => TERM_META_SIZE,
         };
         let mut out = Vec::new();
         for (term, packed) in self.column_term_entries(column)? {
@@ -972,10 +976,38 @@ impl FtsReader {
             if (meta.df as u32) < df_floor {
                 continue;
             }
-            let maxes: Vec<f32> = (0..meta.num_blocks)
-                .map(|i| meta.skip_entry(region, i).2)
-                .collect();
-            out.push((term, metadata_offset, maxes));
+            // Fence-post block offsets relative to `metadata_offset`:
+            // offsets[i] is block i's start; offsets[n] is the end of
+            // the last block (== the skip-addressable region end), so
+            // a kernel can size any block fetch without the header.
+            let mut maxes: Vec<f32> = Vec::with_capacity(meta.num_blocks);
+            let mut last_docs: Vec<u32> = Vec::with_capacity(meta.num_blocks);
+            let mut offsets: Vec<u32> = Vec::with_capacity(meta.num_blocks + 1);
+            for i in 0..meta.num_blocks {
+                let (last, off, max) = meta.skip_entry(region, i);
+                maxes.push(max);
+                last_docs.push(last);
+                offsets.push(u32::try_from(off).map_err(|_| {
+                    FtsError::Read(ReadError::MalformedVersion(
+                        "block offset exceeds u32 in resident skip".into(),
+                    ))
+                })?);
+            }
+            let region_end = meta.block_end_in_term(region, meta.num_blocks - 1);
+            offsets.push(u32::try_from(region_end).map_err(|_| {
+                FtsError::Read(ReadError::MalformedVersion(
+                    "block region end exceeds u32 in resident skip".into(),
+                ))
+            })?);
+            debug_assert!(offsets[0] as usize >= term_meta_size);
+            out.push(ResidentTermSkip {
+                term,
+                metadata_offset,
+                df: meta.df,
+                maxes,
+                last_docs,
+                offsets,
+            });
         }
         Ok(out)
     }
@@ -1034,17 +1066,17 @@ impl FtsReader {
         column: &str,
         k: usize,
         floor: f32,
-        metadata_offset: u64,
-        quantized: &[u8],
-        scale: f32,
+        row: &RoutedTermRow<'_>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let column_id = self.resolve_column_id(column)?;
-        if k == 0 || quantized.is_empty() {
+        if k == 0 || row.quantized.is_empty() {
             return Ok(Vec::new());
         }
+        validate_resident_rows(slice::from_ref(row))?;
+        let quantized = row.quantized;
         let col_meta = &self.columns[column_id as usize];
         let floor_eff = floor.next_down();
-        let dequant = |q: u8| -> f32 { q as f32 / u8::MAX as f32 * scale };
+        let dequant = |q: u8| -> f32 { q as f32 / u8::MAX as f32 * row.scale };
         // Flat bounds cannot prune: every block ties the maximum, so
         // best-first would visit them all and only add wave overhead —
         // the whole-term walk (one contiguous fetch, one pass) is
@@ -1055,40 +1087,23 @@ impl FtsReader {
         let max_q = quantized.iter().copied().max().unwrap_or(0);
         let bounds_can_prune = min_q < max_q;
 
-        // One ranged read: term header + the whole skip table (the
-        // exact bounds + per-block offsets the fetch waves need).
-        let term_meta_size = match col_meta.positions {
-            true => TERM_META_POSITIONAL_SIZE,
-            false => TERM_META_SIZE,
-        };
-        let head_len = term_meta_size + quantized.len() * SKIP_ENTRY_SIZE;
-        let fetched = self
-            .fetch_term_postings(&[(metadata_offset as usize, head_len)])
-            .await?;
-        let head = &fetched[0];
-        let meta = TermMeta::parse(head, 0, col_meta.positions)?;
-        if meta.num_blocks != quantized.len() {
-            return Err(FtsError::Read(ReadError::MalformedVersion(format!(
-                "resident block-max rows ({}) disagree with the skip table ({}) — stale routing",
-                quantized.len(),
-                meta.num_blocks
-            ))));
-        }
-
-        let idf_t = bm25::idf(self.n_docs as u64, meta.df);
+        // The row carries the full skip data resident (df, bounds,
+        // fence-post offsets) — no term-header fetch at all.
+        let n_blocks = quantized.len();
+        let idf_t = bm25::idf(self.n_docs as u64, row.df);
         let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
         let dl_norm_k1 = &col_meta.dl_norm_k1;
 
         // Best-first visit order off the resident bounds. Flat bounds
         // keep index order: the single full wave then coalesces into
         // contiguous ranges instead of a shuffled scatter.
-        let mut order: Vec<u32> = (0..meta.num_blocks as u32).collect();
+        let mut order: Vec<u32> = (0..n_blocks as u32).collect();
         if bounds_can_prune {
             order.sort_unstable_by(|&a, &b| quantized[b as usize].cmp(&quantized[a as usize]));
         }
 
         let mut heap: BinaryHeap<TopKEntry> =
-            BinaryHeap::with_capacity(k.min(meta.num_blocks * BLOCK_LEN).max(1));
+            BinaryHeap::with_capacity(k.min(n_blocks * BLOCK_LEN).max(1));
         let mut buf_d = vec![0u32; BLOCK_LEN];
         let mut buf_t = vec![0u32; BLOCK_LEN];
         let mut next = 0usize;
@@ -1097,10 +1112,13 @@ impl FtsReader {
             false => order.len(),
         };
         while next < order.len() {
+            // `next_down` on the kth: a candidate tying the kth-best
+            // can still displace it on the ascending-doc-id tie-break,
+            // so gates must not skip score-tied blocks.
             let bar = match heap.len() >= k {
                 true => {
                     let TopKEntry(min_score, _) = heap.peek().expect("heap full");
-                    min_score.max(floor_eff)
+                    min_score.next_down().max(floor_eff)
                 }
                 false => floor_eff,
             };
@@ -1123,9 +1141,9 @@ impl FtsReader {
             let ranges: Vec<(usize, usize)> = wave
                 .iter()
                 .map(|&i| {
-                    let (_, off, _) = meta.skip_entry(head, i as usize);
-                    let end = meta.block_end_in_term(head, i as usize);
-                    (metadata_offset as usize + off, end - off)
+                    let off = row.offsets[i as usize] as usize;
+                    let end = row.offsets[i as usize + 1] as usize;
+                    (row.metadata_offset as usize + off, end - off)
                 })
                 .collect();
             let blocks = self.fetch_block_ranges(&ranges).await?;
@@ -1135,12 +1153,11 @@ impl FtsReader {
                 let bar = match heap.len() >= k {
                     true => {
                         let TopKEntry(min_score, _) = heap.peek().expect("heap full");
-                        min_score.max(floor_eff)
+                        min_score.next_down().max(floor_eff)
                     }
                     false => floor_eff,
                 };
-                let (_, _, exact_bound) = meta.skip_entry(head, block as usize);
-                if exact_bound <= bar {
+                if dequant(quantized[block as usize]) <= bar {
                     continue;
                 }
                 let n = decode_block(bytes, &mut buf_d, &mut buf_t);
@@ -1151,14 +1168,7 @@ impl FtsReader {
                     if score <= floor_eff {
                         continue;
                     }
-                    if heap.len() < k {
-                        heap.push(TopKEntry(score, doc_id));
-                    } else if let Some(TopKEntry(min_score, _)) = heap.peek()
-                        && score > *min_score
-                    {
-                        heap.pop();
-                        heap.push(TopKEntry(score, doc_id));
-                    }
+                    and_heap_push(&mut heap, k, None, score, doc_id);
                 }
             }
         }
@@ -1203,39 +1213,15 @@ impl FtsReader {
         let col_meta = &self.columns[column_id as usize];
         let floor_eff = floor.next_down();
         let dl_norm_k1 = &col_meta.dl_norm_k1;
-        let term_meta_size = match col_meta.positions {
-            true => TERM_META_POSITIONAL_SIZE,
-            false => TERM_META_SIZE,
-        };
 
-        // ---- Heads: one batched fetch of every routed term's header
-        // + full skip table (offsets + exact bounds for everything
-        // below; the resident rows carry only the quantized bounds).
-        let head_ranges: Vec<(usize, usize)> = routed
+        // ---- Routed terms carry their FULL skip data resident (df,
+        // per-block bounds, last doc ids, fence-post offsets) — no
+        // term-header fetch. A cold consumer's first query used to be
+        // dominated by exactly those head reads, per shard x per term.
+        validate_resident_rows(routed)?;
+        let routed_idf_x_k1p1: Vec<f32> = routed
             .iter()
-            .map(|r| {
-                (
-                    r.metadata_offset as usize,
-                    term_meta_size + r.quantized.len() * SKIP_ENTRY_SIZE,
-                )
-            })
-            .collect();
-        let heads = self.fetch_term_postings(&head_ranges).await?;
-        let mut metas: Vec<TermMeta> = Vec::with_capacity(routed.len());
-        for (row, head) in routed.iter().zip(&heads) {
-            let meta = TermMeta::parse(head, 0, col_meta.positions)?;
-            if meta.num_blocks != row.quantized.len() {
-                return Err(FtsError::Read(ReadError::MalformedVersion(format!(
-                    "resident block-max rows ({}) disagree with the skip table ({}) — stale routing",
-                    row.quantized.len(),
-                    meta.num_blocks
-                ))));
-            }
-            metas.push(meta);
-        }
-        let routed_idf_x_k1p1: Vec<f32> = metas
-            .iter()
-            .map(|m| bm25::idf(self.n_docs as u64, m.df) * (bm25::K1 + 1.0))
+            .map(|r| bm25::idf(self.n_docs as u64, r.df) * (bm25::K1 + 1.0))
             .collect();
 
         // ---- Unrouted terms: decode whole (they are below the
@@ -1322,15 +1308,10 @@ impl FtsReader {
         // table (first block whose last_doc_id >= doc), or None when
         // doc is past the last block.
         let covering_block = |t: usize, doc: u32| -> Option<u32> {
-            let meta = &metas[t];
-            let head: &[u8] = &heads[t];
-            let (mut lo, mut hi) = (0usize, meta.num_blocks);
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                let (last, _, _) = meta.skip_entry(head, mid);
-                if last < doc { lo = mid + 1 } else { hi = mid }
-            }
-            (lo < meta.num_blocks).then_some(lo as u32)
+            // Resident last-doc array: first block whose last >= doc.
+            let last_docs = routed[t].last_docs;
+            let i = last_docs.partition_point(|&last| last < doc);
+            (i < last_docs.len()).then_some(i as u32)
         };
         // Contribution of routed term t at doc from a decoded block
         // (None = block not decoded yet).
@@ -1451,21 +1432,14 @@ impl FtsReader {
                 return Ok(None);
             }
             // ---- Fetch + decode the wave.
-            self.fetch_and_decode_blocks(
-                &wave,
-                routed,
-                &metas,
-                &heads,
-                &mut decoded_at,
-                &mut decoded,
-            )
-            .await?;
+            self.fetch_and_decode_blocks(&wave, routed, &mut decoded_at, &mut decoded)
+                .await?;
             // ---- Score: essential gate, then exact rescore with
             // probe fetches for unfetched covering blocks.
             let mut survivors: Vec<(u32, usize)> = Vec::new();
             for &(t, b) in &wave {
                 let slot = decoded_at[&(t as u32, b)];
-                let (docs, tfs) = (decoded[slot].0.clone(), decoded[slot].1.clone());
+                let (docs, tfs) = (&decoded[slot].0, &decoded[slot].1);
                 for (i, &doc) in docs.iter().enumerate() {
                     if seen.contains(&doc) {
                         continue;
@@ -1495,15 +1469,8 @@ impl FtsReader {
             }
             // Probe fetches: covering blocks the survivors still need.
             let probes = gather_probes(&mut survivors.iter().map(|&(d, _)| d), &decoded_at);
-            self.fetch_and_decode_blocks(
-                &probes,
-                routed,
-                &metas,
-                &heads,
-                &mut decoded_at,
-                &mut decoded,
-            )
-            .await?;
+            self.fetch_and_decode_blocks(&probes, routed, &mut decoded_at, &mut decoded)
+                .await?;
             for (doc, _) in survivors {
                 let score = exact_score(&decoded_at, &decoded, doc);
                 if score <= floor_eff {
@@ -1537,15 +1504,8 @@ impl FtsReader {
             }
         }
         let probes = gather_probes(&mut survivors.iter().copied(), &decoded_at);
-        self.fetch_and_decode_blocks(
-            &probes,
-            routed,
-            &metas,
-            &heads,
-            &mut decoded_at,
-            &mut decoded,
-        )
-        .await?;
+        self.fetch_and_decode_blocks(&probes, routed, &mut decoded_at, &mut decoded)
+            .await?;
         for doc in survivors {
             let score = exact_score(&decoded_at, &decoded, doc);
             if score <= floor_eff {
@@ -1595,10 +1555,6 @@ impl FtsReader {
         let col_meta = &self.columns[column_id as usize];
         let floor_eff = floor.next_down();
         let dl_norm_k1 = &col_meta.dl_norm_k1;
-        let term_meta_size = match col_meta.positions {
-            true => TERM_META_POSITIONAL_SIZE,
-            false => TERM_META_SIZE,
-        };
 
         // One shared head/meta/decoded table over every routed term;
         // the first `n_routed_musts` entries are the required ones.
@@ -1607,36 +1563,18 @@ impl FtsReader {
             .chain(routed_shoulds)
             .map(|r| RoutedTermRow {
                 metadata_offset: r.metadata_offset,
+                df: r.df,
                 quantized: r.quantized,
                 scale: r.scale,
+                last_docs: r.last_docs,
+                offsets: r.offsets,
             })
             .collect();
         let n_routed_musts = routed_musts.len();
-        let head_ranges: Vec<(usize, usize)> = routed
+        validate_resident_rows(&routed)?;
+        let routed_idf_x_k1p1: Vec<f32> = routed
             .iter()
-            .map(|r| {
-                (
-                    r.metadata_offset as usize,
-                    term_meta_size + r.quantized.len() * SKIP_ENTRY_SIZE,
-                )
-            })
-            .collect();
-        let heads = self.fetch_term_postings(&head_ranges).await?;
-        let mut metas: Vec<TermMeta> = Vec::with_capacity(routed.len());
-        for (row, head) in routed.iter().zip(&heads) {
-            let meta = TermMeta::parse(head, 0, col_meta.positions)?;
-            if meta.num_blocks != row.quantized.len() {
-                return Err(FtsError::Read(ReadError::MalformedVersion(format!(
-                    "resident block-max rows ({}) disagree with the skip table ({}) — stale routing",
-                    row.quantized.len(),
-                    meta.num_blocks
-                ))));
-            }
-            metas.push(meta);
-        }
-        let routed_idf_x_k1p1: Vec<f32> = metas
-            .iter()
-            .map(|m| bm25::idf(self.n_docs as u64, m.df) * (bm25::K1 + 1.0))
+            .map(|r| bm25::idf(self.n_docs as u64, r.df) * (bm25::K1 + 1.0))
             .collect();
 
         // Unrouted lists (below the routing df floor) decode whole —
@@ -1696,15 +1634,10 @@ impl FtsReader {
             + unrouted_shoulds.iter().map(|(_, _, _, m)| m).sum::<f32>();
 
         let covering_block = |t: usize, doc: u32| -> Option<u32> {
-            let meta = &metas[t];
-            let head: &[u8] = &heads[t];
-            let (mut lo, mut hi) = (0usize, meta.num_blocks);
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                let (last, _, _) = meta.skip_entry(head, mid);
-                if last < doc { lo = mid + 1 } else { hi = mid }
-            }
-            (lo < meta.num_blocks).then_some(lo as u32)
+            // Resident last-doc array: first block whose last >= doc.
+            let last_docs = routed[t].last_docs;
+            let i = last_docs.partition_point(|&last| last < doc);
+            (i < last_docs.len()).then_some(i as u32)
         };
         // Routed contribution at doc from a decoded block; `None` when
         // the doc is absent from the term (an AND killer for musts, a
@@ -1816,15 +1749,8 @@ impl FtsReader {
                 }
             }
             let probes = gather_probes(&mut survivors.iter().copied(), &decoded_at);
-            self.fetch_and_decode_blocks(
-                &probes,
-                &routed,
-                &metas,
-                &heads,
-                &mut decoded_at,
-                &mut decoded,
-            )
-            .await?;
+            self.fetch_and_decode_blocks(&probes, &routed, &mut decoded_at, &mut decoded)
+                .await?;
             for doc in survivors {
                 if let Some(score) = exact_and_score(&decoded_at, &decoded, doc)
                     && score > floor_eff
@@ -1839,7 +1765,7 @@ impl FtsReader {
         // blocks admit best-first by (block bound + rest UB), and each
         // wave's survivors pay presence probes into the other musts.
         let driver_t = (0..n_routed_musts)
-            .min_by_key(|&t| metas[t].df)
+            .min_by_key(|&t| routed[t].df)
             .expect("routed musts are non-empty on this path");
         let rest_ub = total_ub - routed_term_max[driver_t];
         let driver_order: Vec<u32> = {
@@ -1882,19 +1808,12 @@ impl FtsReader {
             {
                 return Ok(None);
             }
-            self.fetch_and_decode_blocks(
-                &wave,
-                &routed,
-                &metas,
-                &heads,
-                &mut decoded_at,
-                &mut decoded,
-            )
-            .await?;
+            self.fetch_and_decode_blocks(&wave, &routed, &mut decoded_at, &mut decoded)
+                .await?;
             let mut survivors: Vec<u32> = Vec::new();
             for &(t, b) in &wave {
                 let slot = decoded_at[&(t as u32, b)];
-                let (docs, tfs) = (decoded[slot].0.clone(), decoded[slot].1.clone());
+                let (docs, tfs) = (&decoded[slot].0, &decoded[slot].1);
                 for (i, &doc) in docs.iter().enumerate() {
                     let essential = bm25::score_with_dl_norm_k1(
                         routed_idf_x_k1p1[t],
@@ -1914,15 +1833,8 @@ impl FtsReader {
                 return Ok(None);
             }
             let probes = gather_probes(&mut survivors.iter().copied(), &decoded_at);
-            self.fetch_and_decode_blocks(
-                &probes,
-                &routed,
-                &metas,
-                &heads,
-                &mut decoded_at,
-                &mut decoded,
-            )
-            .await?;
+            self.fetch_and_decode_blocks(&probes, &routed, &mut decoded_at, &mut decoded)
+                .await?;
             for doc in survivors {
                 if let Some(score) = exact_and_score(&decoded_at, &decoded, doc)
                     && score > floor_eff
@@ -1941,8 +1853,6 @@ impl FtsReader {
         &self,
         pairs: &[(usize, u32)],
         routed: &[RoutedTermRow<'_>],
-        metas: &[TermMeta],
-        heads: &[Bytes],
         decoded_at: &mut HashMap<(u32, u32), usize>,
         decoded: &mut Vec<(Vec<u32>, Vec<u32>)>,
     ) -> Result<(), FtsError> {
@@ -1957,8 +1867,8 @@ impl FtsReader {
         let ranges: Vec<(usize, usize)> = todo
             .iter()
             .map(|&(t, b)| {
-                let (_, off, _) = metas[t].skip_entry(&heads[t], b as usize);
-                let end = metas[t].block_end_in_term(&heads[t], b as usize);
+                let off = routed[t].offsets[b as usize] as usize;
+                let end = routed[t].offsets[b as usize + 1] as usize;
                 (routed[t].metadata_offset as usize + off, end - off)
             })
             .collect();
@@ -3211,10 +3121,13 @@ impl FtsReader {
         cache: Option<&FtsCursorCache>,
         live: Option<&SharedFloor>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        debug_assert!(
-            lists.negatives.is_empty() && lists.negative_phrases.is_empty(),
-            "the ranged fan-out never carries negation"
-        );
+        // A real error, not a debug assert: dropping negation in a
+        // release build would return docs the query excludes.
+        if !lists.negatives.is_empty() || !lists.negative_phrases.is_empty() {
+            return Err(FtsError::DispatchInvariant(
+                "ranged fan-out unit carries negation".into(),
+            ));
+        }
         let column_id = self.resolve_column_id(column)?;
         if lists.no_positive_atoms() || k == 0 || doc_id_start >= doc_id_end {
             return Ok(Vec::new());
@@ -4008,10 +3921,14 @@ impl FtsReader {
         doc_id_end: u32,
         live: Option<&SharedFloor>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
-        debug_assert!(
-            !must_cursors.is_empty() && !should_cursors.is_empty(),
-            "dispatch routes empty-side shapes to the AND/OR kernels"
-        );
+        // A real error, not a debug assert: an empty side would score
+        // the wrong shape silently in release (dispatch routes
+        // empty-side shapes to the AND/OR kernels).
+        if must_cursors.is_empty() || should_cursors.is_empty() {
+            return Err(FtsError::DispatchInvariant(
+                "mixed must/should kernel needs both sides non-empty".into(),
+            ));
+        }
         if doc_id_start >= doc_id_end {
             return Ok(Vec::new());
         }
@@ -6403,14 +6320,52 @@ fn f32_from_order_key(k: u32) -> f32 {
 /// IEEE-754 f32 sign bit, for the order-key mapping above.
 const SIGN_BIT: u32 = 0x8000_0000;
 
+/// Structural check on resident rows: the parallel skip arrays must
+/// agree (fence-post offsets = bounds + 1) or the state is stale /
+/// corrupt — error loudly rather than mis-address posting bytes.
+fn validate_resident_rows(rows: &[RoutedTermRow<'_>]) -> Result<(), FtsError> {
+    for row in rows {
+        if row.offsets.len() != row.quantized.len() + 1
+            || row.last_docs.len() != row.quantized.len()
+        {
+            return Err(FtsError::Read(ReadError::MalformedVersion(
+                "resident skip arrays disagree — stale routing".into(),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// One heavy term's full skip data, extracted for residency in the
+/// slow-CAS routing state: exact per-block upper bounds, last doc
+/// ids, and fence-post byte offsets. With these resident, the
+/// block-selected kernels never fetch the term header + skip table —
+/// the reads a cold consumer's first query was dominated by.
+pub(crate) struct ResidentTermSkip {
+    pub(crate) term: Vec<u8>,
+    pub(crate) metadata_offset: u64,
+    pub(crate) df: u64,
+    pub(crate) maxes: Vec<f32>,
+    pub(crate) last_docs: Vec<u32>,
+    /// len == maxes.len() + 1 (fence-post; last entry = region end).
+    pub(crate) offsets: Vec<u32>,
+}
+
 /// A term's resident block-max routing row, borrowed from the
 /// supertable's slow-fts-state for one kernel call: the term's
 /// postings-region offset plus its ceil-quantized 1-byte per-block
 /// BM25 upper bounds.
 pub(crate) struct RoutedTermRow<'a> {
     pub(crate) metadata_offset: u64,
+    /// Document frequency (resident) — the idf input.
+    pub(crate) df: u64,
     pub(crate) quantized: &'a [u8],
     pub(crate) scale: f32,
+    /// Per-block last doc ids (resident skip table).
+    pub(crate) last_docs: &'a [u32],
+    /// Fence-post block byte offsets relative to `metadata_offset`
+    /// (`quantized.len() + 1` entries; last = region end).
+    pub(crate) offsets: &'a [u32],
 }
 
 /// Admission budget for the multi-term selected kernel, as a
@@ -8961,6 +8916,10 @@ mod tests {
             println!("{variant:>9}: {:>10.2?}/query", total / ITERS);
         }
     }
+    /// Owned resident-row fields for kernel tests:
+    /// (metadata_offset, df, quantized, scale, last_docs, offsets).
+    type OwnedRow = (u64, u64, Vec<u8>, f32, Vec<u32>, Vec<u32>);
+
     /// The multi-term OR block-selected kernel must agree with the
     /// whole-list walk: same top-k docs and scores on a corpus with
     /// prunable bounds (tf variance), a mid-df term, and an unrouted
@@ -8992,32 +8951,31 @@ mod tests {
         // Synthesize the resident routing rows the way the
         // supertable's slow-fts-state does: exact skip bounds,
         // ceil-quantized to one byte against the term's max bound.
-        let fst_bytes = r.dict_bytes_async().await.expect("dict");
-        let dict = DictReader::open(&fst_bytes).expect("fst");
-        let row_for = |term: &str| -> (u64, Vec<u8>, f32) {
-            let packed = dict.lookup(&make_key("body", term)).expect("term present");
-            let FstValue::Pfor {
-                metadata_offset, ..
-            } = FstValue::unpack(packed)
-            else {
-                panic!("routed test terms are PFOR");
-            };
-            let cursors =
-                futures::executor::block_on(r.build_term_cursors(0, &[term])).expect("cursor");
-            let bounds: Vec<f32> = (0..cursors[0].blocks.len())
-                .map(|i| cursors[0].blocks[i].block_max_bm25)
-                .collect();
-            let scale = bounds.iter().copied().fold(0.0f32, f32::max);
-            let quantized: Vec<u8> = bounds
+        let skips = r.column_block_maxes("body", 2).await.expect("skips");
+        let row_for = |term: &str| -> OwnedRow {
+            let sk = skips
+                .iter()
+                .find(|sk| sk.term == term.as_bytes())
+                .expect("term present");
+            let scale = sk.maxes.iter().copied().fold(0.0f32, f32::max);
+            let quantized: Vec<u8> = sk
+                .maxes
                 .iter()
                 .map(|&m| match scale > 0.0 {
                     true => (m / scale * u8::MAX as f32).ceil().min(u8::MAX as f32) as u8,
                     false => 0,
                 })
                 .collect();
-            (metadata_offset, quantized, scale)
+            (
+                sk.metadata_offset,
+                sk.df,
+                quantized,
+                scale,
+                sk.last_docs.clone(),
+                sk.offsets.clone(),
+            )
         };
-        let rows: Vec<(u64, Vec<u8>, f32)> = vec![row_for("common"), row_for("mid")];
+        let rows: Vec<OwnedRow> = vec![row_for("common"), row_for("mid")];
 
         for k in [3usize, 10, 100, 2000] {
             let expected = r
@@ -9038,10 +8996,13 @@ mod tests {
                 .expect("whole walk");
             let routed: Vec<RoutedTermRow<'_>> = rows
                 .iter()
-                .map(|(off, q, scale)| RoutedTermRow {
+                .map(|(off, df, q, scale, last, offs)| RoutedTermRow {
                     metadata_offset: *off,
+                    df: *df,
                     quantized: q,
                     scale: *scale,
+                    last_docs: last,
+                    offsets: offs,
                 })
                 .collect();
             let got = match r
@@ -9107,42 +9068,43 @@ mod tests {
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
-        let fst_bytes = r.dict_bytes_async().await.expect("dict");
-        let dict = DictReader::open(&fst_bytes).expect("fst");
-        let row_for = |term: &str| -> (u64, Vec<u8>, f32) {
-            let packed = dict.lookup(&make_key("body", term)).expect("term present");
-            let FstValue::Pfor {
-                metadata_offset, ..
-            } = FstValue::unpack(packed)
-            else {
-                panic!("routed test terms are PFOR");
-            };
-            let cursors =
-                futures::executor::block_on(r.build_term_cursors(0, &[term])).expect("cursor");
-            let bounds: Vec<f32> = (0..cursors[0].blocks.len())
-                .map(|i| cursors[0].blocks[i].block_max_bm25)
-                .collect();
-            let scale = bounds.iter().copied().fold(0.0f32, f32::max);
-            let quantized: Vec<u8> = bounds
+        let skips = r.column_block_maxes("body", 2).await.expect("skips");
+        let row_for = |term: &str| -> OwnedRow {
+            let sk = skips
+                .iter()
+                .find(|sk| sk.term == term.as_bytes())
+                .expect("term present");
+            let scale = sk.maxes.iter().copied().fold(0.0f32, f32::max);
+            let quantized: Vec<u8> = sk
+                .maxes
                 .iter()
                 .map(|&m| match scale > 0.0 {
                     true => (m / scale * u8::MAX as f32).ceil().min(u8::MAX as f32) as u8,
                     false => 0,
                 })
                 .collect();
-            (metadata_offset, quantized, scale)
+            (
+                sk.metadata_offset,
+                sk.df,
+                quantized,
+                scale,
+                sk.last_docs.clone(),
+                sk.offsets.clone(),
+            )
         };
         let common = row_for("common");
         let mid = row_for("mid");
-        let as_routed = |rows: &[&(u64, Vec<u8>, f32)]| -> Vec<(u64, Vec<u8>, f32)> {
-            rows.iter().map(|(o, q, s)| (*o, q.clone(), *s)).collect()
+        let as_routed = |rows: &[&OwnedRow]| -> Vec<OwnedRow> {
+            rows.iter()
+                .map(|(o, d, q, s, l, f)| (*o, *d, q.clone(), *s, l.clone(), f.clone()))
+                .collect()
         };
 
         // (musts_routed, musts_unrouted, shoulds_routed, shoulds_unrouted)
         let shapes: Vec<(
-            Vec<(u64, Vec<u8>, f32)>,
+            Vec<OwnedRow>,
             Vec<&str>,
-            Vec<(u64, Vec<u8>, f32)>,
+            Vec<OwnedRow>,
             Vec<&str>,
             Vec<&str>,
             Vec<&str>,
@@ -9204,22 +9166,20 @@ mod tests {
                     )
                     .await
                     .expect("whole walk");
-                let routed_musts: Vec<RoutedTermRow<'_>> = routed_musts_raw
-                    .iter()
-                    .map(|(off, q, scale)| RoutedTermRow {
-                        metadata_offset: *off,
-                        quantized: q,
-                        scale: *scale,
-                    })
-                    .collect();
-                let routed_shoulds: Vec<RoutedTermRow<'_>> = routed_shoulds_raw
-                    .iter()
-                    .map(|(off, q, scale)| RoutedTermRow {
-                        metadata_offset: *off,
-                        quantized: q,
-                        scale: *scale,
-                    })
-                    .collect();
+                fn to_rows(raw: &[OwnedRow]) -> Vec<RoutedTermRow<'_>> {
+                    raw.iter()
+                        .map(|(off, df, q, scale, last, offs)| RoutedTermRow {
+                            metadata_offset: *off,
+                            df: *df,
+                            quantized: q,
+                            scale: *scale,
+                            last_docs: last,
+                            offsets: offs,
+                        })
+                        .collect()
+                }
+                let routed_musts: Vec<RoutedTermRow<'_>> = to_rows(routed_musts_raw);
+                let routed_shoulds: Vec<RoutedTermRow<'_>> = to_rows(routed_shoulds_raw);
                 let got = match r
                     .bm25_multi_term_and_block_selected(
                         "body",
@@ -9258,6 +9218,139 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The AND kernel's decline and edge paths: k=0, no musts, a
+    /// must absent from the dictionary (empty intersection), a stale
+    /// routing row (block-count mismatch errors loudly), and an
+    /// oversized unrouted list (declines to the walk).
+    #[tokio::test]
+    async fn multi_term_and_block_selected_edge_paths() {
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        // 10K docs so `common` spans > UNROUTED_TERM_MAX_BLOCKS
+        // posting blocks — the oversized-unrouted decline must trip.
+        for d in 0..10_000u32 {
+            let mut text = "common ".repeat(((d % 13) + 1) as usize);
+            if d % 97 == 0 {
+                text.push_str("rare ");
+            }
+            text.push_str(&format!("filler{d}"));
+            b.add_doc(0, d, &text).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let skips = r.column_block_maxes("body", 2).await.expect("skips");
+        let sk = skips
+            .iter()
+            .find(|sk| sk.term == b"common")
+            .expect("term present");
+        let quantized: Vec<u8> = vec![u8::MAX; sk.maxes.len()];
+        let routed = [RoutedTermRow {
+            metadata_offset: sk.metadata_offset,
+            df: sk.df,
+            quantized: &quantized,
+            scale: 1.0,
+            last_docs: &sk.last_docs,
+            offsets: &sk.offsets,
+        }];
+
+        // k = 0 short-circuits empty.
+        let got = r
+            .bm25_multi_term_and_block_selected(
+                "body",
+                0,
+                f32::NEG_INFINITY,
+                &routed,
+                &[],
+                &[],
+                &[],
+                None,
+            )
+            .await
+            .expect("k0");
+        assert_eq!(got, Some(Vec::new()));
+
+        // No musts at all: not an AND shape — decline.
+        let got = r
+            .bm25_multi_term_and_block_selected(
+                "body",
+                5,
+                f32::NEG_INFINITY,
+                &[],
+                &[],
+                &routed,
+                &[],
+                None,
+            )
+            .await
+            .expect("no musts");
+        assert!(got.is_none());
+
+        // A must absent from the dictionary empties the intersection.
+        let got = r
+            .bm25_multi_term_and_block_selected(
+                "body",
+                5,
+                f32::NEG_INFINITY,
+                &routed,
+                &["nosuchterm"],
+                &[],
+                &[],
+                None,
+            )
+            .await
+            .expect("absent must")
+            .expect("engaged");
+        assert!(got.is_empty(), "absent must ⇒ empty intersection");
+
+        // Stale routing (wrong block count) must error loudly, never
+        // mis-address posting bytes.
+        let stale_q: Vec<u8> = vec![u8::MAX; sk.maxes.len() + 3];
+        let stale = [RoutedTermRow {
+            metadata_offset: sk.metadata_offset,
+            df: sk.df,
+            quantized: &stale_q,
+            scale: 1.0,
+            last_docs: &sk.last_docs,
+            offsets: &sk.offsets,
+        }];
+        let err = r
+            .bm25_multi_term_and_block_selected(
+                "body",
+                5,
+                f32::NEG_INFINITY,
+                &stale,
+                &[],
+                &[],
+                &[],
+                None,
+            )
+            .await;
+        assert!(err.is_err(), "stale routing rows must be an error");
+
+        // An oversized "unrouted" must (common here) declines to the
+        // walk instead of decoding a mega list.
+        let got = r
+            .bm25_multi_term_and_block_selected(
+                "body",
+                5,
+                f32::NEG_INFINITY,
+                &[],
+                &["common", "rare"],
+                &[],
+                &[],
+                None,
+            )
+            .await
+            .expect("oversized unrouted");
+        assert!(
+            got.is_none(),
+            "an unrouted term over the block cap must decline"
+        );
     }
 
     /// SCRATCH (uncommitted): attribute the post-drain broad-OR gap.

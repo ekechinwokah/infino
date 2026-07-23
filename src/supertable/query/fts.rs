@@ -91,9 +91,7 @@ use crate::{
         SuperfileReader,
         error::{FtsError, ReadError},
         fts::{
-            reader::{
-                ClauseLists, FtsCursorCache, OR_WINDOW_DOMINANCE_MULT, RoutedTermRow, SharedFloor,
-            },
+            reader::{ClauseLists, FtsCursorCache, OR_WINDOW_DOMINANCE_MULT, SharedFloor},
             tokenize::{AsciiLowerTokenizer, Tokenizer},
         },
     },
@@ -168,8 +166,6 @@ fn merge_unit_scores(
     }
 }
 
-/// Minimum bare-OR term count for the multi-term block-selected
-/// kernel; a single bare term has its own dedicated selected walk.
 /// Summed-df ceiling for a scalar-index id lookup: past this many
 /// matching rows the predicate is unselective enough that resolving
 /// ids (posting decode + stub id reads) would rival the scan it is
@@ -177,6 +173,16 @@ fn merge_unit_scores(
 /// stats-pruned plan.
 const SCALAR_INDEX_LOOKUP_MAX_IDS: u64 = 65_536;
 
+/// Driver-size ceiling for the block-selected AND kernel, in posting
+/// blocks of the rarest routed must (its resident row's length). A
+/// larger driver means the intersection is broad and per-survivor
+/// presence probes rival the SIMD leapfrog walk — measured: ten
+/// common musts ground 1.7 ms warm walks into 61 ms kernel runs. An
+/// unrouted (sub-floor) must always qualifies as driver.
+const AND_DRIVER_MAX_BLOCKS: usize = 256;
+
+/// Minimum bare-OR term count for the multi-term block-selected
+/// kernel; a single bare term has its own dedicated selected walk.
 const MULTI_SELECT_MIN_TERMS: usize = 2;
 /// Minimum quantized block-bound spread for a resident row to count
 /// as prunable at routing time. Bounds are ceil-quantized to u8
@@ -423,7 +429,7 @@ async fn bm25_fanout_wave(
             (Some(term), _, Some(state)) => kept.iter().partition(|e| {
                 state
                     .term_block_max(e.superfile_id, &column_arc, term)
-                    .is_some_and(|row| row.quantized.iter().min() < row.quantized.iter().max())
+                    .is_some_and(row_can_prune)
             }),
             // Mirror the kernel's engagement gate exactly (>= 1 row
             // present AND every present row prunable): a file that can
@@ -440,10 +446,21 @@ async fn bm25_fanout_wave(
                     .filter_map(|term| state.term_block_max(e.superfile_id, &column_arc, term))
                     .collect();
                 if must_selected {
-                    // AND engagement: at least one resident row — the
-                    // driver's presence probes do the pruning, so flat
-                    // bounds don't disqualify.
-                    !rows.is_empty()
+                    // AND engagement mirror: at least one resident row
+                    // AND a small driver (an absent must row means a
+                    // sub-floor driver; a present one qualifies by
+                    // block count). Flat bounds don't disqualify —
+                    // presence probes prune — but a broad driver does.
+                    let must_row_of =
+                        |term: &String| state.term_block_max(e.superfile_id, &column_arc, term);
+                    let small_driver = must_arc.iter().any(|t| must_row_of(t).is_none())
+                        || must_arc
+                            .iter()
+                            .filter_map(must_row_of)
+                            .map(|row| row.quantized.len())
+                            .min()
+                            .is_some_and(|blocks| blocks <= AND_DRIVER_MAX_BLOCKS);
+                    !rows.is_empty() && small_driver
                 } else {
                     !rows.is_empty()
                         && rows.iter().all(|row| row_can_prune(row))
@@ -525,20 +542,17 @@ async fn bm25_fanout_wave(
                 let term = must_arc.first().or_else(|| should_arc.first());
                 if let Some(term) = term
                     && let Some(row) = state.term_block_max(suid, &column_arc, term)
-                    // Flat bounds can't prune: the ranged parallel
-                    // walk (sub-range units) beats a serial selected
-                    // walk that must visit everything anyway.
-                    && row.quantized.iter().min() < row.quantized.iter().max()
+                    // Near-flat bounds can't prune: the ranged
+                    // parallel walk (sub-range units) beats a serial
+                    // selected walk that must visit ~everything
+                    // anyway. Same spread bar as the partition above
+                    // and the multi-term gates — the two MUST agree
+                    // or a file parks on a unit that degrades to the
+                    // single-threaded whole-shard walk.
+                    && row_can_prune(row)
                 {
                     let hits = r
-                        .bm25_single_term_block_selected(
-                            &column_arc,
-                            k,
-                            floor,
-                            row.metadata_offset,
-                            &row.quantized,
-                            row.scale,
-                        )
+                        .bm25_single_term_block_selected(&column_arc, k, floor, &row.as_row())
                         .await
                         .map_err(fts_read_error)?;
                     merge_unit_scores(&shared, &tombstones, suid, now, &hits);
@@ -570,11 +584,7 @@ async fn bm25_fanout_wave(
                     let mut unrouted: Vec<&str> = Vec::new();
                     for (term, row) in should_arc.iter().zip(&rows) {
                         match row {
-                            Some(row) => routed_rows.push(RoutedTermRow {
-                                metadata_offset: row.metadata_offset,
-                                quantized: &row.quantized,
-                                scale: row.scale,
-                            }),
+                            Some(row) => routed_rows.push(row.as_row()),
                             None => unrouted.push(term.as_str()),
                         }
                     }
@@ -619,16 +629,24 @@ async fn bm25_fanout_wave(
                     .iter()
                     .map(|term| state.term_block_max(suid, &column_arc, term))
                     .collect();
-                if must_rows.iter().chain(should_rows.iter()).flatten().count() > 0 {
+                // Engage only with a genuinely small driver: some
+                // must below the routing floor (no row), or a routed
+                // must whose block count is under the ceiling. Broad
+                // intersections (all musts common) keep the walk.
+                let small_driver = must_rows.iter().any(|r| r.is_none())
+                    || must_rows
+                        .iter()
+                        .flatten()
+                        .map(|row| row.quantized.len())
+                        .min()
+                        .is_some_and(|blocks| blocks <= AND_DRIVER_MAX_BLOCKS);
+                if small_driver && must_rows.iter().chain(should_rows.iter()).flatten().count() > 0
+                {
                     let mut routed_musts = Vec::new();
                     let mut unrouted_musts: Vec<&str> = Vec::new();
                     for (term, row) in must_arc.iter().zip(&must_rows) {
                         match row {
-                            Some(row) => routed_musts.push(RoutedTermRow {
-                                metadata_offset: row.metadata_offset,
-                                quantized: &row.quantized,
-                                scale: row.scale,
-                            }),
+                            Some(row) => routed_musts.push(row.as_row()),
                             None => unrouted_musts.push(term.as_str()),
                         }
                     }
@@ -636,11 +654,7 @@ async fn bm25_fanout_wave(
                     let mut unrouted_shoulds: Vec<&str> = Vec::new();
                     for (term, row) in should_arc.iter().zip(&should_rows) {
                         match row {
-                            Some(row) => routed_shoulds.push(RoutedTermRow {
-                                metadata_offset: row.metadata_offset,
-                                quantized: &row.quantized,
-                                scale: row.scale,
-                            }),
+                            Some(row) => routed_shoulds.push(row.as_row()),
                             None => unrouted_shoulds.push(term.as_str()),
                         }
                     }
@@ -2327,7 +2341,9 @@ mod tests {
     use datafusion::prelude::{col, lit};
     use tokio::runtime::Builder;
 
-    use super::{BoolMode, FanOut, build_work_units, fanout_for, hits_id_score_batch};
+    use super::{
+        BoolMode, FanOut, build_work_units, dispatch::open_reader, fanout_for, hits_id_score_batch,
+    };
     use crate::{
         config::{CompactionSettings, DEFAULT_STALE_SEAL_TIMEOUT_MS},
         storage::{LocalFsStorageProvider, StorageProvider},
@@ -3881,6 +3897,16 @@ mod tests {
             w.commit().expect("commit");
         }
         st.drain_vectors_to_cells_sync().expect("drain");
+        // One tombstone per commit before compacting: partially
+        // deleted inputs are the shape whose merge once repacked rows
+        // out of id order.
+        for c in 0..COMMITS {
+            let doc = c * PER + 5;
+            let stats = st
+                .delete(col("body").eq(lit(format!("uniq{doc} common filler"))))
+                .expect("delete");
+            assert_eq!(stats.n_tombstoned(), 1, "commit {c}");
+        }
         st.optimize(&OptimizeOptions::compact(PLACEMENT_TEST_COMPACTION))
             .expect("optimize");
 
@@ -3961,6 +3987,37 @@ mod tests {
                 "row {r} text {:?} not a valid doc",
                 body.value(r)
             );
+        }
+
+        // The merged user file must stay id-ordered even though its
+        // inputs carried tombstones — the per-file tie cap and the
+        // placement bisection both lean on the table's time/id-order
+        // contract, and the old deleted-first input packing broke
+        // exactly this.
+        let manifest = reader.manifest();
+        for entry in manifest.get_all_superfiles() {
+            let sf = block_on(open_reader(
+                &manifest.options.store,
+                manifest.options.disk_cache.as_ref(),
+                manifest.options.storage.as_ref(),
+                entry,
+                true,
+            ))
+            .expect("open user superfile");
+            let batch = sf.get_record_batch(None).expect("rows");
+            let idx = batch.schema().index_of("_id").expect("_id column");
+            let ids = batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("_id decimal");
+            for r in 1..ids.len() {
+                assert!(
+                    ids.value(r - 1) < ids.value(r),
+                    "user file {} `_id` column must ascend at row {r}",
+                    entry.superfile_id
+                );
+            }
         }
 
         // token_match and exact_match must honor the same placement +

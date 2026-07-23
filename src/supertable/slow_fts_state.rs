@@ -32,7 +32,10 @@ use uuid::Uuid;
 
 use crate::{
     storage::{StorageError, StorageProvider},
-    superfile::{error::FtsError, fts::reader::FtsReader},
+    superfile::{
+        error::FtsError,
+        fts::reader::{FtsReader, RoutedTermRow},
+    },
     supertable::manifest::{RoutingRef, part::ContentHash},
 };
 
@@ -44,7 +47,7 @@ pub(crate) const STORAGE_PREFIX: &str = "slow-fts-state/";
 const MAGIC: &[u8; 8] = b"INFFBM01";
 
 /// Blob format version.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 /// Quantization steps for the 1-byte per-block bound (`u8::MAX`).
 const QUANT_STEPS: f32 = 255.0;
@@ -67,22 +70,51 @@ pub(crate) struct TermBlockMax {
     /// The term's postings-region `metadata_offset` — saves the FST
     /// lookup on the block-selected path.
     pub metadata_offset: u64,
+    /// Document frequency — the idf input, resident so kernels never
+    /// parse the term header.
+    pub df: u64,
     /// Per-term dequantization scale: the largest block bound.
     pub scale: f32,
     /// One byte per posting block: `ceil(bound / scale × 255)` — an
     /// UPPER bound after dequantization, so selection can skip a block
     /// only when it truly cannot beat the floor.
     pub quantized: Vec<u8>,
+    /// Per-block last doc id — the covering-block binary search runs
+    /// on resident data instead of a fetched skip table.
+    pub last_docs: Vec<u32>,
+    /// Fence-post block byte offsets relative to `metadata_offset`
+    /// (`len == quantized.len() + 1`; the last entry is the region
+    /// end), sizing any block fetch without the term header. With
+    /// `last_docs` this makes the term's skip table fully resident:
+    /// a cold consumer's first query was dominated by per-shard ×
+    /// per-term head fetches re-reading these exact bytes (150 KB -
+    /// 1 MB each at 1M-10M docs), on every query until the
+    /// background fill landed.
+    pub offsets: Vec<u32>,
 }
 
-#[cfg(test)]
 impl TermBlockMax {
+    /// The row borrowed in kernel-call shape — the one construction
+    /// point for [`RoutedTermRow`] from resident state.
+    pub(crate) fn as_row(&self) -> RoutedTermRow<'_> {
+        RoutedTermRow {
+            metadata_offset: self.metadata_offset,
+            df: self.df,
+            quantized: &self.quantized,
+            scale: self.scale,
+            last_docs: &self.last_docs,
+            offsets: &self.offsets,
+        }
+    }
+
     /// Dequantized upper bound for block `i` (test-only convenience;
     /// the query kernel dequantizes inline over the raw fields).
+    #[cfg(test)]
     fn block_bound(&self, i: usize) -> f32 {
         self.quantized[i] as f32 / QUANT_STEPS * self.scale
     }
 
+    #[cfg(test)]
     fn n_blocks(&self) -> usize {
         self.quantized.len()
     }
@@ -151,9 +183,10 @@ pub(crate) async fn build_file_block_max(
         }
         let terms = rows
             .into_iter()
-            .map(|(term, metadata_offset, maxes)| {
-                let scale = maxes.iter().copied().fold(0.0f32, f32::max);
-                let quantized = maxes
+            .map(|row| {
+                let scale = row.maxes.iter().copied().fold(0.0f32, f32::max);
+                let quantized = row
+                    .maxes
                     .iter()
                     .map(|&m| match scale > 0.0 {
                         // ceil() keeps the dequantized value a true
@@ -165,10 +198,13 @@ pub(crate) async fn build_file_block_max(
                     })
                     .collect();
                 TermBlockMax {
-                    term,
-                    metadata_offset,
+                    term: row.term,
+                    metadata_offset: row.metadata_offset,
+                    df: row.df,
                     scale,
                     quantized,
+                    last_docs: row.last_docs,
+                    offsets: row.offsets,
                 }
             })
             .collect();
@@ -198,9 +234,16 @@ pub(crate) fn encode_state(state: &SlowFtsState) -> Vec<u8> {
                 out.extend_from_slice(&(t.term.len() as u16).to_le_bytes());
                 out.extend_from_slice(&t.term);
                 out.extend_from_slice(&t.metadata_offset.to_le_bytes());
+                out.extend_from_slice(&t.df.to_le_bytes());
                 out.extend_from_slice(&t.scale.to_le_bytes());
                 out.extend_from_slice(&(t.quantized.len() as u32).to_le_bytes());
                 out.extend_from_slice(&t.quantized);
+                for &d in &t.last_docs {
+                    out.extend_from_slice(&d.to_le_bytes());
+                }
+                for &o in &t.offsets {
+                    out.extend_from_slice(&o.to_le_bytes());
+                }
             }
         }
     }
@@ -229,13 +272,18 @@ pub(crate) fn decode_state(bytes: &[u8]) -> Result<SlowFtsState, SlowFtsStateErr
             "unsupported slow-fts-state version {version}"
         )));
     }
+    // Length prefixes are untrusted until their bytes are consumed:
+    // clamp every pre-allocation by the bytes remaining (each element
+    // is at least one byte), so a corrupt count returns `Err` at the
+    // first truncated element instead of aborting on allocation.
+    let bounded_cap = |n: usize, at: usize| n.min(bytes.len().saturating_sub(at));
     let n_files = u32::from_le_bytes(take(&mut at, 4)?.try_into().expect("4 bytes")) as usize;
-    let mut files = Vec::with_capacity(n_files);
+    let mut files = Vec::with_capacity(bounded_cap(n_files, at));
     for _ in 0..n_files {
         let superfile_id = Uuid::from_slice(take(&mut at, 16)?)
             .map_err(|e| SlowFtsStateError::Parse(e.to_string()))?;
         let n_columns = u32::from_le_bytes(take(&mut at, 4)?.try_into().expect("4 bytes")) as usize;
-        let mut columns = Vec::with_capacity(n_columns);
+        let mut columns = Vec::with_capacity(bounded_cap(n_columns, at));
         for _ in 0..n_columns {
             let name_len =
                 u16::from_le_bytes(take(&mut at, 2)?.try_into().expect("2 bytes")) as usize;
@@ -243,22 +291,34 @@ pub(crate) fn decode_state(bytes: &[u8]) -> Result<SlowFtsState, SlowFtsStateErr
                 .map_err(|e| SlowFtsStateError::Parse(e.to_string()))?;
             let n_terms =
                 u32::from_le_bytes(take(&mut at, 4)?.try_into().expect("4 bytes")) as usize;
-            let mut terms = Vec::with_capacity(n_terms);
+            let mut terms = Vec::with_capacity(bounded_cap(n_terms, at));
             for _ in 0..n_terms {
                 let term_len =
                     u16::from_le_bytes(take(&mut at, 2)?.try_into().expect("2 bytes")) as usize;
                 let term = take(&mut at, term_len)?.to_vec();
                 let metadata_offset =
                     u64::from_le_bytes(take(&mut at, 8)?.try_into().expect("8 bytes"));
+                let df = u64::from_le_bytes(take(&mut at, 8)?.try_into().expect("8 bytes"));
                 let scale = f32::from_le_bytes(take(&mut at, 4)?.try_into().expect("4 bytes"));
                 let n_blocks =
                     u32::from_le_bytes(take(&mut at, 4)?.try_into().expect("4 bytes")) as usize;
                 let quantized = take(&mut at, n_blocks)?.to_vec();
+                let last_docs: Vec<u32> = take(&mut at, n_blocks * 4)?
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
+                    .collect();
+                let offsets: Vec<u32> = take(&mut at, (n_blocks + 1) * 4)?
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
+                    .collect();
                 terms.push(TermBlockMax {
                     term,
                     metadata_offset,
+                    df,
                     scale,
                     quantized,
+                    last_docs,
+                    offsets,
                 });
             }
             columns.push(ColumnBlockMax { column, terms });
@@ -331,14 +391,20 @@ mod tests {
                         TermBlockMax {
                             term: b"common".to_vec(),
                             metadata_offset: 1234,
+                            df: 4096,
                             scale: 8.5,
                             quantized: vec![255, 30, 254, 1],
+                            last_docs: vec![100, 250, 900, 4095],
+                            offsets: vec![0, 64, 130, 220, 300],
                         },
                         TermBlockMax {
                             term: b"heavy".to_vec(),
                             metadata_offset: 99,
+                            df: 300 * 128,
                             scale: 3.25,
                             quantized: vec![128; 300],
+                            last_docs: (0..300).map(|b| (b + 1) * 128 - 1).collect(),
+                            offsets: (0..=300).map(|b| b * 96).collect(),
                         },
                     ],
                 }],
@@ -412,20 +478,69 @@ mod tests {
                 .await
                 .expect("full walk");
             let got = r
-                .bm25_single_term_block_selected(
-                    "body",
-                    k,
-                    f32::NEG_INFINITY,
-                    row.metadata_offset,
-                    &row.quantized,
-                    row.scale,
-                )
+                .bm25_single_term_block_selected("body", k, f32::NEG_INFINITY, &row.as_row())
                 .await
                 .expect("block-selected walk");
-            let exp_scores: Vec<f32> = expected.iter().map(|&(_, s)| s).collect();
-            let got_scores: Vec<f32> = got.iter().map(|&(_, s)| s).collect();
-            assert_eq!(got_scores, exp_scores, "k={k}");
+            // Full (doc, score) equality: the tie contract (kth-score
+            // ties resolve to ascending doc id) must hold under
+            // bound-ordered visits, not just the score profile.
+            assert_eq!(got, expected, "k={k}");
         }
+    }
+
+    /// kth-score ties must resolve to ascending doc id even when the
+    /// tied docs live in blocks with unequal bounds (visited out of
+    /// doc order). Planted shape: doc 500 is the clear top hit, docs
+    /// 0 and 501 tie exactly for the kth slot (same tf, same doc
+    /// length) — doc 501 rides the high-bound block that is visited
+    /// first, doc 0 sits alone in a lower-bound block. The kernel
+    /// must still visit doc 0's block (bar excludes the kth tie) and
+    /// keep doc 0 over doc 501.
+    #[tokio::test]
+    async fn block_selected_keeps_smallest_ids_on_kth_ties() {
+        let tok = StdArc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for d in 0..2000u32 {
+            // `common` lives only in docs 0..600 (healthy idf; an
+            // every-doc term's block maxes collapse to the fixed-point
+            // floor and the bounds go flat, which skips the pruning
+            // path this test exists to exercise).
+            let tf = match d {
+                500 => 5,
+                0 | 501 => 3,
+                _ if d < 600 => 1,
+                _ => 0,
+            };
+            let text = format!("{}filler{}", "common ".repeat(tf as usize), d);
+            b.add_doc(0, d, &text).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let r =
+            FtsReader::open(blob, r#"[{"name":"body","tokenizer":"ascii_lower"}]"#).expect("open");
+
+        let file = build_file_block_max(Uuid::from_u128(1), &r, 2)
+            .await
+            .expect("rows");
+        let state = SlowFtsState { files: vec![file] };
+        let row = state
+            .term_block_max(Uuid::from_u128(1), "body", "common")
+            .expect("'common' carries a row");
+
+        let expected = r
+            .search_with_floor("body", &["common"], 2, BoolMode::Or, f32::NEG_INFINITY)
+            .await
+            .expect("full walk");
+        assert_eq!(
+            expected.iter().map(|&(d, _)| d).collect::<Vec<_>>(),
+            vec![500, 0],
+            "planted corpus: doc 0 wins the kth tie in the plain walk"
+        );
+        let got = r
+            .bm25_single_term_block_selected("body", 2, f32::NEG_INFINITY, &row.as_row())
+            .await
+            .expect("block-selected walk");
+        assert_eq!(got, expected);
     }
 
     /// The quantized bound must never drop below the exact bound —
