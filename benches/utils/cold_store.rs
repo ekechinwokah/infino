@@ -59,11 +59,23 @@ pub fn measure_cold_store<C>(
     let after_open = meter.snapshot();
     let open = after_open.since(&before_open);
 
+    io_counters::timeline_reset();
     let first_cpu0 = cpu::process_cpu_ns();
     let first_started = Instant::now();
     run_first(&consumer);
     let first_wall_s = first_started.elapsed().as_secs_f64();
     let first_cpu_s = cpu::cpu_seconds_since(first_cpu0);
+    for span in io_counters::timeline_take() {
+        eprintln!(
+            "[cold-timeline] first {} {} off={} len={} {}us{}",
+            span.op,
+            span.uri,
+            span.off,
+            span.len,
+            span.end_us.saturating_sub(span.start_us),
+            if span.background { " (bg)" } else { "" },
+        );
+    }
     let mut window_start = meter.snapshot();
     let first_query = window_start.since(&after_open);
 
