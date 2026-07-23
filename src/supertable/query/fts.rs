@@ -70,7 +70,7 @@
 use std::{
     borrow::Cow,
     cmp::{Ordering, Reverse},
-    collections::BinaryHeap,
+    collections::{BinaryHeap, HashMap},
     slice,
     sync::{Arc, Mutex},
     time::Instant,
@@ -1877,6 +1877,37 @@ async fn select_top_k_stable(
         });
         let kth_score = cands[k - 1].score;
         cands.retain(|c| c.score >= kth_score);
+    }
+    // Bound the tie band BEFORE resolving `_id`s: within one superfile,
+    // local doc order is id order (user files are id-ordered by the
+    // commit/compaction contract; drain-merged text shards emit locals in
+    // source commit order, so they are id-monotone too). The global
+    // (score desc, `_id` asc) top-k can therefore never admit more than
+    // the first k kth-score ties of any single file in local order —
+    // later ties of that file lose to its earlier ones before they beat
+    // any other file's. Dropping them here changes nothing in the result
+    // but caps id resolution at k per hit-bearing file; without the cap a
+    // heavily tied band (planted corpora tie by construction; quantized
+    // doc lengths tie real ones) attaches its WHOLE tie set, and on a
+    // non-arithmetic shard stub that reads nearly every `_id` page.
+    if cands.len() > k {
+        cands.sort_unstable_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.superfile.cmp(&b.superfile))
+                .then(a.local_doc_id.cmp(&b.local_doc_id))
+        });
+        let kth_score = cands[k - 1].score;
+        let mut kept_per_file: HashMap<Uuid, usize> = HashMap::new();
+        cands.retain(|c| {
+            if c.score > kth_score {
+                return true;
+            }
+            let kept = kept_per_file.entry(c.superfile.0).or_insert(0);
+            *kept += 1;
+            *kept <= k
+        });
     }
     dispatch::attach_stable_ids_to_hits(tr, &mut cands).await?;
     sort_hits_by_score_then_id(&mut cands);
@@ -4276,5 +4307,116 @@ mod cold_read_probe {
             hits, io.get_count
         );
         assert_eq!(hits, 1, "df1 term matches exactly one doc");
+    }
+}
+
+#[cfg(test)]
+mod tie_cap_probe {
+    use std::sync::Arc;
+
+    use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use tempfile::TempDir;
+
+    use super::BoolMode;
+    use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
+        superfile::builder::FtsConfig,
+        supertable::{Supertable, SupertableOptions},
+        test_helpers::default_tokenizer as tok,
+    };
+
+    /// Every doc ties at the kth score (same tf, same doc length), so the
+    /// deterministic (score desc, `_id` asc) contract must return the k
+    /// smallest `_id`s — and the per-file tie cap in
+    /// [`super::select_top_k_stable`] must not change that.
+    #[test]
+    fn massive_tie_band_returns_k_smallest_ids() {
+        const COMMITS: u32 = 2;
+        const PER: u32 = 300;
+        const K: usize = 10;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "body",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let dir = TempDir::new_in("/mnt/scratch/tmp").expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "body".into(),
+                    positions: false,
+                }],
+                vec![],
+                Some(tok()),
+            )
+            .expect("options")
+            .with_storage(storage)
+            .with_writer_pool(Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(2)
+                    .build()
+                    .expect("pool"),
+            )),
+        )
+        .expect("create");
+        for _ in 0..COMMITS {
+            let texts: Vec<String> = (0..PER).map(|_| "needle filler pad".into()).collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(LargeStringArray::from(texts)) as _],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        let rows = st
+            .bm25_search("body", "needle", K, BoolMode::Or, None)
+            .expect("search");
+        let got: Vec<i128> = rows
+            .iter()
+            .flat_map(|b| {
+                let ids = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("_id col");
+                ids.values().to_vec()
+            })
+            .collect();
+        assert_eq!(got.len(), K);
+        // All 600 docs tie; the winners must be the K smallest ids overall,
+        // ascending — independent of file count, completion order, or the
+        // per-file tie cap.
+        let mut sorted = got.clone();
+        sorted.sort_unstable();
+        assert_eq!(got, sorted, "tied hits must come back in ascending _id");
+        let reference = st
+            .bm25_search("body", "needle", 600, BoolMode::Or, None)
+            .expect("full search");
+        let all: Vec<i128> = reference
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("_id col")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        let mut all_sorted = all;
+        all_sorted.sort_unstable();
+        assert_eq!(
+            got,
+            all_sorted[..K],
+            "k-tied winners must be the k smallest ids in the corpus"
+        );
     }
 }
