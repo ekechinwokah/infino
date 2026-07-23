@@ -3108,17 +3108,6 @@ async fn materialized_user_rows_for_drain(
 
 // ---- Hidden text-shard drain (FTS) --------------------------------------
 
-/// Bytes per MiB, for the `fts.text_shard_target_mb` knob.
-const BYTES_PER_MIB: u64 = 1024 * 1024;
-
-/// Target byte size for one text shard's merged FTS blob (the
-/// `fts.text_shard_target_mb` YAML knob): small enough that a term's
-/// routing (manifest bloom + term range) pins one shard, large enough
-/// that shard counts stay in the tens.
-fn text_shard_target_bytes() -> u64 {
-    config::global().fts.text_shard_target_mb * BYTES_PER_MIB
-}
-
 /// Everything the text drain hands back for the epoch's single OCC
 /// commit: uploaded shard entries to append, the previous epoch's text
 /// entries to remove, and the deferred store/cache inserts applied
@@ -3817,20 +3806,40 @@ async fn drain_fts_text_shards(
     // the undrained tail's per-file idf scope.
     let mut all_runs: Vec<TextRun> = tiers.into_iter().flatten().collect();
     all_runs.sort_unstable_by_key(|r| r.base);
+    // One shard per drain worker — the vector scheme
+    // ([`packed_cell_shard_count`]: the writer pool, half the logical
+    // cores by default). Runs stay base-ordered so every group is a
+    // contiguous doc range; bytes balance the split so no worker
+    // inherits the fat tail. Runs are the atomic unit: fewer runs
+    // than workers means fewer shards (a fold run carries a whole
+    // prior shard, so a topology change converges over one epoch).
+    let shard_workers = packed_cell_shard_count(&hidden_inner.options);
+    let mut run_sizes: Vec<u64> = Vec::with_capacity(all_runs.len());
+    let mut remaining_bytes: u64 = 0;
+    for run in &all_runs {
+        let run_bytes = fs::metadata(&run.path)
+            .map_err(|error| BuildError::Store(format!("text run stat: {error}")))?
+            .len();
+        remaining_bytes += run_bytes;
+        run_sizes.push(run_bytes);
+    }
     let mut groups: Vec<Vec<TextRun>> = Vec::new();
     {
         let mut current: Vec<TextRun> = Vec::new();
         let mut current_bytes: u64 = 0;
-        for run in all_runs {
-            let run_bytes = fs::metadata(&run.path)
-                .map_err(|error| BuildError::Store(format!("text run stat: {error}")))?
-                .len();
-            if !current.is_empty() && current_bytes + run_bytes > text_shard_target_bytes() {
+        for (run, run_bytes) in all_runs.into_iter().zip(run_sizes) {
+            current_bytes += run_bytes;
+            remaining_bytes -= run_bytes;
+            current.push(run);
+            // Close once this group holds its fair share of what was
+            // left when it started; the last group takes the rest.
+            let groups_left = shard_workers.saturating_sub(groups.len());
+            if groups_left > 1
+                && current_bytes * groups_left as u64 >= current_bytes + remaining_bytes
+            {
                 groups.push(mem::take(&mut current));
                 current_bytes = 0;
             }
-            current_bytes += run_bytes;
-            current.push(run);
         }
         if !current.is_empty() {
             groups.push(current);
@@ -3839,10 +3848,21 @@ async fn drain_fts_text_shards(
 
     let scalar_schema = hidden_inner.options.scalar_schema();
     let id_column = hidden_inner.options.id_column.clone();
-    let mut prepared: Vec<PreparedSuperfile> = Vec::with_capacity(groups.len());
-    let mut fts_state_files: Vec<FileBlockMax> = Vec::with_capacity(groups.len());
     let n_groups = groups.len();
-    for (shard_id, group) in groups.iter().enumerate() {
+    // One build task per shard — the drain's worker budget IS the
+    // group count, so every shard builds in parallel and the section's
+    // wall time is the slowest shard, not the sum. `try_join_all`
+    // preserves group order (shard ordinals, partition keys, and the
+    // routing rows stay doc-range-ordered).
+    let shard_outputs = try_join_all(groups.iter().enumerate().map(|(shard_id, group)| {
+        let scalar_schema = scalar_schema.clone();
+        let id_column = id_column.clone();
+        let merge_columns = &merge_columns;
+        let columns_json = columns_json.as_str();
+        let fts_columns = fts_columns.clone();
+        let ids_path = ids_path.clone();
+        async move {
+
         let group_base = group.first().expect("groups are non-empty").base;
         let shard_docs: u32 = group.iter().map(|r| r.n_docs).sum();
         debug_assert!(
@@ -3857,21 +3877,21 @@ async fn drain_fts_text_shards(
             1 => group[0].path.clone(),
             _ => {
                 let out = scratch.join(format!("fts_text_group_{shard_id}.bin"));
-                merge_text_runs(group, &merge_columns, &columns_json, &out)
+                merge_text_runs(group, merge_columns, columns_json, &out)
                     .await?
                     .path
             }
         };
         let inter_bytes = mmap_readonly_bytes(&inter_path)
             .map_err(|error| BuildError::Store(format!("text group mmap: {error}")))?;
-        let inter_reader = FtsReader::open(inter_bytes, &columns_json)
+        let inter_reader = FtsReader::open(inter_bytes, columns_json)
             .map_err(|e| BuildError::Store(e.to_string()))?;
         // Bigram synthetic terms per shard, generated from the shard's
         // own unigram postings — already in shard doc space, so no
         // remap; folds regenerate them like every derived term.
         let synthetic = generate_bigram_terms(
             &inter_reader,
-            fts_columns,
+            &fts_columns,
             config::global().fts.bigram_member_df_permille,
             shard_docs,
         )
@@ -3891,7 +3911,7 @@ async fn drain_fts_text_shards(
                     reader: &inter_reader,
                     doc_id_remap: &identity,
                 }],
-                &merge_columns,
+                merge_columns,
                 shard_docs,
                 None,
                 &synthetic,
@@ -4017,27 +4037,37 @@ async fn drain_fts_text_shards(
         });
         // Resident block-max routing rows for this shard: every heavy
         // term's ceil-quantized per-block bounds (the FTS admit slab).
-        {
+        let shard_rows = {
             let shard_reader = SuperfileReader::open(shard_bytes)
                 .map_err(|e| BuildError::Store(format!("text shard reopen: {e}")))?;
             let fts = shard_reader
                 .fts()
                 .ok_or_else(|| BuildError::Store("text shard missing FTS blob".into()))?;
-            let rows = slow_fts_state::build_file_block_max(
+            slow_fts_state::build_file_block_max(
                 entry.superfile_id,
                 fts,
                 config::global().fts.block_max_df_floor,
             )
             .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
-            fts_state_files.push(rows);
+            .map_err(|e| BuildError::Store(e.to_string()))?
+        };
+        Ok::<(FileBlockMax, PreparedSuperfile), BuildError>((
+            shard_rows,
+            PreparedSuperfile {
+                entry,
+                bytes_for_store: p.bytes_for_store,
+                bytes_for_storage: p.bytes_for_storage,
+                bytes_for_cache: p.bytes_for_cache,
+            },
+        ))
         }
-        prepared.push(PreparedSuperfile {
-            entry,
-            bytes_for_store: p.bytes_for_store,
-            bytes_for_storage: p.bytes_for_storage,
-            bytes_for_cache: p.bytes_for_cache,
-        });
+    }))
+    .await?;
+    let mut prepared: Vec<PreparedSuperfile> = Vec::with_capacity(n_groups);
+    let mut fts_state_files: Vec<FileBlockMax> = Vec::with_capacity(n_groups);
+    for (rows, p) in shard_outputs {
+        fts_state_files.push(rows);
+        prepared.push(p);
     }
     let _ = fs::remove_file(&ids_path);
     let n_shards = prepared.len();

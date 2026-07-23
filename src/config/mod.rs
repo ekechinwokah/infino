@@ -432,12 +432,6 @@ impl Default for VectorSettings {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct FtsSettings {
-    /// Target byte size for one text shard's merged FTS blob. The
-    /// drain slices the merged inverted index at term boundaries into
-    /// shards of roughly this size: small enough that a term's routing
-    /// (manifest bloom + lex range) pins one shard, large enough that
-    /// shard counts stay in the tens.
-    pub text_shard_target_mb: u64,
     /// Terms whose document frequency is below this floor get no
     /// resident block-max slab: their posting lists span a handful of
     /// blocks, so whole-term fetches are already cheap and block
@@ -459,8 +453,6 @@ pub struct FtsSettings {
     pub bigram_member_df_permille: u32,
 }
 
-/// Default [`FtsSettings::text_shard_target_mb`].
-const DEFAULT_FTS_TEXT_SHARD_TARGET_MB: u64 = 256;
 /// Default [`FtsSettings::block_max_df_floor`] — ~8 posting blocks at
 /// the 128-doc block length.
 const DEFAULT_FTS_BLOCK_MAX_DF_FLOOR: u32 = 1024;
@@ -473,7 +465,6 @@ const DEFAULT_FTS_BIGRAM_MEMBER_DF_PERMILLE: u32 = 200;
 impl Default for FtsSettings {
     fn default() -> Self {
         Self {
-            text_shard_target_mb: DEFAULT_FTS_TEXT_SHARD_TARGET_MB,
             block_max_df_floor: DEFAULT_FTS_BLOCK_MAX_DF_FLOOR,
             bigram_member_df_permille: DEFAULT_FTS_BIGRAM_MEMBER_DF_PERMILLE,
         }

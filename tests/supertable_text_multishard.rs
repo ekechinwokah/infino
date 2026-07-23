@@ -8,17 +8,16 @@
 //! OR scoring, k>=3 phrase chains) once a corpus outgrew one shard:
 //! per-shard kernels can't intersect keys living in different shards.
 //! Shards are doc-partitioned now — each is a complete index over its
-//! doc slice — and this binary is the regression gate the term layout
-//! never had: it forces several shards with a tiny `fts.
-//! text_shard_target_mb` (own-process cwd config: this is a standalone
-//! test binary precisely so the knob can't leak into other tests) and
+//! doc slice, one shard per drain worker (the writer pool, pinned to
+//! 4 threads here so the count is runner-independent) — and this
+//! binary is the regression gate the term layout never had: it
 //! asserts the shapes that die under term partitioning.
 //!
 //! One `#[test]` fn: the cwd/config trick is process-global.
 
 #![deny(clippy::unwrap_used)]
 
-use std::{collections::HashSet, env, fs, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 
 use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -57,16 +56,10 @@ fn ids_of(batches: &[RecordBatch]) -> Vec<i128> {
 
 #[test]
 fn multishard_and_or_phrase_correctness() {
-    // Process-local engine config: a 1 MiB shard target so this small
-    // corpus produces several doc-partitioned shards. Must run before
-    // the first config read; this binary owns its process.
-    let config_cwd = TempDir::new().expect("config cwd");
-    fs::write(
-        config_cwd.path().join("infino.yaml"),
-        "fts:\n  text_shard_target_mb: 1\n",
-    )
-    .expect("write config");
-    env::set_current_dir(config_cwd.path()).expect("enter config cwd");
+    // Shard count follows the drain's worker budget (the writer
+    // pool, one shard per worker — the vector scheme). A multi-thread
+    // writer pool over a multi-commit corpus therefore produces
+    // several doc-partitioned shards without any config.
 
     let schema = Arc::new(Schema::new(vec![Field::new(
         "body",
@@ -87,6 +80,14 @@ fn multishard_and_or_phrase_correctness() {
         )
         .expect("options")
         .with_storage(storage)
+        .with_writer_pool(Arc::new(
+            // Pin the drain's worker budget so the shard count (one
+            // per worker) is deterministic on any runner.
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .expect("pool"),
+        ))
         .with_drain_batch_superfiles(1),
     )
     .expect("create");

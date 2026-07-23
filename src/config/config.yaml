@@ -238,13 +238,6 @@ vector:
 # Hidden text-index (FTS) tuning: the drain's text-shard build and the
 # resident block-max routing state.
 fts:
-  # Target size (MiB) for one text shard's merged FTS blob. The drain
-  # slices the merged inverted index at term boundaries into shards of
-  # roughly this size: small enough that a term's routing (manifest
-  # bloom + lex range) pins one shard, large enough that shard counts
-  # stay in the tens.
-  text_shard_target_mb: 256
-
   # Terms whose document frequency is below this floor carry no
   # resident block-max slab: their posting lists span a handful of
   # blocks, so whole-term fetches are already cheap and block
