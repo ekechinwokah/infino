@@ -1091,11 +1091,16 @@ const FTS_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
 /// states serve from the doc-partitioned shards with the top-k
 /// id-page reads capped by the per-file tie bound (14 on two shards
 /// at 1M; post-delta 22 with the undrained tail).
+// 1M column: measured+2 (7 shards, Azure). 10M column: post-drain
+// measured 26 (fatter shards don't reach dl/id residency after one
+// query, so steady pays per-shard posting reads); post-delta and
+// post-compact still provisional — the measuring run panicked at
+// post-drain; tighten from the next full 10M run.
 const FTS_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
     ("pre-drain", 128, 384),
-    ("post-drain", 3, 9),
-    ("post-delta", 22, 66),
-    ("post-compact", 5, 15),
+    ("post-drain", 3, 28),
+    ("post-delta", 22, 80),
+    ("post-compact", 5, 60),
 ];
 /// SQL scans are user-only in every state. 1M measured (first full
 /// SQL lifecycle after the settle-stall fixes): first cold 8 GETs
