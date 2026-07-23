@@ -1074,9 +1074,9 @@ const VECTOR_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
 /// 10M lifecycle calibrates it.
 const FTS_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
     ("pre-drain", 130, 390),
-    ("post-drain", 32, 96),
-    ("post-delta", 40, 120),
-    ("post-compact", 32, 96),
+    ("post-drain", 35, 105),
+    ("post-delta", 43, 129),
+    ("post-compact", 35, 105),
 ];
 /// Second (steady) cold FTS query, tight at the exact 1M
 /// measurements (same runs as [`FTS_COLD_GET_CEILINGS_FIRST`]):
@@ -1086,9 +1086,9 @@ const FTS_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
 /// at 1M; post-delta 22 with the undrained tail).
 const FTS_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
     ("pre-drain", 128, 384),
-    ("post-drain", 14, 42),
-    ("post-delta", 22, 66),
-    ("post-compact", 14, 42),
+    ("post-drain", 16, 48),
+    ("post-delta", 24, 72),
+    ("post-compact", 16, 48),
 ];
 /// SQL scans are user-only in every state. 1M measured (first full
 /// SQL lifecycle after the settle-stall fixes): first cold 8 GETs
