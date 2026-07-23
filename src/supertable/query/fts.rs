@@ -352,20 +352,53 @@ async fn bm25_fanout_wave(
         && !has_negation
         && must_arc.is_empty()
         && should_arc.len() >= MULTI_SELECT_MIN_TERMS;
+    // A single bare phrase (either polarity — a lone atom matches and
+    // scores identically as must or should) engages the bound-ordered
+    // phrase kernel when EVERY member has a resident row (all at/above
+    // the df floor — the expensive shape) and at least one row can
+    // prune.
+    let single_bare_phrase: Option<&Vec<String>> = (!has_negation
+        && must_arc.is_empty()
+        && should_arc.is_empty()
+        && must_ph_arc.len() + should_ph_arc.len() == 1)
+        .then(|| must_ph_arc.first().or_else(|| should_ph_arc.first()))
+        .flatten();
+    let phrase_rows_engage = |state: &SlowFtsState, suid: Uuid, phrase: &[String]| -> bool {
+        let mut any_prunable = false;
+        let all_routed =
+            phrase
+                .iter()
+                .all(|term| match state.term_block_max(suid, &column_arc, term) {
+                    Some(row) => {
+                        any_prunable |= row.quantized.iter().min() < row.quantized.iter().max();
+                        true
+                    }
+                    None => false,
+                });
+        all_routed && any_prunable
+    };
     let (selected_refs, sliceable_refs): (Vec<&Arc<SuperfileEntry>>, Vec<&Arc<SuperfileEntry>>) =
-        match (single_bare_term, multi_bare_or, routing.as_ref()) {
-            (Some(term), _, Some(state)) => kept.iter().partition(|e| {
+        match (
+            single_bare_term,
+            multi_bare_or,
+            single_bare_phrase,
+            routing.as_ref(),
+        ) {
+            (Some(term), _, _, Some(state)) => kept.iter().partition(|e| {
                 state
                     .term_block_max(e.superfile_id, &column_arc, term)
                     .is_some_and(|row| row.quantized.iter().min() < row.quantized.iter().max())
             }),
-            (None, true, Some(state)) => kept.iter().partition(|e| {
+            (None, true, _, Some(state)) => kept.iter().partition(|e| {
                 should_arc.iter().any(|term| {
                     state
                         .term_block_max(e.superfile_id, &column_arc, term)
                         .is_some_and(|row| row.quantized.iter().min() < row.quantized.iter().max())
                 })
             }),
+            (None, false, Some(phrase), Some(state)) => kept
+                .iter()
+                .partition(|e| phrase_rows_engage(state, e.superfile_id, phrase)),
             _ => (Vec::new(), kept.iter().collect()),
         };
     let mut work_units = build_work_units(&sliceable_refs, fanout, pool_threads);
@@ -501,6 +534,57 @@ async fn bm25_fanout_wave(
                             floor,
                             &routed_rows,
                             &unrouted,
+                            Some(&live),
+                        )
+                        .await
+                        .map_err(fts_read_error)?
+                    {
+                        merge_unit_scores(&shared, &tombstones, suid, now, &hits);
+                        return Ok(hits);
+                    }
+                }
+            }
+            // Single-bare-phrase bound-ordered admission: an un-ranged
+            // unit whose file has resident rows for EVERY phrase
+            // member (≥1 prunable) verifies positions only inside doc
+            // windows admitted best-first by the phrase upper bound —
+            // the fix for the merged shard's compressed global-idf
+            // band, where the doc-order walk verifies every candidate.
+            // Falls through to the plain walk when the kernel
+            // declines (flat bounds / stale routing / bail).
+            if range.is_none()
+                && n_terms == 0
+                && neg_arc.is_empty()
+                && neg_ph_arc.is_empty()
+                && must_ph_arc.len() + should_ph_arc.len() == 1
+                && let Some(state) = routing.as_ref()
+            {
+                let phrase = must_ph_arc
+                    .first()
+                    .or_else(|| should_ph_arc.first())
+                    .expect("one phrase");
+                let mut any_prunable = false;
+                let all_routed =
+                    phrase
+                        .iter()
+                        .all(|term| match state.term_block_max(suid, &column_arc, term) {
+                            Some(row) => {
+                                any_prunable |=
+                                    row.quantized.iter().min() < row.quantized.iter().max();
+                                true
+                            }
+                            None => false,
+                        });
+                if all_routed && any_prunable {
+                    let cache = Arc::clone(&*cursor_caches.entry(suid).or_default());
+                    let live = shared.live_floor();
+                    if let Some(hits) = r
+                        .bm25_phrase_block_selected(
+                            &column_arc,
+                            phrase,
+                            k,
+                            floor,
+                            Some(&cache),
                             Some(&live),
                         )
                         .await
