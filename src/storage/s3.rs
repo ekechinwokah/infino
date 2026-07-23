@@ -34,12 +34,11 @@ use object_store::{
     path::Path as ObjPath,
 };
 
-use crate::runtime_metrics::io::UsageMeter;
-
 use super::{
     ObjectMeta, StorageError, StorageOptions, StorageProvider, counting, io_counters,
     logical_list_key, options::apply, retry,
 };
+use crate::runtime_metrics::io::UsageMeter;
 
 /// Whether `opts` names a custom S3 endpoint, under any object_store alias
 /// (`aws_endpoint`, `endpoint`, `aws_endpoint_url`, …). A custom endpoint

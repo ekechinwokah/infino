@@ -37,18 +37,17 @@
 //! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket INFINO_BENCH_SUPERTABLE_DOCS=100000 cargo bench -- supertable
 //! ```
 
-#[allow(unused_imports)] // `Instant` is consumed by the child mods via `use super::*`
 use std::{
-    hint::black_box,
-    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
-};
-
-use std::collections::HashSet;
-use std::{
+    collections::HashSet,
     env,
     process::{Command, Stdio},
     sync::Arc,
     time::{Duration, Instant},
+};
+#[allow(unused_imports)] // `Instant` is consumed by the child mods via `use super::*`
+use std::{
+    hint::black_box,
+    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
 };
 
 use arrow_array::RecordBatch;
@@ -2393,7 +2392,6 @@ pub mod fts {
 }
 
 pub mod vector {
-    use super::{ExpectedTiers, HitTierStats, RoutingColdStat, RoutingStateStat, TransitionStat};
     use std::{
         cmp::Ordering,
         collections::{HashMap, HashSet},
@@ -2403,7 +2401,9 @@ pub mod vector {
 
     use infino::storage::io_counters;
 
-    use super::*;
+    use super::{
+        ExpectedTiers, HitTierStats, RoutingColdStat, RoutingStateStat, TransitionStat, *,
+    };
     use crate::{
         corpus,
         executors::{
