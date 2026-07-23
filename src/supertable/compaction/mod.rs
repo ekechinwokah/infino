@@ -568,8 +568,10 @@ impl Supertable {
         let mut pending_storage_writes =
             vec![bytes_for_storage.ok_or(CompactionError::EmptyMergedSuperfile)?];
 
+        let mut orphan_skew: u64 = 0;
         for attempt in 0..max_retries {
             let current = inner.manifest.load_full();
+            let based_on = current.manifest_id;
 
             // Another compactor already merged our inputs — nothing left to commit.
             let entries_to_remove = match resolve_entries_to_remove(&current, &job.inputs) {
@@ -588,6 +590,7 @@ impl Supertable {
                 NewEntryBirthVersions::Preserve,
                 &mut pending_storage_writes,
                 &mut pending_storage_replaces,
+                orphan_skew,
             )
             .await
             {
@@ -632,6 +635,13 @@ impl Supertable {
                         unseal_all(&wal_store, sealed).await;
                         return Err(CompactionError::Refresh(e.to_string()));
                     }
+                    // Unmoved pointer after refresh ⇒ the collision was a
+                    // dead writer's orphaned manifest object; walk past it
+                    // (see ManifestSnapshot::with_base_id_advanced).
+                    orphan_skew = match inner.manifest.load_full().manifest_id == based_on {
+                        true => orphan_skew + 1,
+                        false => 0,
+                    };
                     // Input vanished mid-retry (someone else merged it away).
                     // Our built output no longer matches reality, so abort
                     // instead of retrying the commit.

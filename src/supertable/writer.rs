@@ -6875,6 +6875,9 @@ async fn stamp_slow_vector_state(
         return Ok(());
     };
     let max_retries = inner.options.max_commit_retries.max(1);
+    // See `with_base_id_advanced`: consecutive collisions with an
+    // unmoved pointer are a dead writer's orphan, not contention.
+    let mut orphan_skew: u64 = 0;
     for attempt in 0..max_retries {
         let old = inner.manifest.load_full();
         let entries = old.get_all_superfiles();
@@ -6915,8 +6918,18 @@ async fn stamp_slow_vector_state(
             // Same membership already stamped — republish is a no-op.
             return Ok(());
         }
-        let new_manifest =
-            old.with_slow_vector_state(published.uri, published.content_hash, published.centroids);
+        // Phantom-contention escape: build from an id-advanced base
+        // when prior rounds collided while the pointer stayed put
+        // (see `with_base_id_advanced`).
+        let build_base = match orphan_skew {
+            0 => Arc::clone(&old),
+            skew => Arc::new(old.with_base_id_advanced(skew)),
+        };
+        let new_manifest = build_base.with_slow_vector_state(
+            published.uri.clone(),
+            published.content_hash,
+            published.centroids.clone(),
+        );
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -6929,9 +6942,14 @@ async fn stamp_slow_vector_state(
                 return Ok(());
             }
             Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                let based_on = old.manifest_id;
                 refresh_inner_state_async(inner, &storage)
                     .await
                     .map_err(|e| BuildError::Store(e.to_string()))?;
+                orphan_skew = match inner.manifest.load_full().manifest_id == based_on {
+                    true => orphan_skew + 1,
+                    false => 0,
+                };
                 sleep(backoff_delay(attempt)).await;
             }
             Err(e) => return Err(BuildError::Store(e.to_string())),
@@ -6953,6 +6971,7 @@ async fn record_hidden_deleted_ids(
         return Ok(());
     };
     let max_retries = inner.options.max_commit_retries.max(1);
+    let mut orphan_skew: u64 = 0;
     for attempt in 0..max_retries {
         let old = inner.manifest.load_full();
         let mut ids = hidden_deleted::deleted_user_ids(&old)
@@ -6967,7 +6986,11 @@ async fn record_hidden_deleted_ids(
             return Ok(());
         }
         let bytes = encode_deleted_ids(&ids);
-        let new_manifest = old.with_deleted_user_ids(bytes);
+        let build_base = match orphan_skew {
+            0 => Arc::clone(&old),
+            skew => Arc::new(old.with_base_id_advanced(skew)),
+        };
+        let new_manifest = build_base.with_deleted_user_ids(bytes);
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -6980,9 +7003,14 @@ async fn record_hidden_deleted_ids(
                 return Ok(());
             }
             Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                let based_on = old.manifest_id;
                 refresh_inner_state_async(inner, &storage)
                     .await
                     .map_err(|e| BuildError::Store(e.to_string()))?;
+                orphan_skew = match inner.manifest.load_full().manifest_id == based_on {
+                    true => orphan_skew + 1,
+                    false => 0,
+                };
                 sleep(backoff_delay(attempt)).await;
             }
             Err(e) => return Err(BuildError::Store(e.to_string())),
@@ -7054,8 +7082,13 @@ pub(in crate::supertable) async fn persist_commit_async(
     let max_retries = opts.max_commit_retries.max(1);
     let drive = async move {
         let mut last_err: Option<SupertableCommitError> = None;
+        // Consecutive contention rounds with an UNMOVED pointer mean
+        // the colliding manifest object is a dead writer's orphan,
+        // not a live competitor — walk the retry past it.
+        let mut orphan_skew: u64 = 0;
         for attempt in 0..max_retries {
             let old = inner.manifest.load_full();
+            let based_on = old.manifest_id;
             // Re-apply call-site stamps on every attempt. A pre-store of these
             // fields is not OCC-safe: contention refresh reloads from storage
             // and would drop them before a successful CAS.
@@ -7075,6 +7108,7 @@ pub(in crate::supertable) async fn persist_commit_async(
                 NewEntryBirthVersions::StampCommit,
                 pending_writes,
                 pending_replaces,
+                orphan_skew,
             )
             .await
             {
@@ -7083,6 +7117,10 @@ pub(in crate::supertable) async fn persist_commit_async(
                     if attempt + 1 < max_retries =>
                 {
                     refresh_inner_state_async(inner, &storage_async).await?;
+                    orphan_skew = match inner.manifest.load_full().manifest_id == based_on {
+                        true => orphan_skew + 1,
+                        false => 0,
+                    };
                     last_err = Some(SupertableCommitError::WriteContentionExhausted);
                     sleep(backoff_delay(attempt)).await;
                 }
@@ -7364,7 +7402,17 @@ pub(crate) async fn try_commit_attempt(
     birth_versions: NewEntryBirthVersions,
     pending_storage_writes: &mut Vec<(SuperfileUri, Bytes)>,
     pending_storage_replaces: &mut Vec<(SuperfileUri, Bytes)>,
+    orphan_id_skew: u64,
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
+    // Phantom-contention escape (see `with_base_id_advanced`): derive
+    // the successor from an id-advanced base so its manifest id — and
+    // every id-derived stamp — walks past a dead writer's orphaned
+    // manifest object. The pointer-etag check below stays on the
+    // UNSKEWED snapshot: the pointer itself has not moved.
+    let update_base = match orphan_id_skew {
+        0 => Arc::clone(&current_manifest),
+        skew => Arc::new(current_manifest.with_base_id_advanced(skew)),
+    };
     // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(
         &storage,
@@ -7377,12 +7425,10 @@ pub(crate) async fn try_commit_attempt(
     // 2. update the manifest for the commit.
     let (mut new_manifest, parts_to_write) = match birth_versions {
         NewEntryBirthVersions::StampCommit => {
-            current_manifest
-                .update(new_entries, entries_to_remove)
-                .await?
+            update_base.update(new_entries, entries_to_remove).await?
         }
         NewEntryBirthVersions::Preserve => {
-            current_manifest
+            update_base
                 .update_preserving_birth_versions(new_entries, entries_to_remove)
                 .await?
         }
@@ -7504,9 +7550,14 @@ pub(in crate::supertable) async fn stamp_tombstone_seqs(
         return Ok(());
     };
     let max_retries = inner.options.max_commit_retries.max(1);
+    let mut orphan_skew: u64 = 0;
     for attempt in 0..max_retries {
         let old = inner.manifest.load_full();
-        let Some(new_manifest) = old.with_tombstone_seqs_bumped(touched) else {
+        let build_base = match orphan_skew {
+            0 => Arc::clone(&old),
+            skew => Arc::new(old.with_base_id_advanced(skew)),
+        };
+        let Some(new_manifest) = build_base.with_tombstone_seqs_bumped(touched) else {
             // No persisted list ⇒ in-process-only ⇒ nothing to stamp.
             return Ok(());
         };
@@ -7530,7 +7581,12 @@ pub(in crate::supertable) async fn stamp_tombstone_seqs(
                 return Ok(());
             }
             Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                let based_on = old.manifest_id;
                 refresh_inner_state_async(inner, &storage).await?;
+                orphan_skew = match inner.manifest.load_full().manifest_id == based_on {
+                    true => orphan_skew + 1,
+                    false => 0,
+                };
                 sleep(backoff_delay(attempt)).await;
             }
             Err(e) => return Err(e),

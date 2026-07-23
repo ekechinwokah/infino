@@ -1261,6 +1261,45 @@ impl ManifestSnapshot {
     /// [`ManifestSnapshot::with_deleted_user_ids`]. Standalone restamp path
     /// (e.g. post-drain refresh); membership commits instead compose the
     /// ref via [`Self::with_slow_vector_state_ref`] before the same CAS.
+    /// Faithful copy with the base `manifest_id` advanced `skew`
+    /// places — the OCC loops' escape from PHANTOM contention. A
+    /// writer that dies between its manifest-list PUT and the pointer
+    /// CAS leaves `manifest-{id}.json` orphaned on storage with the
+    /// pointer unmoved; every retry then rederives the same id, hits
+    /// the orphan's `PreconditionFailed`, and exhausts the budget as
+    /// if contended — permanently wedging the table. Building the
+    /// retry's successor from an advanced base walks past the orphan
+    /// while keeping every id-derived stamp (successor id, entry
+    /// birth versions) consistent. The pointer CAS remains the sole
+    /// visibility barrier: skipped ids are unreferenced garbage for
+    /// GC, and the pointer-etag check still runs against the
+    /// UNSKEWED snapshot (the pointer itself has not moved).
+    pub(crate) fn with_base_id_advanced(&self, skew: u64) -> Self {
+        let advanced = self.superfile_list.manifest_id + skew;
+        Self {
+            superfile_list: SuperfileList {
+                manifest_id: advanced,
+                options: Arc::clone(&self.superfile_list.options),
+                superfiles: self.superfile_list.superfiles.clone(),
+                vector_index_storage_prefix: self
+                    .superfile_list
+                    .vector_index_storage_prefix
+                    .clone(),
+            },
+            list: self.list.as_ref().map(|list| {
+                let mut list = list.clone();
+                list.manifest_id = advanced;
+                list
+            }),
+            parts: self.parts.clone(),
+            loader: self.loader.clone(),
+            stamped_partition_strategy: self.stamped_partition_strategy.clone(),
+            stamped_global_vector_index: self.stamped_global_vector_index.clone(),
+            stamped_drained_ranges: self.stamped_drained_ranges.clone(),
+            stamped_slow_fts_state: self.stamped_slow_fts_state.clone(),
+        }
+    }
+
     pub fn with_slow_vector_state(
         &self,
         uri: String,

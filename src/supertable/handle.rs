@@ -4124,6 +4124,323 @@ mod tests {
     /// cache is in lazy-foreground mode — the exact reader state a query
     /// fan-out leaves behind, which compaction must still read eagerly.
     /// Returns the temp dirs (kept alive by the caller) and the consumer.
+    /// One drain over MULTIPLE undrained sources — the multi-batch
+    /// path production takes and single-batch unit tests skip: batch
+    /// planning, per-batch local+remote checkpoints, per-cell scratch
+    /// spills, and the cross-batch merge of a cell's spilled fragments
+    /// (batch 2+ folds into batch 1's spilled subsection). Covers the
+    /// kmeans and splice consolidation arms.
+    #[test]
+    fn multi_batch_drain_spills_and_merges_cells_across_batches() {
+        use crate::superfile::reader::VectorSearchOptions;
+
+        const DIM: usize = 16;
+        // drain_each = false: three undrained sources meet ONE drain,
+        // and the default one-file batch budget makes it three batches.
+        let (_storage_dir, _cache_dir, consumer) =
+            vector_consumer_with_lazy_cache(DIM, 2_000, 3, false);
+
+        consumer
+            .drain_vectors_to_cells_sync()
+            .expect("multi-batch drain");
+
+        let hidden = consumer
+            .reader()
+            .vector_index_table()
+            .expect("hidden index")
+            .clone();
+        let n_docs: u64 = hidden
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .filter(|e| !e.vector_summary.is_empty())
+            .map(|e| e.n_docs)
+            .sum();
+        assert_eq!(n_docs, 6_000, "every batch's rows landed in cells");
+
+        let query = vec![1.0f32; DIM];
+        let hits = consumer
+            .reader()
+            .vector_hits("emb", &query, 10, VectorSearchOptions::new(), None)
+            .expect("vector search");
+        assert_eq!(hits.len(), 10, "post-drain search over merged cells");
+    }
+
+    /// The splice consolidation arm of the same multi-batch shape:
+    /// rows accumulate per cell verbatim (no kmeans re-clustering) and
+    /// still ride the spill + cross-batch merge machinery.
+    #[test]
+    fn multi_batch_splice_drain_accumulates_cells() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            config::DrainConsolidate,
+            superfile::{
+                builder::{FtsConfig, VectorConfig},
+                reader::VectorSearchOptions,
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+        };
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                    positions: false,
+                }],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim,
+                    n_cent: 4,
+                    rot_seed: 7,
+                    metric: Metric::Cosine,
+                    rerank_codec: RerankCodec::Sq8FixedResidual,
+                    provided_centroids: None,
+                }],
+                Some(default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(Arc::clone(&storage))
+            .with_writer_pool(Arc::clone(&pool))
+            .with_drain_consolidate(DrainConsolidate::Splice),
+        )
+        .expect("create");
+
+        for c in 0..2 {
+            let n = 64usize;
+            let titles =
+                LargeStringArray::from((0..n).map(|i| format!("doc{c}_{i}")).collect::<Vec<_>>());
+            let flat = Float32Array::from(vec![1.0f32; n * dim]);
+            let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(titles) as Arc<dyn Array>,
+                    Arc::new(fsl) as Arc<dyn Array>,
+                ],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+            drop(w);
+        }
+        st.drain_vectors_to_cells_sync().expect("splice drain");
+
+        let query = vec![1.0f32; dim];
+        let hits = st
+            .reader()
+            .vector_hits("emb", &query, 5, VectorSearchOptions::new(), None)
+            .expect("vector search");
+        assert_eq!(hits.len(), 5, "spliced cells answer post-drain search");
+    }
+
+    /// Fault-injection sweep over the drain's storage surface: with
+    /// the k-th storage operation failing, the drain must return a
+    /// clean error (never panic, never corrupt), and a retry with the
+    /// fault cleared must succeed and serve correct queries — the
+    /// checkpoint-resume contract. Sweeping k walks every distinct
+    /// storage-error arm on the text-drain path.
+    #[test]
+    fn drain_survives_a_failure_at_every_storage_op() {
+        use std::{
+            ops::Range,
+            sync::atomic::{AtomicI64, Ordering as AtomicOrdering},
+        };
+
+        use arrow_array::{Array, LargeStringArray};
+        use async_trait::async_trait;
+        use bytes::Bytes;
+
+        use crate::{
+            storage::{ObjectMeta, StorageError},
+            superfile::fts::reader::BoolMode,
+        };
+
+        /// Fails exactly one operation: the one issued when the armed
+        /// countdown hits zero. Negative = disarmed.
+        #[derive(Debug)]
+        struct FailNthOp {
+            inner: Arc<dyn StorageProvider>,
+            countdown: AtomicI64,
+        }
+        impl FailNthOp {
+            fn trip(&self, uri: &str) -> Result<(), StorageError> {
+                let n = self.countdown.fetch_sub(1, AtomicOrdering::SeqCst);
+                if std::env::var("DBG_SWEEP").is_ok() {
+                    eprintln!("DBG op countdown={n} uri={uri}");
+                }
+                match n == 0 {
+                    true => Err(StorageError::Permanent {
+                        uri: uri.to_string(),
+                        source: "injected fault".into(),
+                    }),
+                    false => Ok(()),
+                }
+            }
+        }
+        #[async_trait]
+        impl StorageProvider for FailNthOp {
+            async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+                self.trip(uri)?;
+                self.inner.head(uri).await
+            }
+            async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+                self.trip(uri)?;
+                self.inner.get(uri).await
+            }
+            async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+                self.trip(uri)?;
+                self.inner.get_range(uri, range).await
+            }
+            async fn put_atomic(
+                &self,
+                uri: &str,
+                bytes: Bytes,
+            ) -> Result<Option<String>, StorageError> {
+                self.trip(uri)?;
+                self.inner.put_atomic(uri, bytes).await
+            }
+            async fn put_if_match(
+                &self,
+                uri: &str,
+                bytes: Bytes,
+                e: Option<&str>,
+            ) -> Result<Option<String>, StorageError> {
+                self.trip(uri)?;
+                self.inner.put_if_match(uri, bytes, e).await
+            }
+            async fn put_multipart(
+                &self,
+                uri: &str,
+            ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
+                self.trip(uri)?;
+                self.inner.put_multipart(uri).await
+            }
+            async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+                self.trip(uri)?;
+                self.inner.delete(uri).await
+            }
+            async fn list_with_prefix_metadata(
+                &self,
+                prefix: &str,
+            ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
+                self.trip(prefix)?;
+                self.inner.list_with_prefix_metadata(prefix).await
+            }
+        }
+
+        /// Ceiling on swept ops — well above the drain's real count so
+        /// the sweep always reaches the armed-but-unused break arm.
+        const MAX_SWEPT_OPS: i64 = 100;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let mut swept_all = false;
+        let k_range = match std::env::var("DBG_SWEEP") {
+            Ok(v) => {
+                let k: i64 = v.parse().expect("DBG_SWEEP=k");
+                k..k + 1
+            }
+            Err(_) => 0..MAX_SWEPT_OPS,
+        };
+        for k in k_range {
+            let dir = TempDir::new().expect("tempdir");
+            let injected = Arc::new(FailNthOp {
+                inner: Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider")),
+                countdown: AtomicI64::new(-1),
+            });
+            let st = Supertable::create(
+                SupertableOptions::new(
+                    schema.clone(),
+                    vec![FtsConfig {
+                        column: "title".into(),
+                        positions: false,
+                    }],
+                    vec![],
+                    Some(default_tokenizer()),
+                )
+                .expect("valid options")
+                .with_storage(Arc::clone(&injected) as _)
+                .with_writer_pool(Arc::clone(&pool)),
+            )
+            .expect("create");
+            for text in ["alpha one", "beta two"] {
+                let titles = LargeStringArray::from(vec![text]);
+                let batch = arrow_array::RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(titles) as Arc<dyn Array>],
+                )
+                .expect("batch");
+                let mut w = st.writer().expect("writer");
+                w.append(&batch).expect("append");
+                w.commit().expect("commit");
+                drop(w);
+            }
+
+            injected.countdown.store(k, AtomicOrdering::SeqCst);
+            let outcome = st.drain_vectors_to_cells_sync();
+            let armed = injected.countdown.load(AtomicOrdering::SeqCst) >= 0;
+            if armed {
+                // Fewer ops than k: the whole surface has been swept.
+                assert!(outcome.is_ok(), "unfired fault must not fail the drain");
+                swept_all = true;
+                break;
+            }
+            // The fault fired: whatever the outcome, the table must
+            // still answer correctly afterward — either the drain
+            // failed cleanly (user path) or a background arm absorbed
+            // the error (hidden path).
+            injected.countdown.store(-1, AtomicOrdering::SeqCst);
+            if outcome.is_err() {
+                st.drain_vectors_to_cells_sync()
+                    .unwrap_or_else(|e| panic!("retry after fault {k} failed: {e}"));
+            }
+            let n = st
+                .reader()
+                .count("title", "alpha", BoolMode::Or)
+                .unwrap_or_else(|e| panic!("query after fault {k} failed: {e}"));
+            assert_eq!(n, 1, "fault {k}: post-recovery query");
+        }
+        assert!(
+            swept_all,
+            "sweep never exhausted the drain's ops — raise MAX_SWEPT_OPS"
+        );
+    }
+
     fn vector_consumer_with_lazy_cache(
         dim: usize,
         rows_per_commit: usize,
