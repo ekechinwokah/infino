@@ -1118,6 +1118,7 @@ fn measure_routing_state_with(
     consumer_meter: &storage_meter::MeteredStorage,
     hit_tiers: &dyn Fn() -> HitTierStats,
     warm_query: &dyn Fn(),
+    settle_fills: &dyn Fn(),
     cold_measure: &dyn Fn() -> Option<RoutingColdStat>,
     include_warm: bool,
     include_cold: bool,
@@ -1147,8 +1148,13 @@ fn measure_routing_state_with(
         // Settle the cache before timing: a freshly-opened
         // consumer serves its first queries from the store (the
         // lazy fill lags the query), which would meter as a
-        // "warm" window doing cold fetches. Probe until one
-        // query completes with zero GETs (bounded).
+        // "warm" window doing cold fetches. Force pending fills
+        // to completion first (a post-compact shard generation is
+        // hundreds of MB — the bounded probe below can't outwait
+        // it; measured 31 GET/query leaking into the timed
+        // window), then probe until one query runs at zero GETs.
+        search();
+        settle_fills();
         for _ in 0..WARM_SETTLE_MAX_ITERS {
             let before = consumer_meter.snapshot();
             search();
@@ -1238,6 +1244,11 @@ fn measure_routing_state_with(
 }
 
 /// Repeated warm probes per routing-state transition.
+/// Ceiling for forcing pending background fills to settle before a
+/// routing-state warm window is timed (the post-fix settle waiter
+/// pushes fills through held readers, so the wait is fill bandwidth,
+/// not politeness).
+const ROUTING_SETTLE_TIMEOUT: Duration = Duration::from_secs(600);
 const ROUTING_STATE_WARM_ITERS: usize = 20;
 
 /// Cap on pre-timing settle probes for a routing-state warm window:
@@ -1679,6 +1690,11 @@ pub mod fts {
                         .bm25_search(supertable::TEXT_COLUMN, &query, TOP_K, mode, None)
                         .expect("routing-state warm bm25 search"),
                 );
+            },
+            &|| {
+                consumer
+                    .wait_until_warm(super::ROUTING_SETTLE_TIMEOUT)
+                    .expect("routing-state fill settle");
             },
             &|| {
                 measure_cold_store(built).map(|cold| RoutingColdStat {
@@ -3363,6 +3379,9 @@ pub mod vector {
                         .expect("routing-state warm vector search"),
                 );
             },
+            // Vector consumers open with allow_background_fill =
+            // false (block cache only) — no fills to settle.
+            &|| {},
             &|| {
                 measure_cold_store(
                     label,
@@ -4439,6 +4458,11 @@ pub mod sql {
             },
             &|| {
                 black_box(reader.query_sql(rep.sql).expect("routing-state warm sql"));
+            },
+            &|| {
+                consumer
+                    .wait_until_warm(super::ROUTING_SETTLE_TIMEOUT)
+                    .expect("routing-state fill settle");
             },
             &|| {
                 measure_cold_store(built).map(|cold| RoutingColdStat {

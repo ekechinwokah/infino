@@ -2906,6 +2906,28 @@ impl FtsReader {
             if cursors.is_empty() {
                 return Ok(Vec::new());
             }
+            // Same dispatch as the whole-file path: a uniform
+            // multi-term OR (no dominant upper bound) degrades
+            // MaxScore — its essential set never shrinks and every
+            // posting pays the per-doc pivot machinery — while the
+            // windowed union scorer streams the same postings through
+            // an L1-resident accumulator. The ranged fan-out
+            // previously hard-coded BMM, which is why a merged
+            // shard's broad ORs ran ~6x slower than the same walk
+            // pre-drain (per-file units took this branch). The live
+            // floor stays BMM-only: uniform bands are precisely where
+            // floors cannot prune.
+            if prefer_windowed_union(&cursors) {
+                return self.run_windowed_union(
+                    column_id,
+                    cursors,
+                    k,
+                    None,
+                    floor_eff,
+                    doc_id_start,
+                    doc_id_end,
+                );
+            }
             return self.run_max_score_bmm_range(
                 column_id,
                 cursors,

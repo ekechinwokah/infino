@@ -3202,6 +3202,7 @@ async fn generate_bigram_terms(
         if !fc.positions {
             continue;
         }
+        let phase_t0 = time::Instant::now();
         // Tee triples for common members only.
         let mut common_terms: Vec<Vec<u8>> = Vec::new();
         let mut triples: Vec<(u32, u32, u32)> = Vec::new();
@@ -3252,7 +3253,11 @@ async fn generate_bigram_terms(
         if common_terms.is_empty() {
             continue;
         }
+        let tee_ms = phase_t0.elapsed().as_millis();
+        let phase_t0 = time::Instant::now();
         triples.sort_unstable();
+        let sort_ms = phase_t0.elapsed().as_millis();
+        let phase_t0 = time::Instant::now();
         // Adjacent-position scan → (bigram members, doc, anchor).
         let mut anchors: Vec<(u32, u32, u32, u32)> = Vec::new(); // (t1, t2, doc, pos)
         for w in triples.windows(2) {
@@ -3308,6 +3313,12 @@ async fn generate_bigram_terms(
             i = pair_end;
         }
         terms.sort_unstable_by(|x, y| x.term.cmp(&y.term));
+        eprintln!(
+            "[supertable drain] bigrams {}: tee {tee_ms}ms sort {sort_ms}ms group {}ms — {} pair term(s)",
+            fc.column,
+            phase_t0.elapsed().as_millis(),
+            terms.len(),
+        );
         out.push(SyntheticTerms {
             column: fc.column.clone(),
             terms,
