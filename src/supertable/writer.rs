@@ -82,7 +82,7 @@ use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio::time::sleep;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use super::{
@@ -3067,7 +3067,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     }
     let batch_cfg = drain_batch_superfiles(&user_inner.options);
     if batch_cfg == 0 {
-        eprintln!("[supertable drain] skipped (drain_batch_superfiles = 0)");
+        debug!("[supertable drain] skipped (drain_batch_superfiles = 0)");
         return Ok(());
     }
 
@@ -3177,7 +3177,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .cloned()
             .collect();
         if selected.is_empty() {
-            eprintln!(
+            debug!(
                 "[supertable drain] nothing to drain: all {} user superfile(s) already drained",
                 sources.len()
             );
@@ -3666,7 +3666,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             DrainTestFailurePhase::AfterBatch,
             local_checkpoint.batches_done,
         )?;
-        eprintln!(
+        info!(
             "[supertable drain] batch {}/{} ({} sf, {batch_log})",
             batch_idx + 1,
             n_batches,
@@ -3935,7 +3935,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         {
             tracing::warn!("drain local checkpoint cleanup failed: {error}");
         }
-        eprintln!(
+        info!(
             "[supertable drain] cell build: {} row(s), {} cell(s) -> {} packed shard superfile(s) for {} worker(s), {:.1}ms",
             total_rows,
             n_cells_total,
@@ -3952,7 +3952,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         }
     }
 
-    eprintln!(
+    info!(
         "[supertable drain] done ({}, {} batch(es), budget {} sf): total {:.1}ms; RSS {} -> {} MiB",
         match consolidate {
             DrainConsolidate::Kmeans => "kmeans",

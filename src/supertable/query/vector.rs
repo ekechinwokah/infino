@@ -77,6 +77,7 @@ use arrow_array::{Array, Decimal128Array};
 use futures::future::try_join_all;
 use roaring::RoaringBitmap;
 use tokio::join;
+use tracing::warn;
 
 use super::{
     SuperfileHit,
@@ -1096,7 +1097,7 @@ impl SupertableReader {
                 Some(section)
             }
             Err(error) => {
-                eprintln!(
+                warn!(
                     "[supertable] centroid section {} unavailable ({error}); deferred rescores \
                      will fail unless the parts cache covers their cells",
                     reference.uri
