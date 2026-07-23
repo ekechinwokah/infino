@@ -10,12 +10,11 @@
 //! single-modality peers: FTS-only, vector-only, SQL, and combined FTS +
 //! vector.
 //!
-//! **Real object store only** (`INFINO_BENCH_STORE=s3` or `azure`). The
-//! multi-commit build relies on conditional `If-Match` PUTs that the
-//! `s3s-fs` emulator does not implement, so this bench rejects `s3s_fs` (the
-//! default) and exits with a message otherwise. Every object the run writes
-//! lands under one unique prefix per shape, all deleted before the runner
-//! returns (unless `INFINO_BENCH_KEEP_TABLE` is set).
+//! **RustFS (default), S3, or Azure** — the multi-commit build relies on
+//! conditional `If-Match` PUTs; the default local RustFS session implements
+//! them. Real S3 and Azure are also supported. Every object the run writes
+//! lands under one unique bucket/prefix per shape, all deleted before the
+//! runner returns (unless `INFINO_BENCH_KEEP_TABLE` is set).
 //!
 //! ## Per-shape process isolation
 //!
@@ -31,6 +30,7 @@
 //! ## Invocation
 //!
 //! ```text
+//! cargo bench -- supertable
 //! INFINO_BENCH_STORE=s3 INFINO_REAL_S3_BUCKET=my-bucket cargo bench -- supertable
 //! INFINO_BENCH_STORE=azure INFINO_REAL_AZURE_CONTAINER=my-container \
 //!   AZURE_STORAGE_ACCOUNT_NAME=... AZURE_STORAGE_ACCOUNT_KEY=... cargo bench -- supertable
@@ -3600,6 +3600,11 @@ pub mod vector {
                     == Some("1");
             let skip_vector_delta =
                 std::env::var(SKIP_VECTOR_DELTA_ENV).ok().as_deref() == Some("1");
+            // Force compaction (optimize) + post-compact on a reopened, already-drained
+            // table -- otherwise a drained existing prefix reports phase-derived only and
+            // never exercises the split.
+            let force_compact =
+                std::env::var("INFINO_BENCH_FORCE_COMPACT").ok().as_deref() == Some("1");
 
             let search_title = |phase: &str| {
                 format!(
@@ -3671,6 +3676,9 @@ pub mod vector {
             } else {
                 force_pre_post_drain
             };
+            // Run compaction/split + post-compact either in the forced drain
+            // lifecycle or when explicitly forced on a reopened drained table.
+            let run_compact = pre_post_drain || force_compact;
             let mut drain_stats: Option<(f64, storage_meter::ObjectStoreMeter, u64, Option<f64>)> =
                 None;
             let mut delta_stats: Option<(f64, storage_meter::ObjectStoreMeter, u64, Option<f64>)> =
@@ -4172,7 +4180,7 @@ pub mod vector {
                 // Optimize compacts user + hidden physical files; when the
                 // delta phase ran it first drains that tail. The following
                 // state must therefore be hidden-only in either mode.
-                let compaction_stats = pre_post_drain.then(|| {
+                let compaction_stats = run_compact.then(|| {
                     eprintln!("[supertable_vector] compacting (optimize: user + hidden)...");
                     let before = consumer_meter.snapshot();
                     let sampler = PeakSampler::start_default();
@@ -4206,7 +4214,7 @@ pub mod vector {
                     });
                 }
                 let mut cold_split_post = None;
-                if pre_post_drain {
+                if run_compact {
                     let compact_map = delta_id_to_dense.as_ref().unwrap_or(&id_to_dense);
                     let compact_truth = if skip_vector_delta {
                         &gt_correct
@@ -4552,8 +4560,13 @@ pub mod sql {
         let warm_sets_pre = if phases.warm {
             eprintln!("[supertable_sql] warm (pre-drain): opening consumer...");
             let (cache_dir, consumer) = open_consumer(Modality::Sql, &built);
-            let sets =
-                exec_sql::measure_query_sets(&consumer, &inputs, exec_sql::ITERS, "supertable_sql");
+            let sets = exec_sql::measure_query_sets(
+                &consumer,
+                &inputs,
+                exec_sql::ITERS,
+                "supertable_sql",
+                &[],
+            );
             drop(consumer);
             drop(cache_dir);
             let (anchor, title, note) = if run_lifecycle {
@@ -4668,6 +4681,7 @@ pub mod sql {
                             &inputs,
                             exec_sql::ITERS,
                             "supertable_sql",
+                            &[],
                         );
                         drop(c);
                         drop(cache_dir);

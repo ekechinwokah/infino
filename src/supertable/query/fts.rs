@@ -466,18 +466,22 @@ async fn bm25_fanout_wave(
         let routing = routing.clone();
         let cursor_caches = Arc::clone(&cursor_caches);
         async move {
-            // A cross-file floor can suppress score-tied single-term hits
-            // according to task completion order. Local BMW still prunes
-            // those queries; share the global floor for every other
-            // shape — including a single bare phrase, whose position
-            // verification makes the floor's block pruning a large win.
+            // Share the global kth-best floor with every superfile —
+            // single-term queries included — so each prunes its scored
+            // scan against the running top-k instead of returning a full
+            // local top-k for the merge to re-sort. Without this the
+            // fan-out churns ~(superfiles × k) candidates through the
+            // merge heap at large k, which dominates high-k latency.
+            // Ties stay correct: the floor prunes only scores strictly
+            // below the published kth-best (kernels compare via
+            // `floor.next_down()`), so the merged top-k — score ties
+            // included — matches an uncoordinated run; only the amount
+            // of skipped work depends on segment completion order.
+            // The deterministic choice among kth-score ties is made
+            // once, at the merge, by [`select_top_k_stable`].
             let n_terms = must_arc.len() + should_arc.len();
             let phrase_free = must_ph_arc.is_empty() && should_ph_arc.is_empty();
-            let floor = if n_terms == 1 && phrase_free {
-                f32::NEG_INFINITY
-            } else {
-                shared.floor()
-            };
+            let floor = shared.floor();
             // Resident-routed block selection: a single bare term with
             // a resident admit row visits blocks best-first by bound
             // and fetches exactly those (the FTS cell-read analog).
@@ -617,9 +621,7 @@ async fn bm25_fanout_wave(
         }
     };
     let per_unit = dispatch::fanout_local_hits(ctx, units, kernel).await?;
-    let mut hits = top_k_descending(per_unit, k);
-    dispatch::attach_stable_ids_to_hits(ctx, &mut hits).await?;
-    Ok(hits)
+    select_top_k_stable(ctx, per_unit, k).await
 }
 
 /// One unranked token-match fan-out wave over `kept` superfiles
@@ -862,9 +864,7 @@ async fn bm25_prefix_wave(
         }
     };
     let per_unit = dispatch::fanout_local_hits(ctx, units, kernel).await?;
-    let mut hits = top_k_descending(per_unit, k);
-    dispatch::attach_stable_ids_to_hits(ctx, &mut hits).await?;
-    Ok(hits)
+    select_top_k_stable(ctx, per_unit, k).await
 }
 
 impl SupertableReader {
@@ -1111,7 +1111,13 @@ impl SupertableReader {
                 None,
             );
             let (text_hits, tail_hits) = join!(text_wave, tail_wave);
-            let mut combined = top_k_descending(vec![text_hits?, tail_hits?], k_fetch);
+            // Each wave returns its own id-attached top-`k_fetch` in the
+            // (score desc, `_id` asc) total order, so the cross-wave
+            // combine is a plain merge under the same order —
+            // deterministic regardless of wave completion timing.
+            let mut combined = text_hits?;
+            combined.extend(tail_hits?);
+            sort_hits_by_score_then_id(&mut combined);
             combined.retain(|hit| {
                 hit.stable_id
                     .is_some_and(|id| route.deleted.binary_search(&id).is_err())
@@ -1203,7 +1209,11 @@ impl SupertableReader {
                 k_fetch,
             );
             let (text_hits, tail_hits) = join!(text_wave, tail_wave);
-            let mut combined = top_k_descending(vec![text_hits?, tail_hits?], k_fetch);
+            // Same cross-wave merge contract as `bm25_search_async`:
+            // waves are id-attached and (score desc, `_id` asc)-ordered.
+            let mut combined = text_hits?;
+            combined.extend(tail_hits?);
+            sort_hits_by_score_then_id(&mut combined);
             combined.retain(|hit| {
                 hit.stable_id
                     .is_some_and(|id| route.deleted.binary_search(&id).is_err())
@@ -1823,42 +1833,55 @@ fn build_work_units(
     units
 }
 
-/// Merge per-superfile hits and return the top-k by *descending*
-/// score (highest BM25 = most relevant). Uses a min-heap of size k
-/// so we never sort more than k elements.
-fn top_k_descending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
-    #[derive(PartialEq)]
-    struct MinByScore(SuperfileHit);
-    impl Eq for MinByScore {}
-    impl PartialOrd for MinByScore {
-        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-    impl Ord for MinByScore {
-        fn cmp(&self, other: &Self) -> Ordering {
-            other
-                .0
-                .score
-                .partial_cmp(&self.0.score)
-                .unwrap_or(Ordering::Equal)
-        }
-    }
+/// Total order for merged, id-attached hits: score descending, then
+/// stable `_id` ascending — deterministic and invariant across
+/// compaction (unlike physical superfile/offset keys). Shared by the
+/// single-wave merge ([`select_top_k_stable`]) and the two-wave
+/// hidden-text combines, so both routes rank ties identically.
+fn sort_hits_by_score_then_id(hits: &mut [SuperfileHit]) {
+    hits.sort_unstable_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then(a.stable_id.cmp(&b.stable_id))
+    });
+}
 
-    let mut heap = BinaryHeap::with_capacity(k + 1);
-    for hit in per_superfile.into_iter().flatten() {
-        if heap.len() < k {
-            heap.push(MinByScore(hit));
-        } else if let Some(worst) = heap.peek()
-            && hit.score > worst.0.score
-        {
-            heap.pop();
-            heap.push(MinByScore(hit));
-        }
+/// Select the global top-k deterministically and compaction-stably: order
+/// by score descending, breaking ties on the stable `_id` (ascending).
+///
+/// A plain score-only merge leaves the choice among
+/// score-tied hits to segment completion order — the cross-superfile floor
+/// changes which ties each segment returns, so the surviving tied docs vary
+/// run to run. Physical keys (superfile uuid + local offset) would break the
+/// tie but shift on every compaction. The stable `_id` is invariant across
+/// compaction, so tie-breaking on it yields the same top-k as a
+/// single-segment engine's docid-ordered ties, independent of layout or
+/// completion order. `_id`s are resolved up front here — cheap because the
+/// shared floor caps the candidate set near k.
+async fn select_top_k_stable(
+    tr: &SupertableReader,
+    per_unit: Vec<Vec<SuperfileHit>>,
+    k: usize,
+) -> Result<Vec<SuperfileHit>, QueryError> {
+    let mut cands: Vec<SuperfileHit> = per_unit.into_iter().flatten().collect();
+    // Narrow to the top-k *by score plus its boundary ties* before touching
+    // `_id`. `_id` resolution costs a decode per hit, so it must stay
+    // top-k-sized (never per-candidate — that's what the fan-out defers).
+    // Partition at the k-th best score, then keep everything scoring at or
+    // above it: the strictly-better hits are always in, and the ties at the
+    // k-th score are the only ones whose inclusion the `_id` order decides.
+    if cands.len() > k {
+        cands.select_nth_unstable_by(k - 1, |a, b| {
+            b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal)
+        });
+        let kth_score = cands[k - 1].score;
+        cands.retain(|c| c.score >= kth_score);
     }
-    let mut result: Vec<SuperfileHit> = heap.into_iter().map(|m| m.0).collect();
-    result.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-    result
+    dispatch::attach_stable_ids_to_hits(tr, &mut cands).await?;
+    sort_hits_by_score_then_id(&mut cands);
+    cands.truncate(k);
+    Ok(cands)
 }
 
 impl Supertable {
@@ -3817,9 +3840,9 @@ mod tests {
                     let mut t = String::new();
                     if d == 7 {
                         t.push_str("quick brown quick brown quick brown ");
-                    } else if d % 2 == 0 {
+                    } else if d.is_multiple_of(2) {
                         t.push_str("quick brown ");
-                    } else if d % 3 == 0 {
+                    } else if d.is_multiple_of(3) {
                         t.push_str("quick sep brown ");
                     }
                     t.push_str(&format!("fill{d} tail"));
