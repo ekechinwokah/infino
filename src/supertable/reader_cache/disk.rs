@@ -2303,15 +2303,30 @@ async fn lazy_background_fill(
             &mut filled,
             skip_vec,
         )
-        .await?
+        .await
         {
-            BackgroundFillOutcome::Complete => break,
+            Ok(BackgroundFillOutcome::Complete) => break,
             // Keep the partial `tmp` and the `filled` cursor: the next attempt
             // resumes from the first unwritten chunk.
-            BackgroundFillOutcome::Paused => {}
-            BackgroundFillOutcome::Abandoned => {
+            Ok(BackgroundFillOutcome::Paused) => {}
+            Ok(BackgroundFillOutcome::Abandoned) => {
                 rollback_lazy_background_fill(&store, &uri, &tmp);
                 return Ok(());
+            }
+            // A failed fetch must NOT leave the entry latched: nothing
+            // ever re-spawns a fill whose task died (`fill_spawned`
+            // stays set with no mmap), so `wait_until_fills_settled`
+            // would burn its whole timeout on every settle — captured
+            // live as the SQL post-drain battery stall. Roll the entry
+            // back instead; the next open re-fetches cold.
+            Err(error) => {
+                tracing::warn!(
+                    uri = ?uri,
+                    error = %error,
+                    "background fill failed; rolling entry back for a cold retry"
+                );
+                rollback_lazy_background_fill(&store, &uri, &tmp);
+                return Err(error);
             }
         }
     }
@@ -2755,6 +2770,45 @@ mod tests {
         assert!(
             !tmp.exists(),
             "tmp scratch file must be deleted after rollback"
+        );
+    }
+
+    /// A background fill that errors must roll its entry back, not
+    /// stay latched (`fill_spawned` set, no mmap, no live task):
+    /// nothing re-spawns a dead fill, so a latched entry makes
+    /// `wait_until_fills_settled` burn its full timeout on every call
+    /// — captured live (gdb thread dump) as the SQL post-drain
+    /// battery stall.
+    #[tokio::test]
+    async fn background_fill_failure_rolls_back_instead_of_latching() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+
+        // The lazy open spawns the background fill; it stays paused
+        // while the foreground reader is alive.
+        let reader = store
+            .reader_with_hints(&uri, None, None, true)
+            .await
+            .expect("lazy open");
+        // Yank the backing object, then release the foreground reader
+        // so the fill proceeds — its chunk fetch now fails.
+        store
+            .storage
+            .delete(&uri.storage_path())
+            .await
+            .expect("delete backing object");
+        drop(reader);
+
+        // A failed fill must settle promptly by rolling back; a
+        // latched entry keeps `pending` true until the timeout errs.
+        store
+            .wait_until_fills_settled(Duration::from_secs(30))
+            .await
+            .expect("settle must not time out on a failed fill");
+        assert!(
+            !store.is_cached(&uri),
+            "failed fill must evict its entry for a cold retry"
         );
     }
 

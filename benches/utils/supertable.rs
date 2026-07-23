@@ -1024,6 +1024,38 @@ const VECTOR_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
     ("post-delta", 2, 5),
     ("post-compact", 1, 5),
 ];
+/// Per-state `(label, <5M ceiling, 5M-20M ceiling)` on the FIRST cold
+/// FTS query's data GETs, calibrated on the 1M Azure lifecycle:
+/// pre-drain 128 measured (one posting fetch per surviving user file);
+/// post-drain/post-compact 26 (merged-shard open + routed posting
+/// blocks); post-delta 34 (26 hidden + 8 undrained tail). The mid
+/// column is a provisional 3x of the small tier until a 10M lifecycle
+/// calibrates it.
+const FTS_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
+    ("pre-drain", 160, 480),
+    ("post-drain", 40, 120),
+    ("post-delta", 52, 156),
+    ("post-compact", 40, 120),
+];
+/// Second (steady) cold FTS query: pre-drain re-fetches per file
+/// (128 measured); drained states serve from the merged shard
+/// (8 measured; 15 seen while two shard generations overlap).
+const FTS_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
+    ("pre-drain", 160, 480),
+    ("post-drain", 20, 60),
+    ("post-delta", 20, 60),
+    ("post-compact", 24, 72),
+];
+/// SQL scans are user-only in every state. 1M measured: first cold 8
+/// GETs, steady cold 208 (the per-file scan fan-out the scalar-index
+/// family is designed to collapse). Post-delta/post-compact rows are
+/// intentionally absent until the post-drain aggregate hang is fixed
+/// and a full SQL lifecycle calibrates them.
+const SQL_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] =
+    &[("pre-drain", 16, 48), ("post-drain", 16, 48)];
+/// See [`SQL_COLD_GET_CEILINGS_FIRST`].
+const SQL_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] =
+    &[("pre-drain", 260, 780), ("post-drain", 260, 780)];
 /// Ceiling for `label` + `n_docs` out of one of the two gate tables,
 /// when one applies to that state at this scale.
 fn cold_data_get_ceiling(table: &[(&str, u64, u64)], label: &str, n_docs: usize) -> Option<u64> {
@@ -1650,7 +1682,11 @@ pub mod fts {
             },
             true,
             true,
-            None,
+            Some(super::ColdReadAssert {
+                expected,
+                ceilings_first: super::FTS_COLD_GET_CEILINGS_FIRST,
+                ceilings_second: super::FTS_COLD_GET_CEILINGS_SECOND,
+            }),
         )
     }
 
@@ -4406,7 +4442,11 @@ pub mod sql {
             },
             true,
             true,
-            None,
+            Some(super::ColdReadAssert {
+                expected: ExpectedTiers::UserOnly,
+                ceilings_first: super::SQL_COLD_GET_CEILINGS_FIRST,
+                ceilings_second: super::SQL_COLD_GET_CEILINGS_SECOND,
+            }),
         )
     }
 
