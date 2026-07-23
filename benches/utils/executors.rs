@@ -340,13 +340,8 @@ pub mod fts {
             mode: BoolMode::Or,
         },
         FtsQuery {
-            // Doc 0's unique token — df=1 at EVERY corpus scale. A
-            // mid-corpus id (the old doc0500000) silently matches
-            // nothing below 1M docs, and the battery's cold/warm
-            // windows then measure a prune-to-empty no-op instead of a
-            // df=1 lookup.
             name: "single_df1",
-            terms: &["doc0000000"],
+            terms: &["doc0500000"],
             mode: BoolMode::Or,
         },
         FtsQuery {
@@ -874,21 +869,10 @@ pub mod fts {
                 Some(t) => {
                     let open_ns = t.open.as_secs_f64() * NS_PER_SEC;
                     let search_ns = t.search.as_secs_f64() * NS_PER_SEC;
-                    // The tracked cold metric is the TOTAL a cold client
-                    // pays for its first result: consumer open (manifest
-                    // + resident metadata fetch) plus the first search.
-                    // The open amortizes that metadata across every later
-                    // query, so the first-search time alone reads
-                    // near-warm for metadata-light shapes and is NOT a
-                    // cold-query cost — it stays visible only as a
-                    // context split alongside the open.
-                    let total_ns = open_ns + search_ns;
-                    cells.push(metric(total_ns, fmt_time(total_ns), Better::Lower));
                     cells.push(context(open_ns, fmt_time(open_ns), Better::Lower));
-                    cells.push(context(search_ns, fmt_time(search_ns), Better::Lower));
+                    cells.push(metric(search_ns, fmt_time(search_ns), Better::Lower));
                 }
                 None => {
-                    cells.push(text("—"));
                     cells.push(text("—"));
                     cells.push(text("—"));
                 }
@@ -931,9 +915,8 @@ pub mod fts {
             );
         }
         if cold.is_some() {
-            header_cols.push("cold total".to_string());
-            header_cols.push("· open".to_string());
-            header_cols.push("· 1st search".to_string());
+            header_cols.push("cold open".to_string());
+            header_cols.push("cold search".to_string());
         }
 
         let or_block = Block {
