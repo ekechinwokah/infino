@@ -169,6 +169,14 @@ fn merge_unit_scores(
 
 /// Minimum bare-OR term count for the multi-term block-selected
 /// kernel; a single bare term has its own dedicated selected walk.
+/// Driver-size ceiling for the block-selected AND kernel, in posting
+/// blocks of the rarest routed must (its resident row's length). A
+/// larger driver means the intersection is broad and per-survivor
+/// presence probes rival the SIMD leapfrog walk — measured: ten
+/// common musts ground 1.7 ms warm walks into 61 ms kernel runs. An
+/// unrouted (sub-floor) must always qualifies as driver.
+const AND_DRIVER_MAX_BLOCKS: usize = 256;
+
 const MULTI_SELECT_MIN_TERMS: usize = 2;
 /// Minimum quantized block-bound spread for a resident row to count
 /// as prunable at routing time. Bounds are ceil-quantized to u8
@@ -432,10 +440,21 @@ async fn bm25_fanout_wave(
                     .filter_map(|term| state.term_block_max(e.superfile_id, &column_arc, term))
                     .collect();
                 if must_selected {
-                    // AND engagement: at least one resident row — the
-                    // driver's presence probes do the pruning, so flat
-                    // bounds don't disqualify.
-                    !rows.is_empty()
+                    // AND engagement mirror: at least one resident row
+                    // AND a small driver (an absent must row means a
+                    // sub-floor driver; a present one qualifies by
+                    // block count). Flat bounds don't disqualify —
+                    // presence probes prune — but a broad driver does.
+                    let must_row_of =
+                        |term: &String| state.term_block_max(e.superfile_id, &column_arc, term);
+                    let small_driver = must_arc.iter().any(|t| must_row_of(t).is_none())
+                        || must_arc
+                            .iter()
+                            .filter_map(must_row_of)
+                            .map(|row| row.quantized.len())
+                            .min()
+                            .is_some_and(|blocks| blocks <= AND_DRIVER_MAX_BLOCKS);
+                    !rows.is_empty() && small_driver
                 } else {
                     !rows.is_empty()
                         && rows.iter().all(|row| row_can_prune(row))
@@ -611,7 +630,19 @@ async fn bm25_fanout_wave(
                     .iter()
                     .map(|term| state.term_block_max(suid, &column_arc, term))
                     .collect();
-                if must_rows.iter().chain(should_rows.iter()).flatten().count() > 0 {
+                // Engage only with a genuinely small driver: some
+                // must below the routing floor (no row), or a routed
+                // must whose block count is under the ceiling. Broad
+                // intersections (all musts common) keep the walk.
+                let small_driver = must_rows.iter().any(|r| r.is_none())
+                    || must_rows
+                        .iter()
+                        .flatten()
+                        .map(|row| row.quantized.len())
+                        .min()
+                        .is_some_and(|blocks| blocks <= AND_DRIVER_MAX_BLOCKS);
+                if small_driver && must_rows.iter().chain(should_rows.iter()).flatten().count() > 0
+                {
                     let mut routed_musts = Vec::new();
                     let mut unrouted_musts: Vec<&str> = Vec::new();
                     for (term, row) in must_arc.iter().zip(&must_rows) {
