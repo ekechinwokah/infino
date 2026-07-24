@@ -1083,10 +1083,17 @@ const VECTOR_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
 // reads + text-shard exact parquet reads): post-drain first 34. The
 // 10M column is stale pre-exact-read data; re-pin from the next 10M
 // gate run.
+// 10M column: post-delta re-pinned measured+2 from the exact-read
+// gate run (measured 105; the old 104 predated exact reads);
+// post-compact PROVISIONAL (widened for one measuring pass under
+// exact reads — tighten to measured+2 from the next green gate).
+// 10M column: measured+2 from the green Azure gate
+// (fts10m_azure_20260724T072204Z, V3 tiered routing + exact reads):
+// pre-drain 134, post-drain 87, post-delta 100, post-compact 41.
 const FTS_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
-    ("pre-drain", 130, 390),
+    ("pre-drain", 130, 136),
     ("post-drain", 36, 89),
-    ("post-delta", 94, 104),
+    ("post-delta", 94, 102),
     ("post-compact", 30, 43),
 ];
 /// Second (steady) cold FTS query, tight at the exact 1M
@@ -1106,11 +1113,20 @@ const FTS_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
 // lucky roll of the second-query-vs-background-fill race).
 // post-compact 16 is provisional (measured 14 pre-fix-C); tighten
 // with the 10M column from the next gate runs.
+// 10M column: post-delta re-pinned measured+2 (measured 37, exact
+// reads: more, smaller GETs but ~100x fewer bytes — 278 KB steady);
+// post-compact PROVISIONAL for one measuring pass.
+// 10M column: observed-max+2 across the exact-read-era gate runs
+// (Azure green 072204Z: 130/27/35/16; the first Azure pass measured
+// post-drain 31 — V3's engaged terms each pay one spilled-slice
+// ranged read cold, so the count varies with term engagement).
+// Bytes tell the real story: steady cold is ~190-270 KB where the
+// pre-exact-read era paid 4.5-29 MiB.
 const FTS_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
     ("pre-drain", 128, 384),
-    ("post-drain", 13, 28),
-    ("post-delta", 22, 31),
-    ("post-compact", 16, 13),
+    ("post-drain", 13, 33),
+    ("post-delta", 22, 39),
+    ("post-compact", 16, 18),
 ];
 /// SQL scans are user-only in every state. 1M measured (first full
 /// SQL lifecycle after the settle-stall fixes): first cold 8 GETs
