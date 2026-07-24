@@ -1,39 +1,59 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Resident FTS block-max routing state — the text-superfile analog of
-//! the vector path's 1-bit admit slab.
+//! Tiered FTS block-max routing state — the text-superfile analog of
+//! the vector path's resident 1-bit admit slab + spilled fp32
+//! centroid section.
 //!
 //! For every text superfile (merged inverted-index shard) the drain
-//! publishes, this blob carries each **heavy** term's per-block BM25
-//! upper bounds, 1-byte quantized, plus the term's postings-region
-//! offset. Hydrated resident, it lets a query select which posting
-//! blocks to visit — best-first by bound, stopping once the running
-//! kth-best floor exceeds every remaining bound — and fetch **only the
-//! selected blocks' byte ranges**, exactly as the vector path ranks
-//! cells on the resident slab and fetches only admitted cells' bytes.
-//! Deeper scans (larger `k`) admit more blocks.
+//! publishes, one content-addressed blob carries each **heavy** term's
+//! routing data in two tiers:
+//!
+//! * **Resident directory (L0)** — per term: postings-region offset,
+//!   df, dequantization scale, block count, and COARSE bounds (one
+//!   ceil-quantized byte per [`COARSE_GROUP_BLOCKS`]-block group).
+//!   Hydration keeps ONLY this tier in memory: ~1 MB at 10M docs where
+//!   full per-block residency was ~70 MB (and ~7 GB at 1B — the
+//!   VERSION-2 lesson). The coarse bounds drive the dispatch gates:
+//!   which files engage block selection at all.
+//! * **Spilled per-term slices (L1)** — per block: the 1-byte bound,
+//!   last doc id, and fence-post offset. Fetched on demand per
+//!   (file, term) as one ranged read of this same blob (CRC-checked,
+//!   single-flight, cached for the generation's lifetime), exactly as
+//!   the vector path preads its once-per-generation centroid section.
+//!   Engaged queries pay at most one extra GET per routed term cold
+//!   and nothing warm.
+//!
+//! Kernels then select posting blocks best-first by bound, stopping
+//! once the running kth-best floor exceeds every remaining bound, and
+//! fetch **only the selected blocks' byte ranges**. Deeper scans
+//! (larger `k`) admit more blocks.
 //!
 //! The exact 16-byte skip entries stay inside the superfile next to
-//! the postings (the fetch source for selected blocks' offsets); this
-//! blob is a pure routing accelerator: lose it and queries fall back
-//! to whole-term posting fetches, wrong it can never be (quantization
-//! only ever rounds bounds UP).
+//! the postings; this blob is a pure routing accelerator: lose it and
+//! queries fall back to whole-term posting fetches, wrong it can never
+//! be (quantization only ever rounds bounds UP).
 //!
 //! One content-addressed object per generation, referenced from the
 //! hidden manifest list ([`ManifestSnapshot::slow_fts_state_blob`]),
 //! stamped by the drain in the same commit that publishes the text
-//! shards it describes, and kept alive by GC via that ref.
+//! shards it describes, and kept alive by GC via that ref. Hydration
+//! currently downloads the whole blob once to verify the content hash
+//! and drops everything past the directory; moving to a ranged
+//! header-only read (blob size in [`RoutingRef`]) is a scoped
+//! follow-up.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
+use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use crate::{
     storage::{StorageError, StorageProvider},
     superfile::{
         error::FtsError,
+        format::checksum::crc32c,
         fts::reader::{FtsReader, RoutedTermRow},
     },
     supertable::manifest::{RoutingRef, part::ContentHash},
@@ -46,11 +66,26 @@ pub(crate) const STORAGE_PREFIX: &str = "slow-fts-state/";
 /// 8-byte magic at the start of the blob.
 const MAGIC: &[u8; 8] = b"INFFBM01";
 
-/// Blob format version.
-const VERSION: u32 = 2;
+/// Blob format version. 3 = tiered layout: resident directory with
+/// coarse bounds, per-term block data spilled behind `spill_base`.
+const VERSION: u32 = 3;
 
 /// Quantization steps for the 1-byte per-block bound (`u8::MAX`).
 pub(crate) const QUANT_STEPS: f32 = 255.0;
+
+/// Blocks per coarse-bound group in the resident directory: each
+/// group byte is the max of its blocks' quantized bounds, so the
+/// resident tier is 1/8 the per-block data and still a true upper
+/// bound for every block it covers.
+pub(crate) const COARSE_GROUP_BLOCKS: usize = 8;
+
+/// Fixed-width prefix before the directory: magic + version +
+/// `spill_base` (u64).
+const HEADER_PREFIX_BYTES: usize = 8 + 4 + 8;
+
+/// Trailing crc32c width, used by both the directory (last 4 bytes
+/// before `spill_base`) and every spilled term slice.
+const CRC_BYTES: usize = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SlowFtsStateError {
@@ -62,7 +97,9 @@ pub(crate) enum SlowFtsStateError {
     Fts(String),
 }
 
-/// One heavy term's resident routing row.
+/// One heavy term's FULL routing row: the build-side shape the drain
+/// produces, and the fetched shape a query hydrates from one spilled
+/// slice (L1) when the term engages block selection.
 #[derive(Debug, Clone)]
 pub(crate) struct TermBlockMax {
     /// Term bytes (tokenizer output), sorted within the column.
@@ -120,36 +157,114 @@ impl TermBlockMax {
     }
 }
 
-/// One column's heavy terms, sorted by term bytes.
+/// One column's heavy terms, sorted by term bytes (build side).
 #[derive(Debug, Clone)]
 pub(crate) struct ColumnBlockMax {
     pub column: String,
     pub terms: Vec<TermBlockMax>,
 }
 
-/// One text superfile's routing rows.
+/// One text superfile's routing rows (build side).
 #[derive(Debug, Clone)]
 pub(crate) struct FileBlockMax {
     pub superfile_id: Uuid,
     pub columns: Vec<ColumnBlockMax>,
 }
 
-/// The hydrated resident state for one published generation.
+/// The build-side state: every file's FULL rows, as the drain computes
+/// them. [`encode_state`] is its only consumer — the encoder derives
+/// the resident directory (coarse bounds, spill offsets) from it.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SlowFtsState {
-    /// Sorted by `superfile_id` for binary-search lookup.
+pub(crate) struct SlowFtsStateFull {
+    /// Sorted by `superfile_id`.
     pub files: Vec<FileBlockMax>,
 }
 
+/// One heavy term's RESIDENT directory row (L0): everything the
+/// dispatch gates need to decide engagement, plus the location of the
+/// term's spilled per-block slice.
+#[derive(Debug)]
+pub(crate) struct TermDirRow {
+    /// Term bytes (tokenizer output), sorted within the column.
+    pub term: Vec<u8>,
+    /// The term's postings-region `metadata_offset`.
+    pub metadata_offset: u64,
+    /// Document frequency — the idf input.
+    pub df: u64,
+    /// Per-term dequantization scale: the largest block bound.
+    pub scale: f32,
+    /// Posting block count (sizes the spilled slice).
+    pub n_blocks: u32,
+    /// Spilled-slice offset relative to the blob's `spill_base`.
+    spill_rel: u64,
+    /// Coarse bounds: one byte per [`COARSE_GROUP_BLOCKS`]-block
+    /// group, the max of the group's quantized bounds — a true upper
+    /// bound for every covered block, at 1/8 the residency.
+    pub coarse: Vec<u8>,
+    /// Single-flight cache of the fetched full row, per generation.
+    cell: OnceCell<Arc<TermBlockMax>>,
+}
+
+impl TermDirRow {
+    /// Largest coarse bound — by ceil-quantization construction this
+    /// is always the term max (255) for a non-empty row.
+    #[cfg(test)]
+    fn max_coarse(&self) -> u8 {
+        self.coarse.iter().copied().max().unwrap_or(0)
+    }
+}
+
+/// One column's resident directory rows, sorted by term bytes.
+#[derive(Debug)]
+pub(crate) struct ColumnDir {
+    pub column: String,
+    pub terms: Vec<TermDirRow>,
+}
+
+/// One text superfile's resident directory.
+#[derive(Debug)]
+pub(crate) struct FileDir {
+    pub superfile_id: Uuid,
+    pub columns: Vec<ColumnDir>,
+}
+
+/// Where a hydrated state's spilled slices live.
+#[derive(Debug)]
+enum Spill {
+    /// The whole blob is in memory (tests). Slices decode from it
+    /// directly, through the same directory-parse + slice-decode
+    /// path as production.
+    #[cfg(test)]
+    Inline(Bytes),
+    /// Slices are ranged reads of the published generation object.
+    Remote {
+        storage: Arc<dyn StorageProvider>,
+        uri: String,
+    },
+}
+
+/// The hydrated QUERY-side state for one published generation:
+/// resident directory + on-demand spilled slices.
+#[derive(Debug, Default)]
+pub(crate) struct SlowFtsState {
+    /// Sorted by `superfile_id` for binary-search lookup.
+    pub files: Vec<FileDir>,
+    /// Absolute blob offset where the spilled section starts.
+    spill_base: u64,
+    /// `None` only for the `Default` empty state (no files ⇒ no
+    /// lookups ⇒ no fetches).
+    spill: Option<Spill>,
+}
+
 impl SlowFtsState {
-    /// The resident routing row for `(superfile, column, term)`, if the
-    /// term was heavy enough to carry one.
-    pub(crate) fn term_block_max(
+    /// The resident directory row for `(superfile, column, term)`, if
+    /// the term was heavy enough to carry one.
+    pub(crate) fn term_dir(
         &self,
         superfile_id: Uuid,
         column: &str,
         term: &str,
-    ) -> Option<&TermBlockMax> {
+    ) -> Option<&TermDirRow> {
         let file = self
             .files
             .binary_search_by(|f| f.superfile_id.cmp(&superfile_id))
@@ -161,6 +276,64 @@ impl SlowFtsState {
             .ok()
             .map(|i| &col.terms[i])
     }
+
+    /// The term's FULL row, fetching its spilled slice on first use
+    /// (single-flight per term per generation; one ranged read, CRC
+    /// checked). Warm calls return the cached `Arc` untouched.
+    pub(crate) async fn fetch_row(
+        &self,
+        dir: &TermDirRow,
+    ) -> Result<Arc<TermBlockMax>, SlowFtsStateError> {
+        dir.cell
+            .get_or_try_init(|| async {
+                let n = dir.n_blocks as usize;
+                let len = slice_len(n) as u64;
+                let start = self
+                    .spill_base
+                    .checked_add(dir.spill_rel)
+                    .ok_or_else(|| SlowFtsStateError::Parse("spill offset overflow".into()))?;
+                let bytes = match self.spill.as_ref() {
+                    #[cfg(test)]
+                    Some(Spill::Inline(blob)) => {
+                        let s = start as usize;
+                        let e = s
+                            .checked_add(len as usize)
+                            .filter(|&e| e <= blob.len())
+                            .ok_or_else(|| {
+                                SlowFtsStateError::Parse("spill slice out of bounds".into())
+                            })?;
+                        blob.slice(s..e)
+                    }
+                    Some(Spill::Remote { storage, uri }) => storage
+                        .get_range(uri, start..start + len)
+                        .await
+                        .map_err(|e| SlowFtsStateError::Storage(e.to_string()))?,
+                    None => {
+                        return Err(SlowFtsStateError::Parse(
+                            "slow-fts-state has no spill source".into(),
+                        ));
+                    }
+                };
+                decode_term_slice(&bytes, dir).map(Arc::new)
+            })
+            .await
+            .map(Arc::clone)
+    }
+}
+
+/// Spilled-slice byte length for `n` blocks: bounds + last docs +
+/// fence-post offsets + trailing crc32c.
+fn slice_len(n: usize) -> usize {
+    n + n * 4 + (n + 1) * 4 + CRC_BYTES
+}
+
+/// Coarse bounds for one full row: max of each
+/// [`COARSE_GROUP_BLOCKS`]-block group's quantized bounds.
+fn coarse_bounds(quantized: &[u8]) -> Vec<u8> {
+    quantized
+        .chunks(COARSE_GROUP_BLOCKS)
+        .map(|g| g.iter().copied().max().unwrap_or(0))
+        .collect()
 }
 
 /// Extract one text superfile's routing rows from its (resident)
@@ -216,13 +389,43 @@ pub(crate) async fn build_file_block_max(
     })
 }
 
-/// Encode the state to its wire form (see the module docs for the
-/// role; layout below is length-prefixed little-endian).
-pub(crate) fn encode_state(state: &SlowFtsState) -> Vec<u8> {
+/// Encode the build-side state to its V3 wire form: a resident
+/// directory (crc-terminated) at the front, every term's per-block
+/// slice (crc-terminated) behind `spill_base`. Spill offsets in the
+/// directory are RELATIVE to `spill_base`, so the directory's length
+/// never depends on the absolute positions it describes.
+pub(crate) fn encode_state(state: &SlowFtsStateFull) -> Vec<u8> {
+    // Pass 1: the spilled section, recording each term's relative
+    // offset in build order (the same order the directory serializes).
+    let mut spill: Vec<u8> = Vec::new();
+    let mut spill_rels: Vec<u64> = Vec::new();
+    for file in &state.files {
+        for col in &file.columns {
+            for t in &col.terms {
+                spill_rels.push(spill.len() as u64);
+                let payload_start = spill.len();
+                spill.extend_from_slice(&t.quantized);
+                for &d in &t.last_docs {
+                    spill.extend_from_slice(&d.to_le_bytes());
+                }
+                for &o in &t.offsets {
+                    spill.extend_from_slice(&o.to_le_bytes());
+                }
+                let crc = crc32c(&spill[payload_start..]);
+                spill.extend_from_slice(&crc.to_le_bytes());
+            }
+        }
+    }
+
+    // Pass 2: the directory, with coarse bounds derived per term.
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
+    // `spill_base` back-patched once the directory length is known.
+    let spill_base_at = out.len();
+    out.extend_from_slice(&0u64.to_le_bytes());
     out.extend_from_slice(&(state.files.len() as u32).to_le_bytes());
+    let mut next_rel = spill_rels.iter().copied();
     for file in &state.files {
         out.extend_from_slice(file.superfile_id.as_bytes());
         out.extend_from_slice(&(file.columns.len() as u32).to_le_bytes());
@@ -237,21 +440,31 @@ pub(crate) fn encode_state(state: &SlowFtsState) -> Vec<u8> {
                 out.extend_from_slice(&t.df.to_le_bytes());
                 out.extend_from_slice(&t.scale.to_le_bytes());
                 out.extend_from_slice(&(t.quantized.len() as u32).to_le_bytes());
-                out.extend_from_slice(&t.quantized);
-                for &d in &t.last_docs {
-                    out.extend_from_slice(&d.to_le_bytes());
-                }
-                for &o in &t.offsets {
-                    out.extend_from_slice(&o.to_le_bytes());
-                }
+                let rel = next_rel.next().expect("one spill slice per term");
+                out.extend_from_slice(&rel.to_le_bytes());
+                out.extend_from_slice(&coarse_bounds(&t.quantized));
             }
         }
     }
+    let dir_crc = crc32c(&out);
+    out.extend_from_slice(&dir_crc.to_le_bytes());
+    let spill_base = out.len() as u64;
+    out[spill_base_at..spill_base_at + 8].copy_from_slice(&spill_base.to_le_bytes());
+    // The directory crc covers the back-patched `spill_base`, so
+    // recompute it now that the field is final.
+    let crc_at = out.len() - CRC_BYTES;
+    let dir_crc = crc32c(&out[..crc_at]);
+    let crc_bytes = dir_crc.to_le_bytes();
+    out[crc_at..].copy_from_slice(&crc_bytes);
+    out.extend_from_slice(&spill);
     out
 }
 
-/// Decode a blob written by [`encode_state`]. Corrupt input yields
-/// `Err`, never a panic — consumers fall back to whole-term fetches.
+/// Decode a V3 directory written by [`encode_state`] from the blob's
+/// prefix (`bytes` must reach `spill_base`; extra bytes are ignored).
+/// Corrupt input yields `Err`, never a panic — consumers fall back to
+/// whole-term fetches. The returned state carries no spill source;
+/// [`fetch_state`] (or a test's inline attach) supplies it.
 pub(crate) fn decode_state(bytes: &[u8]) -> Result<SlowFtsState, SlowFtsStateError> {
     let mut at = 0usize;
     let take = |at: &mut usize, n: usize| -> Result<&[u8], SlowFtsStateError> {
@@ -272,11 +485,26 @@ pub(crate) fn decode_state(bytes: &[u8]) -> Result<SlowFtsState, SlowFtsStateErr
             "unsupported slow-fts-state version {version}"
         )));
     }
+    let spill_base = u64::from_le_bytes(take(&mut at, 8)?.try_into().expect("8 bytes"));
+    let dir_len = usize::try_from(spill_base)
+        .ok()
+        .filter(|&d| d >= HEADER_PREFIX_BYTES + CRC_BYTES && d <= bytes.len())
+        .ok_or_else(|| SlowFtsStateError::Parse("bad slow-fts-state spill base".into()))?;
+    // Directory integrity: the trailing crc32c covers everything
+    // before it, `spill_base` included (it was back-patched before the
+    // crc was computed).
+    let crc_at = dir_len - CRC_BYTES;
+    let want = u32::from_le_bytes(bytes[crc_at..dir_len].try_into().expect("4 bytes"));
+    if crc32c(&bytes[..crc_at]) != want {
+        return Err(SlowFtsStateError::Parse(
+            "slow-fts-state directory crc mismatch".into(),
+        ));
+    }
     // Length prefixes are untrusted until their bytes are consumed:
     // clamp every pre-allocation by the bytes remaining (each element
     // is at least one byte), so a corrupt count returns `Err` at the
     // first truncated element instead of aborting on allocation.
-    let bounded_cap = |n: usize, at: usize| n.min(bytes.len().saturating_sub(at));
+    let bounded_cap = |n: usize, at: usize| n.min(dir_len.saturating_sub(at));
     let n_files = u32::from_le_bytes(take(&mut at, 4)?.try_into().expect("4 bytes")) as usize;
     let mut files = Vec::with_capacity(bounded_cap(n_files, at));
     for _ in 0..n_files {
@@ -300,35 +528,73 @@ pub(crate) fn decode_state(bytes: &[u8]) -> Result<SlowFtsState, SlowFtsStateErr
                     u64::from_le_bytes(take(&mut at, 8)?.try_into().expect("8 bytes"));
                 let df = u64::from_le_bytes(take(&mut at, 8)?.try_into().expect("8 bytes"));
                 let scale = f32::from_le_bytes(take(&mut at, 4)?.try_into().expect("4 bytes"));
-                let n_blocks =
-                    u32::from_le_bytes(take(&mut at, 4)?.try_into().expect("4 bytes")) as usize;
-                let quantized = take(&mut at, n_blocks)?.to_vec();
-                let last_docs: Vec<u32> = take(&mut at, n_blocks * 4)?
-                    .chunks_exact(4)
-                    .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
-                    .collect();
-                let offsets: Vec<u32> = take(&mut at, (n_blocks + 1) * 4)?
-                    .chunks_exact(4)
-                    .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
-                    .collect();
-                terms.push(TermBlockMax {
+                let n_blocks = u32::from_le_bytes(take(&mut at, 4)?.try_into().expect("4 bytes"));
+                let spill_rel = u64::from_le_bytes(take(&mut at, 8)?.try_into().expect("8 bytes"));
+                let coarse =
+                    take(&mut at, (n_blocks as usize).div_ceil(COARSE_GROUP_BLOCKS))?.to_vec();
+                terms.push(TermDirRow {
                     term,
                     metadata_offset,
                     df,
                     scale,
-                    quantized,
-                    last_docs,
-                    offsets,
+                    n_blocks,
+                    spill_rel,
+                    coarse,
+                    cell: OnceCell::new(),
                 });
             }
-            columns.push(ColumnBlockMax { column, terms });
+            columns.push(ColumnDir { column, terms });
         }
-        files.push(FileBlockMax {
+        files.push(FileDir {
             superfile_id,
             columns,
         });
     }
-    Ok(SlowFtsState { files })
+    if at != crc_at {
+        return Err(SlowFtsStateError::Parse(
+            "slow-fts-state directory has trailing bytes".into(),
+        ));
+    }
+    Ok(SlowFtsState {
+        files,
+        spill_base,
+        spill: None,
+    })
+}
+
+/// Decode one spilled term slice (crc-terminated) into the FULL row.
+fn decode_term_slice(bytes: &[u8], dir: &TermDirRow) -> Result<TermBlockMax, SlowFtsStateError> {
+    let n = dir.n_blocks as usize;
+    if bytes.len() != slice_len(n) {
+        return Err(SlowFtsStateError::Parse(
+            "slow-fts-state slice length mismatch".into(),
+        ));
+    }
+    let crc_at = bytes.len() - CRC_BYTES;
+    let want = u32::from_le_bytes(bytes[crc_at..].try_into().expect("4 bytes"));
+    if crc32c(&bytes[..crc_at]) != want {
+        return Err(SlowFtsStateError::Parse(
+            "slow-fts-state slice crc mismatch".into(),
+        ));
+    }
+    let quantized = bytes[..n].to_vec();
+    let last_docs: Vec<u32> = bytes[n..n + n * 4]
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
+        .collect();
+    let offsets: Vec<u32> = bytes[n + n * 4..crc_at]
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
+        .collect();
+    Ok(TermBlockMax {
+        term: dir.term.clone(),
+        metadata_offset: dir.metadata_offset,
+        df: dir.df,
+        scale: dir.scale,
+        quantized,
+        last_docs,
+        offsets,
+    })
 }
 
 /// Content-addressed URI for one published generation.
@@ -339,7 +605,7 @@ pub(crate) fn storage_path(hash: &ContentHash) -> String {
 /// Publish one generation: encode, content-address, idempotent PUT.
 pub(crate) async fn write_state(
     storage: &dyn StorageProvider,
-    state: &SlowFtsState,
+    state: &SlowFtsStateFull,
 ) -> Result<RoutingRef, SlowFtsStateError> {
     let bytes = encode_state(state);
     let content_hash = ContentHash::of(&bytes);
@@ -351,10 +617,15 @@ pub(crate) async fn write_state(
     Ok(RoutingRef { uri, content_hash })
 }
 
-/// Fetch + verify + decode one generation. Any failure surfaces as
-/// `Err`; consumers treat it as "no resident routing" and fall back.
+/// Fetch + verify one generation, keeping ONLY the resident directory
+/// in memory; per-term slices come back later as ranged reads of the
+/// same (immutable, content-addressed) object. Any failure surfaces
+/// as `Err`; consumers treat it as "no resident routing" and fall
+/// back. The whole blob is downloaded once here so the content hash
+/// can be verified end-to-end, then dropped past the directory;
+/// slices re-fetched later are guarded by their own crc32c.
 pub(crate) async fn fetch_state(
-    storage: &dyn StorageProvider,
+    storage: Arc<dyn StorageProvider>,
     reference: &RoutingRef,
 ) -> Result<Arc<SlowFtsState>, SlowFtsStateError> {
     let (bytes, _) = storage
@@ -367,7 +638,24 @@ pub(crate) async fn fetch_state(
             reference.uri
         )));
     }
-    Ok(Arc::new(decode_state(&bytes)?))
+    let mut state = decode_state(&bytes)?;
+    state.spill = Some(Spill::Remote {
+        storage,
+        uri: reference.uri.clone(),
+    });
+    Ok(Arc::new(state))
+}
+
+/// Hydrate a build-side state through the real wire path with the
+/// whole blob retained inline — the query-side state tests use this,
+/// exercising the same directory parse and slice decode as production
+/// without a storage provider.
+#[cfg(test)]
+pub(crate) fn hydrate_inline(full: &SlowFtsStateFull) -> Result<SlowFtsState, SlowFtsStateError> {
+    let bytes = encode_state(full);
+    let mut state = decode_state(&bytes)?;
+    state.spill = Some(Spill::Inline(Bytes::from(bytes)));
+    Ok(state)
 }
 
 #[cfg(test)]
@@ -381,8 +669,8 @@ mod tests {
         builder::FtsBuilder, reader::BoolMode, tokenize::AsciiLowerTokenizer,
     };
 
-    fn sample_state() -> SlowFtsState {
-        SlowFtsState {
+    fn sample_state() -> SlowFtsStateFull {
+        SlowFtsStateFull {
             files: vec![FileBlockMax {
                 superfile_id: Uuid::from_u128(7),
                 columns: vec![ColumnBlockMax {
@@ -412,32 +700,59 @@ mod tests {
         }
     }
 
-    #[test]
-    fn state_round_trips() {
-        let state = sample_state();
-        let bytes = encode_state(&state);
-        let decoded = decode_state(&bytes).expect("decode");
-        assert_eq!(decoded.files.len(), 1);
-        let t = decoded
-            .term_block_max(Uuid::from_u128(7), "title", "common")
-            .expect("row present");
-        assert_eq!(t.metadata_offset, 1234);
-        assert_eq!(t.n_blocks(), 4);
-        assert_eq!(t.block_bound(0), 8.5);
+    #[tokio::test]
+    async fn state_round_trips() {
+        let full = sample_state();
+        let state = hydrate_inline(&full).expect("hydrate");
+        assert_eq!(state.files.len(), 1);
+        let dir = state
+            .term_dir(Uuid::from_u128(7), "title", "common")
+            .expect("dir row present");
+        assert_eq!(dir.metadata_offset, 1234);
+        assert_eq!(dir.n_blocks, 4);
+        assert_eq!(dir.coarse.len(), 1, "4 blocks fit one coarse group");
+        assert_eq!(dir.max_coarse(), 255, "ceil-quant max is always full");
+        // The fetched full row equals the encoded input exactly.
+        let row = state.fetch_row(dir).await.expect("slice fetch");
+        let want = &full.files[0].columns[0].terms[0];
+        assert_eq!(row.quantized, want.quantized);
+        assert_eq!(row.last_docs, want.last_docs);
+        assert_eq!(row.offsets, want.offsets);
+        assert_eq!(row.n_blocks(), 4);
+        assert_eq!(row.block_bound(0), 8.5);
+        // Second fetch returns the cached Arc (single-flight cell).
+        let again = state.fetch_row(dir).await.expect("cached fetch");
+        assert!(StdArc::ptr_eq(&row, &again));
+        // The 300-block term spans multiple coarse groups.
+        let heavy = state
+            .term_dir(Uuid::from_u128(7), "title", "heavy")
+            .expect("heavy dir row");
+        assert_eq!(heavy.coarse.len(), 300usize.div_ceil(COARSE_GROUP_BLOCKS));
         assert!(
-            decoded
-                .term_block_max(Uuid::from_u128(7), "title", "absent")
+            state
+                .term_dir(Uuid::from_u128(7), "title", "absent")
                 .is_none()
         );
     }
 
-    #[test]
-    fn decode_rejects_truncation_and_bad_magic() {
+    #[tokio::test]
+    async fn decode_rejects_truncation_and_bad_magic() {
         let bytes = encode_state(&sample_state());
-        assert!(decode_state(&bytes[..bytes.len() - 3]).is_err());
         let mut bad = bytes.clone();
         bad[0] = b'X';
         assert!(decode_state(&bad).is_err());
+        // A cut inside the directory fails decode outright.
+        let spill_base = u64::from_le_bytes(bytes[12..20].try_into().expect("8")) as usize;
+        assert!(decode_state(&bytes[..spill_base - 3]).is_err());
+        // A cut inside the SPILL leaves the directory decodable — the
+        // damage surfaces as a failed (crc/length-checked) slice fetch.
+        let cut = Bytes::from(bytes[..bytes.len() - 3].to_vec());
+        let mut state = decode_state(&cut).expect("directory intact");
+        state.spill = Some(Spill::Inline(cut));
+        let dir = state
+            .term_dir(Uuid::from_u128(7), "title", "heavy")
+            .expect("dir row");
+        assert!(state.fetch_row(dir).await.is_err());
     }
 
     /// `write_state` / `fetch_state` round-trip through LocalFs, and a
@@ -453,19 +768,27 @@ mod tests {
         let dir = TempDir::new().expect("tmpdir");
         let storage = Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
         let state = sample_state();
+        let storage_dyn: Arc<dyn StorageProvider> = storage.clone();
         let reference = write_state(storage.as_ref(), &state)
             .await
             .expect("write_state");
-        let fetched = fetch_state(storage.as_ref(), &reference)
+        let fetched = fetch_state(Arc::clone(&storage_dyn), &reference)
             .await
             .expect("fetch_state");
         assert_eq!(fetched.files.len(), state.files.len());
         assert_eq!(fetched.files[0].superfile_id, state.files[0].superfile_id);
+        // Remote spill path: a slice comes back as a ranged read of
+        // the published object and matches the encoded input.
+        let dir = fetched
+            .term_dir(Uuid::from_u128(7), "title", "common")
+            .expect("dir row");
+        let row = fetched.fetch_row(dir).await.expect("remote slice fetch");
+        assert_eq!(row.quantized, state.files[0].columns[0].terms[0].quantized);
 
         // Tamper with the expected hash — fetch must refuse the bytes.
         let mut bad = reference.clone();
         bad.content_hash.0[0] ^= 0xff;
-        let err = fetch_state(storage.as_ref(), &bad)
+        let err = fetch_state(Arc::clone(&storage_dyn), &bad)
             .await
             .expect_err("hash mismatch");
         assert!(
@@ -478,7 +801,7 @@ mod tests {
             uri: "slow-fts-state/does-not-exist.bin".into(),
             content_hash: ContentHash([0u8; 32]),
         };
-        let err = fetch_state(storage.as_ref(), &missing)
+        let err = fetch_state(storage_dyn, &missing)
             .await
             .expect_err("missing uri");
         assert!(matches!(err, SlowFtsStateError::Storage(_)), "{err:?}");
@@ -489,7 +812,9 @@ mod tests {
     #[test]
     fn decode_rejects_bad_version_and_non_utf8_column() {
         let mut bytes = encode_state(&sample_state());
-        // VERSION is the u32 immediately after MAGIC.
+        // VERSION is the u32 immediately after MAGIC (checked before
+        // the directory crc, so an unsupported version reports as
+        // such rather than as corruption).
         let ver_at = MAGIC.len();
         bytes[ver_at..ver_at + 4].copy_from_slice(&999u32.to_le_bytes());
         let err = decode_state(&bytes).expect_err("bad version");
@@ -498,16 +823,29 @@ mod tests {
             "{err:?}"
         );
 
-        // Re-encode, then overwrite the first column name with a
-        // non-UTF-8 byte sequence of the same length.
+        // A tampered column name without a crc re-patch fails closed
+        // at the directory crc.
         let mut bytes = encode_state(&sample_state());
-        // Layout after MAGIC+version+n_files+uuid+n_columns: u16 name_len, name bytes.
-        let name_len_at = MAGIC.len() + 4 + 4 + 16 + 4;
+        // Layout after MAGIC+version+spill_base+n_files+uuid+n_columns:
+        // u16 name_len, name bytes.
+        let name_len_at = MAGIC.len() + 4 + 8 + 4 + 16 + 4;
         let name_len =
             u16::from_le_bytes(bytes[name_len_at..name_len_at + 2].try_into().expect("2"));
         assert_eq!(name_len as usize, "title".len());
         let name_at = name_len_at + 2;
         bytes[name_at] = 0xff; // invalid UTF-8 lead byte
+        let err = decode_state(&bytes).expect_err("crc catches the tamper");
+        assert!(
+            matches!(err, SlowFtsStateError::Parse(ref msg) if msg.contains("crc")),
+            "{err:?}"
+        );
+
+        // Re-patch the crc so the parse reaches the name itself — the
+        // UTF-8 validation must still fail closed.
+        let spill_base = u64::from_le_bytes(bytes[12..20].try_into().expect("8")) as usize;
+        let crc_at = spill_base - CRC_BYTES;
+        let crc = crc32c(&bytes[..crc_at]).to_le_bytes();
+        bytes[crc_at..spill_base].copy_from_slice(&crc);
         let err = decode_state(&bytes).expect_err("non-utf8 column");
         assert!(matches!(err, SlowFtsStateError::Parse(_)), "{err:?}");
     }
@@ -538,10 +876,11 @@ mod tests {
         let file = build_file_block_max(Uuid::from_u128(1), &r, 2)
             .await
             .expect("rows");
-        let state = SlowFtsState { files: vec![file] };
-        let row = state
-            .term_block_max(Uuid::from_u128(1), "body", "common")
+        let state = hydrate_inline(&SlowFtsStateFull { files: vec![file] }).expect("hydrate");
+        let dir = state
+            .term_dir(Uuid::from_u128(1), "body", "common")
             .expect("'common' is heavy enough at floor 2");
+        let row = state.fetch_row(dir).await.expect("slice fetch");
         assert!(row.n_blocks() > 4, "corpus spans multiple blocks");
 
         for k in [1usize, 3, 10, 100, 500] {
@@ -601,10 +940,11 @@ mod tests {
         let file = build_file_block_max(Uuid::from_u128(1), &r, 2)
             .await
             .expect("rows");
-        let state = SlowFtsState { files: vec![file] };
-        let row = state
-            .term_block_max(Uuid::from_u128(1), "body", "common")
+        let state = hydrate_inline(&SlowFtsStateFull { files: vec![file] }).expect("hydrate");
+        let dir = state
+            .term_dir(Uuid::from_u128(1), "body", "common")
             .expect("'common' carries a row");
+        let row = state.fetch_row(dir).await.expect("slice fetch");
 
         let expected = r
             .search_with_floor("body", &["common"], 2, BoolMode::Or, f32::NEG_INFINITY)

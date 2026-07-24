@@ -103,7 +103,7 @@ use super::{
     },
     opann,
     options::{DECIMAL128_PRECISION, DECIMAL128_SCALE, SupertableOptions},
-    slow_fts_state::{self, FileBlockMax, SlowFtsState},
+    slow_fts_state::{self, FileBlockMax, SlowFtsStateFull},
     utils::vector_split::split_vectors,
     wal::{
         WalStore,
@@ -3120,7 +3120,7 @@ struct TextDrainOutcome {
     /// Resident block-max routing rows for this epoch's shards; the
     /// caller publishes them as the slow-CAS FTS blob and stamps the
     /// ref in the same commit.
-    fts_state: SlowFtsState,
+    fts_state: SlowFtsStateFull,
 }
 
 /// Build this epoch's hidden **text superfiles**: term-range shards of
@@ -3788,7 +3788,7 @@ async fn drain_fts_text_shards(
             removed_entries,
             pending_cache_inserts: Vec::new(),
             pending_store_inserts: Vec::new(),
-            fts_state: SlowFtsState::default(),
+            fts_state: SlowFtsStateFull::default(),
         }));
     }
     // Doc-partitioned shards: group the final runs (contiguous,
@@ -4112,7 +4112,7 @@ async fn drain_fts_text_shards(
         removed_entries,
         pending_cache_inserts: publish.pending_cache_inserts,
         pending_store_inserts: publish.pending_store_inserts,
-        fts_state: SlowFtsState {
+        fts_state: SlowFtsStateFull {
             files: fts_state_files,
         },
     }))

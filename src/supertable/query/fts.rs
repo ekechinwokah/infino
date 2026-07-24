@@ -79,6 +79,7 @@ use std::{
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, LargeStringArray};
 use dashmap::DashMap;
+use futures::future::try_join_all;
 use roaring::RoaringBitmap;
 use tokio::join;
 use tracing::debug;
@@ -110,7 +111,7 @@ use crate::{
             },
         },
         reader_cache::disk::ForegroundQueryGuard,
-        slow_fts_state::{QUANT_STEPS, SlowFtsState, TermBlockMax},
+        slow_fts_state::{QUANT_STEPS, SlowFtsState, TermDirRow},
         tombstones::SidecarCache,
     },
 };
@@ -176,6 +177,20 @@ fn merge_unit_scores(
 /// unrouted (sub-floor) must always qualifies as driver.
 const AND_DRIVER_MAX_BLOCKS: usize = 256;
 
+/// A routed term is "large" — worth avoiding a full fetch of — at or
+/// above this posting-block count (~131K docs at 1M scale, ~13% df).
+/// The block-selected AND kernel only pays for itself when a small
+/// driver coexists with a large non-driver: the kernel's per-survivor
+/// probe machinery avoids fetching that large term's blocks cold.
+/// When every term is moderate (both `small_and` terms), there is no
+/// large fetch to save, and the machinery is pure warm overhead —
+/// measured 26x per hit (small_and 1.54 ms vs the plain leapfrog's
+/// 187 us for the same 783 hits, kernel decomposition 2026-07-24). So
+/// engage block selection only when a large term is present; otherwise
+/// the plain leapfrog runs (fast warm, and cheap cold since moderate
+/// terms have small skip tables).
+const AND_LARGE_TERM_MIN_BLOCKS: usize = 1024;
+
 const MULTI_SELECT_MIN_TERMS: usize = 2;
 /// Minimum quantized block-bound spread for a resident row to count
 /// as prunable at routing time. Bounds are ceil-quantized to u8
@@ -188,15 +203,17 @@ const MULTI_SELECT_MIN_TERMS: usize = 2;
 /// pre-drain).
 const MULTI_SELECT_MIN_ROW_SPREAD: u8 = 16;
 
-/// Whether a resident block-max row can actually prune a broad-OR
-/// walk: present bounds with at least [`MULTI_SELECT_MIN_ROW_SPREAD`]
-/// of variance. Shared by the wave partition and the kernel
-/// engagement gate — the two MUST agree, or a file that can never
+/// Whether a block-max bound row can actually prune a broad-OR walk:
+/// present bounds with at least [`MULTI_SELECT_MIN_ROW_SPREAD`] of
+/// variance. Takes the raw bound bytes so the wave partition can gate
+/// on the resident COARSE bounds (group maxes — spread there implies
+/// spread per block) and the kernel arms re-gate on the fetched full
+/// rows — the two MUST agree in shape, or a file that can never
 /// engage loses its ranged slicing to a fallback that runs the union
 /// on one thread.
-fn row_can_prune(row: &TermBlockMax) -> bool {
-    let min = row.quantized.iter().min().copied().unwrap_or(0);
-    let max = row.quantized.iter().max().copied().unwrap_or(0);
+fn bounds_can_prune(bounds: &[u8]) -> bool {
+    let min = bounds.iter().min().copied().unwrap_or(0);
+    let max = bounds.iter().max().copied().unwrap_or(0);
     max - min >= MULTI_SELECT_MIN_ROW_SPREAD
 }
 
@@ -207,15 +224,16 @@ fn row_can_prune(row: &TermBlockMax) -> bool {
 /// rows pass the engagement gate, then the kernel's bail thresholds
 /// fire and the un-ranged fallback walks the shard serially — the
 /// same 1-vs-8-threads cliff the any-vs-all gate fix closed for
-/// never-engaging files. Each row's `scale` is its term's exact max
-/// block bound, so no dequantization is needed.
-fn rows_have_dominant_ub<'a>(rows: impl Iterator<Item = &'a TermBlockMax>) -> bool {
+/// never-engaging files. Each term's `scale` is its exact max block
+/// bound, so no dequantization is needed; directory rows and fetched
+/// full rows feed the same math.
+fn scales_have_dominant_ub(scales: impl Iterator<Item = f32>) -> bool {
     let mut total = 0.0f32;
     let mut max = 0.0f32;
     let mut n = 0usize;
-    for row in rows {
-        total += row.scale;
-        max = max.max(row.scale);
+    for scale in scales {
+        total += scale;
+        max = max.max(scale);
         n += 1;
     }
     n > 0 && max > OR_WINDOW_DOMINANCE_MULT * (total / n as f32)
@@ -421,8 +439,8 @@ async fn bm25_fanout_wave(
         ) {
             (Some(term), _, Some(state)) => kept.iter().partition(|e| {
                 state
-                    .term_block_max(e.superfile_id, &column_arc, term)
-                    .is_some_and(row_can_prune)
+                    .term_dir(e.superfile_id, &column_arc, term)
+                    .is_some_and(|dir| bounds_can_prune(&dir.coarse))
             }),
             // Mirror the kernel's engagement gate exactly (>= 1 row
             // present AND every present row prunable): a file that can
@@ -433,31 +451,39 @@ async fn bm25_fanout_wave(
             // broad-OR gap; ten/forty_term_or 12/39 ms vs 2.1/6.2
             // pre-drain).
             (None, true, Some(state)) => kept.iter().partition(|e| {
-                let rows: Vec<_> = must_arc
+                let dirs: Vec<_> = must_arc
                     .iter()
                     .chain(should_arc.iter())
-                    .filter_map(|term| state.term_block_max(e.superfile_id, &column_arc, term))
+                    .filter_map(|term| state.term_dir(e.superfile_id, &column_arc, term))
                     .collect();
                 if must_selected {
-                    // AND engagement mirror: at least one resident row
-                    // AND a small driver (an absent must row means a
+                    // AND engagement mirror: at least one resident row,
+                    // a small driver (an absent must row means a
                     // sub-floor driver; a present one qualifies by
-                    // block count). Flat bounds don't disqualify —
-                    // presence probes prune — but a broad driver does.
-                    let must_row_of =
-                        |term: &String| state.term_block_max(e.superfile_id, &column_arc, term);
-                    let small_driver = must_arc.iter().any(|t| must_row_of(t).is_none())
+                    // block count), AND a large term whose full fetch
+                    // the kernel's probes are worth avoiding. Without a
+                    // large term (all-moderate ANDs) the plain leapfrog
+                    // is both faster warm and cheap cold — see
+                    // AND_LARGE_TERM_MIN_BLOCKS. Flat bounds don't
+                    // disqualify — presence probes prune — but a broad
+                    // driver does.
+                    let must_dir_of =
+                        |term: &String| state.term_dir(e.superfile_id, &column_arc, term);
+                    let small_driver = must_arc.iter().any(|t| must_dir_of(t).is_none())
                         || must_arc
                             .iter()
-                            .filter_map(must_row_of)
-                            .map(|row| row.quantized.len())
+                            .filter_map(must_dir_of)
+                            .map(|dir| dir.n_blocks as usize)
                             .min()
                             .is_some_and(|blocks| blocks <= AND_DRIVER_MAX_BLOCKS);
-                    !rows.is_empty() && small_driver
+                    let has_large_term = dirs
+                        .iter()
+                        .any(|dir| dir.n_blocks as usize >= AND_LARGE_TERM_MIN_BLOCKS);
+                    !dirs.is_empty() && small_driver && has_large_term
                 } else {
-                    !rows.is_empty()
-                        && rows.iter().all(|row| row_can_prune(row))
-                        && rows_have_dominant_ub(rows.iter().copied())
+                    !dirs.is_empty()
+                        && dirs.iter().all(|dir| bounds_can_prune(&dir.coarse))
+                        && scales_have_dominant_ub(dirs.iter().map(|dir| dir.scale))
                 }
             }),
             _ => (Vec::new(), kept.iter().collect()),
@@ -553,16 +579,18 @@ async fn bm25_fanout_wave(
                 && let Some(state) = routing.as_ref()
             {
                 let term = must_arc.first().or_else(|| should_arc.first());
+                // Near-flat bounds can't prune: the ranged parallel
+                // walk (sub-range units) beats a serial selected walk
+                // that must visit ~everything anyway. The coarse gate
+                // mirrors the partition; the fetched full row re-gates
+                // before the kernel commits (a fetch failure falls to
+                // the plain walk — routing is an accelerator, never a
+                // dependency).
                 if let Some(term) = term
-                    && let Some(row) = state.term_block_max(suid, &column_arc, term)
-                    // Near-flat bounds can't prune: the ranged
-                    // parallel walk (sub-range units) beats a serial
-                    // selected walk that must visit ~everything
-                    // anyway. Same spread bar as the partition above
-                    // and the multi-term gates — the two MUST agree
-                    // or a file parks on a unit that degrades to the
-                    // single-threaded whole-shard walk.
-                    && row_can_prune(row)
+                    && let Some(dir) = state.term_dir(suid, &column_arc, term)
+                    && bounds_can_prune(&dir.coarse)
+                    && let Ok(row) = state.fetch_row(dir).await
+                    && bounds_can_prune(&row.quantized)
                 {
                     let hits = r
                         .bm25_single_term_block_selected(
@@ -594,26 +622,38 @@ async fn bm25_fanout_wave(
                 && neg_ph_arc.is_empty()
                 && let Some(state) = routing.as_ref()
             {
-                let rows: Vec<Option<&TermBlockMax>> = should_arc
+                let dirs: Vec<Option<&TermDirRow>> = should_arc
                     .iter()
-                    .map(|term| state.term_block_max(suid, &column_arc, term))
+                    .map(|term| state.term_dir(suid, &column_arc, term))
                     .collect();
                 // EXACTLY the partition's predicate (prunable AND
-                // dominant): shapes can reach this un-ranged gate
-                // through fanouts the partition never saw, and an
-                // all-prunable-but-uniform row set (the folded-shard
-                // shape) makes the kernel CRAWL serially — best-first
-                // visits everything with wave overhead — rather than
-                // bail. Dominance is what predicts real pruning.
-                let engage = rows.iter().flatten().count() > 0
-                    && rows.iter().flatten().all(|row| row_can_prune(row))
-                    && rows_have_dominant_ub(rows.iter().flatten().copied());
-                if engage {
+                // dominant), on the resident coarse tier: shapes can
+                // reach this un-ranged gate through fanouts the
+                // partition never saw, and an all-prunable-but-uniform
+                // row set (the folded-shard shape) makes the kernel
+                // CRAWL serially — best-first visits everything with
+                // wave overhead — rather than bail. Dominance is what
+                // predicts real pruning. Only engaged units pay the
+                // spilled-slice fetches (cached per generation).
+                let engage = dirs.iter().flatten().count() > 0
+                    && dirs
+                        .iter()
+                        .flatten()
+                        .all(|dir| bounds_can_prune(&dir.coarse))
+                    && scales_have_dominant_ub(dirs.iter().flatten().map(|dir| dir.scale));
+                if engage
+                    && let Ok(full_rows) =
+                        try_join_all(dirs.iter().flatten().map(|dir| state.fetch_row(dir))).await
+                {
+                    let mut full_iter = full_rows.iter();
                     let mut routed_rows = Vec::new();
                     let mut unrouted: Vec<&str> = Vec::new();
-                    for (term, row) in should_arc.iter().zip(&rows) {
-                        match row {
-                            Some(row) => routed_rows.push(row.as_row()),
+                    for (term, dir) in should_arc.iter().zip(&dirs) {
+                        match dir {
+                            Some(_) => {
+                                let row = full_iter.next().expect("one full row per dir");
+                                routed_rows.push(row.as_row());
+                            }
                             None => unrouted.push(term.as_str()),
                         }
                     }
@@ -652,40 +692,66 @@ async fn bm25_fanout_wave(
                 && neg_ph_arc.is_empty()
                 && let Some(state) = routing.as_ref()
             {
-                let must_rows: Vec<Option<&TermBlockMax>> = must_arc
+                let must_dirs: Vec<Option<&TermDirRow>> = must_arc
                     .iter()
-                    .map(|term| state.term_block_max(suid, &column_arc, term))
+                    .map(|term| state.term_dir(suid, &column_arc, term))
                     .collect();
-                let should_rows: Vec<Option<&TermBlockMax>> = should_arc
+                let should_dirs: Vec<Option<&TermDirRow>> = should_arc
                     .iter()
-                    .map(|term| state.term_block_max(suid, &column_arc, term))
+                    .map(|term| state.term_dir(suid, &column_arc, term))
                     .collect();
-                // Engage only with a genuinely small driver: some
-                // must below the routing floor (no row), or a routed
-                // must whose block count is under the ceiling. Broad
-                // intersections (all musts common) keep the walk.
-                let small_driver = must_rows.iter().any(|r| r.is_none())
-                    || must_rows
+                // Engage only with a genuinely small driver (some must
+                // below the routing floor, or a routed must under the
+                // ceiling) AND a large term worth avoiding a full fetch
+                // of. Broad intersections (all musts common) keep the
+                // walk via the driver ceiling; all-moderate ANDs keep
+                // it via the missing large term (block selection's
+                // probe machinery only pays when it saves a large cold
+                // fetch — see AND_LARGE_TERM_MIN_BLOCKS).
+                let small_driver = must_dirs.iter().any(|r| r.is_none())
+                    || must_dirs
                         .iter()
                         .flatten()
-                        .map(|row| row.quantized.len())
+                        .map(|dir| dir.n_blocks as usize)
                         .min()
                         .is_some_and(|blocks| blocks <= AND_DRIVER_MAX_BLOCKS);
-                if small_driver && must_rows.iter().chain(should_rows.iter()).flatten().count() > 0
+                let has_large_term = must_dirs
+                    .iter()
+                    .chain(should_dirs.iter())
+                    .flatten()
+                    .any(|dir| dir.n_blocks as usize >= AND_LARGE_TERM_MIN_BLOCKS);
+                if small_driver
+                    && has_large_term
+                    && must_dirs.iter().chain(should_dirs.iter()).flatten().count() > 0
+                    && let Ok(full_rows) = try_join_all(
+                        must_dirs
+                            .iter()
+                            .chain(should_dirs.iter())
+                            .flatten()
+                            .map(|dir| state.fetch_row(dir)),
+                    )
+                    .await
                 {
+                    let mut full_iter = full_rows.iter();
                     let mut routed_musts = Vec::new();
                     let mut unrouted_musts: Vec<&str> = Vec::new();
-                    for (term, row) in must_arc.iter().zip(&must_rows) {
-                        match row {
-                            Some(row) => routed_musts.push(row.as_row()),
+                    for (term, dir) in must_arc.iter().zip(&must_dirs) {
+                        match dir {
+                            Some(_) => {
+                                let row = full_iter.next().expect("one full row per must dir");
+                                routed_musts.push(row.as_row());
+                            }
                             None => unrouted_musts.push(term.as_str()),
                         }
                     }
                     let mut routed_shoulds = Vec::new();
                     let mut unrouted_shoulds: Vec<&str> = Vec::new();
-                    for (term, row) in should_arc.iter().zip(&should_rows) {
-                        match row {
-                            Some(row) => routed_shoulds.push(row.as_row()),
+                    for (term, dir) in should_arc.iter().zip(&should_dirs) {
+                        match dir {
+                            Some(_) => {
+                                let row = full_iter.next().expect("one full row per should dir");
+                                routed_shoulds.push(row.as_row());
+                            }
                             None => unrouted_shoulds.push(term.as_str()),
                         }
                     }
@@ -1069,7 +1135,7 @@ impl SupertableReader {
                 .column_block_maxes(column, df_floor)
                 .await
                 .map_err(|e| QueryError::Execute(e.to_string()))?;
-            rows.sort_by(|a, b| b.df.cmp(&a.df));
+            rows.sort_by_key(|row| Reverse(row.df));
             for row in rows.iter().take(top_n) {
                 let hi = row.maxes.iter().copied().fold(0.0f32, f32::max);
                 let lo = row.maxes.iter().copied().fold(f32::INFINITY, f32::min);
@@ -2363,8 +2429,8 @@ mod tests {
     use tokio::runtime::Builder;
 
     use super::{
-        BoolMode, FanOut, SharedTopK, build_work_units, dispatch::open_reader, fanout_for,
-        hits_id_score_batch, row_can_prune, rows_have_dominant_ub,
+        BoolMode, FanOut, SharedTopK, bounds_can_prune, build_work_units, dispatch::open_reader,
+        fanout_for, hits_id_score_batch, scales_have_dominant_ub,
     };
     use crate::{
         config::{CompactionSettings, DEFAULT_STALE_SEAL_TIMEOUT_MS},
@@ -2487,35 +2553,27 @@ mod tests {
     }
 
     /// Engagement helpers for the block-selected fanout arms — the
-    /// partition and kernel gates share these predicates.
+    /// partition (coarse directory bounds) and kernel gates (fetched
+    /// full bounds) share these predicates.
     #[test]
     fn block_select_engagement_helpers_match_spread_and_dominance() {
-        use crate::supertable::slow_fts_state::TermBlockMax;
-
-        let make = |term: &[u8], scale: f32, quantized: Vec<u8>| TermBlockMax {
-            term: term.to_vec(),
-            metadata_offset: 0,
-            df: quantized.len() as u64,
-            scale,
-            last_docs: (0..quantized.len() as u32).collect(),
-            offsets: (0..=quantized.len() as u32).collect(),
-            quantized,
-        };
-        let flat = make(b"flat", 1.0, vec![100, 100, 100, 100]);
-        let spread = make(b"spread", 10.0, vec![10, 40, 80, 255]);
-        assert!(!row_can_prune(&flat), "flat bounds cannot prune");
-        assert!(row_can_prune(&spread), "spread >= 16 is prunable");
+        assert!(
+            !bounds_can_prune(&[100, 100, 100, 100]),
+            "flat bounds cannot prune"
+        );
+        assert!(
+            bounds_can_prune(&[10, 40, 80, 255]),
+            "spread >= 16 is prunable"
+        );
 
         // avg=9, 1.5×avg=13.5 → 10 is not dominant.
-        let peer = make(b"peer", 8.0, vec![10, 40, 80, 255]);
         assert!(
-            !rows_have_dominant_ub([&spread, &peer].into_iter()),
+            !scales_have_dominant_ub([10.0f32, 8.0].into_iter()),
             "near-uniform scales must not claim dominance"
         );
         // avg=5.5, 1.5×avg=8.25 → 10 dominates.
-        let tiny = make(b"tiny", 1.0, vec![10, 40, 80, 255]);
         assert!(
-            rows_have_dominant_ub([&spread, &tiny].into_iter()),
+            scales_have_dominant_ub([10.0f32, 1.0].into_iter()),
             "10.0 dominates 1.0 under the 1.5× avg rule"
         );
     }
@@ -2656,12 +2714,20 @@ mod tests {
             .find(|e| !e.fts_summary.is_empty())
             .expect("text shard")
             .superfile_id;
-        let needle_row = routing
-            .term_block_max(shard_id, "title", "needle")
+        let needle_dir = routing
+            .term_dir(shard_id, "title", "needle")
             .expect("needle above df floor");
-        assert!(row_can_prune(needle_row), "needle must be prunable");
         assert!(
-            routing.term_block_max(shard_id, "title", "bolt").is_some(),
+            bounds_can_prune(&needle_dir.coarse),
+            "needle must be prunable at the coarse tier"
+        );
+        let needle_row = block_on(routing.fetch_row(needle_dir)).expect("needle slice fetch");
+        assert!(
+            bounds_can_prune(&needle_row.quantized),
+            "needle must be prunable at the full tier"
+        );
+        assert!(
+            routing.term_dir(shard_id, "title", "bolt").is_some(),
             "bolt must be in the admit slab"
         );
 
@@ -4072,18 +4138,21 @@ mod tests {
         println!("drain done in {:?}", t.elapsed());
 
         let query = "t0w0 t1x t2y0 t3z t4a0 t5b t6c t7d t8e t9f";
-        let warm_window = |label: &str| {
+        // Common ∧ common: both terms in every doc — the #25 shape
+        // whose post-compact battery row runs ~3x pre-drain.
+        let and_query = "t5b t6c";
+        let warm_window = |label: &str, q: &str, mode: BoolMode| {
             let reader = st.reader();
             for _ in 0..10 {
                 reader
-                    .bm25_search("body", query, 10, BoolMode::Or, None)
+                    .bm25_search("body", q, 10, mode, None)
                     .expect("query");
             }
             let mut samples: Vec<u128> = (0..ITERS)
                 .map(|_| {
                     let t = Instant::now();
                     reader
-                        .bm25_search("body", query, 10, BoolMode::Or, None)
+                        .bm25_search("body", q, 10, mode, None)
                         .expect("query");
                     t.elapsed().as_micros()
                 })
@@ -4098,7 +4167,8 @@ mod tests {
             );
         };
 
-        warm_window("POST-DRAIN warm ten_term_or");
+        warm_window("POST-DRAIN warm ten_term_or", query, BoolMode::Or);
+        warm_window("POST-DRAIN warm two_term_and", and_query, BoolMode::And);
 
         // Mirror the bench lifecycle exactly: an undrained delta batch
         // lands between the drain and the optimize, so optimize's
@@ -4154,8 +4224,18 @@ mod tests {
         );
 
         println!("PROFILE_NOW pid={}", std::process::id());
-        warm_window("POST-COMPACT warm ten_term_or");
-        warm_window("POST-COMPACT warm ten_term_or (2nd window)");
+        warm_window("POST-COMPACT warm ten_term_or", query, BoolMode::Or);
+        warm_window(
+            "POST-COMPACT warm ten_term_or (2nd window)",
+            query,
+            BoolMode::Or,
+        );
+        warm_window("POST-COMPACT warm two_term_and", and_query, BoolMode::And);
+        warm_window(
+            "POST-COMPACT warm two_term_and (2nd window)",
+            and_query,
+            BoolMode::And,
+        );
     }
 
     /// Aggressive compaction settings for the placement regression

@@ -1790,7 +1790,7 @@ impl SupertableReader {
             }
         }
         let storage = self.manifest.options.storage.as_ref()?;
-        match slow_fts_state::fetch_state(storage.as_ref(), &reference).await {
+        match slow_fts_state::fetch_state(Arc::clone(storage), &reference).await {
             Ok(state) => {
                 let mut cache = self
                     .inner
