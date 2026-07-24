@@ -4470,27 +4470,24 @@ impl FtsReader {
                         cursors[0].next();
                         continue;
                     }
-                    // SIMD-pack non-essentials at `candidate`.
-                    let mut idfs = [cursors[0].idf_x_k1p1, 0.0, 0.0, 0.0];
-                    let mut tfs = [cursors[0].current_tf() as f32, 0.0, 0.0, 0.0];
-                    let mut packed = 1;
-                    let mut score: f32 = 0.0;
+                    // Scalar accumulation: union docs typically match
+                    // 1-2 of the query's terms, so 4-lane packing runs
+                    // with mostly dead lanes and pays stack traffic per
+                    // doc (measured ~17% of the walk in vmovss spills).
+                    let mut score: f32 = bm25::score_with_dl_norm_k1(
+                        cursors[0].idf_x_k1p1,
+                        cursors[0].current_tf(),
+                        norm,
+                    );
                     for cursor in cursors.iter_mut().skip(1) {
                         cursor.skip_to(candidate);
                         if cursor.current_doc_id() == candidate {
-                            idfs[packed] = cursor.idf_x_k1p1;
-                            tfs[packed] = cursor.current_tf() as f32;
-                            packed += 1;
-                            if packed == 4 {
-                                score += bm25::score_simd_x4(idfs, tfs, norm);
-                                idfs = [0.0; 4];
-                                tfs = [0.0; 4];
-                                packed = 0;
-                            }
+                            score += bm25::score_with_dl_norm_k1(
+                                cursor.idf_x_k1p1,
+                                cursor.current_tf(),
+                                norm,
+                            );
                         }
-                    }
-                    if packed > 0 {
-                        score += bm25::score_simd_x4(idfs, tfs, norm);
                     }
 
                     if heap.len() < k {
@@ -4596,26 +4593,19 @@ impl FtsReader {
                 // scoring has no early-bail; non-essential scoring below
                 // does, so it stays scalar to keep `score` always
                 // up-to-date for the bail check.)
+                // Scalar accumulation — see the f=1 fast path: few
+                // essentials match any given union doc, so packing
+                // wastes lanes and spills per doc.
                 let norm = dl_norm_k1.get(candidate);
                 let mut score: f32 = 0.0;
-                let mut idfs = [0.0_f32; 4];
-                let mut tfs = [0.0_f32; 4];
-                let mut packed = 0;
                 for cursor in cursors.iter().take(f_essential) {
                     if cursor.current_doc_id() == candidate {
-                        idfs[packed] = cursor.idf_x_k1p1;
-                        tfs[packed] = cursor.current_tf() as f32;
-                        packed += 1;
-                        if packed == 4 {
-                            score += bm25::score_simd_x4(idfs, tfs, norm);
-                            idfs = [0.0; 4];
-                            tfs = [0.0; 4];
-                            packed = 0;
-                        }
+                        score += bm25::score_with_dl_norm_k1(
+                            cursor.idf_x_k1p1,
+                            cursor.current_tf(),
+                            norm,
+                        );
                     }
-                }
-                if packed > 0 {
-                    score += bm25::score_simd_x4(idfs, tfs, norm);
                 }
 
                 // Per-doc UB tightening: bound the doc's max possible
