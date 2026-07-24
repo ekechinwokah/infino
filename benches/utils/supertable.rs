@@ -1133,7 +1133,10 @@ const FTS_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
     ("post-drain", 13, 33),
     // post-delta 10M headroom for the variable delta tail (see FIRST).
     ("post-delta", 22, 46),
-    ("post-compact", 16, 18),
+    // post-compact 10M is hidden-only but the fold's parallel-build
+    // shard layout has slight run-to-run variance in block-selection
+    // engagement (measured 16-19 steady GETs); +margin.
+    ("post-compact", 16, 22),
 ];
 /// SQL scans are user-only in every state. 1M measured (first full
 /// SQL lifecycle after the settle-stall fixes): first cold 8 GETs
