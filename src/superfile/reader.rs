@@ -1185,6 +1185,7 @@ impl SuperfileReader {
 
     /// Multi-term OR over resident-routed block selection — see
     /// [`FtsReader::bm25_multi_term_or_block_selected`].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn bm25_multi_term_or_block_selected(
         &self,
         column: &str,
@@ -1193,12 +1194,23 @@ impl SuperfileReader {
         routed: &[RoutedTermRow<'_>],
         unrouted_terms: &[&str],
         live: Option<&SharedFloor>,
+        window: Option<(u32, u32)>,
+        pool: Option<&ThreadPool>,
     ) -> Result<Option<Vec<(u32, f32)>>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .bm25_multi_term_or_block_selected(column, k, floor, routed, unrouted_terms, live)
+            .bm25_multi_term_or_block_selected(
+                column,
+                k,
+                floor,
+                routed,
+                unrouted_terms,
+                live,
+                window,
+                pool,
+            )
             .await?)
     }
 
@@ -1241,12 +1253,14 @@ impl SuperfileReader {
         k: usize,
         floor: f32,
         row: &RoutedTermRow<'_>,
+        window: Option<(u32, u32)>,
+        pool: Option<&ThreadPool>,
     ) -> Result<Vec<(u32, f32)>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts
-            .bm25_single_term_block_selected(column, k, floor, row)
+            .bm25_single_term_block_selected(column, k, floor, row, window, pool)
             .await?)
     }
 

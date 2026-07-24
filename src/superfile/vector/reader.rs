@@ -16,7 +16,6 @@ use std::{
     collections::{BinaryHeap, HashMap},
     ops::Range,
     sync::{Arc, OnceLock},
-    thread,
 };
 
 use bytes::Bytes;
@@ -29,6 +28,7 @@ use tokio::sync::oneshot;
 pub(crate) use crate::superfile::lazy_source::Source;
 use crate::{
     memory::{ConnectionMemoryBudget, Reservation},
+    runtime_bridge::{par_map, parallel_chunks, spawn_on},
     storage::io_counters,
     superfile::{
         BuildError, ReadError,
@@ -3845,44 +3845,6 @@ const PARALLEL_SCAN_MIN: usize = 2048;
 /// Number of chunks to split a parallel rayon scan into — the machine's
 /// logical parallelism, capped by the item count so we never make more
 /// chunks than there is work.
-fn parallel_chunks(n_items: usize) -> usize {
-    thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(1)
-        .min(n_items)
-        .max(1)
-}
-
-/// Dispatch `f` onto `pool` if provided, or the global rayon pool otherwise.
-fn spawn_on<F: FnOnce() + Send + 'static>(pool: Option<&ThreadPool>, f: F) {
-    match pool {
-        Some(pool) => pool.spawn(f),
-        None => rayon::spawn(f),
-    }
-}
-
-/// Map `f` over `items` on the configured rayon pool, preserving input
-/// order. The order-independent vector scans (rerank) use this; the
-/// compute runs on rayon (`par_iter().map().collect()`) bridged back to
-/// the async caller via a oneshot, so no tokio worker blocks under it.
-/// `f` and the items must be `'static` so the work can move onto rayon.
-async fn par_map<T, R, F>(items: Vec<T>, f: F, pool: Option<Arc<ThreadPool>>) -> Vec<R>
-where
-    T: Send + Sync + 'static,
-    R: Send + 'static,
-    F: Fn(&T) -> R + Send + Sync + 'static,
-{
-    if parallel_chunks(items.len()) <= 1 {
-        return items.iter().map(&f).collect();
-    }
-    let (tx, rx) = oneshot::channel();
-    spawn_on(pool.as_deref(), move || {
-        let out: Vec<R> = items.par_iter().map(f).collect();
-        let _ = tx.send(out);
-    });
-    rx.await.expect("rerank rayon task dropped result")
-}
-
 #[inline]
 fn score_cluster_codes_into_heap(
     cluster_codes: &[u8],
@@ -4123,7 +4085,7 @@ async fn rerank_candidates_from_blocks(
                         );
                         (cand.did, distance_bytes_codec(metric, codec, &query, bytes))
                     },
-                    pool.clone(),
+                    pool.as_deref(),
                 )
                 .await
             } else {
@@ -4412,7 +4374,7 @@ async fn score_sq8_residual_candidates(
                     kernel.distance_with_norm(code, &row[dim..dim * 2], norm),
                 )
             },
-            pool,
+            pool.as_deref(),
         )
         .await
     } else {
@@ -4733,6 +4695,7 @@ mod tests {
         hint::black_box,
         path::{Path, PathBuf},
         sync::Arc,
+        thread,
         time::Duration,
     };
 

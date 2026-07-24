@@ -37,14 +37,85 @@ use std::{
     thread,
 };
 
+use rayon::{ThreadPool, prelude::*};
 use tokio::{
-    runtime::{self, Handle, Runtime},
+    runtime::{self, Handle, Runtime, RuntimeFlavor},
+    sync::oneshot,
     task::block_in_place,
 };
 
 /// Fallback worker count for [`build_query_runtime`] when the host's available
 /// parallelism can't be determined.
 const FALLBACK_QUERY_RUNTIME_WORKERS: usize = 4;
+
+/// Worker count worth spawning for `n_items` independent work items:
+/// the host's available parallelism, capped by the item count.
+pub(crate) fn parallel_chunks(n_items: usize) -> usize {
+    thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(n_items)
+        .max(1)
+}
+
+/// Dispatch `f` onto `pool` if provided, or the global rayon pool otherwise.
+pub(crate) fn spawn_on<F: FnOnce() + Send + 'static>(pool: Option<&ThreadPool>, f: F) {
+    match pool {
+        Some(pool) => pool.spawn(f),
+        None => rayon::spawn(f),
+    }
+}
+
+/// Map `f` over `items` on the configured rayon pool, preserving input
+/// order. The compute runs on rayon (`par_iter().map().collect()`)
+/// bridged back to the async caller via a oneshot, so no tokio worker
+/// blocks under it. `f` and the items must be `'static` so the work
+/// can move onto rayon; single-item (or single-core) inputs run inline.
+pub(crate) async fn par_map<T, R, F>(items: Vec<T>, f: F, pool: Option<&ThreadPool>) -> Vec<R>
+where
+    T: Send + Sync + 'static,
+    R: Send + 'static,
+    F: Fn(&T) -> R + Send + Sync + 'static,
+{
+    if parallel_chunks(items.len()) <= 1 {
+        return items.iter().map(&f).collect();
+    }
+    let (tx, rx) = oneshot::channel();
+    spawn_on(pool, move || {
+        let out: Vec<R> = items.par_iter().map(f).collect();
+        let _ = tx.send(out);
+    });
+    rx.await.expect("par_map rayon task dropped result")
+}
+
+/// Scoped sibling of [`par_map`] for CPU waves whose closures borrow
+/// non-`'static` state — the FTS block-selected kernels' resident
+/// routing rows and per-doc length tables are borrowed views too large
+/// to clone per wave, so the work cannot move onto rayon. The map runs
+/// under `pool.install` with the caller's borrows intact
+/// (order-preserving: output `i` is `f(i)`); on a multi-thread tokio
+/// runtime the blocked worker is announced via [`block_in_place`] —
+/// the same worker the serial scan would have burned — and on a
+/// current-thread runtime (unit tests) the pool still runs the wave.
+/// `None` runs inline serially, never on the global rayon pool.
+/// Prefer [`par_map`] wherever the inputs can move onto rayon.
+pub(crate) fn par_map_scoped<R: Send>(
+    pool: Option<&ThreadPool>,
+    len: usize,
+    f: impl Fn(usize) -> R + Send + Sync,
+) -> Vec<R> {
+    let Some(pool) = pool else {
+        return (0..len).map(f).collect();
+    };
+    let work = || (0..len).into_par_iter().map(&f).collect();
+    let multi_thread = Handle::try_current()
+        .map(|h| h.runtime_flavor() == RuntimeFlavor::MultiThread)
+        .unwrap_or(false);
+    match multi_thread {
+        true => block_in_place(|| pool.install(work)),
+        false => pool.install(work),
+    }
+}
 
 /// Drive `fut` to completion from a sync context. Uses the ambient
 /// tokio runtime if present (via `block_in_place + Handle::block_on`),

@@ -550,7 +550,14 @@ mod tests {
                 .await
                 .expect("full walk");
             let got = r
-                .bm25_single_term_block_selected("body", k, f32::NEG_INFINITY, &row.as_row())
+                .bm25_single_term_block_selected(
+                    "body",
+                    k,
+                    f32::NEG_INFINITY,
+                    &row.as_row(),
+                    None,
+                    None,
+                )
                 .await
                 .expect("block-selected walk");
             // Full (doc, score) equality: the tie contract (kth-score
@@ -609,7 +616,14 @@ mod tests {
             "planted corpus: doc 0 wins the kth tie in the plain walk"
         );
         let got = r
-            .bm25_single_term_block_selected("body", 2, f32::NEG_INFINITY, &row.as_row())
+            .bm25_single_term_block_selected(
+                "body",
+                2,
+                f32::NEG_INFINITY,
+                &row.as_row(),
+                None,
+                None,
+            )
             .await
             .expect("block-selected walk");
         assert_eq!(got, expected);

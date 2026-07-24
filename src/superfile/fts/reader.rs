@@ -30,9 +30,11 @@ use std::{
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::future::try_join_all;
+use rayon::ThreadPool;
 use serde::Deserialize;
 use tokio::sync::OnceCell;
 
+use crate::runtime_bridge::{par_map, par_map_scoped};
 use crate::superfile::{
     ReadError,
     error::FtsError,
@@ -1067,6 +1069,8 @@ impl FtsReader {
         k: usize,
         floor: f32,
         row: &RoutedTermRow<'_>,
+        window: Option<(u32, u32)>,
+        pool: Option<&ThreadPool>,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if k == 0 || row.quantized.is_empty() {
@@ -1077,19 +1081,37 @@ impl FtsReader {
         let col_meta = &self.columns[column_id as usize];
         let floor_eff = floor.next_down();
         let dequant = |q: u8| -> f32 { q as f32 / u8::MAX as f32 * row.scale };
+        // Doc-id window ([lo, hi), whole file when `None`) → the
+        // block-ordinal range that can intersect it, off the resident
+        // last-doc array: a block whose last doc precedes `lo`, or
+        // whose predecessor's last doc already reaches `hi - 1`,
+        // cannot hold an in-window doc. Boundary blocks may straddle
+        // the window; the scan filters their out-of-window docs.
+        let (doc_lo, doc_hi) = window.unwrap_or((0, u32::MAX));
+        let b_lo = row.last_docs.partition_point(|&last| last < doc_lo);
+        let b_hi = row
+            .last_docs
+            .partition_point(|&last| last < doc_hi.saturating_sub(1))
+            .saturating_add(1)
+            .min(quantized.len());
+        if b_lo >= b_hi {
+            return Ok(Vec::new());
+        }
         // Flat bounds cannot prune: every block ties the maximum, so
         // best-first would visit them all and only add wave overhead —
         // the whole-term walk (one contiguous fetch, one pass) is
         // strictly better. Term identity is already resolved, so reuse
         // the direct-offset walk below with every block admitted at
-        // once by falling through with a single full wave.
-        let min_q = quantized.iter().copied().min().unwrap_or(0);
-        let max_q = quantized.iter().copied().max().unwrap_or(0);
+        // once by falling through with a single full wave. The check
+        // runs on the window slice: a window can be flat inside a
+        // prunable whole-file row (and vice versa).
+        let min_q = quantized[b_lo..b_hi].iter().copied().min().unwrap_or(0);
+        let max_q = quantized[b_lo..b_hi].iter().copied().max().unwrap_or(0);
         let bounds_can_prune = min_q < max_q;
 
         // The row carries the full skip data resident (df, bounds,
         // fence-post offsets) — no term-header fetch at all.
-        let n_blocks = quantized.len();
+        let n_blocks = b_hi - b_lo;
         let idf_t = bm25::idf(self.n_docs as u64, row.df);
         let idf_x_k1p1 = idf_t * (bm25::K1 + 1.0);
         let dl_norm_k1 = &col_meta.dl_norm_k1;
@@ -1097,15 +1119,13 @@ impl FtsReader {
         // Best-first visit order off the resident bounds. Flat bounds
         // keep index order: the single full wave then coalesces into
         // contiguous ranges instead of a shuffled scatter.
-        let mut order: Vec<u32> = (0..n_blocks as u32).collect();
+        let mut order: Vec<u32> = (b_lo as u32..b_hi as u32).collect();
         if bounds_can_prune {
             order.sort_unstable_by(|&a, &b| quantized[b as usize].cmp(&quantized[a as usize]));
         }
 
         let mut heap: BinaryHeap<TopKEntry> =
             BinaryHeap::with_capacity(k.min(n_blocks * BLOCK_LEN).max(1));
-        let mut buf_d = vec![0u32; BLOCK_LEN];
-        let mut buf_t = vec![0u32; BLOCK_LEN];
         let mut next = 0usize;
         let mut wave_cap = match bounds_can_prune {
             true => BLOCK_SELECT_FIRST_WAVE,
@@ -1147,27 +1167,40 @@ impl FtsReader {
                 })
                 .collect();
             let blocks = self.fetch_block_ranges(&ranges).await?;
-            for (&block, bytes) in wave.iter().zip(&blocks) {
-                // Exact skip bound re-gate (tighter than the resident
-                // quantized bound) against the LIVE bar.
-                let bar = match heap.len() >= k {
-                    true => {
-                        let TopKEntry(min_score, _) = heap.peek().expect("heap full");
-                        min_score.next_down().max(floor_eff)
-                    }
-                    false => floor_eff,
-                };
+            // Decode + score the wave in parallel; heap pushes stay
+            // serial in wave order, preserving the entry-order tie
+            // contract. Blocks are re-gated against the wave-start bar
+            // (the serial walk re-gated against the live bar mid-wave,
+            // but the pushes that skipping avoided are exactly those a
+            // full heap rejects — results are identical, at most one
+            // wave's-worth of extra decode).
+            let block_cands: Vec<Vec<(u32, f32)>> = par_map_scoped(pool, wave.len(), |i| {
+                let block = wave[i];
                 if dequant(quantized[block as usize]) <= bar {
-                    continue;
+                    return Vec::new();
                 }
-                let n = decode_block(bytes, &mut buf_d, &mut buf_t);
+                let mut buf_d = vec![0u32; BLOCK_LEN];
+                let mut buf_t = vec![0u32; BLOCK_LEN];
+                let n = decode_block(&blocks[i], &mut buf_d, &mut buf_t);
+                let mut out = Vec::new();
                 for j in 0..n {
                     let doc_id = buf_d[j];
+                    // Boundary blocks straddle the window; every
+                    // in-window doc must score in exactly one range.
+                    if doc_id < doc_lo || doc_id >= doc_hi {
+                        continue;
+                    }
                     let score =
                         bm25::score_with_dl_norm_k1(idf_x_k1p1, buf_t[j], dl_norm_k1.get(doc_id));
                     if score <= floor_eff {
                         continue;
                     }
+                    out.push((doc_id, score));
+                }
+                out
+            });
+            for cands in block_cands {
+                for (doc_id, score) in cands {
                     and_heap_push(&mut heap, k, None, score, doc_id);
                 }
             }
@@ -1205,6 +1238,8 @@ impl FtsReader {
         routed: &[RoutedTermRow<'_>],
         unrouted_terms: &[&str],
         live: Option<&SharedFloor>,
+        window: Option<(u32, u32)>,
+        pool: Option<&ThreadPool>,
     ) -> Result<Option<Vec<(u32, f32)>>, FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if k == 0 || routed.is_empty() {
@@ -1219,6 +1254,26 @@ impl FtsReader {
         // term-header fetch. A cold consumer's first query used to be
         // dominated by exactly those head reads, per shard x per term.
         validate_resident_rows(routed)?;
+        // Doc-id window ([lo, hi), whole file when `None`) → each
+        // routed term's block-ordinal range that can intersect it —
+        // same resident last-doc math as the single-term kernel.
+        // Every windowed quantity below (candidate order, term maxes,
+        // bail denominators) runs on these slices, so ranged units of
+        // one file admit disjoint block sets bar the boundary blocks,
+        // whose out-of-window docs the scans filter.
+        let (doc_lo, doc_hi) = window.unwrap_or((0, u32::MAX));
+        let term_window: Vec<(usize, usize)> = routed
+            .iter()
+            .map(|r| {
+                let b_lo = r.last_docs.partition_point(|&last| last < doc_lo);
+                let b_hi = r
+                    .last_docs
+                    .partition_point(|&last| last < doc_hi.saturating_sub(1))
+                    .saturating_add(1)
+                    .min(r.quantized.len());
+                (b_lo, b_lo.max(b_hi))
+            })
+            .collect();
         let routed_idf_x_k1p1: Vec<f32> = routed
             .iter()
             .map(|r| bm25::idf(self.n_docs as u64, r.df) * (bm25::K1 + 1.0))
@@ -1251,11 +1306,21 @@ impl FtsReader {
             })
             .collect();
 
-        // ---- Upper-bound bookkeeping.
+        // ---- Upper-bound bookkeeping. Term maxes come from each
+        // term's window slice — a true upper bound for in-window docs
+        // (an in-window doc's covering block always lies inside the
+        // term's block window), and tighter than the whole-row max. A
+        // term with no in-window blocks cannot contribute at all.
         let dequant = |row: &RoutedTermRow<'_>, q: u8| q as f32 / u8::MAX as f32 * row.scale;
         let routed_term_max: Vec<f32> = routed
             .iter()
-            .map(|r| dequant(r, r.quantized.iter().copied().max().unwrap_or(0)))
+            .zip(&term_window)
+            .map(|(r, &(b_lo, b_hi))| {
+                dequant(
+                    r,
+                    r.quantized[b_lo..b_hi].iter().copied().max().unwrap_or(0),
+                )
+            })
             .collect();
         let total_ub: f32 = routed_term_max.iter().sum::<f32>()
             + unrouted.iter().map(|(_, _, _, m)| m).sum::<f32>();
@@ -1264,13 +1329,14 @@ impl FtsReader {
         // ---- Per-term candidate order: counting sort by quantized
         // bound (descending), so only admitted candidates ever pay a
         // comparison; a cross-term heap merges the per-term streams
-        // by admit key.
+        // by admit key. Only in-window blocks are candidates.
         let per_term_order: Vec<Vec<u32>> = routed
             .iter()
-            .map(|r| {
+            .zip(&term_window)
+            .map(|(r, &(b_lo, b_hi))| {
                 let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); (u8::MAX as usize) + 1];
-                for (b, &q) in r.quantized.iter().enumerate() {
-                    buckets[q as usize].push(b as u32);
+                for b in b_lo..b_hi {
+                    buckets[r.quantized[b] as usize].push(b as u32);
                 }
                 buckets.into_iter().rev().flatten().collect()
             })
@@ -1382,7 +1448,9 @@ impl FtsReader {
         };
 
         let mut wave_cap = BLOCK_SELECT_FIRST_WAVE;
-        let total_blocks: usize = routed.iter().map(|r| r.quantized.len()).sum();
+        // Bail budgets are window-scoped: the candidate universe of a
+        // ranged unit is its window's blocks, not the whole file's.
+        let total_blocks: usize = term_window.iter().map(|&(b_lo, b_hi)| b_hi - b_lo).sum();
         let mut admitted_total: usize = 0;
         loop {
             // `next_down` on the kth: a candidate tying the kth-best
@@ -1432,15 +1500,26 @@ impl FtsReader {
                 return Ok(None);
             }
             // ---- Fetch + decode the wave.
-            self.fetch_and_decode_blocks(&wave, routed, &mut decoded_at, &mut decoded)
+            self.fetch_and_decode_blocks(&wave, routed, &mut decoded_at, &mut decoded, pool)
                 .await?;
             // ---- Score: essential gate, then exact rescore with
-            // probe fetches for unfetched covering blocks.
-            let mut survivors: Vec<(u32, usize)> = Vec::new();
-            for &(t, b) in &wave {
+            // probe fetches for unfetched covering blocks. The
+            // essential scan is the wave's CPU — blocks scan in
+            // parallel against the immutable earlier-waves `seen` set;
+            // same-wave dedup happens in the serial wave-order merge
+            // below (a doc admitted by ANY block's gate survives, same
+            // set as the serial walk).
+            let block_cands: Vec<Vec<u32>> = par_map_scoped(pool, wave.len(), |w| {
+                let (t, b) = wave[w];
                 let slot = decoded_at[&(t as u32, b)];
                 let (docs, tfs) = (&decoded[slot].0, &decoded[slot].1);
+                let mut out = Vec::new();
                 for (i, &doc) in docs.iter().enumerate() {
+                    // Boundary blocks straddle the window; every
+                    // in-window doc must score in exactly one range.
+                    if doc < doc_lo || doc >= doc_hi {
+                        continue;
+                    }
                     if seen.contains(&doc) {
                         continue;
                     }
@@ -1452,8 +1531,16 @@ impl FtsReader {
                     if essential + routed_others_ub[t] <= bar {
                         continue;
                     }
-                    seen.insert(doc);
-                    survivors.push((doc, t));
+                    out.push(doc);
+                }
+                out
+            });
+            let mut survivors: Vec<u32> = Vec::new();
+            for cands in block_cands {
+                for doc in cands {
+                    if seen.insert(doc) {
+                        survivors.push(doc);
+                    }
                 }
             }
             if total_blocks >= MULTI_SELECT_BAIL_MIN_BLOCKS
@@ -1468,10 +1555,10 @@ impl FtsReader {
                 return Ok(None);
             }
             // Probe fetches: covering blocks the survivors still need.
-            let probes = gather_probes(&mut survivors.iter().map(|&(d, _)| d), &decoded_at);
-            self.fetch_and_decode_blocks(&probes, routed, &mut decoded_at, &mut decoded)
+            let probes = gather_probes(&mut survivors.iter().copied(), &decoded_at);
+            self.fetch_and_decode_blocks(&probes, routed, &mut decoded_at, &mut decoded, pool)
                 .await?;
-            for (doc, _) in survivors {
+            for doc in survivors {
                 let score = exact_score(&decoded_at, &decoded, doc);
                 if score <= floor_eff {
                     continue;
@@ -1493,6 +1580,11 @@ impl FtsReader {
         let mut survivors: Vec<u32> = Vec::new();
         for (docs, _, _, _) in &unrouted {
             for &doc in docs {
+                // Unrouted lists are decoded whole; only in-window
+                // docs are this range's candidates.
+                if doc < doc_lo || doc >= doc_hi {
+                    continue;
+                }
                 if seen.contains(&doc) {
                     continue;
                 }
@@ -1504,7 +1596,7 @@ impl FtsReader {
             }
         }
         let probes = gather_probes(&mut survivors.iter().copied(), &decoded_at);
-        self.fetch_and_decode_blocks(&probes, routed, &mut decoded_at, &mut decoded)
+        self.fetch_and_decode_blocks(&probes, routed, &mut decoded_at, &mut decoded, pool)
             .await?;
         for doc in survivors {
             let score = exact_score(&decoded_at, &decoded, doc);
@@ -1749,7 +1841,7 @@ impl FtsReader {
                 }
             }
             let probes = gather_probes(&mut survivors.iter().copied(), &decoded_at);
-            self.fetch_and_decode_blocks(&probes, &routed, &mut decoded_at, &mut decoded)
+            self.fetch_and_decode_blocks(&probes, &routed, &mut decoded_at, &mut decoded, None)
                 .await?;
             for doc in survivors {
                 if let Some(score) = exact_and_score(&decoded_at, &decoded, doc)
@@ -1808,7 +1900,7 @@ impl FtsReader {
             {
                 return Ok(None);
             }
-            self.fetch_and_decode_blocks(&wave, &routed, &mut decoded_at, &mut decoded)
+            self.fetch_and_decode_blocks(&wave, &routed, &mut decoded_at, &mut decoded, None)
                 .await?;
             let mut survivors: Vec<u32> = Vec::new();
             for &(t, b) in &wave {
@@ -1833,7 +1925,7 @@ impl FtsReader {
                 return Ok(None);
             }
             let probes = gather_probes(&mut survivors.iter().copied(), &decoded_at);
-            self.fetch_and_decode_blocks(&probes, &routed, &mut decoded_at, &mut decoded)
+            self.fetch_and_decode_blocks(&probes, &routed, &mut decoded_at, &mut decoded, None)
                 .await?;
             for doc in survivors {
                 if let Some(score) = exact_and_score(&decoded_at, &decoded, doc)
@@ -1855,6 +1947,7 @@ impl FtsReader {
         routed: &[RoutedTermRow<'_>],
         decoded_at: &mut HashMap<(u32, u32), usize>,
         decoded: &mut Vec<(Vec<u32>, Vec<u32>)>,
+        pool: Option<&ThreadPool>,
     ) -> Result<(), FtsError> {
         let todo: Vec<(usize, u32)> = pairs
             .iter()
@@ -1873,11 +1966,25 @@ impl FtsReader {
             })
             .collect();
         let blocks = self.fetch_block_ranges(&ranges).await?;
-        let mut buf_d = vec![0u32; BLOCK_LEN];
-        let mut buf_t = vec![0u32; BLOCK_LEN];
-        for (&(t, b), bytes) in todo.iter().zip(&blocks) {
-            let n = decode_block(bytes, &mut buf_d, &mut buf_t);
-            decoded.push((buf_d[..n].to_vec(), buf_t[..n].to_vec()));
+        // Decode is the wave's CPU: blocks are independent Bytes, so
+        // fan the PFOR decodes across the reader pool via the shared
+        // oneshot bridge (order-preserving — `decoded` slot assignment
+        // stays deterministic).
+        let waves: Vec<(Vec<u32>, Vec<u32>)> = par_map(
+            blocks,
+            |bytes| {
+                let mut buf_d = vec![0u32; BLOCK_LEN];
+                let mut buf_t = vec![0u32; BLOCK_LEN];
+                let n = decode_block(bytes, &mut buf_d, &mut buf_t);
+                buf_d.truncate(n);
+                buf_t.truncate(n);
+                (buf_d, buf_t)
+            },
+            pool,
+        )
+        .await;
+        for (&(t, b), block) in todo.iter().zip(waves) {
+            decoded.push(block);
             decoded_at.insert((t as u32, b), decoded.len() - 1);
         }
         Ok(())
@@ -6850,6 +6957,8 @@ impl TermCursor {
 mod tests {
     use std::{collections::HashSet, sync::Arc};
 
+    use rayon::ThreadPoolBuilder;
+
     use super::*;
     use crate::superfile::{BytesLazyByteSource, fts::builder::FtsBuilder};
 
@@ -9014,6 +9123,8 @@ mod tests {
                     &routed,
                     &["rare"],
                     None,
+                    None,
+                    None,
                 )
                 .await
                 .expect("kernel")
@@ -9043,6 +9154,370 @@ mod tests {
             }
         }
     }
+
+    /// The pool-parallel CPU waves (block decode + candidate scan via
+    /// `par_map` / `par_map_scoped`) must return exactly the serial kernels'
+    /// results: the parallel map is order-preserving and the heap
+    /// merge stays serial in wave order, so docs AND scores must
+    /// match bit-for-bit across k values that exercise both pruning
+    /// and near-exhaustive admission.
+    #[tokio::test]
+    async fn block_selected_pool_parallel_matches_serial() {
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for d in 0..5000u32 {
+            let mut text = "common ".repeat(((d % 13) + 1) as usize);
+            if d % 3 == 0 {
+                text.push_str("mid ");
+            }
+            if d % 97 == 0 {
+                text.push_str("rare ");
+            }
+            text.push_str(&format!("filler{d}"));
+            b.add_doc(0, d, &text).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let skips = r.column_block_maxes("body", 2).await.expect("skips");
+        let row_for = |term: &str| -> OwnedRow {
+            let sk = skips
+                .iter()
+                .find(|sk| sk.term == term.as_bytes())
+                .expect("term present");
+            let scale = sk.maxes.iter().copied().fold(0.0f32, f32::max);
+            let quantized: Vec<u8> = sk
+                .maxes
+                .iter()
+                .map(|&m| match scale > 0.0 {
+                    true => (m / scale * u8::MAX as f32).ceil().min(u8::MAX as f32) as u8,
+                    false => 0,
+                })
+                .collect();
+            (
+                sk.metadata_offset,
+                sk.df,
+                quantized,
+                scale,
+                sk.last_docs.clone(),
+                sk.offsets.clone(),
+            )
+        };
+        let rows: Vec<OwnedRow> = vec![row_for("common"), row_for("mid")];
+        let routed: Vec<RoutedTermRow<'_>> = rows
+            .iter()
+            .map(|(off, df, q, scale, last, offs)| RoutedTermRow {
+                metadata_offset: *off,
+                df: *df,
+                quantized: q,
+                scale: *scale,
+                last_docs: last,
+                offsets: offs,
+            })
+            .collect();
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .expect("test pool");
+
+        for k in [3usize, 10, 100, 2000] {
+            let serial = r
+                .bm25_multi_term_or_block_selected(
+                    "body",
+                    k,
+                    f32::NEG_INFINITY,
+                    &routed,
+                    &["rare"],
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("serial kernel")
+                .expect("serial kernel engaged");
+            let parallel = r
+                .bm25_multi_term_or_block_selected(
+                    "body",
+                    k,
+                    f32::NEG_INFINITY,
+                    &routed,
+                    &["rare"],
+                    None,
+                    None,
+                    Some(&pool),
+                )
+                .await
+                .expect("parallel kernel")
+                .expect("parallel kernel engaged");
+            assert_eq!(serial, parallel, "OR kernel diverged under pool at k={k}");
+
+            let serial = r
+                .bm25_single_term_block_selected(
+                    "body",
+                    k,
+                    f32::NEG_INFINITY,
+                    &routed[0],
+                    None,
+                    None,
+                )
+                .await
+                .expect("serial single-term kernel");
+            let parallel = r
+                .bm25_single_term_block_selected(
+                    "body",
+                    k,
+                    f32::NEG_INFINITY,
+                    &routed[0],
+                    None,
+                    Some(&pool),
+                )
+                .await
+                .expect("parallel single-term kernel");
+            assert_eq!(
+                serial, parallel,
+                "single-term kernel diverged under pool at k={k}"
+            );
+        }
+    }
+
+    /// Windowed block-selected kernels over a partition of the doc
+    /// space must union to exactly the whole-file kernel's result.
+    /// At k ≥ every match the union is doc-exact with each doc scored
+    /// in exactly one window (boundary blocks straddle window cuts —
+    /// they must neither drop nor double-score in-window docs); at
+    /// small k the merged top-k scores equal the un-windowed
+    /// kernel's (windowed admission bars and term maxes stay sound).
+    /// Window cuts land mid-block on purpose (not multiples of the
+    /// 128-doc block length).
+    #[tokio::test]
+    async fn windowed_block_selected_partitions_match_whole_file() {
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        const N_DOCS: u32 = 5000;
+        for d in 0..N_DOCS {
+            let mut text = "common ".repeat(((d % 13) + 1) as usize);
+            if d % 3 == 0 {
+                text.push_str("mid ");
+            }
+            if d % 97 == 0 {
+                text.push_str("rare ");
+            }
+            text.push_str(&format!("filler{d}"));
+            b.add_doc(0, d, &text).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let skips = r.column_block_maxes("body", 2).await.expect("skips");
+        let row_for = |term: &str| -> OwnedRow {
+            let sk = skips
+                .iter()
+                .find(|sk| sk.term == term.as_bytes())
+                .expect("term present");
+            let scale = sk.maxes.iter().copied().fold(0.0f32, f32::max);
+            let quantized: Vec<u8> = sk
+                .maxes
+                .iter()
+                .map(|&m| match scale > 0.0 {
+                    true => (m / scale * u8::MAX as f32).ceil().min(u8::MAX as f32) as u8,
+                    false => 0,
+                })
+                .collect();
+            (
+                sk.metadata_offset,
+                sk.df,
+                quantized,
+                scale,
+                sk.last_docs.clone(),
+                sk.offsets.clone(),
+            )
+        };
+        let rows: Vec<OwnedRow> = vec![row_for("common"), row_for("mid")];
+        let routed: Vec<RoutedTermRow<'_>> = rows
+            .iter()
+            .map(|(off, df, q, scale, last, offs)| RoutedTermRow {
+                metadata_offset: *off,
+                df: *df,
+                quantized: q,
+                scale: *scale,
+                last_docs: last,
+                offsets: offs,
+            })
+            .collect();
+        let single = &routed[0];
+
+        // Every doc matches "common", so k = N_DOCS covers every match
+        // — no tie-band truncation, union must be doc-exact.
+        let k_all = N_DOCS as usize;
+        for splits in [2usize, 3, 7] {
+            // Mid-block cuts: stride offsets by 29 (not a multiple of
+            // the 128-doc block length).
+            let bounds: Vec<u32> = (1..splits as u32)
+                .map(|j| j * N_DOCS / splits as u32 + 29)
+                .collect();
+            let windows: Vec<(u32, u32)> = {
+                let mut lo = 0u32;
+                let mut w = Vec::new();
+                for &b in &bounds {
+                    w.push((lo, b));
+                    lo = b;
+                }
+                w.push((lo, N_DOCS));
+                w
+            };
+
+            // ---- Multi-term OR: doc-exact union at k_all.
+            let whole = r
+                .bm25_multi_term_or_block_selected(
+                    "body",
+                    k_all,
+                    f32::NEG_INFINITY,
+                    &routed,
+                    &["rare"],
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("whole kernel")
+                .expect("whole kernel engaged");
+            let mut union: HashMap<u32, f32> = HashMap::new();
+            for &w in &windows {
+                let part = r
+                    .bm25_multi_term_or_block_selected(
+                        "body",
+                        k_all,
+                        f32::NEG_INFINITY,
+                        &routed,
+                        &["rare"],
+                        None,
+                        Some(w),
+                        None,
+                    )
+                    .await
+                    .expect("windowed kernel")
+                    .expect("windowed kernel engaged");
+                for (doc, score) in part {
+                    assert!(
+                        union.insert(doc, score).is_none(),
+                        "splits={splits}: doc {doc} scored in two windows"
+                    );
+                }
+            }
+            assert_eq!(union.len(), whole.len(), "splits={splits}: union size");
+            for (doc, score) in &whole {
+                let got = union
+                    .get(doc)
+                    .unwrap_or_else(|| panic!("splits={splits}: doc {doc} missing from union"));
+                let rel = (got - score).abs() / score.abs().max(f32::MIN_POSITIVE);
+                assert!(
+                    rel < 1e-5,
+                    "splits={splits}: doc {doc} score {got} != {score}"
+                );
+            }
+
+            // ---- Multi-term OR: merged small-k scores match.
+            const K_SMALL: usize = 10;
+            let whole_small = r
+                .bm25_multi_term_or_block_selected(
+                    "body",
+                    K_SMALL,
+                    f32::NEG_INFINITY,
+                    &routed,
+                    &["rare"],
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("whole kernel")
+                .expect("whole kernel engaged");
+            let mut merged: Vec<(u32, f32)> = Vec::new();
+            for &w in &windows {
+                merged.extend(
+                    r.bm25_multi_term_or_block_selected(
+                        "body",
+                        K_SMALL,
+                        f32::NEG_INFINITY,
+                        &routed,
+                        &["rare"],
+                        None,
+                        Some(w),
+                        None,
+                    )
+                    .await
+                    .expect("windowed kernel")
+                    .expect("windowed kernel engaged"),
+                );
+            }
+            merged.sort_unstable_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .expect("finite scores")
+                    .then(a.0.cmp(&b.0))
+            });
+            merged.truncate(K_SMALL);
+            for (i, ((_, gs), (_, es))) in merged.iter().zip(whole_small.iter()).enumerate() {
+                let rel = (gs - es).abs() / es.abs().max(f32::MIN_POSITIVE);
+                assert!(
+                    rel < 1e-5,
+                    "splits={splits}: merged small-k score at rank {i}: {gs} != {es}"
+                );
+            }
+
+            // ---- Single term: doc-exact union at k_all.
+            let whole = r
+                .bm25_single_term_block_selected(
+                    "body",
+                    k_all,
+                    f32::NEG_INFINITY,
+                    single,
+                    None,
+                    None,
+                )
+                .await
+                .expect("whole single-term kernel");
+            let mut union: HashMap<u32, f32> = HashMap::new();
+            for &w in &windows {
+                let part = r
+                    .bm25_single_term_block_selected(
+                        "body",
+                        k_all,
+                        f32::NEG_INFINITY,
+                        single,
+                        Some(w),
+                        None,
+                    )
+                    .await
+                    .expect("windowed single-term kernel");
+                for (doc, score) in part {
+                    assert!(
+                        union.insert(doc, score).is_none(),
+                        "splits={splits}: single-term doc {doc} scored in two windows"
+                    );
+                }
+            }
+            assert_eq!(
+                union.len(),
+                whole.len(),
+                "splits={splits}: single-term union size"
+            );
+            for (doc, score) in &whole {
+                let got = union.get(doc).unwrap_or_else(|| {
+                    panic!("splits={splits}: single-term doc {doc} missing from union")
+                });
+                let rel = (got - score).abs() / score.abs().max(f32::MIN_POSITIVE);
+                assert!(
+                    rel < 1e-5,
+                    "splits={splits}: single-term doc {doc} score {got} != {score}"
+                );
+            }
+        }
+    }
+
     /// The AND / must+should block-selected kernel must agree with
     /// the whole-list walk on docs and scores: the all-routed driver
     /// path (common∧mid), the small-unrouted-driver path

@@ -462,6 +462,19 @@ async fn bm25_fanout_wave(
             _ => (Vec::new(), kept.iter().collect()),
         };
     let mut work_units = build_work_units(&sliceable_refs, fanout, pool_threads);
+    // Selected files keep ONE un-ranged unit each: block-selected
+    // admission must stay a single stream per file. The resident rows
+    // prescribe a best-first *order*, but the realized fetch set is
+    // adaptive — each wave raises the floor that prunes the next — so
+    // splitting a file across planners weakens the floor and
+    // fragments the few coalesced ~MiB posting reads into per-range
+    // small GETs (measured: post-drain steady cold 3 -> 12 GETs at
+    // 1M). Parallelism comes from *inside* the kernel instead: each
+    // fetched wave's decode + scan fans across the reader pool
+    // (`map_cpu_wave`), which spreads the warm CPU without changing a
+    // single fetch. Doc-window slicing (the windowed kernel API)
+    // remains for the plain ranged walk, whose cursor cache shares
+    // fetches across ranges.
     work_units.extend(build_work_units(
         &selected_refs,
         FanOut::PerSuperfile,
@@ -491,6 +504,10 @@ async fn bm25_fanout_wave(
     // tombstone-filters each unit's hits. The per-unit `params` is
     // the optional doc-id sub-range (`None` searches the whole
     // superfile) plus the superfile id for the tombstone-aware merge.
+    // The reader pool for the block-selected kernels' CPU waves
+    // (decode + candidate scan fan out per fetched wave; admission
+    // stays one stream per file).
+    let reader_pool = Arc::clone(&ctx.manifest().options.reader_pool);
     let kernel = move |r: Arc<SuperfileReader>, (range, suid): (Option<(u32, u32)>, Uuid)| {
         let column_arc = Arc::clone(&column_arc);
         let must_arc = Arc::clone(&must_arc);
@@ -503,6 +520,7 @@ async fn bm25_fanout_wave(
         let tombstones = tombstones.clone();
         let routing = routing.clone();
         let cursor_caches = Arc::clone(&cursor_caches);
+        let reader_pool = Arc::clone(&reader_pool);
         async move {
             // Share the global kth-best floor with every superfile —
             // single-term queries included — so each prunes its scored
@@ -523,9 +541,11 @@ async fn bm25_fanout_wave(
             // Resident-routed block selection: a single bare term with
             // a resident admit row visits blocks best-first by bound
             // and fetches exactly those (the FTS cell-read analog).
+            // The kernel is windowed — a ranged unit admits within its
+            // doc sub-range off the same resident row, so big files
+            // parallelize instead of walking on one thread.
             // Everything else keeps the whole-term kernels.
-            if range.is_none()
-                && n_terms == 1
+            if n_terms == 1
                 && phrase_free
                 && neg_arc.is_empty()
                 && neg_ph_arc.is_empty()
@@ -544,21 +564,29 @@ async fn bm25_fanout_wave(
                     && row_can_prune(row)
                 {
                     let hits = r
-                        .bm25_single_term_block_selected(&column_arc, k, floor, &row.as_row())
+                        .bm25_single_term_block_selected(
+                            &column_arc,
+                            k,
+                            floor,
+                            &row.as_row(),
+                            range,
+                            Some(reader_pool.as_ref()),
+                        )
                         .await
                         .map_err(fts_read_error)?;
                     merge_unit_scores(&shared, &tombstones, suid, now, &hits);
                     return Ok(hits);
                 }
             }
-            // Multi-term bare-OR admission: an un-ranged unit whose
-            // file has at least one prunable resident row runs the
-            // (term, block) best-first kernel — fetching only blocks
-            // that can beat the live bar — instead of walking every
-            // term's whole merged list. Falls through to the plain
-            // walk when the kernel declines (stale routing).
-            if range.is_none()
-                && n_terms >= MULTI_SELECT_MIN_TERMS
+            // Multi-term bare-OR admission: a unit whose file has
+            // prunable, dominant resident rows runs the (term, block)
+            // best-first kernel — fetching only blocks that can beat
+            // the live bar — instead of walking every term's whole
+            // merged list. The kernel is windowed, so ranged units of
+            // a big file admit their own doc sub-ranges in parallel.
+            // Falls through to the (equally ranged) plain walk when
+            // the kernel declines (stale routing / flat window).
+            if n_terms >= MULTI_SELECT_MIN_TERMS
                 && must_arc.is_empty()
                 && phrase_free
                 && neg_arc.is_empty()
@@ -597,6 +625,8 @@ async fn bm25_fanout_wave(
                             &routed_rows,
                             &unrouted,
                             Some(&live),
+                            range,
+                            Some(reader_pool.as_ref()),
                         )
                         .await
                         .map_err(fts_read_error)?
@@ -1883,13 +1913,17 @@ fn fanout_for(n_musts: usize, n_shoulds: usize, has_negatives: bool) -> FanOut {
 /// Slice the kept superfiles into parallel work units — one
 /// [`WorkUnit`] per (superfile, doc_id sub-range) tuple.
 ///
-/// `FanOut::SubRanges` slices only when:
-///   1. The reader pool has more threads than kept superfiles —
-///      otherwise every thread is already saturated by one superfile
-///      and splitting just adds overhead.
-///   2. The candidate sub-range width is at least
+/// `FanOut::SubRanges` slices each superfile into a thread share
+/// proportional to its **doc mass**, not the file count: with one
+/// merged mega-shard beside tiny delta shards (the post-compact
+/// topology), a per-file split would hand the mega-shard one unit and
+/// serialize ~the whole corpus on one thread while the tiny shards
+/// finish instantly. Two floors still apply:
+///   1. A file's sub-range width never drops below
 ///      `SUBRANGE_MIN_DOCS` — below that, BMM bookkeeping +
 ///      cross-sub-range top-K merge dominate the parallel win.
+///   2. Every file keeps at least one unit (tiny files round up to a
+///      single un-ranged unit).
 ///
 /// Otherwise each kept superfile becomes a single un-ranged work unit
 /// — identical to the original `par_iter` over superfiles shape.
@@ -1898,8 +1932,8 @@ fn build_work_units(
     fanout: FanOut,
     pool_threads: usize,
 ) -> Vec<WorkUnit> {
-    let want_subranges = pool_threads.div_ceil(kept.len().max(1)).max(1);
-    if matches!(fanout, FanOut::PerSuperfile) || want_subranges <= 1 {
+    let total_docs: u64 = kept.iter().map(|e| e.n_docs).sum();
+    if matches!(fanout, FanOut::PerSuperfile) || pool_threads <= 1 || total_docs == 0 {
         return kept
             .iter()
             .map(|e| WorkUnit {
@@ -1909,20 +1943,18 @@ fn build_work_units(
             .collect();
     }
 
-    let mut units: Vec<WorkUnit> = Vec::with_capacity(kept.len() * want_subranges);
+    let mut units: Vec<WorkUnit> = Vec::with_capacity(kept.len() + pool_threads);
     for entry in kept {
         let n_docs = entry.n_docs as u32;
         if n_docs == 0 {
             continue;
         }
-        // Round the sub-range count down to avoid producing
-        // narrower-than-floor slices. With `want_subranges = 2` on
-        // a 1.25M-doc superfile, stride = 625K (well above floor) so
-        // both sub-ranges fire. With a tiny superfile (e.g., 10K
-        // docs, well below `SUBRANGE_MIN_DOCS`), the division
-        // collapses to 1 sub-range = full superfile.
+        // Ceil on the share so the dominant file always claims the
+        // spare threads; the floor cap collapses tiny files back to
+        // one whole-file unit.
+        let share = (entry.n_docs * pool_threads as u64).div_ceil(total_docs) as usize;
         let cap_by_floor = (n_docs / SUBRANGE_MIN_DOCS).max(1) as usize;
-        let n_sub = want_subranges.min(cap_by_floor);
+        let n_sub = share.clamp(1, cap_by_floor);
         if n_sub <= 1 {
             units.push(WorkUnit {
                 entry: Arc::clone(entry),
@@ -3358,6 +3390,69 @@ mod tests {
             cursor = end;
         }
         assert_eq!(cursor, 200_000, "sub-ranges tile the whole superfile");
+    }
+
+    #[test]
+    fn build_work_units_shares_threads_by_doc_mass_not_file_count() {
+        use std::collections::HashMap;
+
+        use uuid::Uuid;
+
+        use crate::supertable::manifest::{SuperfileEntry, SuperfileUri};
+
+        fn entry(n_docs: u64) -> Arc<SuperfileEntry> {
+            let id = Uuid::new_v4();
+            Arc::new(SuperfileEntry {
+                birth_version: 0,
+                superfile_id: id,
+                uri: SuperfileUri(id),
+                n_docs,
+                id_min: 0,
+                id_max: n_docs.saturating_sub(1) as i128,
+                scalar_stats: HashMap::new(),
+                row_group_stats: None,
+                fts_summary: HashMap::new(),
+                vector_summary: HashMap::new(),
+                partition_key: Vec::new(),
+                partition_hint: None,
+                vector_layout: VectorLayout::Ivf,
+                subsection_offsets: None,
+            })
+        }
+
+        // The post-compact topology: one folded mega-shard holding
+        // ~all docs beside tiny delta shards. A per-file thread split
+        // (pool / files = 1) would leave the mega-shard on one unit
+        // and serialize ~the whole corpus on a single thread; the
+        // doc-mass share must hand it ~the whole pool instead.
+        let mega = entry(900_000);
+        let tiny: Vec<Arc<SuperfileEntry>> = (0..7).map(|_| entry(10_000)).collect();
+        let mut kept: Vec<&Arc<SuperfileEntry>> = vec![&mega];
+        kept.extend(tiny.iter());
+
+        let units = build_work_units(&kept, FanOut::SubRanges, 8);
+        let mega_units: Vec<_> = units
+            .iter()
+            .filter(|u| u.entry.superfile_id == mega.superfile_id)
+            .collect();
+        assert_eq!(
+            mega_units.len(),
+            8,
+            "mega-shard claims the pool's thread share"
+        );
+        let mut cursor = 0u32;
+        for u in &mega_units {
+            let (start, end) = u.range.expect("mega-shard units are ranged");
+            assert_eq!(start, cursor);
+            cursor = end;
+        }
+        assert_eq!(cursor, 900_000, "mega-shard sub-ranges tile the file");
+        for u in units
+            .iter()
+            .filter(|u| u.entry.superfile_id != mega.superfile_id)
+        {
+            assert!(u.range.is_none(), "tiny shards keep one un-ranged unit");
+        }
     }
 
     #[test]
