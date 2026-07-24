@@ -1926,6 +1926,192 @@ mod tests {
         assert_eq!(r.n_docs_total(), 0);
     }
 
+    /// Cell-packed hits must carry `stable_id` from the search wave —
+    /// span arithmetic is unavailable and resolve must not invent ids.
+    #[test]
+    fn resolve_hits_errors_when_multicell_hits_lack_stable_id() {
+        use arrow_array::LargeStringArray;
+        use datafusion::error::DataFusionError;
+
+        use crate::supertable::{
+            manifest::ManifestSnapshot,
+            query::{
+                SuperfileHit,
+                exec::common::{output_schema_with_score, resolve_hits},
+            },
+        };
+
+        let st = Supertable::create(opts()).expect("create");
+        let mut w = st.writer().expect("writer");
+        let titles = LargeStringArray::from(vec!["rust async", "python data"]);
+        let batch = arrow_array::RecordBatch::try_new(
+            st.options().schema.clone(),
+            vec![Arc::new(titles) as _],
+        )
+        .expect("batch");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        let old = st.inner.manifest.load();
+        let mut entry = (*old.superfiles[0]).clone();
+        entry.vector_layout = VectorLayout::MultiCellIvf;
+        let uri = entry.uri;
+        let new = ManifestSnapshot::new(
+            old.manifest_id,
+            Arc::clone(&old.options),
+            vec![Arc::new(entry)],
+            None,
+            None,
+        );
+        st.inner.manifest.store(Arc::new(new));
+
+        let reader = st.reader();
+        let hits = vec![SuperfileHit {
+            superfile: uri,
+            local_doc_id: 0,
+            score: 1.0,
+            stable_id: None,
+        }];
+        let scalar_schema = reader.options().scalar_schema();
+        let output_schema = output_schema_with_score(&scalar_schema);
+        let id_idx = scalar_schema.index_of("_id").expect("_id");
+        let title_idx = scalar_schema.index_of("title").expect("title");
+        let err = reader
+            .block_on(resolve_hits(
+                &reader,
+                &hits,
+                &scalar_schema,
+                &output_schema,
+                Some(&[id_idx, title_idx]),
+            ))
+            .expect_err("missing stable_id");
+        match err {
+            DataFusionError::Execution(msg) => {
+                assert!(msg.contains("missing stable _id"), "{msg}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    /// `open` is storage-backed; an in-memory options set without a
+    /// provider must fail closed rather than invent an empty table.
+    #[test]
+    fn open_without_storage_errors() {
+        let err = Supertable::open(opts()).expect_err("no storage");
+        match err {
+            OpenError::Build(BuildError::Store(msg)) => {
+                assert!(msg.contains("requires options.storage"), "{msg}");
+            }
+            other => panic!("expected OpenError::Build(Store), got {other:?}"),
+        }
+    }
+
+    /// Freshness policy: no storage ⇒ never; Strong ⇒ always; Snapshot ⇒
+    /// never; BoundedStaleness ⇒ once per window.
+    #[test]
+    fn pointer_refresh_due_respects_consistency_and_storage() {
+        use std::time::Duration;
+
+        assert!(
+            !Supertable::create(opts())
+                .expect("create")
+                .pointer_refresh_due(),
+            "in-memory handle has no pointer to refresh"
+        );
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+
+        let strong = Supertable::create(
+            opts()
+                .with_storage(Arc::clone(&storage))
+                .with_read_consistency(Consistency::Strong),
+        )
+        .expect("create strong");
+        assert!(strong.pointer_refresh_due());
+        assert!(strong.pointer_refresh_due(), "Strong always checks");
+
+        let snapshot = Supertable::create(
+            opts()
+                .with_storage(Arc::clone(&storage))
+                .with_read_consistency(Consistency::Snapshot),
+        )
+        .expect("create snapshot");
+        assert!(!snapshot.pointer_refresh_due());
+
+        let bounded = Supertable::create(
+            opts()
+                .with_storage(storage)
+                .with_read_consistency(Consistency::BoundedStaleness(Duration::from_secs(3600))),
+        )
+        .expect("create bounded");
+        assert!(
+            bounded.pointer_refresh_due(),
+            "first check in window is due"
+        );
+        assert!(
+            !bounded.pointer_refresh_due(),
+            "second check inside the window is suppressed"
+        );
+    }
+
+    /// Hidden vector-index sibling: vector columns, no FTS, VectorCell
+    /// partition. Any other combination is a user table.
+    #[test]
+    fn is_hidden_vector_index_table_matrix() {
+        use crate::{
+            superfile::{
+                builder::VectorConfig,
+                vector::{distance::Metric, rerank_codec::RerankCodec},
+            },
+            supertable::manifest::{
+                ClusterCentroids,
+                list::{CellRoutingParams, PartitionStrategy},
+            },
+        };
+
+        assert!(!is_hidden_vector_index_table(&opts()));
+
+        let dim = 16i32;
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "emb",
+            DataType::FixedSizeList(item, dim),
+            false,
+        )]));
+        let vector = VectorConfig {
+            column: "emb".into(),
+            dim: dim as usize,
+            n_cent: 2,
+            rot_seed: 1,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        };
+        let mut hidden = SupertableOptions::new(schema, vec![], vec![vector], None)
+            .expect("vector-only options");
+        assert!(
+            !is_hidden_vector_index_table(&hidden),
+            "vector columns alone are not enough"
+        );
+        hidden = hidden.with_partition_strategy(PartitionStrategy::VectorCell {
+            column: "emb".into(),
+            clusters: ClusterCentroids::empty(),
+            routing: CellRoutingParams::default(),
+        });
+        assert!(is_hidden_vector_index_table(&hidden));
+
+        // FTS columns disqualify even with VectorCell routing.
+        let with_fts = opts().with_partition_strategy(PartitionStrategy::VectorCell {
+            column: "emb".into(),
+            clusters: ClusterCentroids::empty(),
+            routing: CellRoutingParams::default(),
+        });
+        assert!(!is_hidden_vector_index_table(&with_fts));
+    }
+
     #[test]
     fn supertable_clone_shares_inner_state() {
         let st1 = Supertable::create(opts()).expect("create");
@@ -2377,6 +2563,595 @@ mod tests {
             .bm25_search("title", "engine", 10, BoolMode::Or, None)
             .expect("bm25 after reopen");
         assert_eq!(rows[0].num_rows(), 1);
+    }
+
+    /// Positions-enabled FTS-only tables emit adjacent-pair bigrams
+    /// into the drained text shard; phrase BM25 must hit via that
+    /// rewrite with the planted phrase df.
+    #[test]
+    fn fts_only_positions_bigrams_answer_phrase_queries() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::superfile::{builder::FtsConfig, format::FST_SEPARATOR, fts::reader::BoolMode};
+
+        /// Docs sharing the planted phrase — clears the default 200‰
+        /// bigram member floor on a tiny corpus.
+        const N_DOCS: usize = 8;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: true,
+            }],
+            vec![],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(Arc::clone(&storage))
+        .with_writer_pool(Arc::clone(&pool));
+        let st = Supertable::create(options).expect("create");
+
+        let texts: Vec<&str> = std::iter::repeat_n("alpha beta gamma", N_DOCS).collect();
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(LargeStringArray::from(texts)) as Arc<dyn Array>],
+        )
+        .expect("batch");
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("text drain");
+
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden sibling")
+            .clone();
+        let text_entries: Vec<_> = hidden
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .filter(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty())
+            .cloned()
+            .collect();
+        assert_eq!(text_entries.len(), 1);
+        assert_eq!(text_entries[0].n_docs as usize, N_DOCS);
+        assert!(
+            hidden.reader().manifest().slow_fts_state_blob().is_some(),
+            "drain stamps FTS routing when the epoch is non-empty"
+        );
+
+        // Shard carries the synthetic pair term with full phrase df.
+        let shard = bridge_sync_to_async(open_reader(
+            &hidden.reader().manifest().options.store,
+            hidden.reader().manifest().options.disk_cache.as_ref(),
+            hidden.reader().manifest().options.storage.as_ref(),
+            &text_entries[0],
+            true,
+        ))
+        .expect("open text shard");
+        let fts = shard.fts().expect("fts blob");
+        let mut bigram = b"alpha".to_vec();
+        bigram.push(FST_SEPARATOR);
+        bigram.extend_from_slice(b"beta");
+        let key = String::from_utf8(bigram).expect("utf8");
+        let df = bridge_sync_to_async(fts.term_df("title", &key)).expect("bigram df");
+        assert_eq!(df, N_DOCS as u64, "pair term df matches planted phrase");
+
+        let phrase = st
+            .reader()
+            .bm25_search(
+                "title",
+                "\"alpha beta\"",
+                N_DOCS,
+                BoolMode::Or,
+                Some(&["_id", "score"]),
+            )
+            .expect("phrase via bigram rewrite");
+        assert_eq!(
+            phrase.iter().map(|b| b.num_rows()).sum::<usize>(),
+            N_DOCS,
+            "every planted doc matches the phrase"
+        );
+    }
+
+    /// Several single-superfile batches (`drain_batch_superfiles = 1`)
+    /// land in one shard group under the default MiB target, so the
+    /// drain must merge those runs (`group.len() > 1`) before emitting
+    /// bigrams. A follow-up fold epoch then drops a deleted doc and
+    /// keeps phrase search correct.
+    #[test]
+    fn fts_only_multibatch_merge_and_fold_keeps_phrase_hits() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::prelude::{col, lit};
+
+        use crate::superfile::{builder::FtsConfig, format::FST_SEPARATOR, fts::reader::BoolMode};
+
+        /// Commits / batches — each becomes its own text-merge run.
+        const COMMITS: usize = 3;
+        /// Docs per commit; phrase is corpus-wide so bigrams clear the
+        /// default 200‰ floor after the cross-batch merge.
+        const PER: usize = 4;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                    positions: true,
+                }],
+                vec![],
+                Some(crate::test_helpers::default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(Arc::clone(&storage))
+            .with_writer_pool(Arc::clone(&pool))
+            .with_drain_batch_superfiles(1),
+        )
+        .expect("create");
+
+        for c in 0..COMMITS {
+            let texts: Vec<String> = (0..PER)
+                .map(|i| format!("alpha beta gamma uniq{}", c * PER + i))
+                .collect();
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(LargeStringArray::from(texts)) as Arc<dyn Array>],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync()
+            .expect("multi-batch text drain");
+
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden sibling")
+            .clone();
+        let text_entries: Vec<_> = hidden
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .filter(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty())
+            .cloned()
+            .collect();
+        assert_eq!(text_entries.len(), 1, "tiny runs coalesce to one shard");
+        assert_eq!(
+            text_entries[0].n_docs as usize,
+            COMMITS * PER,
+            "group merge keeps every live doc"
+        );
+
+        let shard = bridge_sync_to_async(open_reader(
+            &hidden.reader().manifest().options.store,
+            hidden.reader().manifest().options.disk_cache.as_ref(),
+            hidden.reader().manifest().options.storage.as_ref(),
+            &text_entries[0],
+            true,
+        ))
+        .expect("open text shard");
+        let fts = shard.fts().expect("fts blob");
+        let mut bigram = b"alpha".to_vec();
+        bigram.push(FST_SEPARATOR);
+        bigram.extend_from_slice(b"beta");
+        let key = String::from_utf8(bigram).expect("utf8");
+        let df = bridge_sync_to_async(fts.term_df("title", &key)).expect("bigram df");
+        assert_eq!(df, (COMMITS * PER) as u64);
+
+        let phrase_n = st
+            .reader()
+            .bm25_search("title", "\"alpha beta\"", COMMITS * PER, BoolMode::Or, None)
+            .expect("phrase")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>();
+        assert_eq!(phrase_n, COMMITS * PER);
+
+        // Fold epoch: tombstone one doc + append a delta, re-drain.
+        let del = st
+            .delete(col("title").eq(lit("alpha beta gamma uniq0")))
+            .expect("delete");
+        assert_eq!(del.n_tombstoned(), 1);
+        {
+            let batch = arrow_array::RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(LargeStringArray::from(vec!["alpha beta gamma uniq_delta"]))
+                        as Arc<dyn Array>,
+                ],
+            )
+            .expect("delta");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("fold drain");
+        let folded: Vec<_> = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden")
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .filter(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty())
+            .cloned()
+            .collect();
+        assert_eq!(folded.len(), 1);
+        assert_eq!(
+            folded[0].n_docs as usize,
+            COMMITS * PER, // -1 deleted +1 delta
+            "fold replaces the prior shard with live docs only"
+        );
+        assert_eq!(
+            st.reader()
+                .count("title", "uniq0", BoolMode::Or)
+                .expect("deleted vocab gone"),
+            0
+        );
+        assert_eq!(
+            st.reader()
+                .bm25_search("title", "uniq_delta", 5, BoolMode::Or, None)
+                .expect("delta")[0]
+                .num_rows(),
+            1
+        );
+        let phrase_n = st
+            .reader()
+            .bm25_search("title", "\"alpha beta\"", COMMITS * PER, BoolMode::Or, None)
+            .expect("phrase after fold")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>();
+        assert_eq!(phrase_n, COMMITS * PER);
+    }
+
+    /// Text drain with a disk cache attached must warm-insert the new
+    /// shard so the next open is a cache hit (zero storage GETs).
+    #[test]
+    fn fts_only_drain_warms_disk_cache_for_text_shard() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::{
+            superfile::{builder::FtsConfig, fts::reader::BoolMode},
+            test_helpers::default_disk_cache,
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let cache_root = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_root).expect("cache root");
+        let cache = default_disk_cache(Arc::clone(&storage), &cache_root);
+        let st = Supertable::create(
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                    positions: false,
+                }],
+                vec![],
+                Some(crate::test_helpers::default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(Arc::clone(&storage))
+            .with_writer_pool(pool)
+            .with_disk_cache(Arc::clone(&cache)),
+        )
+        .expect("create");
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(LargeStringArray::from(vec![
+                "cache warm rust",
+                "cache warm engine",
+            ])) as Arc<dyn Array>],
+        )
+        .expect("batch");
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden sibling")
+            .clone();
+        let text = hidden
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .find(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty())
+            .expect("text shard")
+            .clone();
+        // Drain warm-inserts into the hidden table's cache (same Arc).
+        let hidden_reader = hidden.reader();
+        let hidden_cache = hidden_reader
+            .manifest()
+            .options
+            .disk_cache
+            .as_ref()
+            .expect("hidden disk cache");
+        assert!(
+            hidden_cache.is_cached(&text.uri),
+            "text shard must be warm in the disk cache after drain"
+        );
+        assert_eq!(
+            st.reader()
+                .count("title", "rust", BoolMode::Or)
+                .expect("count"),
+            1
+        );
+    }
+
+    /// First drain over a fully-tombstoned user table takes the empty
+    /// `n_docs_merged == 0` path: no text shards, no routing blob.
+    /// (Idle re-drain after a live epoch intentionally keeps the old
+    /// shards — post-epoch deletes filter at query time until new
+    /// undrained data arrives.)
+    #[test]
+    fn fts_only_all_tombstoned_before_drain_publishes_empty_epoch() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::prelude::{col, lit};
+
+        use crate::superfile::{builder::FtsConfig, fts::reader::BoolMode};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                    positions: false,
+                }],
+                vec![],
+                Some(crate::test_helpers::default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(storage)
+            .with_writer_pool(pool),
+        )
+        .expect("create");
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(LargeStringArray::from(vec!["rust engine", "tokio runtime"]))
+                    as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        let del = st
+            .delete(
+                col("title")
+                    .eq(lit("rust engine"))
+                    .or(col("title").eq(lit("tokio runtime"))),
+            )
+            .expect("tombstone every row");
+        assert_eq!(del.n_tombstoned(), 2);
+        st.drain_vectors_to_cells_sync()
+            .expect("drain fully-tombstoned table");
+        let hidden = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden sibling")
+            .clone();
+        let n_text = hidden
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .filter(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty())
+            .count();
+        assert_eq!(n_text, 0, "empty live corpus publishes no text shards");
+        assert!(
+            hidden.reader().manifest().slow_fts_state_blob().is_none(),
+            "empty epoch stamps no FTS routing blob"
+        );
+        assert_eq!(
+            st.reader()
+                .count("title", "rust", BoolMode::Or)
+                .expect("count"),
+            0
+        );
+    }
+
+    /// Empty user table: FTS-only drain returns before publishing —
+    /// no sources means no text epoch.
+    #[test]
+    fn fts_only_empty_table_drain_is_noop() {
+        use std::sync::Arc;
+
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::superfile::builder::FtsConfig;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            SupertableOptions::new(
+                schema,
+                vec![FtsConfig {
+                    column: "title".into(),
+                    positions: false,
+                }],
+                vec![],
+                Some(crate::test_helpers::default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(storage)
+            .with_writer_pool(pool),
+        )
+        .expect("create");
+        st.drain_vectors_to_cells_sync().expect("empty drain");
+        let n_text = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden sibling")
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .filter(|e| !e.fts_summary.is_empty())
+            .count();
+        assert_eq!(n_text, 0);
+    }
+
+    /// `drain_batch_superfiles = 0` is the explicit skip switch: the
+    /// FTS-only drain returns without publishing shards even when the
+    /// user table has undrained files.
+    #[test]
+    fn fts_only_drain_batch_zero_skips_text_epoch() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::superfile::builder::FtsConfig;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                    positions: false,
+                }],
+                vec![],
+                Some(crate::test_helpers::default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(storage)
+            .with_writer_pool(pool)
+            .with_drain_batch_superfiles(0),
+        )
+        .expect("create");
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(LargeStringArray::from(vec!["rust engine"])) as Arc<dyn Array>],
+        )
+        .expect("batch");
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("skipped drain");
+        let n_text = st
+            .reader()
+            .vector_index_table()
+            .expect("hidden sibling")
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .filter(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty())
+            .count();
+        assert_eq!(n_text, 0, "batch=0 must not publish text shards");
     }
 
     /// Regression for the text drain's batch-open pairing: readers

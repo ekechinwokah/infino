@@ -4717,6 +4717,64 @@ mod tests {
         assert_eq!(uri.cache_tmp_filename(), format!("seg-{id}.sf.parquet.tmp"));
     }
 
+    /// Cache restart reuses NVMe bytes only for complete `seg-<uuid>.sf.parquet`
+    /// names — in-flight `.tmp` files and garbage names are ignored.
+    #[test]
+    fn from_cache_filename_round_trips_and_rejects_tmp() {
+        let uri = SuperfileUri(Uuid::new_v4());
+        assert_eq!(
+            SuperfileUri::from_cache_filename(&uri.cache_filename()),
+            Some(uri)
+        );
+        assert!(
+            SuperfileUri::from_cache_filename(&uri.cache_tmp_filename()).is_none(),
+            "incomplete .tmp writes must not rehydrate"
+        );
+        assert!(SuperfileUri::from_cache_filename("seg-not-a-uuid.sf.parquet").is_none());
+        assert!(SuperfileUri::from_cache_filename("other.bin").is_none());
+    }
+
+    /// A user-table manifest with indexed columns stamps the default hidden
+    /// prefix (or reuses an existing one); a hidden sibling (no columns)
+    /// must never claim its own subtree.
+    #[test]
+    fn stamp_vector_index_storage_prefix_defaults_and_skips_hidden() {
+        let snap = ManifestSnapshot::empty(opts());
+        let vectors = [list::VectorColumnInfo {
+            column: "emb".into(),
+            dim: 4,
+            n_cent: 2,
+            rot_seed: 1,
+            metric: "l2sq".into(),
+        }];
+        assert_eq!(
+            snap.stamp_vector_index_storage_prefix(&vectors, &[])
+                .as_deref(),
+            Some(DEFAULT_VECTOR_INDEX_PREFIX)
+        );
+        let fts = [list::FtsColumnInfo {
+            column: "body".into(),
+        }];
+        assert_eq!(
+            snap.stamp_vector_index_storage_prefix(&[], &fts).as_deref(),
+            Some(DEFAULT_VECTOR_INDEX_PREFIX)
+        );
+        assert_eq!(
+            snap.stamp_vector_index_storage_prefix(&[], &[]),
+            None,
+            "hidden sibling options declare no columns"
+        );
+
+        let stamped =
+            ManifestSnapshot::empty_with_vector_index_prefix(opts(), Some("custom_prefix".into()));
+        assert_eq!(
+            stamped
+                .stamp_vector_index_storage_prefix(&vectors, &[])
+                .as_deref(),
+            Some("custom_prefix")
+        );
+    }
+
     #[test]
     fn manifest_debug_reports_counts() {
         let m = ManifestSnapshot::empty(opts()).with_appended(vec![seg_entry(Uuid::new_v4(), 3)]);

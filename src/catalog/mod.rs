@@ -2398,4 +2398,99 @@ mod tests {
             "connection B must stay quiet while A writes: {delta_b:?}"
         );
     }
+
+    /// `usage_meter()` hands out the same ledger `usage_snapshot` reads —
+    /// create/append traffic must land on both views.
+    #[test]
+    fn usage_meter_arc_matches_usage_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = connect(dir.path().to_str().expect("utf8")).expect("connect");
+        let meter = conn.usage_meter();
+        let before = meter.snapshot();
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create")
+            .append(&build_title_batch(&["metered"]))
+            .expect("append");
+        let via_meter = meter.snapshot().since(&before);
+        let via_conn = conn.usage_snapshot().since(&before);
+        assert_eq!(
+            via_meter, via_conn,
+            "meter Arc and connection snapshot agree"
+        );
+        assert!(
+            via_meter.put_count > 0 || via_meter.get_count > 0 || via_meter.list_count > 0,
+            "create/append must move the shared meter: {via_meter:?}"
+        );
+    }
+
+    /// Budget exhaustion becomes `OverBudget`; every other DataFusion
+    /// failure stays a generic `Query` error.
+    #[test]
+    fn sql_exec_error_maps_resources_exhausted_to_over_budget() {
+        let over = sql_exec_error(DataFusionError::ResourcesExhausted("cap".into()));
+        assert!(matches!(over, InfinoError::OverBudget(msg) if msg == "cap"));
+        let other = sql_exec_error(DataFusionError::Internal("boom".into()));
+        match other {
+            InfinoError::Query(msg) => assert!(msg.contains("boom"), "{msg}"),
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    /// Tokenizer is required exactly when the index spec names FTS columns.
+    #[test]
+    fn table_tokenizer_present_iff_fts_columns() {
+        assert!(table_tokenizer(&IndexSpec::new()).is_none());
+        assert!(table_tokenizer(&IndexSpec::new().fts("title")).is_some());
+    }
+
+    /// Physical locations must be unique per create so a logical drop +
+    /// re-create never reopens the dropped table's bytes.
+    #[test]
+    fn unique_location_is_distinct_and_prefixed() {
+        let a = unique_location("docs");
+        let b = unique_location("docs");
+        assert_ne!(a, b);
+        assert!(a.starts_with("docs-"), "{a}");
+        assert!(b.starts_with("docs-"), "{b}");
+    }
+
+    /// Per-name gate is shared across lookups for the same table name.
+    #[test]
+    fn single_flight_gate_reuses_mutex_per_name() {
+        use dashmap::DashMap;
+
+        let building: DashMap<String, Arc<std::sync::Mutex<()>>> = DashMap::new();
+        let a = single_flight_gate(&building, "docs");
+        let b = single_flight_gate(&building, "docs");
+        let c = single_flight_gate(&building, "other");
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(!Arc::ptr_eq(&a, &c));
+        assert_eq!(building.len(), 2);
+    }
+
+    #[test]
+    fn validate_name_accepts_alnum_and_rejects_reserved() {
+        assert!(validate_name("docs").is_ok());
+        assert!(validate_name("Docs_1-2").is_ok());
+        assert!(validate_name("").is_err());
+        assert!(validate_name("_hidden").is_err());
+        assert!(validate_name("has space").is_err());
+        assert!(validate_name("dot.name").is_err());
+    }
+
+    /// `with_validate(true)` probes the catalog root at connect; a
+    /// healthy local-fs root must succeed and leave an empty catalog.
+    #[test]
+    fn connect_with_validate_probes_local_fs_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = connect_with(
+            dir.path().to_str().expect("utf8"),
+            ConnectOptions::new().with_validate(true),
+        )
+        .expect("validate connect");
+        assert!(
+            conn.list_tables().expect("list").is_empty(),
+            "fresh validated catalog has no tables"
+        );
+    }
 }

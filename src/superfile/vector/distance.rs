@@ -2100,6 +2100,134 @@ mod tests {
         }
     }
 
+    /// Portable wide sum — call the fallback kernel directly so AVX-512
+    /// hosts still exercise it (the public `sum_f32` never reaches it).
+    #[test]
+    fn sum_f32_wide_matches_iter_sum() {
+        for len in [1, 7, 8, 9, 15, 17, 33] {
+            let v: Vec<f32> = (0..len).map(|i| (i as f32) * 0.5 - 3.0).collect();
+            let expected: f32 = v.iter().copied().sum();
+            assert!(
+                approx(sum_f32_wide(&v), expected, 1e-4),
+                "len={len}: got {} expected {expected}",
+                sum_f32_wide(&v)
+            );
+        }
+    }
+
+    #[test]
+    fn add_f32_to_f64_acc_scalar_matches_naive() {
+        let row = [1.0f32, -2.5, 3.25, 0.0, 8.0];
+        let mut acc = [10.0f64; 5];
+        add_f32_to_f64_acc_scalar(&mut acc, &row);
+        assert_eq!(acc, [11.0, 7.5, 13.25, 10.0, 18.0]);
+    }
+
+    #[test]
+    fn decode_f32_le_wide_round_trips() {
+        let values: Vec<f32> = (0..19).map(|i| i as f32 * 0.125 - 2.0).collect();
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut out = vec![0f32; values.len()];
+        decode_f32_le_wide(&bytes, &mut out, values.len());
+        assert_eq!(out, values);
+    }
+
+    /// Half-block (8-lane) transposed scorer — skipped on AVX-512 hosts
+    /// by the public block dispatcher, so call it directly.
+    #[test]
+    fn score_centroid_block8_transposed_wide_matches_scalar_dots() {
+        let dim = 4usize;
+        let n_cent = CENTROID_BATCH_LANES; // one full padded block
+        let mut centroids = vec![0f32; n_cent * dim];
+        for i in 0..n_cent {
+            centroids[i * dim] = i as f32;
+            centroids[i * dim + 1] = (i as f32) * 0.5;
+        }
+        let transposed = transpose_centroids_cluster_major(&centroids, n_cent, dim);
+        let query = [1.0f32, 0.5, 0.0, 0.0];
+        for (half, lane_offset) in [(0usize, 0usize), (1, F32X8_LANES)] {
+            let scores = score_centroid_block8_transposed_wide(
+                Metric::L2Sq,
+                &query,
+                &transposed,
+                dim,
+                0,
+                lane_offset,
+            );
+            for (lane, &got) in scores.iter().enumerate() {
+                let c = lane_offset + lane;
+                let want = distance(Metric::L2Sq, &query, &centroids[c * dim..(c + 1) * dim]);
+                assert!(
+                    approx(got, want, 1e-4),
+                    "half={half} lane={lane}: got {got} want {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dequantize_sq8_residual_wide_matches_scalar_kernel() {
+        let dim = 17usize;
+        let scale: Vec<f32> = (0..dim).map(|i| 0.01 * (i as f32 + 1.0)).collect();
+        let offset: Vec<f32> = (0..dim).map(|i| -0.5 + 0.03 * i as f32).collect();
+        let codes: Vec<u8> = (0..dim).map(|i| (i * 17 % 256) as u8).collect();
+        let residuals: Vec<u8> = (0..dim)
+            .map(|i| ((i as i8).wrapping_mul(3)).to_le_bytes()[0])
+            .collect();
+        let mut wide = vec![0f32; dim];
+        let mut scalar = vec![0f32; dim];
+        dequantize_sq8_residual_wide(
+            &scale,
+            &offset,
+            &codes,
+            &residuals,
+            SQ8_RESIDUAL_DIVISOR,
+            &mut wide,
+            dim,
+        );
+        dequantize_sq8_residual_into(
+            &scale,
+            &offset,
+            &codes,
+            &residuals,
+            SQ8_RESIDUAL_DIVISOR,
+            &mut scalar,
+        );
+        for i in 0..dim {
+            assert!(
+                approx(wide[i], scalar[i], 1e-5),
+                "dim lane {i}: wide {} vs scalar {}",
+                wide[i],
+                scalar[i]
+            );
+        }
+    }
+
+    #[test]
+    fn sq8_residual_norm_sq_wide_matches_public_norm() {
+        let dim = 17usize;
+        let scale: Vec<f32> = (0..dim).map(|i| 0.01 * (i as f32 + 1.0)).collect();
+        let offset: Vec<f32> = (0..dim).map(|i| -0.5 + 0.03 * i as f32).collect();
+        let codes: Vec<u8> = (0..dim).map(|i| (i * 17 % 256) as u8).collect();
+        let residuals: Vec<u8> = (0..dim)
+            .map(|i| ((i as i8).wrapping_mul(3)).to_le_bytes()[0])
+            .collect();
+        let wide = sq8_residual_norm_sq_wide(
+            &scale,
+            &offset,
+            &codes,
+            &residuals,
+            SQ8_RESIDUAL_DIVISOR,
+            dim,
+        );
+        let public =
+            sq8_residual_norm_sq(&scale, &offset, &codes, &residuals, SQ8_RESIDUAL_DIVISOR);
+        assert!(
+            (wide - public).abs() <= 1e-5 * (1.0 + public.abs()),
+            "wide {wide} vs public {public}"
+        );
+    }
+
     #[test]
     fn sq8_residual_norm_sq_matches_dequant_dot_self() {
         let dim = 17;

@@ -1154,6 +1154,55 @@ mod decode_error_tests {
             decode_value_counts(&with_null),
             Err(DecodeError::ArrowIpc(msg)) if msg.contains("null")
         ));
+
+        // Two batches → dedicated UnexpectedBatchCount (never silently
+        // pick the first batch).
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new("count", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![1u64])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        let mut multi = Vec::new();
+        {
+            let mut w = StreamWriter::try_new(&mut multi, &schema).expect("ipc init");
+            w.write(&batch).expect("write");
+            w.write(&batch).expect("write");
+            w.finish().expect("finish");
+        }
+        assert!(matches!(
+            decode_value_counts(&multi),
+            Err(DecodeError::UnexpectedBatchCount(2))
+        ));
+    }
+
+    /// A `__value_counts` column that is not Binary must fail closed —
+    /// mistyped optional stats never assemble into a ScalarStatsAgg.
+    #[test]
+    fn decode_scalar_stats_wrong_value_counts_type_errors() {
+        let bytes = ipc_batch(
+            vec![
+                Field::new("c__min", DataType::Int64, true),
+                Field::new("c__max", DataType::Int64, true),
+                Field::new("c__value_counts", DataType::Int64, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![9i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![0i64])) as ArrayRef,
+            ],
+        );
+        let err = decode_scalar_stats(&bytes).expect_err("bad value_counts type");
+        assert!(
+            matches!(err, DecodeError::ArrowIpc(ref msg) if msg.contains("Binary")),
+            "{err:?}"
+        );
     }
 
     /// `decode_length1_array` rejects corrupt / wrong-shaped bytes with a typed
@@ -1776,6 +1825,51 @@ mod vector_summary_tests {
         );
     }
 
+    /// Corrupt / empty cluster-centroid wire forms must fail closed
+    /// (or decode to empty) — never silently admit a truncated slab.
+    #[test]
+    fn decode_cluster_centroids_rejects_bad_headers() {
+        use super::{CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY, DecodeError, decode_cluster_centroids};
+        use crate::supertable::manifest::ADMIT_CODE_WORD_BITS;
+
+        // n_cent = 0 → empty centroids (valid sentinel).
+        let empty = 0u32
+            .to_le_bytes()
+            .into_iter()
+            .chain(4u32.to_le_bytes())
+            .collect::<Vec<_>>();
+        let got = decode_cluster_centroids(&empty).expect("empty");
+        assert_eq!(got.n_cent, 0);
+
+        // Unknown wire tag.
+        let mut bad_tag = Vec::new();
+        bad_tag.extend_from_slice(&1u32.to_le_bytes());
+        bad_tag.extend_from_slice(&8u32.to_le_bytes());
+        bad_tag.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        bad_tag.extend_from_slice(&3u32.to_le_bytes()); // counts
+        let err = decode_cluster_centroids(&bad_tag).expect_err("bad tag");
+        assert!(
+            matches!(err, DecodeError::InvalidVectorSummary(ref msg) if msg.contains("wire tag")),
+            "{err:?}"
+        );
+
+        // Routing-only: words_per_code must match dim.
+        let dim = 32u32;
+        let expected_words = (dim as usize).div_ceil(ADMIT_CODE_WORD_BITS) as u32;
+        let mut bad_wpc = Vec::new();
+        bad_wpc.extend_from_slice(&1u32.to_le_bytes());
+        bad_wpc.extend_from_slice(&dim.to_le_bytes());
+        bad_wpc.extend_from_slice(&CLUSTER_CENTROIDS_WIRE_RABITQ_ONLY.to_le_bytes());
+        bad_wpc.extend_from_slice(&1u32.to_le_bytes()); // count
+        bad_wpc.extend_from_slice(&7u64.to_le_bytes()); // rot_seed
+        bad_wpc.extend_from_slice(&(expected_words + 3).to_le_bytes()); // wrong width
+        let err = decode_cluster_centroids(&bad_wpc).expect_err("words_per_code");
+        assert!(
+            matches!(err, DecodeError::InvalidVectorSummary(ref msg) if msg.contains("words_per_code")),
+            "{err:?}"
+        );
+    }
+
     /// A cell without a built slab can't be written routing-only; the
     /// encoder falls back to the full form so the artifact stays decodable.
     #[test]
@@ -1853,6 +1947,123 @@ mod row_group_stats_tests {
                 .expect("empty decodes")
                 .columns
                 .is_empty()
+        );
+    }
+
+    /// Unknown suffixes, unpaired bounds, mistyped nulls, length
+    /// mismatches, and multi-batch streams must fail closed — corrupt
+    /// row-group stats are never silently admitted into prune decisions.
+    #[test]
+    fn decode_row_group_stats_rejects_bad_shapes() {
+        use std::io::Cursor;
+
+        use arrow::ipc::writer::StreamWriter;
+        use arrow_schema::{DataType, Field, Schema};
+
+        use super::DecodeError;
+
+        fn ipc_batch(fields: Vec<Field>, arrays: Vec<ArrayRef>) -> Vec<u8> {
+            let schema = Arc::new(Schema::new(fields));
+            let batch =
+                arrow_array::RecordBatch::try_new(Arc::clone(&schema), arrays).expect("batch");
+            let mut bytes = Vec::new();
+            {
+                let mut w =
+                    StreamWriter::try_new(Cursor::new(&mut bytes), &schema).expect("writer");
+                w.write(&batch).expect("write");
+                w.finish().expect("finish");
+            }
+            bytes
+        }
+
+        let err = decode_row_group_stats(b"not-arrow-ipc").expect_err("garbage");
+        assert!(matches!(err, DecodeError::ArrowIpc(_)));
+
+        let err = decode_row_group_stats(&ipc_batch(
+            vec![Field::new("x", DataType::Int64, true)],
+            vec![Arc::new(Int64Array::from(vec![1i64])) as ArrayRef],
+        ))
+        .expect_err("bad suffix");
+        assert!(
+            matches!(err, DecodeError::ArrowIpc(ref msg) if msg.contains("unrecognized")),
+            "{err:?}"
+        );
+
+        // Min without a matching max.
+        let err = decode_row_group_stats(&ipc_batch(
+            vec![Field::new("c__min", DataType::Int64, true)],
+            vec![Arc::new(Int64Array::from(vec![1i64, 2])) as ArrayRef],
+        ))
+        .expect_err("unpaired min");
+        assert!(
+            matches!(err, DecodeError::ArrowIpc(ref msg) if msg.contains("unpaired")),
+            "{err:?}"
+        );
+
+        // `__nulls` must be UInt64.
+        let err = decode_row_group_stats(&ipc_batch(
+            vec![
+                Field::new("c__min", DataType::Int64, true),
+                Field::new("c__max", DataType::Int64, true),
+                Field::new("c__nulls", DataType::Int64, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![9i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![0i64])) as ArrayRef,
+            ],
+        ))
+        .expect_err("bad nulls type");
+        assert!(
+            matches!(err, DecodeError::ArrowIpc(ref msg) if msg.contains("UInt64")),
+            "{err:?}"
+        );
+
+        // Two batches → dedicated UnexpectedBatchCount.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("c__min", DataType::Int64, true),
+            Field::new("c__max", DataType::Int64, true),
+        ]));
+        let batch = arrow_array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![2i64])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        let mut multi = Vec::new();
+        {
+            let mut w = StreamWriter::try_new(Cursor::new(&mut multi), &schema).expect("writer");
+            w.write(&batch).expect("write");
+            w.write(&batch).expect("write");
+            w.finish().expect("finish");
+        }
+        let err = decode_row_group_stats(&multi).expect_err("two batches");
+        assert!(
+            matches!(err, DecodeError::UnexpectedBatchCount(2)),
+            "{err:?}"
+        );
+
+        // Equal counts but different bases: a__min + b__max is not a pair.
+        let err = decode_row_group_stats(&ipc_batch(
+            vec![
+                Field::new("a__min", DataType::Int64, true),
+                Field::new("b__max", DataType::Int64, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![9i64])) as ArrayRef,
+            ],
+        ))
+        .expect_err("mismatched bases");
+        assert!(
+            matches!(
+                err,
+                DecodeError::ArrowIpc(ref msg)
+                    if msg.contains("__min but no __max") || msg.contains("unpaired")
+            ),
+            "{err:?}"
         );
     }
 }

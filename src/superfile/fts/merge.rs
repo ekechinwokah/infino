@@ -816,4 +816,147 @@ mod tests {
         let got: Vec<i128> = (0..col.len()).map(|i| col.value(i)).collect();
         assert_eq!(got, stable_ids);
     }
+
+    /// Synthetic terms must be valid UTF-8 — corrupt bytes fail closed
+    /// as `InvalidData`, never panic mid-encode.
+    #[tokio::test]
+    async fn merge_rejects_non_utf8_synthetic_term() {
+        use std::io::ErrorKind;
+
+        use crate::superfile::error::BuildError;
+
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        b.add_doc(0, 0, "alpha").expect("add");
+        let src = FtsReader::open(
+            Bytes::from(b.finish().expect("finish")),
+            r#"[{"name":"body","tokenizer":"ascii_lower"}]"#,
+        )
+        .expect("open");
+        let synthetic = [SyntheticTerms {
+            column: "body".into(),
+            // Lex-before "alpha" so the synthetic head is visited first.
+            terms: vec![SyntheticTerm {
+                term: vec![0xff, 0xfe],
+                pairs: vec![(0, 1)],
+                runs: Vec::new(),
+            }],
+        }];
+        let err = merge_fts_blobs(
+            &[MergeSource {
+                reader: &src,
+                doc_id_remap: &[Some(0)],
+            }],
+            &[MergeColumn {
+                name: "body".into(),
+                positions: false,
+            }],
+            1,
+            None,
+            &synthetic,
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("non-utf8 synthetic");
+        match err {
+            BuildError::Io(io) => {
+                assert_eq!(io.kind(), ErrorKind::InvalidData);
+                assert!(io.to_string().contains("UTF-8"), "got: {io}");
+            }
+            other => panic!("expected Io InvalidData, got {other:?}"),
+        }
+    }
+
+    /// Synthetics outside `key_bounds` (or with empty pairs) are skipped
+    /// — the merged FST must not grow a term the shard range excludes.
+    #[tokio::test]
+    async fn merge_skips_synthetic_outside_key_bounds() {
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        b.add_doc(0, 0, "alpha beta").expect("add");
+        let src = FtsReader::open(
+            Bytes::from(b.finish().expect("finish")),
+            r#"[{"name":"body","tokenizer":"ascii_lower"}]"#,
+        )
+        .expect("open");
+
+        // Keep only body\x1Falpha .. body\x1Fbeta (half-open).
+        let mut lo = b"body".to_vec();
+        lo.push(FST_SEPARATOR);
+        lo.extend_from_slice(b"alpha");
+        let mut hi = b"body".to_vec();
+        hi.push(FST_SEPARATOR);
+        hi.extend_from_slice(b"beta");
+
+        // zeta is outside [alpha, beta); empty pairs → also skipped.
+        let synthetic = [SyntheticTerms {
+            column: "body".into(),
+            terms: vec![
+                SyntheticTerm {
+                    term: b"zeta".to_vec(),
+                    pairs: vec![(0, 1)],
+                    runs: Vec::new(),
+                },
+                SyntheticTerm {
+                    term: b"alpha".to_vec(), // in bounds but empty pairs
+                    pairs: vec![],
+                    runs: Vec::new(),
+                },
+            ],
+        }];
+
+        let mut out = Vec::new();
+        merge_fts_blobs(
+            &[MergeSource {
+                reader: &src,
+                doc_id_remap: &[Some(0)],
+            }],
+            &[MergeColumn {
+                name: "body".into(),
+                positions: false,
+            }],
+            1,
+            Some((&lo, &hi)),
+            &synthetic,
+            &mut out,
+        )
+        .await
+        .expect("merge");
+        let r = FtsReader::open(
+            Bytes::from(out),
+            r#"[{"name":"body","tokenizer":"ascii_lower"}]"#,
+        )
+        .expect("open");
+        let terms: Vec<Vec<u8>> = r
+            .column_term_entries("body")
+            .expect("entries")
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(
+            terms,
+            vec![b"alpha".to_vec()],
+            "zeta skipped; empty-pairs noop"
+        );
+    }
+
+    /// Source decode failures surface as `InvalidData` I/O errors so a
+    /// corrupt input never panics the merge.
+    #[test]
+    fn map_source_err_wraps_fts_error_as_invalid_data() {
+        use std::io::ErrorKind;
+
+        use crate::superfile::error::FtsError;
+
+        let err = map_source_err(FtsError::UnknownColumn("body".into()));
+        match err {
+            BuildError::Io(io) => {
+                assert_eq!(io.kind(), ErrorKind::InvalidData);
+                assert!(io.to_string().contains("unknown FTS column"));
+            }
+            other => panic!("expected Io InvalidData, got {other:?}"),
+        }
+    }
 }

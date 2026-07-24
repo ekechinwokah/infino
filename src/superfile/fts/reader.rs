@@ -7678,6 +7678,17 @@ mod tests {
         assert_eq!(default_tokenizer(), "ascii_lower");
     }
 
+    /// `BoolMode::from` is the SQL/TVF wire parser — only `"and"` is
+    /// conjunctive; everything else (including typos) is disjunctive.
+    #[test]
+    fn bool_mode_from_str_maps_and_or_and_defaults() {
+        assert_eq!(BoolMode::from("and"), BoolMode::And);
+        assert_eq!(BoolMode::from("or"), BoolMode::Or);
+        assert_eq!(BoolMode::from("AND"), BoolMode::Or, "case-sensitive");
+        assert_eq!(BoolMode::from(""), BoolMode::Or);
+        assert_eq!(BoolMode::from("anything-else"), BoolMode::Or);
+    }
+
     #[test]
     fn fts_column_config_missing_tokenizer_defaults() {
         // A column JSON without the optional `tokenizer` field decodes to

@@ -440,6 +440,78 @@ mod tests {
         assert!(decode_state(&bad).is_err());
     }
 
+    /// `write_state` / `fetch_state` round-trip through LocalFs, and a
+    /// wrong content hash fails closed before decode.
+    #[tokio::test]
+    async fn write_and_fetch_state_round_trip_and_rejects_hash_mismatch() {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+
+        use crate::storage::LocalFsStorageProvider;
+
+        let dir = TempDir::new().expect("tmpdir");
+        let storage = Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        let state = sample_state();
+        let reference = write_state(storage.as_ref(), &state)
+            .await
+            .expect("write_state");
+        let fetched = fetch_state(storage.as_ref(), &reference)
+            .await
+            .expect("fetch_state");
+        assert_eq!(fetched.files.len(), state.files.len());
+        assert_eq!(fetched.files[0].superfile_id, state.files[0].superfile_id);
+
+        // Tamper with the expected hash — fetch must refuse the bytes.
+        let mut bad = reference.clone();
+        bad.content_hash.0[0] ^= 0xff;
+        let err = fetch_state(storage.as_ref(), &bad)
+            .await
+            .expect_err("hash mismatch");
+        assert!(
+            matches!(err, SlowFtsStateError::Parse(ref msg) if msg.contains("hash mismatch")),
+            "{err:?}"
+        );
+
+        // Missing object → Storage error (not a parse/hash failure).
+        let missing = RoutingRef {
+            uri: "slow-fts-state/does-not-exist.bin".into(),
+            content_hash: ContentHash([0u8; 32]),
+        };
+        let err = fetch_state(storage.as_ref(), &missing)
+            .await
+            .expect_err("missing uri");
+        assert!(matches!(err, SlowFtsStateError::Storage(_)), "{err:?}");
+    }
+
+    /// Non-UTF-8 column names and unsupported versions must fail
+    /// closed — corrupt routing blobs never produce a partial state.
+    #[test]
+    fn decode_rejects_bad_version_and_non_utf8_column() {
+        let mut bytes = encode_state(&sample_state());
+        // VERSION is the u32 immediately after MAGIC.
+        let ver_at = MAGIC.len();
+        bytes[ver_at..ver_at + 4].copy_from_slice(&999u32.to_le_bytes());
+        let err = decode_state(&bytes).expect_err("bad version");
+        assert!(
+            matches!(err, SlowFtsStateError::Parse(ref msg) if msg.contains("unsupported")),
+            "{err:?}"
+        );
+
+        // Re-encode, then overwrite the first column name with a
+        // non-UTF-8 byte sequence of the same length.
+        let mut bytes = encode_state(&sample_state());
+        // Layout after MAGIC+version+n_files+uuid+n_columns: u16 name_len, name bytes.
+        let name_len_at = MAGIC.len() + 4 + 4 + 16 + 4;
+        let name_len =
+            u16::from_le_bytes(bytes[name_len_at..name_len_at + 2].try_into().expect("2"));
+        assert_eq!(name_len as usize, "title".len());
+        let name_at = name_len_at + 2;
+        bytes[name_at] = 0xff; // invalid UTF-8 lead byte
+        let err = decode_state(&bytes).expect_err("non-utf8 column");
+        assert!(matches!(err, SlowFtsStateError::Parse(_)), "{err:?}");
+    }
+
     /// The block-selected walk must return the same top-k SCORES as
     /// the exhaustive kernel (tie-broken doc ids may differ at the k
     /// boundary; the score multiset may not).

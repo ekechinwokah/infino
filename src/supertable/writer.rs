@@ -7865,6 +7865,422 @@ mod tests {
         }
     }
 
+    /// `generate_bigram_terms` tees adjacent positional pairs for
+    /// members at/above the df floor and skips non-positional columns,
+    /// zero floors, and empty corpora — the exact phrase-tf payload
+    /// the drain splices into each text shard.
+    #[tokio::test]
+    async fn generate_bigram_terms_emits_adjacent_pairs_above_df_floor() {
+        use crate::superfile::{
+            builder::FtsConfig,
+            format::FST_SEPARATOR,
+            fts::{builder::FtsBuilder, tokenize::AsciiLowerTokenizer},
+        };
+
+        /// Docs sharing the planted phrase — well above a 200‰ floor.
+        const N_DOCS: u32 = 10;
+        /// Permille floor matching the production default.
+        const MEMBER_DF_PERILLE: u32 = 200;
+
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), true).expect("register");
+        b.register_column("plain".into(), false).expect("register");
+        for doc in 0..N_DOCS {
+            // Adjacent "alpha beta"; "solo" is separated by a gap token
+            // so it must not pair with beta. Per-doc `rare{doc}` is an
+            // Inline singleton the tee must skip without decoding.
+            b.add_doc(0, doc, &format!("alpha beta gap solo rare{doc}"))
+                .expect("positional");
+            b.add_doc(1, doc, "alpha beta").expect("non-positional");
+        }
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower","positions":true},{"name":"plain","tokenizer":"ascii_lower"}]"#;
+        let reader = FtsReader::open(Bytes::from(b.finish().expect("finish")), json)
+            .expect("open positional blob");
+        let columns = [
+            FtsConfig {
+                column: "body".into(),
+                positions: true,
+            },
+            FtsConfig {
+                column: "plain".into(),
+                positions: false,
+            },
+        ];
+
+        assert!(
+            generate_bigram_terms(&reader, &columns, 0, N_DOCS)
+                .await
+                .expect("zero floor")
+                .is_empty(),
+            "permille 0 disables emission"
+        );
+        assert!(
+            generate_bigram_terms(&reader, &columns, MEMBER_DF_PERILLE, 0)
+                .await
+                .expect("empty corpus")
+                .is_empty(),
+            "empty merged corpus emits nothing"
+        );
+
+        let out = generate_bigram_terms(&reader, &columns, MEMBER_DF_PERILLE, N_DOCS)
+            .await
+            .expect("generate");
+        assert_eq!(out.len(), 1, "only the positional column emits");
+        assert_eq!(out[0].column, "body");
+        let mut expected_key = b"alpha".to_vec();
+        expected_key.push(FST_SEPARATOR);
+        expected_key.extend_from_slice(b"beta");
+        let pair = out[0]
+            .terms
+            .iter()
+            .find(|t| t.term == expected_key)
+            .expect("alpha\\0beta bigram");
+        assert_eq!(
+            pair.pairs.len() as u32,
+            N_DOCS,
+            "pair df equals the planted phrase df"
+        );
+        let mut non_adjacent = b"beta".to_vec();
+        non_adjacent.push(FST_SEPARATOR);
+        non_adjacent.extend_from_slice(b"solo");
+        assert!(
+            out[0].terms.iter().all(|t| t.term != non_adjacent),
+            "gapped 'beta … solo' must not form a bigram"
+        );
+        let mut gap_solo = b"gap".to_vec();
+        gap_solo.push(FST_SEPARATOR);
+        gap_solo.extend_from_slice(b"solo");
+        assert!(
+            out[0].terms.iter().any(|t| t.term == gap_solo),
+            "adjacent 'gap solo' is emitted alongside alpha/beta"
+        );
+        // floor = 100 * 500‰ / 1000 = 50 > planted df (10).
+        assert!(
+            generate_bigram_terms(&reader, &columns, 500, 100)
+                .await
+                .expect("floor above planted df")
+                .iter()
+                .all(|s| s.terms.is_empty()),
+            "floor above every member's df emits no pairs"
+        );
+
+        // Common members never adjacent (unique pads between them) ⇒
+        // tee finds candidates but the adjacent-position scan emits
+        // nothing.
+        let mut gap_builder = FtsBuilder::new(Arc::new(AsciiLowerTokenizer));
+        gap_builder
+            .register_column("body".into(), true)
+            .expect("register");
+        for doc in 0..N_DOCS {
+            gap_builder
+                .add_doc(0, doc, &format!("alpha pad{doc} beta"))
+                .expect("gapped");
+        }
+        let gapped = FtsReader::open(
+            Bytes::from(gap_builder.finish().expect("finish")),
+            r#"[{"name":"body","tokenizer":"ascii_lower","positions":true}]"#,
+        )
+        .expect("open gapped");
+        let gapped_cols = [FtsConfig {
+            column: "body".into(),
+            positions: true,
+        }];
+        assert!(
+            generate_bigram_terms(&gapped, &gapped_cols, MEMBER_DF_PERILLE, N_DOCS)
+                .await
+                .expect("gapped generate")
+                .iter()
+                .all(|s| s.terms.is_empty()),
+            "non-adjacent common members must not emit pairs"
+        );
+    }
+
+    /// Out-of-range local ids on a `VectorColumnView` must fail closed
+    /// instead of panicking — the commit path relies on that.
+    #[test]
+    fn vector_column_view_row_rejects_out_of_range_locals() {
+        let dim = 4usize;
+        let scalar = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "t",
+                DataType::LargeUtf8,
+                false,
+            )])),
+            vec![Arc::new(LargeStringArray::from(vec!["a", "b"])) as _],
+        )
+        .expect("scalar");
+        let vectors = Arc::new(Float32Array::from(vec![
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+        ]));
+        let batch = BufferedBatch {
+            scalar,
+            vectors: vec![vectors],
+        };
+        let batches = [batch];
+        let view = VectorColumnView::over(&batches, 0, dim);
+        assert_eq!(view.n_rows(), 2);
+        assert_eq!(view.row(0).expect("row0").len(), dim);
+        assert_eq!(view.row(1).expect("row1")[1], 1.0);
+        assert!(
+            view.row(2).is_err(),
+            "local past the buffer must be a Store error"
+        );
+    }
+
+    /// Classic (non-multi-cell) IVF open ranges stage the cluster
+    /// index without pulling the full centroid slab into the open
+    /// blob — the cold-open footprint must stay small vs the blob.
+    #[test]
+    fn classic_ivf_open_ranges_stage_cluster_index_not_full_blob() {
+        let dim = 16usize;
+        // Vector logical names live outside the Parquet schema — the
+        // float payload rides the separate `add_batch` vectors slice.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "doc_id",
+            DataType::Decimal128(38, 0),
+            false,
+        )]));
+        let opts = BuilderOptions::new(
+            Arc::clone(&schema),
+            "doc_id",
+            vec![],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::L2Sq,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            None,
+        );
+        // Default layout is classic IVF (not MultiCellIvf).
+        assert_eq!(opts.vector_layout, VectorLayout::Ivf);
+        let mut builder = SuperfileBuilder::new(opts).expect("builder");
+        let n = 32usize;
+        let ids: Vec<i128> = (0..n as i128).collect();
+        let mut flat = vec![0.0f32; n * dim];
+        for row in 0..n {
+            flat[row * dim + (row % dim)] = 1.0;
+        }
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(
+                Decimal128Array::from(ids)
+                    .with_precision_and_scale(38, 0)
+                    .expect("decimal"),
+            )],
+        )
+        .expect("batch");
+        builder.add_batch(&batch, &[flat.as_slice()]).expect("add");
+        let bytes = Bytes::from(builder.finish().expect("finish"));
+        let offsets = build_subsection_offsets(&bytes).expect("offsets");
+        assert!(
+            !offsets.vec_open_ranges.is_empty(),
+            "classic IVF must publish vector open ranges"
+        );
+        let staged: u64 = offsets.vec_open_ranges.iter().map(|&(_, len)| len).sum();
+        assert!(
+            staged < bytes.len() as u64 / 2,
+            "open ranges ({staged}) must be a fraction of the {}-byte blob",
+            bytes.len()
+        );
+    }
+
+    /// Empty `CommitResult.outcomes` is a backend invariant violation —
+    /// `single_outcome` must surface it rather than panicking.
+    #[test]
+    fn single_outcome_rejects_empty_commit_result() {
+        let err = single_outcome(CommitResult {
+            wal_ids: Vec::new(),
+            outcomes: Vec::new(),
+        })
+        .expect_err("empty outcomes");
+        assert!(
+            matches!(err, InfinoError::Backend(_)),
+            "empty outcomes must be Backend, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("no mutation outcome"),
+            "got: {err}"
+        );
+    }
+
+    /// IPC encode is what the update buffer stores — round-trip one
+    /// batch and confirm the Arrow payload survives StreamWriter.
+    #[test]
+    fn encode_record_batch_ipc_round_trips_scalar_batch() {
+        use arrow::ipc::reader::StreamReader;
+        use arrow_array::StringArray;
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["alpha", "beta"]))],
+        )
+        .expect("batch");
+        let bytes = encode_record_batch_ipc(&batch).expect("encode");
+        let mut reader =
+            StreamReader::try_new(std::io::Cursor::new(bytes.as_ref()), None).expect("ipc reader");
+        let decoded = reader.next().expect("one batch").expect("decode");
+        assert_eq!(decoded.num_rows(), 2);
+        assert_eq!(decoded.schema(), schema);
+        assert!(reader.next().is_none(), "stream finishes after one batch");
+    }
+
+    /// Mid-batch shard boundaries slice both scalar and vector columns
+    /// without copying; more shards than rows drops the empty tail.
+    #[test]
+    fn split_buffer_into_row_shards_balances_and_slices_vectors() {
+        use arrow_array::{Float32Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let dim = 2usize;
+        let make_buffer = || {
+            let scalar = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("t", DataType::Utf8, false)])),
+                vec![Arc::new(StringArray::from(vec!["a", "b", "c"]))],
+            )
+            .expect("scalar");
+            let vectors = Float32Array::from(vec![
+                1.0, 0.0, // row 0
+                0.0, 1.0, // row 1
+                1.0, 1.0, // row 2
+            ]);
+            vec![BufferedBatch {
+                scalar,
+                vectors: vec![Arc::new(vectors)],
+            }]
+        };
+        // 3 rows into 2 shards → 2 + 1; into 5 shards → 3 non-empty of 1.
+        let two = split_buffer_into_row_shards(make_buffer(), 2, &[dim]);
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].iter().map(|b| b.scalar.num_rows()).sum::<usize>(), 2);
+        assert_eq!(two[1].iter().map(|b| b.scalar.num_rows()).sum::<usize>(), 1);
+        assert_eq!(two[0][0].vectors[0].len(), 2 * dim);
+        assert_eq!(two[1][0].vectors[0].values(), &[1.0, 1.0]);
+
+        let many = split_buffer_into_row_shards(make_buffer(), 5, &[dim]);
+        assert_eq!(many.len(), 3, "empty trailing shards dropped");
+        assert!(
+            many.iter()
+                .all(|s| s.iter().map(|b| b.scalar.num_rows()).sum::<usize>() == 1)
+        );
+    }
+
+    /// Watermark extension is always a contiguous birth-version
+    /// prefix — empty → `[0, max]`, then append-only growth.
+    #[test]
+    fn extend_drained_prefix_grows_contiguous_watermark() {
+        let mut drained = DrainedVersionRanges::default();
+        extend_drained_prefix(&mut drained, 3);
+        assert_eq!(drained.prefix_end(), Some(3));
+        for v in 0..=3 {
+            assert!(drained.contains(v), "v={v}");
+        }
+        extend_drained_prefix(&mut drained, 7);
+        assert_eq!(drained.prefix_end(), Some(7));
+        assert!(drained.contains(4) && drained.contains(7));
+        // No-op when max does not advance past the existing prefix.
+        extend_drained_prefix(&mut drained, 5);
+        assert_eq!(drained.prefix_end(), Some(7));
+    }
+
+    /// Extra replica budget is zero at the default factor / empty input,
+    /// and capped at `n_rows × REPLICA_CLOSURE_MAX_REPLICAS`.
+    #[test]
+    fn drain_replica_extra_budget_caps_at_closure_width() {
+        assert_eq!(drain_replica_extra_budget(0, 2.0), 0);
+        assert_eq!(
+            drain_replica_extra_budget(100, DEFAULT_DRAIN_REPLICA_TARGET_FACTOR),
+            0
+        );
+        assert_eq!(drain_replica_extra_budget(100, 1.0), 0);
+        // target = ceil(100 * 2.5) = 250 → extra 150
+        assert_eq!(drain_replica_extra_budget(100, 2.5), 150);
+        // Huge factor saturates at 100 * 3 replicas.
+        assert_eq!(
+            drain_replica_extra_budget(100, 100.0),
+            100 * opann::REPLICA_CLOSURE_MAX_REPLICAS
+        );
+    }
+
+    /// Packed-shard grouping is `cell % N`, empty shards dropped, cells
+    /// sorted ascending inside each shard.
+    #[test]
+    fn group_cells_by_packed_shard_buckets_and_sorts() {
+        let cells = vec![
+            (5u32, "e"),
+            (1u32, "a"),
+            (4u32, "d"),
+            (2u32, "b"),
+            (8u32, "h"),
+        ];
+        let grouped = group_cells_by_packed_shard(cells, 3);
+        // shard 0: 3,6 empty — cells 1? 1%3=1, 2%3=2, 4%3=1, 5%3=2, 8%3=2
+        // shard 1: (1,a), (4,d) sorted
+        // shard 2: (2,b), (5,e), (8,h) sorted
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].0, 1);
+        assert_eq!(
+            grouped[0].1.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+        assert_eq!(grouped[1].0, 2);
+        assert_eq!(
+            grouped[1].1.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+            vec![2, 5, 8]
+        );
+        assert_eq!(packed_cell_shard(7, 4), 3);
+        assert_eq!(
+            packed_cell_shard_count(&options_id_title().with_writer_pool(writer_pool_with(1))),
+            1
+        );
+        assert_eq!(
+            packed_cell_shard_count(&options_id_title().with_writer_pool(writer_pool_with(4))),
+            4
+        );
+    }
+
+    /// `put_bytes_multipart_or_atomic` routes by threshold: atomic
+    /// below, multipart at/above; a same-URI retry surfaces
+    /// `PreconditionFailed` so content-addressed callers can
+    /// treat it as already-durable.
+    #[tokio::test]
+    async fn put_bytes_multipart_or_atomic_routes_and_is_idempotent() {
+        use bytes::Bytes;
+        use tempfile::TempDir;
+
+        use crate::{storage::StorageError, supertable::storage::LocalFsStorageProvider};
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
+        let payload = Bytes::from(vec![0xABu8; 64]);
+
+        put_bytes_multipart_or_atomic(&storage, "atomic.bin", payload.clone(), 1024)
+            .await
+            .expect("atomic put");
+        let (got, _) = storage.get("atomic.bin").await.expect("atomic get");
+        assert_eq!(got, payload);
+
+        put_bytes_multipart_or_atomic(&storage, "multi.bin", payload.clone(), 1)
+            .await
+            .expect("multipart put");
+        let (got, _) = storage.get("multi.bin").await.expect("multipart get");
+        assert_eq!(got, payload);
+
+        let err = put_bytes_multipart_or_atomic(&storage, "multi.bin", payload, 1)
+            .await
+            .expect_err("same-URI multipart retry");
+        assert!(
+            matches!(err, StorageError::PreconditionFailed { .. }),
+            "retry must signal identical bytes already durable, got {err:?}"
+        );
+    }
+
     use std::{
         sync::Arc,
         time::{Duration, Instant},
@@ -8702,6 +9118,42 @@ mod tests {
         assert!(matches!(err, BuildError::SupertableInUse));
     }
 
+    /// Public `append` / `update` / `delete` must fail closed with
+    /// operation context when the writer slot is already held — those
+    /// are the map_err arms that wrap `SupertableInUse` for callers.
+    #[test]
+    fn public_mutations_reject_when_writer_slot_held() {
+        use datafusion::prelude::{col, lit};
+
+        let st = Supertable::create(options_id_title_serial()).expect("create");
+        // Seed one row so update/delete have a schema to talk about.
+        st.append(&build_simple_batch(0, 1)).expect("seed");
+        let _w = st.writer().expect("hold slot");
+        let batch = build_simple_batch(10, 1);
+
+        let err = st.append(&batch).expect_err("append while held");
+        assert!(
+            err.to_string().contains("append") || err.to_string().contains("in use"),
+            "{err}"
+        );
+
+        let err = st
+            .update(col("title").eq(lit("x")), &batch)
+            .expect_err("update while held");
+        assert!(
+            err.to_string().contains("update") || err.to_string().contains("in use"),
+            "{err}"
+        );
+
+        let err = st
+            .delete(col("title").eq(lit("x")))
+            .expect_err("delete while held");
+        assert!(
+            err.to_string().contains("delete") || err.to_string().contains("in use"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn writer_slot_releases_on_drop() {
         let st = Supertable::create(options_id_title_serial()).expect("create");
@@ -8727,6 +9179,15 @@ mod tests {
         assert!(
             err.to_string().contains("consumer memory mode"),
             "unexpected refusal: {err}"
+        );
+
+        // Public append takes the same refusal through its map_err arm.
+        let err = st
+            .append(&build_simple_batch(0, 1))
+            .expect_err("consumer append");
+        assert!(
+            err.to_string().contains("append") || err.to_string().contains("consumer"),
+            "{err}"
         );
     }
 
@@ -9572,5 +10033,175 @@ supertable:
         let bytes1 = Bytes::from(b1.finish().expect("finish"));
         let reader1 = SuperfileReader::open(bytes1).expect("open");
         assert!(harvest_row_group_stats(&reader1, columns.iter()).is_none());
+    }
+
+    /// Admission is smallest-footprint-first under the 64 KiB cap —
+    /// a swarm of wide string columns must keep the tiny int column
+    /// and drop the fat ones rather than overflowing the budget.
+    #[test]
+    fn harvest_row_group_stats_admits_smallest_columns_first() {
+        /// Rows per group — 3 groups so harvest is eligible.
+        const TEST_ROW_GROUP_SIZE: usize = 4;
+        /// Wide enough that a handful of string columns exceed the
+        /// 64 KiB admission budget once their per-RG bounds are stored.
+        const WIDE_STRING_CHARS: usize = 4096;
+
+        let mut fields = vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("tiny", DataType::Int64, false),
+        ];
+        // Enough wide columns that the sum of their footprints blows
+        // the budget; the int column is smaller than any of them.
+        for i in 0..24 {
+            fields.push(Field::new(format!("wide_{i}"), DataType::LargeUtf8, false));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let mut opts = BuilderOptions::new(Arc::clone(&schema), "doc_id", vec![], vec![], None);
+        opts.row_group_size = TEST_ROW_GROUP_SIZE;
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+
+        let n_rows = 12usize;
+        let ids: Vec<i128> = (0..n_rows as i128).collect();
+        let mut cols: Vec<ArrayRef> = vec![
+            Arc::new(
+                Decimal128Array::from(ids)
+                    .with_precision_and_scale(38, 0)
+                    .expect("decimal"),
+            ),
+            Arc::new(Int64Array::from((0..n_rows as i64).collect::<Vec<_>>())),
+        ];
+        for i in 0..24 {
+            let pad = "x".repeat(WIDE_STRING_CHARS);
+            let values: Vec<String> = (0..n_rows).map(|r| format!("{pad}-{i}-{r}")).collect();
+            cols.push(Arc::new(LargeStringArray::from(
+                values.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )));
+        }
+        let batch = RecordBatch::try_new(Arc::clone(&schema), cols).expect("batch");
+        b.add_batch(&batch, &[]).expect("add");
+        let reader = SuperfileReader::open(Bytes::from(b.finish().expect("finish"))).expect("open");
+
+        let column_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+        let stats =
+            harvest_row_group_stats(&reader, column_names.iter()).expect("some columns admitted");
+        assert!(
+            stats.columns.contains_key("tiny"),
+            "smallest column must win admission: got {:?}",
+            stats.columns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            stats.columns.len() < column_names.len(),
+            "budget must drop at least one wide column (admitted {})",
+            stats.columns.len()
+        );
+    }
+
+    /// Single-cell (classic IVF) Sq8Residual blobs take the
+    /// `materialized_ivf_rows_in_doc_order` path: stable ids are
+    /// filled from the scalar column when the IVF region has zeros,
+    /// and tombstoned locals are dropped before renumbering.
+    #[tokio::test]
+    async fn materialized_ivf_rows_in_doc_order_fills_ids_and_drops_tombstones() {
+        use roaring::RoaringBitmap;
+
+        use crate::superfile::vector::{builder::VectorBuilder, reader::VectorReader};
+
+        const DIM: usize = 16;
+        const N: u32 = 4;
+        let json = format!(
+            r#"[{{"column":"v","dim":{DIM},"n_cent":2,"rot_seed":7,"metric":"cosine","rerank_codec":"sq8_residual"}}]"#
+        );
+        let cfg = VectorConfig {
+            column: "v".into(),
+            dim: DIM,
+            n_cent: 2,
+            rot_seed: 7,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        };
+        let mut b = VectorBuilder::new();
+        b.register_column(cfg).expect("register");
+        for i in 0..N {
+            let mut v = vec![0.0f32; DIM];
+            v[(i as usize) % DIM] = 1.0;
+            b.add(0, &v).expect("add");
+        }
+        let reader = VectorReader::open(Bytes::from(b.finish().expect("finish")), &json)
+            .expect("open single-cell IVF");
+        assert!(
+            !reader.is_multi_cell(),
+            "streaming VectorBuilder emits classic IVF"
+        );
+
+        let stable_ids: Vec<i128> = (1_000..1_000 + i128::from(N)).collect();
+        let mut tombstones = RoaringBitmap::new();
+        tombstones.insert(1);
+        let rows = materialized_ivf_rows_in_doc_order(&reader, "v", &stable_ids, Some(&tombstones))
+            .await
+            .expect("materialize");
+        assert_eq!(rows.len(), (N - 1) as usize, "tombstoned local dropped");
+        let ids: Vec<i128> = rows.iter().map(|r| r.stable_id).collect();
+        assert_eq!(ids, vec![1_000, 1_002, 1_003]);
+        // Surviving rows keep their original local slots (the None
+        // holes are dropped; locals are not densely reassigned).
+        let locals: Vec<u32> = rows.iter().map(|r| r.local_doc_id).collect();
+        assert_eq!(locals, vec![0, 2, 3]);
+    }
+
+    /// Commit with a 1-byte multipart threshold forces every
+    /// superfile through `put_superfile_multipart`; the table must
+    /// still answer BM25 for the planted doc.
+    #[test]
+    fn commit_via_multipart_threshold_is_queryable() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage = Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                    positions: false,
+                }],
+                vec![],
+                Some(tok()),
+            )
+            .expect("options")
+            .with_storage(storage)
+            .with_writer_pool(pool)
+            .with_put_multipart_threshold_bytes(1),
+        )
+        .expect("create");
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(LargeStringArray::from(vec!["multipart rust"])) as _],
+        )
+        .expect("batch");
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("multipart commit");
+        }
+        let n = st
+            .reader()
+            .count("title", "multipart", BoolMode::Or)
+            .expect("count");
+        assert_eq!(n, 1);
+        let rows = st
+            .reader()
+            .bm25_search("title", "rust", 5, BoolMode::Or, None)
+            .expect("bm25");
+        assert_eq!(rows[0].num_rows(), 1);
     }
 }

@@ -463,3 +463,61 @@ impl QueryError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+
+    use super::{CompactionError, OptimizeError};
+
+    /// Every compaction failure maps onto a public optimize error so
+    /// callers never see the crate-internal `CompactionError` type.
+    #[test]
+    fn optimize_error_from_compaction_maps_each_variant() {
+        let id = Uuid::from_u128(0xABC);
+        let other = Uuid::from_u128(0xDEF);
+
+        assert!(matches!(
+            OptimizeError::from(CompactionError::NoStorage),
+            OptimizeError::NoStorage
+        ));
+        assert!(matches!(
+            OptimizeError::from(CompactionError::SuperfileNotFound(id)),
+            OptimizeError::SuperfileNotFound(got) if got == id
+        ));
+        assert!(matches!(
+            OptimizeError::from(CompactionError::EmptyMergedSuperfile),
+            OptimizeError::EmptyMergedSuperfile
+        ));
+        assert!(matches!(
+            OptimizeError::from(CompactionError::SidecarConflict {
+                superfile_id: id,
+                existing_compaction_id: other,
+            }),
+            OptimizeError::SidecarConflict {
+                superfile_id,
+                existing_compaction_id,
+            } if superfile_id == id && existing_compaction_id == other
+        ));
+        assert!(matches!(
+            OptimizeError::from(CompactionError::Seal("s".into())),
+            OptimizeError::Seal(msg) if msg == "s"
+        ));
+        assert!(matches!(
+            OptimizeError::from(CompactionError::Build("b".into())),
+            OptimizeError::Build(msg) if msg == "b"
+        ));
+        assert!(matches!(
+            OptimizeError::from(CompactionError::Commit("c".into())),
+            OptimizeError::Commit(msg) if msg == "c"
+        ));
+        assert!(matches!(
+            OptimizeError::from(CompactionError::Refresh("r".into())),
+            OptimizeError::Refresh(msg) if msg == "r"
+        ));
+        assert!(matches!(
+            OptimizeError::from(CompactionError::AlreadyCompacting),
+            OptimizeError::AlreadyRunning
+        ));
+    }
+}

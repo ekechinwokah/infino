@@ -141,4 +141,16 @@ mod tests {
             Some("us-east-1")
         );
     }
+
+    #[test]
+    fn with_validate_flips_the_connect_probe_flag() {
+        assert!(!ConnectOptions::new().validate);
+        assert!(ConnectOptions::new().with_validate(true).validate);
+        assert!(
+            !ConnectOptions::new()
+                .with_validate(true)
+                .with_validate(false)
+                .validate
+        );
+    }
 }

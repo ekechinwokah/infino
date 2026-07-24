@@ -109,3 +109,40 @@ pub enum ReaderCacheError {
         source: ReadError,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal cache that keeps the trait-default `remove` — the
+    /// production impls override it, so this is the only exercise
+    /// of the no-op body.
+    struct DefaultRemoveCache;
+
+    impl SuperfileReaderCache for DefaultRemoveCache {
+        fn reader(&self, uri: &SuperfileUri) -> Result<Arc<SuperfileReader>, ReaderCacheError> {
+            Err(ReaderCacheError::NotFound { uri: *uri })
+        }
+        fn insert(&self, _uri: SuperfileUri, _bytes: Bytes) -> Result<(), ReaderCacheError> {
+            Ok(())
+        }
+        fn resident_bytes(&self) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn trait_default_remove_is_a_noop() {
+        let cache = DefaultRemoveCache;
+        let uri = SuperfileUri::new_v4();
+        cache
+            .insert(uri, Bytes::new())
+            .expect("stub insert ignores bytes");
+        cache.remove(&uri);
+        assert_eq!(cache.resident_bytes(), 0);
+        assert!(matches!(
+            cache.reader(&uri),
+            Err(ReaderCacheError::NotFound { .. })
+        ));
+    }
+}

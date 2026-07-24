@@ -237,3 +237,33 @@ impl TableFunctionImpl for ExactMatchCatalogFunc {
             .call_with_args(TableFunctionArgs::new(rest, args.session()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{ConnectOptions, connect_with};
+
+    #[test]
+    fn table_resolver_debug_is_non_exhaustive() {
+        let conn = connect_with("memory://", ConnectOptions::new()).expect("connect");
+        let rendered = format!("{:?}", TableResolver::new(conn));
+        assert!(
+            rendered.contains("TableResolver"),
+            "debug must name the type, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn split_leading_rejects_empty_arg_list() {
+        let conn = connect_with("memory://", ConnectOptions::new()).expect("connect");
+        let resolver = TableResolver::new(conn);
+        let Err(err) = resolver.split_leading(&[], "bm25_search") else {
+            panic!("empty args must fail");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("leading table-name"),
+            "empty-arg error must name the contract, got {msg}"
+        );
+    }
+}

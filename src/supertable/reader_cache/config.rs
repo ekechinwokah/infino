@@ -268,3 +268,22 @@ impl CacheEvictionPolicy for LruPolicy {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_cache_config_debug_lists_tuning_fields() {
+        let cfg = DiskCacheConfig::default();
+        let rendered = format!("{cfg:?}");
+        assert!(
+            rendered.contains("DiskCacheConfig") && rendered.contains("disk_budget_bytes"),
+            "Debug must name the struct and budget field, got {rendered}"
+        );
+        assert!(
+            rendered.contains("<dyn CacheEvictionPolicy>"),
+            "eviction trait object is opaque in Debug"
+        );
+    }
+}

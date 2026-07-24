@@ -412,6 +412,26 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn complete_get_retries_transient_then_succeeds() {
+        let calls = Cell::new(0u32);
+        let (bytes, _m) = complete_get("u", || {
+            let c = calls.get();
+            calls.set(c + 1);
+            async move {
+                if c < 2 {
+                    Err(transient())
+                } else {
+                    Ok((Bytes::from_static(b"hello"), meta(5)))
+                }
+            }
+        })
+        .await
+        .expect("transient then full");
+        assert_eq!(&bytes[..], b"hello");
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn complete_get_reissues_a_truncated_body() {
         // First response is a body of 3 bytes while the response's own meta
         // declares 5 (object_store's short-read-as-success hazard). The helper

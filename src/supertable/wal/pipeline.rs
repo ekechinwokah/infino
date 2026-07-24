@@ -1758,6 +1758,60 @@ mod tests {
         assert!(matches!(err, AppendPhaseError::IpcDecode { .. }), "{err:?}");
     }
 
+    /// Empty IPC stream (schema, no batches) and a two-batch stream are
+    /// both rejected — the WAL arrow sidecar is exactly one batch.
+    #[test]
+    fn decode_ipc_batch_rejects_empty_and_multi_batch_streams() {
+        use arrow_array::StringArray;
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["a"]))],
+        )
+        .expect("batch");
+        let wal_doc = WalStateDoc {
+            wal_id: WalId(1),
+            schema_version: SCHEMA_VERSION,
+            op_kind: OpKind::Update,
+            state: WalState::Intent,
+            created_at: Utc::now(),
+            lease: None,
+            predicate_repr: "ipc shape".into(),
+            target_ids: vec![RowId(1)],
+            new_row_count: Some(1),
+            new_row_content_hash: None,
+            preallocated_superfile_id: None,
+            minted_id_spans: vec![],
+            tombstone_progress: vec![],
+        };
+
+        let mut empty = Vec::new();
+        {
+            let mut w = StreamWriter::try_new(&mut empty, &schema).expect("writer");
+            w.finish().expect("finish empty");
+        }
+        let err = decode_ipc_batch(&Bytes::from(empty), &wal_doc).expect_err("empty");
+        assert!(
+            matches!(err, AppendPhaseError::IpcDecode { .. }),
+            "empty stream: {err:?}"
+        );
+
+        let mut multi = Vec::new();
+        {
+            let mut w = StreamWriter::try_new(&mut multi, &schema).expect("writer");
+            w.write(&batch).expect("b0");
+            w.write(&batch).expect("b1");
+            w.finish().expect("finish multi");
+        }
+        let err = decode_ipc_batch(&Bytes::from(multi), &wal_doc).expect_err("multi");
+        assert!(
+            matches!(err, AppendPhaseError::IpcDecode { ref message, .. } if message.contains("more than one")),
+            "multi-batch: {err:?}"
+        );
+    }
+
     // ---- flatten_spans property ----------------------------------------
 
     #[test]

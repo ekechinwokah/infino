@@ -2248,7 +2248,8 @@ mod tests {
     use tokio::runtime::Builder;
 
     use super::{
-        BoolMode, FanOut, build_work_units, dispatch::open_reader, fanout_for, hits_id_score_batch,
+        BoolMode, FanOut, SharedTopK, build_work_units, dispatch::open_reader, fanout_for,
+        hits_id_score_batch, row_can_prune, rows_have_dominant_ub,
     };
     use crate::{
         config::{CompactionSettings, DEFAULT_STALE_SEAL_TIMEOUT_MS},
@@ -2349,6 +2350,217 @@ mod tests {
         b.add_batch(&batch, &[]).expect("add_batch");
         let bytes = Bytes::from(b.finish().expect("finish"));
         Arc::new(SuperfileReader::open(bytes).expect("open"))
+    }
+
+    /// Shared top-k publishes a live floor handle the block-selected
+    /// multi-term kernels read mid-walk; merge raises it once k scores land.
+    #[test]
+    fn shared_top_k_live_floor_raises_after_k_scores() {
+        let shared = SharedTopK::new(2);
+        let live = shared.live_floor();
+        assert!(
+            live.get().is_infinite() && live.get().is_sign_negative(),
+            "floor starts at -inf"
+        );
+        shared.merge([1.0f32, 3.0, 2.0]);
+        assert_eq!(
+            shared.floor(),
+            2.0,
+            "k=2 floor is the 2nd-best score after merge"
+        );
+        assert_eq!(live.get(), 2.0, "live handle observes the same raise");
+    }
+
+    /// Engagement helpers for the block-selected fanout arms — the
+    /// partition and kernel gates share these predicates.
+    #[test]
+    fn block_select_engagement_helpers_match_spread_and_dominance() {
+        use crate::supertable::slow_fts_state::TermBlockMax;
+
+        let make = |term: &[u8], scale: f32, quantized: Vec<u8>| TermBlockMax {
+            term: term.to_vec(),
+            metadata_offset: 0,
+            df: quantized.len() as u64,
+            scale,
+            last_docs: (0..quantized.len() as u32).collect(),
+            offsets: (0..=quantized.len() as u32).collect(),
+            quantized,
+        };
+        let flat = make(b"flat", 1.0, vec![100, 100, 100, 100]);
+        let spread = make(b"spread", 10.0, vec![10, 40, 80, 255]);
+        assert!(!row_can_prune(&flat), "flat bounds cannot prune");
+        assert!(row_can_prune(&spread), "spread >= 16 is prunable");
+
+        // avg=9, 1.5×avg=13.5 → 10 is not dominant.
+        let peer = make(b"peer", 8.0, vec![10, 40, 80, 255]);
+        assert!(
+            !rows_have_dominant_ub([&spread, &peer].into_iter()),
+            "near-uniform scales must not claim dominance"
+        );
+        // avg=5.5, 1.5×avg=8.25 → 10 dominates.
+        let tiny = make(b"tiny", 1.0, vec![10, 40, 80, 255]);
+        assert!(
+            rows_have_dominant_ub([&spread, &tiny].into_iter()),
+            "10.0 dominates 1.0 under the 1.5× avg rule"
+        );
+    }
+
+    /// `UnrankedMatchSet::default` is the empty-OR sentinel — keep it
+    /// honest so a future caller of `unwrap_or_default` can't silently
+    /// flip polarity.
+    #[test]
+    fn unranked_match_set_default_is_empty_or() {
+        let m = super::UnrankedMatchSet::default();
+        assert!(m.terms.is_empty());
+        assert!(m.phrases.is_empty());
+        assert_eq!(m.mode, BoolMode::Or);
+        let n = super::UnrankedNegatives::default();
+        assert!(n.terms.is_empty());
+        assert!(n.phrases.is_empty());
+    }
+
+    /// Cross-wave merges order by score desc, then stable `_id` asc —
+    /// the same tie contract as a single-segment engine.
+    #[test]
+    fn sort_hits_by_score_then_id_orders_desc_score_asc_id() {
+        use uuid::Uuid;
+
+        use crate::supertable::{manifest::SuperfileUri, query::SuperfileHit};
+
+        let uri = SuperfileUri(Uuid::nil());
+        let mut hits = [
+            SuperfileHit {
+                superfile: uri,
+                local_doc_id: 0,
+                score: 1.0,
+                stable_id: Some(30),
+            },
+            SuperfileHit {
+                superfile: uri,
+                local_doc_id: 1,
+                score: 2.0,
+                stable_id: Some(20),
+            },
+            SuperfileHit {
+                superfile: uri,
+                local_doc_id: 2,
+                score: 2.0,
+                stable_id: Some(10),
+            },
+        ];
+        super::sort_hits_by_score_then_id(&mut hits);
+        assert_eq!(
+            hits.iter()
+                .map(|h| (h.score, h.stable_id))
+                .collect::<Vec<_>>(),
+            vec![(2.0, Some(10)), (2.0, Some(20)), (1.0, Some(30))]
+        );
+    }
+
+    /// Post-drain queries must engage block-max routing: plant a
+    /// dominant high-tf term (`needle`) alongside a uniform common term
+    /// so the multi-term OR partition clears the dominance gate, then
+    /// exercise single-term and must+should arms on the same shard.
+    #[test]
+    fn post_drain_block_selected_arms_return_top_k() {
+        use tempfile::TempDir;
+
+        const N_DOCS: usize = 2_000;
+        /// `needle` lives only in this prefix — must clear the default
+        /// `block_max_df_floor` (1024) so the admit slab carries a row,
+        /// but must not be every-doc (that flattens BM25 block maxes).
+        const NEEDLE_DOCS: usize = 1_200;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "title",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            Arc::clone(&schema),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![],
+            Some(tok()),
+        )
+        .expect("options")
+        .with_storage(storage)
+        .with_writer_pool(pool);
+        let st = Supertable::create(options).expect("create");
+        let texts: Vec<String> = (0..N_DOCS)
+            .map(|d| {
+                // Spike needle tf in the first posting block; keep df
+                // ≥ block_max_df_floor but below every-doc so bounds
+                // spread. Companion `bolt` is uniform in the same
+                // prefix (AND arm needs a second term; multi bare-OR
+                // dominance is covered by the unit helper above).
+                let needle_tf = if d < 128 {
+                    40
+                } else if d < NEEDLE_DOCS {
+                    1
+                } else {
+                    0
+                };
+                let bolt_tf = if d < NEEDLE_DOCS { 1 } else { 0 };
+                format!(
+                    "{}{}filler{d}",
+                    "needle ".repeat(needle_tf),
+                    "bolt ".repeat(bolt_tf)
+                )
+            })
+            .collect();
+        let titles = LargeStringArray::from(texts.iter().map(String::as_str).collect::<Vec<_>>());
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(titles)]).expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("text drain");
+        let hidden = st.reader().vector_index_table().expect("hidden").clone();
+        assert!(
+            hidden.reader().manifest().slow_fts_state_blob().is_some(),
+            "drain must publish block-max routing"
+        );
+        let routing = block_on(hidden.reader().slow_fts_state_resident())
+            .expect("slow FTS state must hydrate for block routing");
+        let shard_id = hidden
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .find(|e| !e.fts_summary.is_empty())
+            .expect("text shard")
+            .superfile_id;
+        let needle_row = routing
+            .term_block_max(shard_id, "title", "needle")
+            .expect("needle above df floor");
+        assert!(row_can_prune(needle_row), "needle must be prunable");
+        assert!(
+            routing.term_block_max(shard_id, "title", "bolt").is_some(),
+            "bolt must be in the admit slab"
+        );
+
+        // Single bare term → single-term block-selected fanout arm.
+        let single = st
+            .bm25_search("title", "needle", 10, BoolMode::Or, None)
+            .expect("single-term");
+        assert_eq!(single[0].num_rows(), 10);
+
+        // Must+should → AND block-selected arm (no dominance gate).
+        let must_should = st
+            .bm25_search("title", "+needle bolt", 10, BoolMode::Or, None)
+            .expect("must+should");
+        assert_eq!(must_should[0].num_rows(), 10);
     }
 
     #[test]
@@ -2680,6 +2892,48 @@ mod tests {
             .bm25_hits("missing_column", "rust", 5, BoolMode::Or)
             .expect_err("expected error");
         assert!(matches!(err, QueryError::Parquet(_)), "got {err:?}");
+    }
+
+    /// Public `Supertable` FTS wrappers must surface a missing column
+    /// as `InfinoError` (with operation context) rather than panicking
+    /// — the map_err arms on each wrapper are the only path that
+    /// attaches that context.
+    #[test]
+    fn public_fts_wrappers_reject_unknown_column() {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["rust"])).expect("append");
+        w.commit().expect("commit");
+
+        let err = st
+            .bm25_search("nope", "rust", 5, BoolMode::Or, None)
+            .expect_err("bm25");
+        assert!(
+            err.to_string().contains("bm25_search") || err.to_string().contains("nope"),
+            "{err}"
+        );
+
+        let err = st
+            .token_match("nope", "rust", BoolMode::Or, None)
+            .expect_err("token_match");
+        assert!(
+            err.to_string().contains("token_match") || err.to_string().contains("nope"),
+            "{err}"
+        );
+
+        let err = st
+            .exact_match("nope", "rust", None)
+            .expect_err("exact_match");
+        assert!(
+            err.to_string().contains("exact_match") || err.to_string().contains("nope"),
+            "{err}"
+        );
+
+        let err = st.count("nope", "rust", BoolMode::Or).expect_err("count");
+        assert!(
+            err.to_string().contains("count") || err.to_string().contains("nope"),
+            "{err}"
+        );
     }
 
     #[test]

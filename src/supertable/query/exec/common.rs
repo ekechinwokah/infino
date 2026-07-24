@@ -1056,6 +1056,30 @@ mod tests {
         assert_eq!(scores.value(1), 0.5);
     }
 
+    /// Direct `resolve_hits` accepts raw field indices; an out-of-range
+    /// index must fail at `Schema::project` rather than panicking.
+    #[test]
+    fn resolve_hits_rejects_out_of_range_projection_index() {
+        let st = demo(16);
+        let reader = st.reader();
+        let hits = two_hits(&reader);
+        let scalar_schema = reader.options().scalar_schema();
+        let output_schema = output_schema_with_score(&scalar_schema);
+        let err = reader
+            .block_on(resolve_hits(
+                &reader,
+                &hits,
+                &scalar_schema,
+                &output_schema,
+                Some(&[999]),
+            ))
+            .expect_err("oob projection");
+        assert!(
+            err.to_string().contains("999") || err.to_string().to_lowercase().contains("project"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn resolve_hits_none_projection_returns_all_scalar_columns_and_score() {
         // `projection: None` (distinct from `resolve_hits_named`'s

@@ -657,3 +657,475 @@ where
     });
     try_join_all(handles).await
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use arrow_array::{LargeStringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use bytes::Bytes;
+    use uuid::Uuid;
+
+    use super::verify_superfile_vector_codecs;
+    use crate::{
+        superfile::{
+            SuperfileReader,
+            builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
+            vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
+        },
+        supertable::manifest::{SuperfileEntry, SuperfileUri, list::FtsSummaryAgg},
+        test_helpers::default_tokenizer as tok,
+    };
+
+    fn fts_only_reader() -> SuperfileReader {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("body", DataType::LargeUtf8, false),
+        ]));
+        let opts = BuilderOptions::new(
+            Arc::clone(&schema),
+            "doc_id",
+            vec![FtsConfig {
+                column: "body".into(),
+                positions: false,
+            }],
+            vec![],
+            Some(tok()),
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(
+                    arrow_array::Decimal128Array::from(vec![1i128])
+                        .with_precision_and_scale(38, 0)
+                        .expect("decimal"),
+                ),
+                Arc::new(LargeStringArray::from(vec!["hello"])) as _,
+            ],
+        )
+        .expect("batch");
+        b.add_batch(&batch, &[]).expect("add");
+        SuperfileReader::open(Bytes::from(b.finish().expect("finish"))).expect("open")
+    }
+
+    fn entry_with_fts_summary() -> SuperfileEntry {
+        let mut fts_summary = HashMap::new();
+        fts_summary.insert(
+            "body".into(),
+            FtsSummaryAgg {
+                term_bloom: None,
+                n_terms_distinct: 1,
+                term_range: Some((b"a".to_vec(), b"z".to_vec())),
+            },
+        );
+        SuperfileEntry {
+            birth_version: 0,
+            superfile_id: Uuid::new_v4(),
+            uri: SuperfileUri(Uuid::new_v4()),
+            n_docs: 1,
+            id_min: 0,
+            id_max: 0,
+            scalar_stats: HashMap::new(),
+            row_group_stats: None,
+            fts_summary,
+            vector_summary: HashMap::new(),
+            partition_key: vec![],
+            partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
+            subsection_offsets: None,
+        }
+    }
+
+    /// Empty expected configs and text-only shards are no-ops — the
+    /// guard exists for vector-bearing files, not FTS drain shards.
+    #[test]
+    fn verify_vector_codecs_skips_empty_expected_and_text_shards() {
+        let reader = fts_only_reader();
+        let entry = entry_with_fts_summary();
+        verify_superfile_vector_codecs(&entry, &reader, &[]).expect("empty expected");
+
+        let expected = [VectorConfig {
+            column: "emb".into(),
+            dim: 4,
+            n_cent: 2,
+            rot_seed: 1,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        }];
+        verify_superfile_vector_codecs(&entry, &reader, &expected)
+            .expect("text shard exempt from vector codec check");
+    }
+
+    /// `tag_hits` stamps the superfile URI and, when the id span is
+    /// contiguous, the arithmetic stable `_id`.
+    #[test]
+    fn tag_hits_stamps_uri_and_arithmetic_stable_ids() {
+        use super::tag_hits;
+
+        let mut entry = entry_with_fts_summary();
+        entry.id_min = 100;
+        entry.id_max = 102;
+        entry.n_docs = 3;
+        let hits = tag_hits(&entry, vec![(0, 1.5), (2, 0.5)]);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].superfile, entry.uri);
+        assert_eq!(hits[0].local_doc_id, 0);
+        assert_eq!(hits[0].score, 1.5);
+        assert_eq!(hits[0].stable_id, Some(100));
+        assert_eq!(hits[1].stable_id, Some(102));
+    }
+
+    /// A gapped id span (or MultiCell layout) leaves `stable_id` unset —
+    /// callers must resolve via the id column / IVF inline region.
+    #[test]
+    fn tag_hits_leaves_stable_id_none_on_gapped_span() {
+        use super::tag_hits;
+
+        let mut entry = entry_with_fts_summary();
+        entry.id_min = 0;
+        entry.id_max = 10; // span 11 ≠ n_docs 3
+        entry.n_docs = 3;
+        let hits = tag_hits(&entry, vec![(0, 1.0), (1, 0.5)]);
+        assert!(hits.iter().all(|h| h.stable_id.is_none()));
+
+        entry.id_min = 0;
+        entry.id_max = 2;
+        entry.n_docs = 3;
+        entry.vector_layout = VectorLayout::MultiCellIvf;
+        let hits = tag_hits(&entry, vec![(0, 1.0)]);
+        assert_eq!(hits[0].stable_id, None);
+    }
+
+    /// Empty hit list is a no-op — must not open the id column.
+    #[tokio::test]
+    async fn attach_stable_ids_empty_hits_is_noop() {
+        use super::attach_stable_ids;
+
+        let reader = fts_only_reader();
+        let entry = entry_with_fts_summary();
+        let mut hits = Vec::new();
+        attach_stable_ids(&reader, &entry, &mut hits, true)
+            .await
+            .expect("empty");
+        assert!(hits.is_empty());
+    }
+
+    /// Zero work units short-circuit before any open / spawn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fanout_with_empty_units_returns_empty_vec() {
+        use super::fanout_with;
+        use crate::supertable::{handle::Supertable, options::SupertableOptions};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "body",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let opts = SupertableOptions::new(
+            schema,
+            vec![FtsConfig {
+                column: "body".into(),
+                positions: false,
+            }],
+            vec![],
+            Some(tok()),
+        )
+        .expect("opts");
+        let st = Supertable::create(opts).expect("create");
+        let reader = st.reader();
+        let units: Vec<(Arc<SuperfileEntry>, ())> = Vec::new();
+        let out: Vec<()> =
+            fanout_with(&reader, units, true, true, |_, _, _, _, _| async { Ok(()) })
+                .await
+                .expect("empty fanout");
+        assert!(out.is_empty());
+    }
+
+    /// No sidecar cache ⇒ tombstone filter is a no-op.
+    #[test]
+    fn apply_tombstone_filter_skips_when_cache_absent() {
+        use std::time::Instant;
+
+        use super::apply_tombstone_filter;
+        use crate::supertable::query::SuperfileHit;
+
+        let entry = entry_with_fts_summary();
+        let mut hits = vec![SuperfileHit {
+            superfile: entry.uri,
+            local_doc_id: 0,
+            score: 1.0,
+            stable_id: Some(0),
+        }];
+        apply_tombstone_filter(None, &entry, &mut hits, Instant::now()).expect("no-op");
+        assert_eq!(hits.len(), 1);
+    }
+
+    /// MultiCell tombstone resolve needs resident Parquet bytes or a
+    /// storage handle — a lazy reader with neither fails closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_resolved_tombstone_filter_multicell_requires_storage() {
+        use std::time::Instant;
+
+        use roaring::RoaringBitmap;
+        use tempfile::TempDir;
+
+        use super::apply_resolved_tombstone_filter;
+        use crate::{
+            storage::{LocalFsStorageProvider, StorageProvider},
+            superfile::{BytesLazyByteSource, LazyByteSource},
+            supertable::{
+                query::SuperfileHit,
+                tombstones::{SidecarCache, TombstoneSeqView, cache::DEFAULT_SEAL_TTL},
+                wal::{WalStore, tombstones_codec::TombstonesSidecar},
+            },
+        };
+
+        let bytes = {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("doc_id", DataType::Decimal128(38, 0), false),
+                Field::new("body", DataType::LargeUtf8, false),
+            ]));
+            let opts = BuilderOptions::new(
+                Arc::clone(&schema),
+                "doc_id",
+                vec![FtsConfig {
+                    column: "body".into(),
+                    positions: false,
+                }],
+                vec![],
+                Some(tok()),
+            );
+            let mut b = SuperfileBuilder::new(opts).expect("builder");
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(
+                        arrow_array::Decimal128Array::from(vec![1i128, 2])
+                            .with_precision_and_scale(38, 0)
+                            .expect("decimal"),
+                    ),
+                    Arc::new(LargeStringArray::from(vec!["a", "b"])) as _,
+                ],
+            )
+            .expect("batch");
+            b.add_batch(&batch, &[]).expect("add");
+            Bytes::from(b.finish().expect("finish"))
+        };
+        let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
+        let reader = SuperfileReader::open_lazy(src).await.expect("open_lazy");
+        assert!(reader.parquet_bytes().is_none());
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let ws = WalStore::new(Arc::clone(&storage));
+        let sf_id = Uuid::from_u128(0xC0FFEE);
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(0);
+        ws.put_tombstones(sf_id, None, &TombstonesSidecar { seal: None, bitmap })
+            .await
+            .expect("put");
+        let cache = Arc::new(SidecarCache::new(
+            ws,
+            DEFAULT_SEAL_TTL,
+            Arc::new(TombstoneSeqView {
+                manifest_id: 1,
+                seqs: [(sf_id, 1u64)].into_iter().collect(),
+            }),
+        ));
+
+        let mut entry = entry_with_fts_summary();
+        entry.superfile_id = sf_id;
+        entry.n_docs = 2;
+        entry.id_max = 1;
+        entry.vector_layout = VectorLayout::MultiCellIvf;
+        let mut hits = vec![SuperfileHit {
+            superfile: entry.uri,
+            local_doc_id: 0,
+            score: 1.0,
+            stable_id: Some(1),
+        }];
+        let err = apply_resolved_tombstone_filter(
+            &reader,
+            None,
+            Some(&cache),
+            &entry,
+            &mut hits,
+            Instant::now(),
+        )
+        .await
+        .expect_err("needs storage");
+        assert!(
+            err.to_string().contains("resident bytes or storage"),
+            "{err}"
+        );
+    }
+
+    /// A sidecar refresh failure surfaces as `QueryError::Store`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tombstone_deny_set_maps_cache_refresh_failure() {
+        use std::time::Instant;
+
+        use bytes::Bytes;
+        use tempfile::TempDir;
+
+        use super::tombstone_deny_set;
+        use crate::{
+            storage::{LocalFsStorageProvider, StorageProvider},
+            supertable::{
+                tombstones::{SidecarCache, TombstoneSeqView, cache::DEFAULT_SEAL_TTL},
+                wal::WalStore,
+            },
+        };
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let sf_id = Uuid::from_u128(0xBAD);
+        // Corrupt sidecar bytes → decode fails → RefreshFailed.
+        storage
+            .put_atomic(
+                &WalStore::tombstones_path(sf_id),
+                Bytes::from_static(b"not a valid sidecar"),
+            )
+            .await
+            .expect("write garbage");
+        let cache = SidecarCache::new(
+            WalStore::new(storage),
+            DEFAULT_SEAL_TTL,
+            Arc::new(TombstoneSeqView {
+                manifest_id: 1,
+                seqs: [(sf_id, 1u64)].into_iter().collect(),
+            }),
+        );
+        let err = tombstone_deny_set(&cache, sf_id, Instant::now()).expect_err("refresh");
+        assert!(
+            matches!(err, crate::supertable::error::QueryError::Store(ref msg) if msg.contains("tombstone cache")),
+            "{err:?}"
+        );
+    }
+
+    /// A vector-bearing table config against an FTS-only file (no
+    /// fts_summary either) must fail closed — missing vector index.
+    #[test]
+    fn verify_vector_codecs_rejects_missing_vector_blob() {
+        let reader = fts_only_reader();
+        let mut entry = entry_with_fts_summary();
+        entry.fts_summary.clear(); // not a text-shard exemption
+        let expected = [VectorConfig {
+            column: "emb".into(),
+            dim: 4,
+            n_cent: 2,
+            rot_seed: 1,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        }];
+        let err =
+            verify_superfile_vector_codecs(&entry, &reader, &expected).expect_err("missing vector");
+        assert!(
+            err.to_string().contains("missing configured vector"),
+            "{err}"
+        );
+    }
+
+    fn vector_reader_and_entry() -> (SuperfileReader, SuperfileEntry) {
+        use crate::supertable::manifest::VectorSummary;
+
+        let dim = 16usize;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "doc_id",
+            DataType::Decimal128(38, 0),
+            false,
+        )]));
+        let opts = BuilderOptions::new(
+            Arc::clone(&schema),
+            "doc_id",
+            vec![],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                n_cent: 4,
+                rot_seed: 7,
+                metric: Metric::L2Sq,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+            }],
+            None,
+        );
+        let mut builder = SuperfileBuilder::new(opts).expect("builder");
+        let n = 32usize;
+        let ids: Vec<i128> = (0..n as i128).collect();
+        let mut flat = vec![0.0f32; n * dim];
+        for row in 0..n {
+            flat[row * dim + (row % dim)] = 1.0;
+        }
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(
+                arrow_array::Decimal128Array::from(ids)
+                    .with_precision_and_scale(38, 0)
+                    .expect("decimal"),
+            )],
+        )
+        .expect("batch");
+        builder.add_batch(&batch, &[flat.as_slice()]).expect("add");
+        let reader =
+            SuperfileReader::open(Bytes::from(builder.finish().expect("finish"))).expect("open");
+        let mut entry = entry_with_fts_summary();
+        entry.fts_summary.clear();
+        entry.n_docs = n as u64;
+        entry.id_max = (n as i128) - 1;
+        // Non-empty vector_summary disables the text-shard exemption.
+        entry.vector_summary.insert(
+            "emb".into(),
+            VectorSummary {
+                centroid: vec![0.0; dim],
+                cells: vec![],
+            },
+        );
+        (reader, entry)
+    }
+
+    /// Stored codec must match the table's write options.
+    #[test]
+    fn verify_vector_codecs_rejects_codec_mismatch() {
+        let (reader, entry) = vector_reader_and_entry();
+        let expected = [VectorConfig {
+            column: "emb".into(),
+            dim: 16,
+            n_cent: 4,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Fp32, // file is Sq8Residual
+            provided_centroids: None,
+        }];
+        let err =
+            verify_superfile_vector_codecs(&entry, &reader, &expected).expect_err("codec mismatch");
+        assert!(err.to_string().contains("codec mismatch"), "{err}");
+    }
+
+    /// A configured column name that is absent from the file fails closed.
+    #[test]
+    fn verify_vector_codecs_rejects_missing_vector_column() {
+        let (reader, entry) = vector_reader_and_entry();
+        let expected = [VectorConfig {
+            column: "emb_missing".into(),
+            dim: 16,
+            n_cent: 4,
+            rot_seed: 7,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        }];
+        let err =
+            verify_superfile_vector_codecs(&entry, &reader, &expected).expect_err("missing column");
+        assert!(
+            err.to_string().contains("missing configured vector column"),
+            "{err}"
+        );
+    }
+}
