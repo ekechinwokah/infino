@@ -1090,10 +1090,16 @@ const VECTOR_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
 // 10M column: measured+2 from the green Azure gate
 // (fts10m_azure_20260724T072204Z, V3 tiered routing + exact reads):
 // pre-drain 134, post-drain 87, post-delta 100, post-compact 41.
+// post-delta 10M has headroom for writer nondeterminism: its first
+// cold query is the stable hidden fan-out (87 GET) PLUS the undrained
+// delta tail, whose cold GET count varies with how the parallel
+// writer groups the 625K delta rows into superfiles (measured 13-24
+// tail GETs run-to-run). The other states are hidden-only (stable),
+// so they stay tight. post-drain 89 measured 87.
 const FTS_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
     ("pre-drain", 130, 136),
     ("post-drain", 36, 89),
-    ("post-delta", 94, 102),
+    ("post-delta", 94, 122),
     ("post-compact", 30, 43),
 ];
 /// Second (steady) cold FTS query, tight at the exact 1M
@@ -1125,7 +1131,8 @@ const FTS_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
 const FTS_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
     ("pre-drain", 128, 384),
     ("post-drain", 13, 33),
-    ("post-delta", 22, 39),
+    // post-delta 10M headroom for the variable delta tail (see FIRST).
+    ("post-delta", 22, 46),
     ("post-compact", 16, 18),
 ];
 /// SQL scans are user-only in every state. 1M measured (first full
