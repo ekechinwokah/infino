@@ -25,12 +25,18 @@ pub(crate) const RETRY_TIMEOUT: Duration = Duration::from_secs(300);
 /// Transient re-issue backoff: `BASE × 2^min(attempt, MAX_SHIFT)` ms, capped.
 const BACKOFF_BASE_MS: u64 = 50;
 const BACKOFF_MAX_SHIFT: u32 = 5;
-const BACKOFF_CAP_MS: u64 = 2000;
+const BACKOFF_CAP_MS: u64 = 5000;
 
 /// App-level re-issue budget for transient transport failures that
 /// `object_store` won't retry itself (e.g. "error sending request" on a
-/// socket the service dropped under us).
-const MAX_TRANSIENT_RETRIES: u32 = 8;
+/// socket the service dropped under us). Sized with the backoff cap to
+/// ride out ~45 s of refused dials: a store saturated by a parallel
+/// multipart upload burst can starve small PUTs' fresh connections for
+/// seconds straight (measured twice: a commit-time manifest-part PUT
+/// exhausted all re-issues in ~5 s while the same store answered a
+/// DELETE moments later). A commit has no recovery above this layer —
+/// aborting a 3-hour build on a 5-second hiccup is the wrong trade.
+const MAX_TRANSIENT_RETRIES: u32 = 12;
 
 /// Retry budget applied to a store builder via `.with_retry(...)`.
 pub(crate) fn config() -> RetryConfig {
