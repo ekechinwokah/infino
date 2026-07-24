@@ -1283,28 +1283,10 @@ impl FtsReader {
         // routing df floor, so a large one means stale routing —
         // bail to the ranged walk rather than decode a mega list).
         let unrouted_cursors = self.build_term_cursors(column_id, unrouted_terms).await?;
-        if unrouted_cursors
-            .iter()
-            .any(|c| c.block_count() > UNROUTED_TERM_MAX_BLOCKS)
-        {
-            return Ok(None);
-        }
         // (docs asc, tfs, idf_x_k1p1, term_max) per unrouted term.
-        let unrouted: Vec<(Vec<u32>, Vec<u32>, f32, f32)> = unrouted_cursors
-            .into_iter()
-            .map(|mut c| {
-                let idf_x_k1p1 = c.idf_x_k1p1;
-                let term_max = c.term_max_bm25;
-                let mut docs = Vec::new();
-                let mut tfs = Vec::new();
-                while !c.is_exhausted() {
-                    docs.push(c.current_doc_id());
-                    tfs.push(c.current_tf());
-                    c.next();
-                }
-                (docs, tfs, idf_x_k1p1, term_max)
-            })
-            .collect();
+        let Some(unrouted) = drain_unrouted_whole(unrouted_cursors) else {
+            return Ok(None);
+        };
 
         // ---- Upper-bound bookkeeping. Term maxes come from each
         // term's window slice — a true upper bound for in-window docs
@@ -1333,13 +1315,7 @@ impl FtsReader {
         let per_term_order: Vec<Vec<u32>> = routed
             .iter()
             .zip(&term_window)
-            .map(|(r, &(b_lo, b_hi))| {
-                let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); (u8::MAX as usize) + 1];
-                for b in b_lo..b_hi {
-                    buckets[r.quantized[b] as usize].push(b as u32);
-                }
-                buckets.into_iter().rev().flatten().collect()
-            })
+            .map(|(r, &(b_lo, b_hi))| descending_block_order(r.quantized, b_lo..b_hi))
             .collect();
         let mut term_pos: Vec<usize> = vec![0; routed.len()];
         let admit_key = |t: usize, pos: usize| -> Option<f32> {
@@ -1671,39 +1647,13 @@ impl FtsReader {
 
         // Unrouted lists (below the routing df floor) decode whole —
         // an oversized one means stale routing; decline.
-        let decode_whole =
-            |cursors: Vec<TermCursor>| -> Option<Vec<(Vec<u32>, Vec<u32>, f32, f32)>> {
-                if cursors
-                    .iter()
-                    .any(|c| c.block_count() > UNROUTED_TERM_MAX_BLOCKS)
-                {
-                    return None;
-                }
-                Some(
-                    cursors
-                        .into_iter()
-                        .map(|mut c| {
-                            let idf_x_k1p1 = c.idf_x_k1p1;
-                            let term_max = c.term_max_bm25;
-                            let mut docs = Vec::new();
-                            let mut tfs = Vec::new();
-                            while !c.is_exhausted() {
-                                docs.push(c.current_doc_id());
-                                tfs.push(c.current_tf());
-                                c.next();
-                            }
-                            (docs, tfs, idf_x_k1p1, term_max)
-                        })
-                        .collect(),
-                )
-            };
-        let Some(unrouted_musts) = decode_whole(
+        let Some(unrouted_musts) = drain_unrouted_whole(
             self.build_term_cursors(column_id, unrouted_must_terms)
                 .await?,
         ) else {
             return Ok(None);
         };
-        let Some(unrouted_shoulds) = decode_whole(
+        let Some(unrouted_shoulds) = drain_unrouted_whole(
             self.build_term_cursors(column_id, unrouted_should_terms)
                 .await?,
         ) else {
@@ -1860,13 +1810,10 @@ impl FtsReader {
             .min_by_key(|&t| routed[t].df)
             .expect("routed musts are non-empty on this path");
         let rest_ub = total_ub - routed_term_max[driver_t];
-        let driver_order: Vec<u32> = {
-            let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); (u8::MAX as usize) + 1];
-            for (b, &q) in routed[driver_t].quantized.iter().enumerate() {
-                buckets[q as usize].push(b as u32);
-            }
-            buckets.into_iter().rev().flatten().collect()
-        };
+        let driver_order = descending_block_order(
+            routed[driver_t].quantized,
+            0..routed[driver_t].quantized.len(),
+        );
         let mut driver_pos = 0usize;
         let mut wave_cap = BLOCK_SELECT_FIRST_WAVE;
         let driver_blocks = driver_order.len();
@@ -5237,6 +5184,53 @@ impl Ord for TopKEntry {
             .unwrap_or(Ordering::Equal)
             .then_with(|| self.1.cmp(&other.1))
     }
+}
+
+/// Drain unrouted (sub-df-floor) term cursors whole into per-term
+/// `(docs asc, tfs, idf_x_k1p1, term_max)` tuples — the candidate
+/// sources the block-selected OR/AND kernels sweep after admitting
+/// routed blocks. `None` when any list exceeds
+/// [`UNROUTED_TERM_MAX_BLOCKS`] (stale routing: the caller declines
+/// to the ranged walk rather than decode a mega list). Shared by both
+/// kernels so the bail threshold and the tuple shape live in one
+/// place.
+fn drain_unrouted_whole(cursors: Vec<TermCursor>) -> Option<Vec<(Vec<u32>, Vec<u32>, f32, f32)>> {
+    if cursors
+        .iter()
+        .any(|c| c.block_count() > UNROUTED_TERM_MAX_BLOCKS)
+    {
+        return None;
+    }
+    Some(
+        cursors
+            .into_iter()
+            .map(|mut c| {
+                let idf_x_k1p1 = c.idf_x_k1p1;
+                let term_max = c.term_max_bm25;
+                let mut docs = Vec::new();
+                let mut tfs = Vec::new();
+                while !c.is_exhausted() {
+                    docs.push(c.current_doc_id());
+                    tfs.push(c.current_tf());
+                    c.next();
+                }
+                (docs, tfs, idf_x_k1p1, term_max)
+            })
+            .collect(),
+    )
+}
+
+/// Block ordinals of `quantized[range]` in descending quantized-bound
+/// order, ascending ordinal on ties — a u8-bucket counting sort, so
+/// only admitted candidates ever pay a comparison. Shared by the
+/// block-selected OR kernel (per-term window slice) and AND kernel
+/// (driver's whole list) so the admit order is defined once.
+fn descending_block_order(quantized: &[u8], range: Range<usize>) -> Vec<u32> {
+    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); (u8::MAX as usize) + 1];
+    for b in range {
+        buckets[quantized[b] as usize].push(b as u32);
+    }
+    buckets.into_iter().rev().flatten().collect()
 }
 
 /// Drain a top-k min-heap into the public result order: descending

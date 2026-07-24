@@ -156,8 +156,11 @@ fn merge_unit_scores(
     now: Instant,
     hits: &[(u32, f32)],
 ) {
-    match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
-        Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
+    match tombstones
+        .as_ref()
+        .map(|c| dispatch::tombstone_deny_set(c, suid, now))
+    {
+        Some(Ok(Some(bitmap))) => shared.merge(
             hits.iter()
                 .filter(|(d, _)| !bitmap.contains(*d))
                 .map(|(_, s)| *s),
@@ -954,12 +957,7 @@ async fn token_match_count_wave(
             async move {
                 // Tombstone bitmap for this superfile (None = no deletes).
                 let tomb = match tombstone_cache.as_ref() {
-                    Some(c) => {
-                        let b = c
-                            .bitmap_for(entry.superfile_id, now)
-                            .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
-                        if b.is_empty() { None } else { Some(b) }
-                    }
+                    Some(c) => dispatch::tombstone_deny_set(c, entry.superfile_id, now)?,
                     None => None,
                 };
                 let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
