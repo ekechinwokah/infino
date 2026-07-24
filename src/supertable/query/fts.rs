@@ -569,8 +569,16 @@ async fn bm25_fanout_wave(
                     .iter()
                     .map(|term| state.term_block_max(suid, &column_arc, term))
                     .collect();
+                // EXACTLY the partition's predicate (prunable AND
+                // dominant): shapes can reach this un-ranged gate
+                // through fanouts the partition never saw, and an
+                // all-prunable-but-uniform row set (the folded-shard
+                // shape) makes the kernel CRAWL serially — best-first
+                // visits everything with wave overhead — rather than
+                // bail. Dominance is what predicts real pruning.
                 let engage = rows.iter().flatten().count() > 0
-                    && rows.iter().flatten().all(|row| row_can_prune(row));
+                    && rows.iter().flatten().all(|row| row_can_prune(row))
+                    && rows_have_dominant_ub(rows.iter().flatten().copied());
                 if engage {
                     let mut routed_rows = Vec::new();
                     let mut unrouted: Vec<&str> = Vec::new();
