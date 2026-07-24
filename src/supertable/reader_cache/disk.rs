@@ -1490,14 +1490,25 @@ impl DiskCacheStore {
                 storage_uri.clone(),
                 total_size,
             ));
+            // FTS subsection reads bypass block rounding (exact ranges);
+            // see the `passthrough` field docs. A text-bearing file with
+            // no vector section bypasses rounding WHOLE-FILE: the 512 KiB
+            // block size is tuned for vector cell scans, and applying it
+            // to a text shard's parquet `_id`-stub pages rounded ~KiB
+            // attach reads to 512 KiB each (measured: 15×512 KiB =
+            // 7.5 MiB of the 1M post-drain first cold query). Repeat
+            // locality for id pages comes from the decoded-id cache and
+            // the backfill's mmap promotion, not block granules.
+            let passthrough = match (offsets.fts, offsets.vec) {
+                (Some(_), None) => Some((0, total_size)),
+                (fts, _) => fts,
+            };
             let block_source = BlockCachedSource::new_pre_reserved(
                 inner,
                 Arc::downgrade(self),
                 *uri,
                 self.blocks_path(uri),
-                // FTS subsection reads bypass block rounding (exact ranges);
-                // see the `passthrough` field docs.
-                offsets.fts,
+                passthrough,
             );
             block_source_arc = Arc::clone(&block_source);
             let mut overlay = PrefetchedSource::new(block_source);

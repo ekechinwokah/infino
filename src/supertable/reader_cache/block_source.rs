@@ -67,12 +67,6 @@ struct BlockFile {
     size: u64,
 }
 
-/// Reads at or past this size leave the exact-read passthrough and go
-/// through the block cache: rounding a large read to 512 KiB blocks
-/// wastes little, and cached blocks make repeated cold queries stop
-/// re-fetching term heads while the background fill is still running.
-const PASSTHROUGH_MAX_READ_BYTES: u64 = 64 * 1024;
-
 /// Block-caching wrapper around a network-backed [`LazyByteSource`].
 /// See the module docs for semantics.
 pub(crate) struct BlockCachedSource {
@@ -149,17 +143,20 @@ impl BlockCachedSource {
     }
 
     /// Whether `[start, start + len)` takes the exact-read passthrough:
-    /// fully inside the hole AND small. The hole exists because posting
-    /// reads are ~KiB-sized and scattered — block-rounding them
-    /// over-fetches ~200x. Reads at or past the block scale (term-head
-    /// skip tables run 150 KB-1 MB) amortize the rounding fine, and
-    /// caching them is what makes a cold consumer's repeat queries stop
-    /// re-fetching every query term's head until the background fill
-    /// lands (measured: the first-cold warmup's dominant reads).
+    /// fully inside the hole, any size. Reads in the FTS subsection go
+    /// out exactly as the kernels coalesced them — small scattered
+    /// posting reads stay small, and a wave's `RangeCoalescePlan`
+    /// output (a few large contiguous ranges) is already the right
+    /// wire shape, so block-rounding it only inflates bytes (measured:
+    /// 29.66 MiB fetched for ~3 MiB of postings on the ten-term cold
+    /// first query at 1M, ~1.1 MiB per GET). A 64 KiB size escape used
+    /// to route bigger reads through the block cache so repeat queries
+    /// stopped re-fetching term heads, but routed-term heads are
+    /// resident now (slow-state VERSION 2) and the escape only caught
+    /// the coalesced posting waves. The accepted trade: no cross-query
+    /// posting dedup until the background fill promotes the mmap —
+    /// warm locality is the fill's job, not this cache's.
     fn in_passthrough(&self, start: u64, len: u64) -> bool {
-        if len >= PASSTHROUGH_MAX_READ_BYTES {
-            return false;
-        }
         match self.passthrough {
             Some((off, hole_len)) => start >= off && start + len <= off + hole_len,
             None => false,
