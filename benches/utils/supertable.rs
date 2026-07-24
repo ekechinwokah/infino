@@ -1079,9 +1079,13 @@ const VECTOR_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
 // Measured+2 on the one-shard-per-worker layout (7 shards), Azure,
 // 2026-07-23: both columns pinned from full green lifecycles at 1M
 // and 10M respectively.
+// 1M column re-pinned measured+2 (2026-07-24, rustfs, exact in-hole
+// reads + text-shard exact parquet reads): post-drain first 34. The
+// 10M column is stale pre-exact-read data; re-pin from the next 10M
+// gate run.
 const FTS_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
     ("pre-drain", 130, 390),
-    ("post-drain", 80, 89),
+    ("post-drain", 36, 89),
     ("post-delta", 94, 104),
     ("post-compact", 30, 43),
 ];
@@ -1096,11 +1100,17 @@ const FTS_COLD_GET_CEILINGS_FIRST: &[(&str, u64, u64)] = &[
 // query, so steady pays per-shard posting reads); post-delta and
 // post-compact still provisional — the measuring run panicked at
 // post-drain; tighten from the next full 10M run.
+// 1M column re-pinned measured+2 (2026-07-24, same runs as FIRST):
+// post-drain steady 11 GET / 53 KB — exact posting + id-page reads,
+// no block rounding, no fill-race luck (the old pin of 3 encoded a
+// lucky roll of the second-query-vs-background-fill race).
+// post-compact 16 is provisional (measured 14 pre-fix-C); tighten
+// with the 10M column from the next gate runs.
 const FTS_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
     ("pre-drain", 128, 384),
-    ("post-drain", 3, 28),
+    ("post-drain", 13, 28),
     ("post-delta", 22, 31),
-    ("post-compact", 5, 13),
+    ("post-compact", 16, 13),
 ];
 /// SQL scans are user-only in every state. 1M measured (first full
 /// SQL lifecycle after the settle-stall fixes): first cold 8 GETs
