@@ -29,6 +29,7 @@
 use std::{sync::Arc, time::Instant};
 
 use infino::{
+    OptimizeOptions,
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::fts::reader::BoolMode,
     supertable::Supertable,
@@ -136,6 +137,72 @@ pub fn run() {
             drain_t0.elapsed().as_secs_f64()
         );
         fs_table.dump_text_skip_spread(COLUMN, SKIP_SPREAD_DF_FLOOR, SKIP_SPREAD_TOP_TERMS);
+
+        // Hidden-index kernel timings on the REAL corpus, per shape:
+        // the same battery as the (user-table) main diag below, over
+        // the drained shards and again after optimize — the direct
+        // user-vs-hidden A/B at kernel granularity that the synthetic
+        // src-tree diag corpus cannot reproduce (its uniform tf/dl
+        // profile hides the bench shapes' regressions).
+        let drained_battery = |tag: &str| {
+            let fs_reader = fs_table.reader();
+            for s in SHAPES {
+                let _ = fs_reader
+                    .bm25_search(COLUMN, s.query, K, s.mode, None)
+                    .expect("drained warm-up");
+            }
+            for s in SHAPES {
+                let mut count = Vec::with_capacity(cfg.iters);
+                let mut kernel = Vec::with_capacity(cfg.iters);
+                let mut full = Vec::with_capacity(cfg.iters);
+                for _ in 0..cfg.iters {
+                    let t = Instant::now();
+                    let c = fs_reader
+                        .count(COLUMN, s.query, s.mode)
+                        .expect("drained count");
+                    count.push(t.elapsed());
+                    std::hint::black_box(c);
+                    let t = Instant::now();
+                    let h = fs_reader
+                        .bm25_hits(COLUMN, s.query, K, s.mode)
+                        .expect("drained bm25_hits");
+                    kernel.push(t.elapsed());
+                    std::hint::black_box(h);
+                    let t = Instant::now();
+                    let out = fs_reader
+                        .bm25_search(COLUMN, s.query, K, s.mode, None)
+                        .expect("drained bm25_search");
+                    full.push(t.elapsed());
+                    std::hint::black_box(out);
+                }
+                // traverse (count) → +score/heap → +resolve/route (full).
+                // On the hidden path `full − kernel` also carries the
+                // two-wave + HDEL + id-attach overhead, so this split
+                // separates "slow leapfrog" from "fixed per-query tax".
+                let cp = diag_common::percentile(&mut count, 50);
+                let kp = diag_common::percentile(&mut kernel, 50);
+                let fp = diag_common::percentile(&mut full, 50);
+                eprintln!(
+                    "[fts-diag/{tag}] {:<18} count {:>9.2?}  kernel {:>9.2?}  full {:>9.2?}  \
+                     (route+resolve {:>9.2?})",
+                    s.name,
+                    cp,
+                    kp,
+                    fp,
+                    fp.saturating_sub(kp),
+                );
+            }
+        };
+        drained_battery("post-drain");
+        let opt_t0 = Instant::now();
+        fs_table
+            .optimize(&OptimizeOptions::default())
+            .expect("skip-spread optimize");
+        eprintln!(
+            "[fts-diag] skip-spread table optimized in {:.1}s",
+            opt_t0.elapsed().as_secs_f64()
+        );
+        drained_battery("post-compact");
     }
 
     // Warm both paths for every shape (cache-hot before timing).
