@@ -769,6 +769,22 @@ impl Supertable {
         self.block_on_query(async move { cache.wait_until_fills_settled(timeout).await })
     }
 
+    /// Diagnostic (bench `fts-diag` token): sync wrapper over the
+    /// reader's `dump_text_skip_spread` — prints the exact per-block
+    /// skip-bound spread of the drained text shards, the measurement
+    /// that decides whether bound-based block admission can prune a
+    /// given corpus.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn dump_text_skip_spread(&self, column: &str, df_floor: u32, top_n: usize) {
+        let reader = self.reader();
+        let result = self.block_on_query(async move {
+            reader.dump_text_skip_spread(column, df_floor, top_n).await
+        });
+        if let Err(error) = result {
+            eprintln!("[skip-spread] failed: {error}");
+        }
+    }
+
     /// This handle's lease-owner id. Stamped on every WAL the
     /// handle's recovery sweep / commit pipeline acquires.
     /// Minted once at handle construction via `IdGenerator`;

@@ -50,7 +50,7 @@ const MAGIC: &[u8; 8] = b"INFFBM01";
 const VERSION: u32 = 2;
 
 /// Quantization steps for the 1-byte per-block bound (`u8::MAX`).
-const QUANT_STEPS: f32 = 255.0;
+pub(crate) const QUANT_STEPS: f32 = 255.0;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SlowFtsStateError {

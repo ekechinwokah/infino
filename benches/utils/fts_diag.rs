@@ -26,9 +26,13 @@
 //! INFINO_DIAG_ITERS=30 cargo bench -- fts-diag
 //! ```
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
-use infino::superfile::fts::reader::BoolMode;
+use infino::{
+    storage::{LocalFsStorageProvider, StorageProvider},
+    superfile::fts::reader::BoolMode,
+    supertable::Supertable,
+};
 
 use crate::{diag_common, markdown::fmt_count};
 
@@ -38,6 +42,12 @@ const K: usize = 1000;
 
 /// FTS column planted by [`diag_common::build_supertable`].
 const COLUMN: &str = "title";
+
+/// Skip-spread dump: only terms at/above the routing df floor matter
+/// (the block-selected kernels only ever see routed terms).
+const SKIP_SPREAD_DF_FLOOR: u32 = 1024;
+/// Skip-spread dump: heaviest terms per shard to print.
+const SKIP_SPREAD_TOP_TERMS: usize = 12;
 
 /// One query shape measured across the kernel and full paths.
 struct FtsShape {
@@ -95,6 +105,38 @@ pub fn run() {
         build_t0.elapsed().as_secs_f64(),
         reader.manifest().superfiles.len(),
     );
+
+    // Exact skip-bound spread of drained shards' heaviest terms —
+    // decides whether bound-based block admission can prune this
+    // corpus (flat exact maxima: whole-list walks are inherent for
+    // those terms; spread: the flat resident rows are a quantization
+    // artifact and an exact-bound tier recovers pruning). The hidden
+    // sibling needs real storage, so a second LocalFs table is built
+    // from the same batches, drained, and dumped; the timed diag
+    // table above stays untouched.
+    {
+        let dir = tempfile::TempDir::new().expect("skip-spread tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("skip-spread localfs"));
+        let fs_table = Supertable::create(diag_common::diag_options().with_storage(storage))
+            .expect("skip-spread table");
+        {
+            let mut writer = fs_table.writer().expect("skip-spread writer");
+            for batch in &_batches {
+                writer.append(batch).expect("skip-spread append");
+            }
+            writer.commit().expect("skip-spread commit");
+        }
+        let drain_t0 = Instant::now();
+        fs_table
+            .drain_vectors_to_cells_sync()
+            .expect("skip-spread drain");
+        eprintln!(
+            "[fts-diag] skip-spread table drained in {:.1}s",
+            drain_t0.elapsed().as_secs_f64()
+        );
+        fs_table.dump_text_skip_spread(COLUMN, SKIP_SPREAD_DF_FLOOR, SKIP_SPREAD_TOP_TERMS);
+    }
 
     // Warm both paths for every shape (cache-hot before timing).
     for s in SHAPES {

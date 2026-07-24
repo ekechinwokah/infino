@@ -70,7 +70,7 @@
 use std::{
     borrow::Cow,
     cmp::{Ordering, Reverse},
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     slice,
     sync::{Arc, Mutex},
     time::Instant,
@@ -101,6 +101,7 @@ use crate::{
         manifest::{ManifestSnapshot, SuperfileEntry, list::DrainedVersionRanges},
         query::{
             SuperfileHit, dispatch,
+            dispatch::open_compaction_input,
             exec::common::{resolve_hits_named, take_rows_byte_source},
             prune::{PruneLeaf, select_superfiles},
             skip::{fts_bloom_skip, fts_prefix_skip},
@@ -109,7 +110,7 @@ use crate::{
             },
         },
         reader_cache::disk::ForegroundQueryGuard,
-        slow_fts_state::{SlowFtsState, TermBlockMax},
+        slow_fts_state::{QUANT_STEPS, SlowFtsState, TermBlockMax},
         tombstones::SidecarCache,
     },
 };
@@ -1022,6 +1023,80 @@ impl SupertableReader {
                 .iter()
                 .any(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty())
         })
+    }
+
+    /// Diagnostic (bench `fts-diag` token): print the EXACT per-block
+    /// skip-bound spread of the drained text shards' terms at/above
+    /// `df_floor` — the measurement that decides whether bound-based
+    /// block admission can prune on a given corpus. Identical exact
+    /// maxima mean NO bound tier (resident, requantized, or on-disk
+    /// exact) can prune those terms, and whole-list walks are inherent
+    /// for them; spread means the flat resident rows are a
+    /// quantization artifact and an exact-bound tier recovers pruning.
+    /// One line per (shard, term), highest df first, `top_n` terms per
+    /// shard: df, block count, exact min/p50/max, and the count of
+    /// distinct values the resident 1-byte ceil-quantization collapses
+    /// them to.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub async fn dump_text_skip_spread(
+        &self,
+        column: &str,
+        df_floor: u32,
+        top_n: usize,
+    ) -> Result<(), QueryError> {
+        let Some(route) = self.hidden_text_route().await? else {
+            eprintln!("[skip-spread] no hidden text epoch");
+            return Ok(());
+        };
+        let manifest = &route.hidden_manifest;
+        let store = Arc::clone(&manifest.options.store);
+        let disk_cache = manifest.options.disk_cache.clone();
+        let storage = manifest.options.storage.clone();
+        let entries: Vec<Arc<SuperfileEntry>> = manifest
+            .get_all_superfiles()
+            .iter()
+            .filter(|e| !e.fts_summary.is_empty() && e.vector_summary.is_empty())
+            .map(Arc::clone)
+            .collect();
+        for entry in entries {
+            let reader =
+                open_compaction_input(&store, disk_cache.as_ref(), storage.as_ref(), &entry)
+                    .await?;
+            let Some(fts) = reader.fts() else {
+                continue;
+            };
+            let mut rows = fts
+                .column_block_maxes(column, df_floor)
+                .await
+                .map_err(|e| QueryError::Execute(e.to_string()))?;
+            rows.sort_by(|a, b| b.df.cmp(&a.df));
+            for row in rows.iter().take(top_n) {
+                let hi = row.maxes.iter().copied().fold(0.0f32, f32::max);
+                let lo = row.maxes.iter().copied().fold(f32::INFINITY, f32::min);
+                let mut sorted = row.maxes.clone();
+                sorted.sort_by(f32::total_cmp);
+                let p50 = sorted[sorted.len() / 2];
+                // The resident row's exact quantization (ceil against the
+                // term max) — how many distinct admit levels survive it.
+                let distinct_q = sorted
+                    .iter()
+                    .map(|&m| match hi > 0.0 {
+                        true => (m / hi * QUANT_STEPS).ceil().min(QUANT_STEPS) as u8,
+                        false => 0,
+                    })
+                    .collect::<HashSet<u8>>()
+                    .len();
+                eprintln!(
+                    "[skip-spread] shard={} term={} df={} blocks={} \
+                     exact[min={lo:.4} p50={p50:.4} max={hi:.4}] q_distinct={distinct_q}",
+                    entry.superfile_id,
+                    String::from_utf8_lossy(&row.term),
+                    row.df,
+                    row.maxes.len(),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// The hidden-text route, when this table's hidden sibling holds
