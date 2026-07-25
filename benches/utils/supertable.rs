@@ -4303,6 +4303,15 @@ pub mod sql {
                 .expect("sql ingest sets sample_key"),
         };
 
+        // Cold battery: realistic row-returning WHERE scans (shared with the
+        // warm scan block so warm/cold reconcile) plus COUNT(*) as the one
+        // manifest-answered aggregate, so the cold cost reflects real scans
+        // rather than the metadata-answered aggregate battery.
+        let scan_qs = exec_sql::scan_battery(&inputs.sample_key, &inputs.sample_title);
+        let mut cold_battery: Vec<(&'static str, &str)> =
+            scan_qs.iter().map(|(n, s)| (*n, s.as_str())).collect();
+        cold_battery.push(("count_star", "SELECT COUNT(*) AS n FROM supertable"));
+
         // Full lifecycle (pre-drain → drain → post-drain → delta → post-delta
         // → compact → post-compact) on a fresh ingest in this process —
         // same gate as FTS/vector. Drain is a no-op without a hidden
@@ -4359,6 +4368,7 @@ pub mod sql {
         let cold_pre = if phases.cold {
             let cold = exec_sql::measure_cold(
                 || SupertableSqlColdGuard::open(&built),
+                &cold_battery,
                 COLD_ITERS,
                 "supertable_sql",
             );
@@ -4381,7 +4391,7 @@ pub mod sql {
                     "Cold = fresh disk cache + consumer per iteration (open = construct only; search is the first query on that cold consumer — no pre-open of all superfiles). Δ is vs the previous run.",
                 )
             };
-            exec_sql::emit_cold(&mut report, anchor, title, note, &cold);
+            exec_sql::emit_cold(&mut report, anchor, title, note, &cold, &cold_battery);
             Some(cold)
         } else {
             None
@@ -4443,6 +4453,7 @@ pub mod sql {
                     let cold = if phases.cold {
                         let cold = exec_sql::measure_cold(
                             || SupertableSqlColdGuard::open(&built),
+                            &cold_battery,
                             COLD_ITERS,
                             "supertable_sql",
                         );
@@ -4455,6 +4466,7 @@ pub mod sql {
                             ),
                             "Post-compact cold: open = construct only; search is the first query on the merged layout. Δ vs previous run.",
                             &cold,
+                            &cold_battery,
                         );
                         Some(cold)
                     } else {
@@ -4534,11 +4546,15 @@ pub mod sql {
         let tvf_names = names_of(|s| &s.tvf);
         let pushdown_names = names_of(|s| &s.fts_pushdown);
         let agg_names = names_of(|s| &s.agg_idx);
+        // Lead with the realistic row-returning WHERE scans (the family the
+        // cold battery shares), then the aggregate-over-candidate scans and
+        // search TVFs; the pure aggregates are labelled as manifest-answered
+        // so their near-free cost isn't mistaken for a scan.
         let sql_groups: [(&str, &[&str]); 4] = [
-            ("Scalar queries", scalar_names.as_slice()),
-            ("Search TVFs", tvf_names.as_slice()),
-            ("FTS-pushdown scans", pushdown_names.as_slice()),
+            ("Row-returning WHERE scans", pushdown_names.as_slice()),
             ("Aggregate over candidates", agg_names.as_slice()),
+            ("Search TVFs", tvf_names.as_slice()),
+            ("Analytics (manifest-answered)", scalar_names.as_slice()),
         ];
         if !warm_vec.is_empty() || !cold_vec.is_empty() {
             emit_cost_warm(
@@ -4633,20 +4649,14 @@ pub mod sql {
     fn measure_cold_store(built: &supertable::IngestResult) -> Option<ColdStoreMeasurement> {
         let sample_title = built.sql_sample_title.as_deref()?;
         let sample_key = built.sql_sample_key.as_deref()?;
-        // Ingest already escapes titles; escape again at the format site so a
-        // non-escaped caller cannot break the SQL string literal.
-        let sample_title = sample_title.replace('\'', "''");
-        let sample_key = sample_key.replace('\'', "''");
-        // Same shapes as warm `fts_pushdown` / filter projections: must
-        // scan row data, so first/steady cold windows accrue real GETs.
-        let first = format!("SELECT key FROM supertable WHERE key = '{sample_key}'");
-        // Steady predicates must hit the ingest sample row on every corpus;
-        // hard-coded category/rating filters can legitimately return zero.
-        let steady = [
-            format!("SELECT title FROM supertable WHERE title = '{sample_title}'"),
-            format!("SELECT key FROM supertable WHERE title = '{sample_title}'"),
-            format!("SELECT title FROM supertable WHERE key = '{sample_key}'"),
-        ];
+        // Probe the SAME realistic row-returning WHERE scans the cold battery
+        // and the serving cost use (`scan_battery`), so the I/O-ledger
+        // open/first/steady/repeat GET+fill rows describe the shapes the
+        // serving prices — not a separate point-lookup probe. `scan_battery`
+        // escapes the sample values itself; index 0 is the by-key point
+        // lookup, which returns the sample row.
+        let scan = exec_sql::scan_battery(sample_key, sample_title);
+        let first = scan[0].1.as_str();
         let meter = storage_meter::wrap(Arc::clone(&built.storage));
         let measured = cold_store::measure_cold_store(
             &meter,
@@ -4663,25 +4673,25 @@ pub mod sql {
                 let consumer = tiers::open_consumer(opts);
                 (cache_dir, consumer)
             },
-            // `query_rows` already `.expect`s on plan/exec failure; require a
-            // non-empty hit so a wrong predicate cannot look like success.
+            // First/repeat probe the by-key point lookup, which returns the
+            // sample row — require a hit so a wrong predicate can't look like
+            // success (`query_rows` already `.expect`s on plan/exec failure).
             |(_cache, consumer)| {
                 assert!(
-                    consumer.query_rows(&first) > 0,
+                    consumer.query_rows(first) > 0,
                     "metered first cold SQL returned no rows: {first}"
                 );
             },
+            // Steady cycles the realistic battery. The range predicate may
+            // legitimately match zero rows yet still scans row groups (real
+            // GETs), so it carries no non-empty assertion.
             |(_cache, consumer), i| {
-                let q = &steady[i % steady.len()];
-                assert!(
-                    consumer.query_rows(q) > 0,
-                    "metered steady cold SQL returned no rows: {q}"
-                );
+                let _ = consumer.query_rows(&scan[i % scan.len()].1);
             },
-            steady.len().min(STEADY_COLD_SAMPLES),
+            scan.len().min(STEADY_COLD_SAMPLES),
             |(_cache, consumer)| {
                 assert!(
-                    consumer.query_rows(&first) > 0,
+                    consumer.query_rows(first) > 0,
                     "metered repeat cold SQL returned no rows: {first}"
                 );
             },

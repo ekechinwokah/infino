@@ -2004,6 +2004,32 @@ pub mod sql {
         },
     ];
 
+    /// Realistic row-returning WHERE queries built from the ingested
+    /// sample row. Unlike the [`SQL_BATTERY`] aggregates — which the
+    /// engine answers from manifest statistics (row count, exact value
+    /// frequencies, min/max) and so touch ~0 row data — these SELECT
+    /// columns behind a predicate, so they scan and fetch the row data
+    /// a real lookup/range pays for. Shared by the warm WHERE-scan block
+    /// and the cold battery so warm and cold measure the same shapes.
+    pub fn scan_battery(sample_key: &str, sample_title: &str) -> Vec<(&'static str, String)> {
+        let k = sample_key.replace('\'', "''");
+        let t = sample_title.replace('\'', "''");
+        vec![
+            (
+                "WHERE key = ? (point lookup, unsorted col)",
+                format!("SELECT key, title, category, rating FROM supertable WHERE key = '{k}'"),
+            ),
+            (
+                "WHERE title = ? (point lookup, sorted col)",
+                format!("SELECT key, rating FROM supertable WHERE title = '{t}'"),
+            ),
+            (
+                "WHERE rating < N (range scan, returns rows)",
+                "SELECT title, rating FROM supertable WHERE rating < 10".to_string(),
+            ),
+        ]
+    }
+
     /// High-cardinality GROUP BY guard, run only on the in-memory superfile
     /// tier (passed as `extra_scalar` to [`measure_query_sets`]). `title` is
     /// near-unique per row, so the group key set is ~n_docs: the shape where
@@ -2216,20 +2242,14 @@ pub mod sql {
         ];
 
         eprintln!("[{log_prefix}] FTS-pushdown equality (sorted title vs unsorted key)...");
-        let fts_pushdown = vec![
-            timed(
-                reader,
-                "WHERE title = ?  (sorted col, min/max prunes)",
-                &format!("SELECT title FROM supertable WHERE title = '{sample_title}'"),
-                iters,
-            ),
-            timed(
-                reader,
-                "WHERE key   = ?  (unsorted col, min/max defeated)",
-                &format!("SELECT key FROM supertable WHERE key = '{sample_key}'"),
-                iters,
-            ),
-        ];
+        // Realistic row-returning WHERE scans (point lookups + range),
+        // shared with the cold battery so warm and cold price the same
+        // shapes. These SELECT columns behind a predicate, so they scan
+        // and fetch row data (unlike the manifest-answered aggregates).
+        let fts_pushdown = scan_battery(sample_key, sample_title)
+            .iter()
+            .map(|(name, sql)| timed(reader, name, sql, iters))
+            .collect::<Vec<_>>();
 
         eprintln!("[{log_prefix}] aggregate shapes over a token_match candidate set...");
         let agg_idx = vec![
@@ -2342,42 +2362,48 @@ pub mod sql {
         });
     }
 
-    /// Cold scalar-battery p50s: `iters` fresh-reader opens per query,
-    /// timing the open and the query separately (see [`ColdTiming`]).
+    /// Cold p50s for a `(name, sql)` battery: `iters` fresh-reader opens
+    /// per query, timing the open and the query separately (see
+    /// [`ColdTiming`]) and metering the search's object-store GETs. The
+    /// caller supplies the battery — for SQL that is realistic
+    /// row-returning WHERE scans ([`scan_battery`]) plus one labelled
+    /// aggregate, not the manifest-answered aggregate battery.
     pub fn measure_cold<G: SqlRead>(
         open_fresh: impl Fn() -> G,
+        battery: &[(&'static str, &str)],
         iters: usize,
         log_prefix: &str,
     ) -> HashMap<&'static str, ColdTiming> {
         let mut out = HashMap::new();
-        for q in SQL_BATTERY {
-            eprintln!(
-                "[{log_prefix}] cold: query {} — {iters} fresh-cache iters...",
-                q.name
-            );
+        for (name, sql) in battery {
+            eprintln!("[{log_prefix}] cold: query {name} — {iters} fresh-cache iters...");
             let mut cold = ColdSamples::with_capacity(iters);
             for _ in 0..iters {
                 let (guard, open_wall, open_cpu) = cpu::timed(&open_fresh);
                 cold.push_open(open_wall, open_cpu);
                 let io_before = io_counters::snapshot();
-                let (rows, search_wall, search_cpu) = cpu::timed(|| guard.query_rows(q.sql));
+                let (rows, search_wall, search_cpu) = cpu::timed(|| guard.query_rows(sql));
                 let io = io_counters::snapshot().since(&io_before);
                 cold.push_search(search_wall, search_cpu);
                 cold.push_search_io(io.get_count, io.get_bytes);
                 black_box(rows);
                 drop(guard);
             }
-            out.insert(q.name, cold.finish());
+            out.insert(*name, cold.finish());
         }
         out
     }
 
+    /// Render the cold table in `battery` order (the same `(name, sql)`
+    /// battery that was measured), so the rows track whatever cold set the
+    /// caller ran rather than a fixed list.
     pub fn emit_cold(
         report: &mut Report,
         anchor: &str,
         title: String,
         note: &str,
         cold: &HashMap<&'static str, ColdTiming>,
+        battery: &[(&'static str, &str)],
     ) {
         let time_cell = |ns: f64| {
             if ns.is_finite() {
@@ -2393,14 +2419,14 @@ pub mod sql {
             blocks: vec![Block {
                 subtitle: String::new(),
                 headers: vec!["Query".into(), "cold open".into(), "cold search".into()],
-                rows: SQL_BATTERY
+                rows: battery
                     .iter()
-                    .map(|q| {
+                    .map(|(name, _sql)| {
                         let (open_ns, search_ns) = cold
-                            .get(&q.name)
+                            .get(name)
                             .map(|t| (t.open.as_secs_f64() * 1e9, t.search.as_secs_f64() * 1e9))
                             .unwrap_or((f64::NAN, f64::NAN));
-                        vec![text(q.name), time_cell(open_ns), time_cell(search_ns)]
+                        vec![text(*name), time_cell(open_ns), time_cell(search_ns)]
                     })
                     .collect(),
             }],

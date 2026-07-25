@@ -1931,6 +1931,10 @@ pub mod sql {
             let corpus_rows = corpus.rows();
             let rows = sql_rows(&corpus_rows);
             let cold = measure_cold_queries(&rows);
+            let cold_battery: Vec<(&'static str, &str)> = exec_sql::SQL_BATTERY
+                .iter()
+                .map(|q| (q.name, q.sql))
+                .collect();
             exec_sql::emit_cold(
                 &mut report,
                 "bench/sql/superfile/cold",
@@ -1940,6 +1944,7 @@ pub mod sql {
                 ),
                 "Cold p50 over `reader().query_sql` after reopening the same SQL table shape from object storage with a fresh disk cache per iteration. Δ is vs the previous run.",
                 &cold,
+                &cold_battery,
             );
         }
         report.save();
@@ -2046,9 +2051,16 @@ pub mod sql {
     ) -> std::collections::HashMap<&'static str, crate::executors::ColdTiming> {
         const COLD_ITERS: usize = 5;
         let artifact = build_cold_artifact(rows);
+        // In-memory single-superfile tier — cold is served locally, so the
+        // scalar aggregate battery is fine here (the object-storage scan
+        // realism only matters for the supertable tier).
+        let battery: Vec<(&'static str, &str)> = exec_sql::SQL_BATTERY
+            .iter()
+            .map(|q| (q.name, q.sql))
+            .collect();
         eprintln!(
             "[superfile_sql] cold queries: {} queries × {COLD_ITERS} fresh-cache iters...",
-            exec_sql::SQL_BATTERY.len(),
+            battery.len(),
         );
         let cold = exec_sql::measure_cold(
             || {
@@ -2059,6 +2071,7 @@ pub mod sql {
                     table,
                 }
             },
+            &battery,
             COLD_ITERS,
             "superfile_sql",
         );
