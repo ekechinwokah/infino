@@ -62,6 +62,7 @@ use crate::{
     cold_store::{self, ColdStoreMeasurement, STEADY_COLD_SAMPLES},
     corpus::DIM,
     cost, cpu,
+    executors::p50,
     ingest::supertable::{self, Modality, modality_label},
     markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
     report::{Better, Block, Cell, Report, Section, context, metric, text},
@@ -1040,8 +1041,10 @@ fn measure_routing_state_with(
         {
             log_query_read_trace(label, "warm measurement", &trace);
         }
-        samples.sort_unstable();
-        let p50_ns = samples[samples.len() / 2].as_secs_f64() * 1e9;
+        // Lower-median (n-1)/2 via the shared helper, matching every other
+        // warm p50 in the harness (per-shape search table, summarize) so the
+        // routing-state warm p50 uses one order-statistic definition.
+        let p50_ns = p50(&mut samples).as_secs_f64() * 1e9;
         (
             p50_ns,
             warm_cpu_s,
@@ -1599,8 +1602,9 @@ pub mod fts {
                         "Supertable FTS — search, multi-superfile / object-store ({} docs)",
                         fmt_count(n_docs)
                     ),
-                    "Warm = shared consumer + disk cache; one prewarm + wait_until_warm, then p50 / p90 / p99 \
-                     over repeated bm25_search (Δ gates on `p50`). Cold open = fresh cache + consumer \
+                    "Warm = shared consumer + disk cache; every battery shape is prewarmed then \
+                     wait_until_warm settles all fills, so p50 / p90 / p99 over repeated bm25_search \
+                     time a fully hot cache (Δ gates on `p50`). Cold open = fresh cache + consumer \
                      construct only; cold search = first bm25_search (query-driven survivor opens + score) — \
                      same split as cost-model cold I/O. Δ is vs the previous run."
                         .to_string(),
@@ -1911,22 +1915,26 @@ pub mod fts {
         crate::rss::log_rss_breakdown("supertable_fts before consumer open");
         let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
         let reader = consumer.reader();
-        // Prewarm + wait: one query opens every pruned-in superfile so the
-        // background fills spawn, then wait_until_warm blocks until each is
-        // mmap-promoted. Warm numbers time a hot cache, not the fill race —
-        // same methodology as the cold split, which meters the fill
-        // explicitly.
-        let first = &FTS_BATTERY[0];
-        let first_query = first.terms.join(" ");
-        let _ = reader
-            .bm25_search(
-                supertable::TEXT_COLUMN,
-                &first_query,
-                TOP_K,
-                exec_fts::to_infino_mode(first.mode),
-                None,
-            )
-            .expect("warm prewarm bm25_search");
+        // Prewarm + wait: run EVERY battery shape once so each opens its
+        // pruned-in superfiles and spawns their background fills, then
+        // wait_until_warm blocks until all are mmap-promoted. A single-shape
+        // prewarm (e.g. a rare term pruning into one superfile) would leave
+        // broad shapes' (common terms, phrases — they prune into every
+        // superfile) working sets unsettled, so their warm p50 would race
+        // lagging fills. Warm numbers time a hot cache, not the fill race —
+        // same methodology as the cold split, which meters fill explicitly.
+        for q in FTS_BATTERY {
+            let query = q.terms.join(" ");
+            let _ = reader
+                .bm25_search(
+                    supertable::TEXT_COLUMN,
+                    &query,
+                    TOP_K,
+                    exec_fts::to_infino_mode(q.mode),
+                    None,
+                )
+                .expect("warm prewarm bm25_search");
+        }
         consumer
             .wait_until_warm(Duration::from_secs(600))
             .expect("supertable warm promotion");
@@ -4379,7 +4387,7 @@ pub mod sql {
                         "Supertable SQL — cold queries pre-compact, fresh cache / object-store ({} rows)",
                         fmt_count(n_docs)
                     ),
-                    "Pre-compact cold: open = construct only; search is the first query on that cold consumer. Δ vs previous run.",
+                    "Pre-compact cold: open = construct only; search is the first query on that cold consumer. The WHERE rows scan and fetch row data; `count_star` answers from manifest statistics (~0 row fetch) — it is the labelled special case, not a scan. Δ vs previous run.",
                 )
             } else {
                 (
@@ -4464,7 +4472,7 @@ pub mod sql {
                                 "Supertable SQL — cold queries post-compact, fresh cache / object-store ({} rows)",
                                 fmt_count(n_docs)
                             ),
-                            "Post-compact cold: open = construct only; search is the first query on the merged layout. Δ vs previous run.",
+                            "Post-compact cold: open = construct only; search is the first query on the merged layout. The WHERE rows scan and fetch row data; `count_star` answers from manifest statistics (~0 row fetch) — the labelled special case, not a scan. Δ vs previous run.",
                             &cold,
                             &cold_battery,
                         );
@@ -4491,10 +4499,12 @@ pub mod sql {
                     "Supertable SQL — pre-compact vs post-compact ({} rows)",
                     fmt_count(n_docs)
                 ),
-                "One filtered-count shape (filter_category_count) measured pre-compact and \
-                 post-compact on one warm cache: warm p50, warm GET/query (0 when the working \
-                 set fits the budget), and the cold open / first-query GET+byte split. SQL never \
-                 routes to hidden data on main, so every state is user-tier."
+                "Pre-compact vs post-compact on one warm cache. Warm p50 / warm GET/query are \
+                 the manifest-answered filter_category_count (0 GET when the working set fits the \
+                 budget); the cold open / first-query GET+byte split is measured over the \
+                 row-returning WHERE scans (scan_battery: by-key point lookup first), which \
+                 actually scan and fetch. SQL never routes to hidden data on main, so every state \
+                 is user-tier."
                     .into(),
                 "Rows (u/h)",
                 &routing_states,
@@ -4682,13 +4692,16 @@ pub mod sql {
                     "metered first cold SQL returned no rows: {first}"
                 );
             },
-            // Steady cycles the realistic battery. The range predicate may
-            // legitimately match zero rows yet still scans row groups (real
-            // GETs), so it carries no non-empty assertion.
+            // Steady cycles the DISTINCT scans (skip scan[0], the first/repeat
+            // query) so every steady sample is a genuinely cold, distinct
+            // query — never a cache-warm re-run of the first that would drag
+            // the wall-median (and its GET count) down. The range predicate
+            // may legitimately match zero rows yet still scans row groups
+            // (real GETs), so it carries no non-empty assertion.
             |(_cache, consumer), i| {
-                let _ = consumer.query_rows(&scan[i % scan.len()].1);
+                let _ = consumer.query_rows(&scan[1 + (i % (scan.len() - 1))].1);
             },
-            scan.len().min(STEADY_COLD_SAMPLES),
+            (scan.len() - 1).min(STEADY_COLD_SAMPLES),
             |(_cache, consumer)| {
                 assert!(
                     consumer.query_rows(first) > 0,

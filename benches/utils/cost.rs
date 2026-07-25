@@ -1391,7 +1391,17 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         // group's per-query p50s and per-query cost (compute + cold request
         // leg from the metered per-query GETs). The monthly blend below uses
         // the battery-wide arithmetic mean.
-        let resident = c.resident_anon_bytes;
+        //
+        // RAM-leg residency is the ENGINE-ONLY set (pinned heap + settled
+        // file cache, harness heap excluded) of the last populated routing
+        // state — the steady-state layout a long-lived table serves — so the
+        // serving $ matches the compute ledger's rows for the same shapes
+        // rather than being inflated by whole-process anon RSS. Falls back to
+        // whole-process anon only when no state sampled the anon/file split.
+        let resident = query_states
+            .last()
+            .map(|s| s.serving_resident_bytes(c.resident_anon_bytes))
+            .unwrap_or(c.resident_anon_bytes);
         let warm_per_q = |name: &str| -> Option<(f64, f64)> {
             c.warm
                 .iter()

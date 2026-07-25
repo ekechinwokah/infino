@@ -227,12 +227,16 @@ pub fn sample_batched_cpu<T>(
     (samples, cpu_s)
 }
 
-/// Cold timings for one query, split at the open/search boundary:
-/// `open` is the fresh-consumer open (consumer + manifest + every
-/// superfile reader), `search` is the first query over the opened but
-/// data-cold table. Timed separately so cold search latency never
-/// bills the one-time open bookkeeping — the same cold-open vs
-/// cold-first-search split the quick-iter object-store harness uses.
+/// Cold timings for one query, split at the open/search boundary.
+/// `open` measures whatever the caller's guard constructor does: for
+/// guards that force-open (the single-superfile FTS guard, the
+/// superfile-tier SQL guard via [`open_all_superfiles`]) it is the
+/// consumer + manifest + every superfile reader; for the supertable
+/// FTS/SQL cold guards and the cost-model cold-store closures it is
+/// consumer + manifest CONSTRUCT ONLY (no `open_all_superfiles`), so the
+/// query-driven survivor opens land in `search`. `search` is the first
+/// query over the opened but data-cold table. Timed separately so cold
+/// search latency never bills the one-time open bookkeeping.
 #[derive(Clone, Copy)]
 pub struct ColdTiming {
     pub open: Duration,
@@ -371,8 +375,12 @@ pub mod fts {
             mode: BoolMode::Or,
         },
         FtsQuery {
+            // doc-unique token for doc 0: df=1 at every scale (the corpus
+            // plants doc{id:07} for id in 0..n_docs). A higher fixed id
+            // (e.g. doc0500000) is absent below that many docs and would
+            // silently measure an empty result at small scales.
             name: "single_df1",
-            terms: &["doc0500000"],
+            terms: &["doc0000000"],
             mode: BoolMode::Or,
         },
         FtsQuery {
@@ -543,6 +551,7 @@ pub mod fts {
     /// AND query names, in table order.
     pub const AND_QUERIES: &[&str] = &[
         "two_term_and",
+        "two_term_and_small",
         "three_wide_and",
         "three_similar_and",
         "five_term_and",
@@ -2229,8 +2238,11 @@ pub mod sql {
             ),
             timed(
                 reader,
+                // doc-unique token for doc 0 — df=1 at any scale (a higher
+                // fixed id would match zero rows below that many docs and
+                // measure an empty candidate set as a "selective" lookup).
                 "token_match (selective)",
-                "SELECT _id FROM token_match('title', 'doc0500000', 'and')",
+                "SELECT _id FROM token_match('title', 'doc0000000', 'and')",
                 iters,
             ),
             timed(
@@ -2279,7 +2291,10 @@ pub mod sql {
             ),
             timed(
                 reader,
-                "SUM(rating) bucket IN all (1M rows)",
+                // `bucket` is b{id % 10}, so `IN (b0..b9)` matches every row:
+                // this scans+aggregates the whole table (n_docs rows, not a
+                // fixed 1M) — the label states the shape, not a row count.
+                "SUM(rating) bucket IN all (whole-table scan)",
                 &format!("SELECT SUM(rating) AS a FROM supertable WHERE bucket IN {BUCKET_IN_ALL}"),
                 iters,
             ),
