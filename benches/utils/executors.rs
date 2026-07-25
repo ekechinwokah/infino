@@ -2004,16 +2004,6 @@ pub mod sql {
         },
     ];
 
-    /// Names of [`SQL_BATTERY`] (keep in sync) — the scalar cold set the
-    /// cost model prices as one serving group.
-    pub const SQL_QUERY_NAMES: &[&str] = &[
-        "agg_max_title",
-        "filter_category_count",
-        "filter_rating_count",
-        "count_star",
-        "group_by_category",
-    ];
-
     /// High-cardinality GROUP BY guard, run only on the in-memory superfile
     /// tier (passed as `extra_scalar` to [`measure_query_sets`]). `title` is
     /// near-unique per row, so the group key set is ~n_docs: the shape where

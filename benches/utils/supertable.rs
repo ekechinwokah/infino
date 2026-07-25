@@ -916,7 +916,11 @@ fn open_consumer(modality: Modality, built: &supertable::IngestResult) -> (TempD
     (cache_dir, tiers::open_consumer(opts))
 }
 
-// ==== ported routing-state framework (hoisted; 8a84236) ====
+// ==== shared routing-state observability framework ====
+// Per-lifecycle-state measurement + rendering shared by the vector, FTS,
+// and SQL drivers (cold GET-class ceilings, tier attribution, the warm
+// window, and the routing/transition tables). Lives at file scope so all
+// three child modules reach it via `super::`.
 
 /// Per-state `(label, <5M ceiling, 5M–20M ceiling)` on the FIRST cold
 /// query's DATA GETs for the vector modality (probe blocks; manifest
@@ -1094,12 +1098,12 @@ fn measure_routing_state_with(
     }
 }
 
-/// Repeated warm probes per routing-state transition.
 /// Ceiling for forcing pending background fills to settle before a
-/// routing-state warm window is timed (the post-fix settle waiter
-/// pushes fills through held readers, so the wait is fill bandwidth,
-/// not politeness).
+/// routing-state warm window is timed (the settle waiter pushes fills
+/// through held readers, so the wait is fill bandwidth, not politeness).
 const ROUTING_SETTLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Repeated warm probes per routing-state transition — sizes the p50
+/// sample and divides the accumulated warm GET count.
 const ROUTING_STATE_WARM_ITERS: usize = 20;
 
 /// Cap on pre-timing settle probes for a routing-state warm window:
@@ -1382,6 +1386,23 @@ struct RoutingColdStat {
     /// per-query cost once the first query's metadata warmup landed.
     second_wall_s: f64,
     second_cpu_s: Option<f64>,
+}
+
+/// Forward of [`vector::routing_cold_to_measurement`]: adapt a shared
+/// [`ColdStoreMeasurement`] into the routing-state cold split. Defined
+/// once at file scope so the FTS and SQL drivers share it instead of
+/// each inlining the field-by-field map (which would drift when a
+/// `RoutingColdStat` field is added).
+fn routing_cold_from_measurement(cold: ColdStoreMeasurement) -> RoutingColdStat {
+    RoutingColdStat {
+        split: cold.split,
+        open_wall_s: cold.open_wall_s,
+        open_cpu_s: cold.open_cpu_s,
+        query_wall_s: cold.first_wall_s,
+        query_cpu_s: cold.first_cpu_s,
+        second_wall_s: cold.second_wall_s,
+        second_cpu_s: cold.second_cpu_s,
+    }
 }
 
 struct TransitionStat {
@@ -1865,17 +1886,7 @@ pub mod fts {
                     .wait_until_warm(super::ROUTING_SETTLE_TIMEOUT)
                     .expect("routing-state fill settle");
             },
-            &|| {
-                measure_cold_store(built).map(|cold| RoutingColdStat {
-                    split: cold.split,
-                    open_wall_s: cold.open_wall_s,
-                    open_cpu_s: cold.open_cpu_s,
-                    query_wall_s: cold.first_wall_s,
-                    query_cpu_s: cold.first_cpu_s,
-                    second_wall_s: cold.second_wall_s,
-                    second_cpu_s: cold.second_cpu_s,
-                })
-            },
+            &|| measure_cold_store(built).map(super::routing_cold_from_measurement),
             true,
             true,
             None,
@@ -4504,6 +4515,31 @@ pub mod sql {
             (warm_pre_vec.as_slice(), cold_pre_vec.as_slice(), None)
         };
         let cold_measured = phases.cold.then(|| measure_cold_store(&built)).flatten();
+        // Per-query-family serving groups built from the exact battery the
+        // warm search table measured — names come straight from the measured
+        // `QuerySets`, so every warm shape is priced (no hand-written name
+        // list to drift or drop shapes). Cold rows render only for families
+        // the cold battery covers (scalar).
+        let active_sets = if run_lifecycle {
+            warm_sets_post.as_ref()
+        } else {
+            warm_sets_pre.as_ref()
+        };
+        let names_of = |pick: fn(&exec_sql::QuerySets) -> &[exec_sql::SqlQueryStat]| -> Vec<&str> {
+            active_sets
+                .map(|s| pick(s).iter().map(|q| q.name).collect())
+                .unwrap_or_default()
+        };
+        let scalar_names = names_of(|s| &s.scalar);
+        let tvf_names = names_of(|s| &s.tvf);
+        let pushdown_names = names_of(|s| &s.fts_pushdown);
+        let agg_names = names_of(|s| &s.agg_idx);
+        let sql_groups: [(&str, &[&str]); 4] = [
+            ("Scalar queries", scalar_names.as_slice()),
+            ("Search TVFs", tvf_names.as_slice()),
+            ("FTS-pushdown scans", pushdown_names.as_slice()),
+            ("Aggregate over candidates", agg_names.as_slice()),
+        ];
         if !warm_vec.is_empty() || !cold_vec.is_empty() {
             emit_cost_warm(
                 &mut report,
@@ -4520,9 +4556,9 @@ pub mod sql {
                 false,
                 store_phases_lifecycle(cold_measured, compaction_stats, &routing_states),
                 None,
-                // Serving/monthly priced from the SQL scalar battery (same
-                // measurement the SQL cold table reports), one group.
-                Some(&[("Scalar queries", exec_sql::SQL_QUERY_NAMES)]),
+                // Serving/monthly priced per query-family from the full warm
+                // battery the search table reports (all shapes, not one).
+                Some(&sql_groups),
             );
         }
 
@@ -4577,17 +4613,7 @@ pub mod sql {
                     .wait_until_warm(super::ROUTING_SETTLE_TIMEOUT)
                     .expect("routing-state fill settle");
             },
-            &|| {
-                measure_cold_store(built).map(|cold| RoutingColdStat {
-                    split: cold.split,
-                    open_wall_s: cold.open_wall_s,
-                    open_cpu_s: cold.open_cpu_s,
-                    query_wall_s: cold.first_wall_s,
-                    query_cpu_s: cold.first_cpu_s,
-                    second_wall_s: cold.second_wall_s,
-                    second_cpu_s: cold.second_cpu_s,
-                })
-            },
+            &|| measure_cold_store(built).map(super::routing_cold_from_measurement),
             true,
             true,
             None,
