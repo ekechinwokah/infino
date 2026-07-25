@@ -65,6 +65,8 @@ pub struct ColdSamples {
     search_wall: Vec<Duration>,
     open_cpu: Vec<f64>,
     search_cpu: Vec<f64>,
+    search_get_count: Vec<u64>,
+    search_get_bytes: Vec<u64>,
 }
 
 impl ColdSamples {
@@ -74,6 +76,8 @@ impl ColdSamples {
             search_wall: Vec::with_capacity(iters),
             open_cpu: Vec::with_capacity(iters),
             search_cpu: Vec::with_capacity(iters),
+            search_get_count: Vec::with_capacity(iters),
+            search_get_bytes: Vec::with_capacity(iters),
         }
     }
 
@@ -92,14 +96,32 @@ impl ColdSamples {
         self.search_cpu.extend(cpu);
     }
 
+    /// Record one first-search's object-store GET count and downloaded
+    /// bytes (process-default meter delta around the search call only).
+    pub fn push_search_io(&mut self, get_count: u64, get_bytes: u64) {
+        self.search_get_count.push(get_count);
+        self.search_get_bytes.push(get_bytes);
+    }
+
     pub fn finish(mut self) -> ColdTiming {
         ColdTiming {
             open: p50(&mut self.open_wall),
             search: p50(&mut self.search_wall),
             open_cpu_s: mean_opt(&self.open_cpu),
             search_cpu_s: mean_opt(&self.search_cpu),
+            search_get_count: p50_u64(&mut self.search_get_count),
+            search_get_bytes: p50_u64(&mut self.search_get_bytes),
         }
     }
+}
+
+/// Median of a `u64` sample set (sorts in place); `0` when empty.
+fn p50_u64(samples: &mut [u64]) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    samples.sort_unstable();
+    samples[samples.len() / 2]
 }
 
 /// p50 / p90 / p99 of a timed-sample set.
@@ -222,6 +244,14 @@ pub struct ColdTiming {
     /// schedstat delta), when sampled. Includes fetch-path on-CPU work
     /// (decompress, CRC, cache write) plus scoring; excludes I/O wait.
     pub search_cpu_s: Option<f64>,
+    /// Median object-store GET count of the first cold search across the
+    /// timed iterations (process-default meter delta around the search
+    /// call only — not the open). Zero when unmetered. This is what lets
+    /// the cost model price each shape's cold request leg from the same
+    /// battery the search table reports, instead of one representative.
+    pub search_get_count: u64,
+    /// Median downloaded bytes of the first cold search across iterations.
+    pub search_get_bytes: u64,
 }
 
 /// Force-open every superfile reader on the consumer's pinned snapshot —
@@ -237,6 +267,7 @@ pub mod fts {
     use std::collections::HashMap;
 
     use infino::{
+        storage::io_counters,
         superfile::{
             SuperfileReader,
             fts::{
@@ -806,9 +837,15 @@ pub mod fts {
             for _ in 0..iters {
                 let (guard, open_wall, open_cpu) = cpu::timed(&open_fresh);
                 cold.push_open(open_wall, open_cpu);
+                // Meter object-store GETs across the search call only (the
+                // process-default meter counts every provider GET), so the
+                // cost model can price each shape's cold request leg.
+                let io_before = io_counters::snapshot();
                 let (rows, search_wall, search_cpu) =
                     cpu::timed(|| guard.bm25_rows(column, &query, k, mode));
+                let io = io_counters::snapshot().since(&io_before);
                 cold.push_search(search_wall, search_cpu);
+                cold.push_search_io(io.get_count, io.get_bytes);
                 std::hint::black_box(rows);
                 drop(guard);
             }
@@ -1926,7 +1963,7 @@ pub mod vector {
 pub mod sql {
     use std::{collections::HashMap, hint::black_box};
 
-    use infino::supertable::Supertable;
+    use infino::{storage::io_counters, supertable::Supertable};
 
     use super::*;
     use crate::{
@@ -1965,6 +2002,16 @@ pub mod sql {
             name: "group_by_category",
             sql: "SELECT category, COUNT(*) AS n FROM supertable GROUP BY category",
         },
+    ];
+
+    /// Names of [`SQL_BATTERY`] (keep in sync) — the scalar cold set the
+    /// cost model prices as one serving group.
+    pub const SQL_QUERY_NAMES: &[&str] = &[
+        "agg_max_title",
+        "filter_category_count",
+        "filter_rating_count",
+        "count_star",
+        "group_by_category",
     ];
 
     /// High-cardinality GROUP BY guard, run only on the in-memory superfile
@@ -2322,8 +2369,11 @@ pub mod sql {
             for _ in 0..iters {
                 let (guard, open_wall, open_cpu) = cpu::timed(&open_fresh);
                 cold.push_open(open_wall, open_cpu);
+                let io_before = io_counters::snapshot();
                 let (rows, search_wall, search_cpu) = cpu::timed(|| guard.query_rows(q.sql));
+                let io = io_counters::snapshot().since(&io_before);
                 cold.push_search(search_wall, search_cpu);
+                cold.push_search_io(io.get_count, io.get_bytes);
                 black_box(rows);
                 drop(guard);
             }

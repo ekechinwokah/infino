@@ -89,6 +89,7 @@ fn emit_cost_warm(
             vector_cell: false,
             storage_months: None,
             cold_open_amortized: false,
+            serving_groups: None,
         },
     );
 }

@@ -68,6 +68,11 @@ const SUMMARY_COMMITS_PER_DRAIN: f64 = 16.0;
 /// Maintenance cadence assumed by the monthly summary: one compaction
 /// (optimize) pass per this many drains.
 const SUMMARY_DRAINS_PER_COMPACTION: f64 = 16.0;
+/// Maintenance cadence for a compaction-only (no-drain) lifecycle — FTS
+/// and SQL never drain, so a compaction (optimize) pass every this many
+/// commits, the same effective compaction interval as the drain path.
+const SUMMARY_COMMITS_PER_COMPACTION: f64 =
+    SUMMARY_COMMITS_PER_DRAIN * SUMMARY_DRAINS_PER_COMPACTION;
 /// Padding on the per-query RAM-hold window: a query holds the resident set
 /// a little longer than its own p50 (dispatch, response write, scheduler
 /// slack between overlapped queries), so the hold is billed at fudge × p50.
@@ -213,6 +218,11 @@ pub struct ColdQuery {
     /// Includes fetch-path on-CPU work (decompress, CRC, cache write) plus
     /// scoring; excludes I/O wait. Priced separately — never copied from warm.
     pub search_cpu_s: Option<f64>,
+    /// Median object-store GETs of the first cold search (process-default
+    /// meter delta around the search call). Prices the cold request leg.
+    pub search_get_count: u64,
+    /// Median downloaded bytes of the first cold search.
+    pub search_get_bytes: u64,
 }
 
 /// Warm query timing and measured on-CPU seconds.
@@ -414,6 +424,15 @@ pub struct CellCost<'a> {
     /// setup, paid once), rather than per-query latency. For a single
     /// superfile the open is part of each cold read, so this is `false`.
     pub cold_open_amortized: bool,
+    /// Per-group serving breakdown: `(group_label, query_names)`. When set,
+    /// the Serving table and the monthly read line are priced from the
+    /// full query battery (`warm` / `cold`, the same measurement the
+    /// per-shape search table reports), aggregated per group as the
+    /// arithmetic mean of the group's per-query p50s and per-query cost —
+    /// so the two tables reconcile by construction. `None` keeps the
+    /// per-lifecycle-state serving rows (the vector cell's single-config
+    /// probe). Text cells (FTS/SQL) set this; vector leaves it `None`.
+    pub serving_groups: Option<&'a [(&'a str, &'a [&'a str])]>,
 }
 
 /// `$X` with adaptive precision: two decimals at or above one cent,
@@ -1365,7 +1384,76 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     // shape a long-lived table serves.
     let mut steady_warm: Option<(String, f64)> = None;
     let mut steady_cold: Option<(String, f64)> = None;
-    if query_states.is_empty() {
+    if let Some(groups) = c.serving_groups {
+        // Per-group serving priced from the full query battery — the SAME
+        // measurement the per-shape search table reports, so the two tables
+        // reconcile by construction. Each row is the arithmetic mean of the
+        // group's per-query p50s and per-query cost (compute + cold request
+        // leg from the metered per-query GETs). The monthly blend below uses
+        // the battery-wide arithmetic mean.
+        let resident = c.resident_anon_bytes;
+        let warm_per_q = |name: &str| -> Option<(f64, f64)> {
+            c.warm
+                .iter()
+                .find(|(n, _, _)| n == name)
+                .and_then(|(_, p50, cpu)| {
+                    cpu.map(|cpu| (*p50, inst.per_query_usd(cpu, *p50, resident)))
+                })
+        };
+        let cold_per_q = |name: &str| -> Option<(f64, f64)> {
+            let cq = c.cold?.iter().find(|q| q.name == name)?;
+            let cpu = cq.search_cpu_s?;
+            // Cold holds the resident set for ~its warm window (bytes local);
+            // the rest of the cold p50 is off-CPU I/O wait.
+            let warm_window = c
+                .warm
+                .iter()
+                .find(|(n, _, _)| n == name)
+                .map(|(_, p, _)| *p)
+                .unwrap_or(cq.search_s);
+            let per_q = inst.per_query_usd(cpu, warm_window, resident)
+                + cq.search_get_count as f64 * USD_PER_GET;
+            Some((cq.search_s, per_q))
+        };
+        let mut all_warm_usd: Vec<f64> = Vec::new();
+        let mut all_cold_usd: Vec<f64> = Vec::new();
+        let group_row =
+            |rows: &mut Vec<Vec<Cell>>, label: &str, kind: &str, samples: &[(f64, f64)]| {
+                if samples.is_empty() {
+                    return;
+                }
+                let n = samples.len() as f64;
+                let mean_p50 = samples.iter().map(|(p, _)| p).sum::<f64>() / n;
+                let mean_usd = samples.iter().map(|(_, u)| u).sum::<f64>() / n;
+                let qpu = 1.0 / mean_usd.max(f64::MIN_POSITIVE);
+                rows.push(vec![
+                    text(format!(
+                        "{label} — {kind} (mean of {} shapes)",
+                        samples.len()
+                    )),
+                    text(fmt_time(mean_p50 * 1e9)),
+                    metric(qpu, format!("{qpu:.0}"), Better::Higher),
+                    speed_per_usd_cell(mean_usd, mean_p50),
+                    text(usd(mean_usd * PER_MILLION)),
+                ]);
+            };
+        for (label, names) in groups {
+            let warms: Vec<(f64, f64)> = names.iter().filter_map(|n| warm_per_q(n)).collect();
+            all_warm_usd.extend(warms.iter().map(|(_, u)| *u));
+            group_row(&mut serving_rows, label, "warm", &warms);
+            let colds: Vec<(f64, f64)> = names.iter().filter_map(|n| cold_per_q(n)).collect();
+            all_cold_usd.extend(colds.iter().map(|(_, u)| *u));
+            group_row(&mut serving_rows, label, "cold", &colds);
+        }
+        if !all_warm_usd.is_empty() {
+            let mean = all_warm_usd.iter().sum::<f64>() / all_warm_usd.len() as f64;
+            steady_warm = Some(("warm (battery mean)".to_string(), mean));
+        }
+        if !all_cold_usd.is_empty() {
+            let mean = all_cold_usd.iter().sum::<f64>() / all_cold_usd.len() as f64;
+            steady_cold = Some(("cold (battery mean)".to_string(), mean));
+        }
+    } else if query_states.is_empty() {
         serving_rows.extend(c.warm.iter().filter_map(|(name, p50_s, cpu_s)| {
             let cpu = (*cpu_s)?;
             let per_q = inst.per_query_usd(cpu, *p50_s, c.resident_anon_bytes);
@@ -1486,9 +1574,17 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         }
     }
     let serving = Block {
-        subtitle: "Serving — query latency and cost by lifecycle state; 1/(s·$) is \
-                   speed per dollar (1 ÷ (p50 seconds × $/query)), higher is better."
-            .into(),
+        subtitle: if c.serving_groups.is_some() {
+            "Serving — query latency and cost per query-family (arithmetic mean of the \
+             family's per-shape p50s and per-query cost, from the same battery the search \
+             table reports); 1/(s·$) is speed per dollar (1 ÷ (p50 seconds × $/query)), higher \
+             is better."
+                .to_string()
+        } else {
+            "Serving — query latency and cost by lifecycle state; 1/(s·$) is \
+             speed per dollar (1 ÷ (p50 seconds × $/query)), higher is better."
+                .to_string()
+        },
         headers: vec![
             "Query".into(),
             "p50".into(),
@@ -1632,7 +1728,10 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             text(""),
         ]);
     }
-    let maintenance_month = drain_pass_usd.map(|drain| {
+    let maintenance_month = if let Some(drain) = drain_pass_usd {
+        // Full-maintenance (drain-based) cadence: a drain every
+        // SUMMARY_COMMITS_PER_DRAIN commits, a compaction every
+        // SUMMARY_DRAINS_PER_COMPACTION drains, one open per pass.
         let drains_mo = c.n_commits.max(1) as f64 / SUMMARY_COMMITS_PER_DRAIN;
         let compacts_mo = drains_mo / SUMMARY_DRAINS_PER_COMPACTION;
         let opens_mo = drains_mo + compacts_mo;
@@ -1653,8 +1752,29 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             )),
             metric(month, usd(month), Better::Lower),
         ]);
-        month
-    });
+        Some(month)
+    } else if let Some(compact) = compact_pass_usd {
+        // Compaction-only (text) cadence: no drain, so one compaction
+        // every SUMMARY_COMMITS_PER_COMPACTION commits, one open per pass.
+        let compacts_mo = c.n_commits.max(1) as f64 / SUMMARY_COMMITS_PER_COMPACTION;
+        let opens_mo = compacts_mo;
+        let month = compacts_mo * compact + opens_mo * steady_open_usd.unwrap_or(0.0);
+        summary_rows.push(vec![
+            text(format!(
+                "Maintenance — compaction / {} commits",
+                fmt_events(SUMMARY_COMMITS_PER_COMPACTION),
+            )),
+            text(format!(
+                "{} compactions + {} opens/mo",
+                fmt_events(compacts_mo),
+                fmt_events(opens_mo),
+            )),
+            metric(month, usd(month), Better::Lower),
+        ]);
+        Some(month)
+    } else {
+        None
+    };
     let monthly_total = storage_month
         + blended_read_q
             .map(|q| q * SUMMARY_QUERIES_PER_MONTH)
@@ -1706,6 +1826,8 @@ pub fn cold_from_timings(cold: &HashMap<&'static str, ColdTiming>) -> Vec<ColdQu
             search_s: t.search.as_secs_f64(),
             open_cpu_s: t.open_cpu_s,
             search_cpu_s: t.search_cpu_s,
+            search_get_count: t.search_get_count,
+            search_get_bytes: t.search_get_bytes,
         })
         .collect()
 }
@@ -1761,6 +1883,8 @@ pub fn cold_from_vector(rows: &[RecallRow]) -> Vec<ColdQuery> {
                     search_s: t.search.as_secs_f64(),
                     open_cpu_s: t.open_cpu_s,
                     search_cpu_s: t.search_cpu_s,
+                    search_get_count: t.search_get_count,
+                    search_get_bytes: t.search_get_bytes,
                 }
             })
         })

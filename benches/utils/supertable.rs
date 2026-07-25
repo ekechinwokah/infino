@@ -49,7 +49,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arrow_array::RecordBatch;
 use infino::{
     OptimizeOptions,
     supertable::{
@@ -651,33 +650,19 @@ fn run_metered_optimize(
     (wall_s, io, peak_rss, cpu_s)
 }
 
-/// Fill cold + drain + delta + compaction slots on [`cost::StorePhases`],
-/// plus the per-state query ledger from the collected routing states.
-/// Populating `query_states` routes the I/O ledger through the per-state
-/// metered rows (one group per routing state) instead of the legacy
-/// pre/steady pair — the same path the vector cell takes, so FTS/SQL
-/// render metered `pre-compact` / `post-compact` rows rather than the
-/// drain-shaped "NOT METERED" transient rows that don't apply to them.
+/// Fill the cold + compaction slots on [`cost::StorePhases`], plus the
+/// per-state query ledger from the collected routing states. Populating
+/// `query_states` routes the I/O ledger through the per-state metered
+/// rows (one group per routing state) instead of the legacy pre/steady
+/// pair, so FTS/SQL render metered `pre-compact` / `post-compact` rows.
+/// The FTS/SQL lifecycle is compaction-only — no drain, no delta — so
+/// those slots stay empty and their ledger rows never render.
 fn store_phases_lifecycle(
     measured: Option<ColdStoreMeasurement>,
-    drain: Option<CompactionStats>,
-    delta: Option<CompactionStats>,
     compaction: Option<CompactionStats>,
     routing_states: &[RoutingStateStat],
 ) -> cost::StorePhases {
     let mut store = store_phases_from_measurement(measured);
-    if let Some((wall_s, io, peak_rss, cpu_s)) = drain {
-        store.drain = Some(io);
-        store.drain_wall_s = Some(wall_s);
-        store.drain_cpu_s = cpu_s;
-        store.drain_peak_rss_bytes = Some(peak_rss);
-    }
-    if let Some((wall_s, io, peak_rss, cpu_s)) = delta {
-        store.delta_commit = Some(io);
-        store.delta_commit_wall_s = Some(wall_s);
-        store.delta_commit_cpu_s = cpu_s;
-        store.delta_commit_peak_rss_bytes = Some(peak_rss);
-    }
     if let Some((wall_s, io, peak_rss, cpu_s)) = compaction {
         store.compaction = Some(io);
         store.compaction_wall_s = Some(wall_s);
@@ -688,98 +673,37 @@ fn store_phases_lifecycle(
     store
 }
 
-/// Metered [`Supertable::drain_vectors_to_cells_sync`]. On FTS/SQL tables
-/// this is a no-op (no hidden vector index) but still brackets a real
-/// drain window so the lifecycle matches the vector cell.
-fn run_metered_drain(
-    label: &str,
-    consumer: &Supertable,
-    meter: &storage_meter::MeteredStorage,
-) -> CompactionStats {
-    eprintln!("[{label}] draining (hidden vector cells; no-op when absent)...");
-    let before = meter.snapshot();
-    let sampler = PeakSampler::start_default();
-    let (result, wall, cpu_s) = cpu::timed(|| consumer.drain_vectors_to_cells_sync());
-    result.expect("drain");
-    let wall_s = wall.as_secs_f64();
-    let rss_stats = sampler.stop_stats();
-    let peak_rss = rss_stats.peak_rss_bytes;
-    let io = meter.snapshot().since(&before);
-    eprintln!(
-        "[{label}] drain object-store I/O: {} PUT ({} up), {} GET ({} down) in {wall_s:.1}s \
-         (peak RSS {} / anon {} / file {})",
-        io.put_count,
-        rss::fmt_bytes(io.put_bytes),
-        io.get_count,
-        rss::fmt_bytes(io.get_bytes),
-        rss::fmt_bytes(peak_rss),
-        rss::fmt_bytes(rss_stats.peak_anon_rss_bytes),
-        rss::fmt_bytes(rss_stats.peak_file_rss_bytes),
-    );
-    (wall_s, io, peak_rss, cpu_s)
-}
-
-/// Metered follow-up `append` of one normal commit (the undrained delta).
-fn run_metered_delta_append(
-    label: &str,
-    consumer: &Supertable,
-    meter: &storage_meter::MeteredStorage,
-    batch: &RecordBatch,
-) -> CompactionStats {
-    let n_rows = batch.num_rows();
-    eprintln!("[{label}] committing {n_rows} undrained delta rows...");
-    let before = meter.snapshot();
-    let sampler = PeakSampler::start_default();
-    let (result, wall, cpu_s) = cpu::timed(|| consumer.append(batch));
-    result.expect("delta append");
-    let wall_s = wall.as_secs_f64();
-    let rss_stats = sampler.stop_stats();
-    let peak_rss = rss_stats.peak_rss_bytes;
-    let io = meter.snapshot().since(&before);
-    eprintln!(
-        "[{label}] delta commit: {n_rows} rows, {} PUT ({} up), {} GET ({} down) in {wall_s:.1}s \
-         (peak RSS {})",
-        io.put_count,
-        rss::fmt_bytes(io.put_bytes),
-        io.get_count,
-        rss::fmt_bytes(io.get_bytes),
-        rss::fmt_bytes(peak_rss),
-    );
-    (wall_s, io, peak_rss, cpu_s)
-}
-
-/// Measure/emit hook points between the shared FTS/SQL mutations.
+/// Measure/emit hook points around the shared FTS/SQL compaction.
 #[derive(Clone, Copy)]
 enum TextLifecyclePhase {
-    /// Fired once the metered lifecycle consumer is open, before the
-    /// drain — the routing-state framework's pre-drain measurement
-    /// window (same consumer + meter as every later phase).
-    PreDrain,
-    Drained,
-    DeltaCommitted,
+    /// Fired once the metered lifecycle consumer is open, before
+    /// compaction — the routing-state framework's pre-compact
+    /// measurement window (same consumer + meter as the post-compact
+    /// phase).
+    PreCompact,
+    /// Fired after `optimize` — the post-compact steady-state layout.
     Compacted,
 }
 
 /// Steady-state cache-budget multiple of the user index for the shared
-/// lifecycle consumer — a hidden index (vectors) is a second on-storage
-/// copy written by the drain after the consumer opens, so sizing from
-/// the ingest-time user index alone leaves the cache under budget
-/// post-drain and evictions silently re-fetch inside "warm" batteries.
+/// lifecycle consumer, so evictions don't silently re-fetch inside the
+/// "warm" batteries at serving scale.
 const SHARED_CONSUMER_CACHE_INDEX_FACTOR: u64 = 2;
 
-/// Shared FTS/SQL mutation sequence: open a metered consumer, then
-/// drain → delta append → optimize, invoking `on_phase` before the
-/// drain (pre-drain) and after each step — passing the SAME consumer +
-/// meter so the routing-state framework measures every state on one
-/// warm cache. Vector keeps its own OPANN-aware path. Drain is a no-op
-/// without a hidden vector index but is still bracketed for parity.
+/// Shared FTS/SQL mutation sequence: open a metered consumer, measure
+/// the pre-compact state, run `optimize`, then measure post-compact —
+/// invoking `on_phase` with the SAME consumer + meter so the
+/// routing-state framework measures both states on one warm cache.
+/// Text tables have no query-facing drain (the scalar/FTS path never
+/// touches a hidden index) and skip the undrained-delta commit, so the
+/// lifecycle is compaction-only: pre-compact → compact → post-compact.
+/// Vector keeps its own OPANN-aware drain/delta path.
 fn run_metered_text_lifecycle(
     label: &str,
     modality: Modality,
     built: &supertable::IngestResult,
-    delta: &RecordBatch,
     mut on_phase: impl FnMut(TextLifecyclePhase, &Supertable, &storage_meter::MeteredStorage),
-) -> (CompactionStats, CompactionStats, CompactionStats) {
+) -> CompactionStats {
     let meter = storage_meter::wrap(Arc::clone(&built.storage));
     let (cache_dir, cache) = tiers::fresh_supertable_search_cache(
         meter.provider(),
@@ -795,16 +719,12 @@ fn run_metered_text_lifecycle(
         cache,
     );
     let consumer = tiers::open_consumer(opts);
-    on_phase(TextLifecyclePhase::PreDrain, &consumer, &meter);
-    let drain = run_metered_drain(label, &consumer, &meter);
-    on_phase(TextLifecyclePhase::Drained, &consumer, &meter);
-    let delta_stats = run_metered_delta_append(label, &consumer, &meter, delta);
-    on_phase(TextLifecyclePhase::DeltaCommitted, &consumer, &meter);
+    on_phase(TextLifecyclePhase::PreCompact, &consumer, &meter);
     let compaction = run_metered_optimize(label, &consumer, &meter);
     on_phase(TextLifecyclePhase::Compacted, &consumer, &meter);
     drop(consumer);
     drop(cache_dir);
-    (drain, delta_stats, compaction)
+    compaction
 }
 
 /// Pre-drain (transient-shape) latency rows: the warm battery and the
@@ -825,6 +745,7 @@ fn emit_cost_warm(
     vector_cell: bool,
     mut store: cost::StorePhases,
     stored_bytes_override: Option<u64>,
+    serving_groups: Option<&[(&str, &[&str])]>,
 ) {
     if warm.is_empty() && cold.is_none() {
         return;
@@ -862,6 +783,7 @@ fn emit_cost_warm(
             vector_cell,
             storage_months: None,
             cold_open_amortized: true,
+            serving_groups,
         },
     );
 }
@@ -1717,45 +1639,31 @@ pub mod fts {
             );
         }
 
-        let mut drain_stats = None;
-        let mut delta_stats = None;
         let mut compaction_stats = None;
         let mut routing_states: Vec<RoutingStateStat> = Vec::new();
         let (warm_post, cold_post) = if run_lifecycle {
-            let delta_batch = supertable::fts_delta_batch(
-                corpus
-                    .as_ref()
-                    .expect("FTS lifecycle retains text corpus for delta"),
-            );
             let mut warm_post = None;
             let mut cold_post = None;
-            let (drain, delta, compaction) = run_metered_text_lifecycle(
+            // FTS is compaction-only: the user FTS index has no drain and
+            // no undrained-delta commit, so the lifecycle measures just
+            // two states — pre-compact and post-compact — and emits only
+            // the post-compact search battery (pre-compact already ran).
+            let compaction = run_metered_text_lifecycle(
                 "supertable_fts",
                 Modality::Fts,
                 &built,
-                &delta_batch,
                 |phase, lifecycle_consumer, lifecycle_meter| {
-                    // FTS has no hidden-index drain on main: the user-table
-                    // FTS index is untouched by the drain/delta steps, so
-                    // those states duplicate the post-ingest layout. The
-                    // only meaningful transition is compaction, so collect
-                    // routing-state rows for just the two states that
-                    // differ — pre-compact and post-compact — and emit only
-                    // the post-compact search battery (pre-compact already ran).
-                    let state = match phase {
-                        TextLifecyclePhase::PreDrain => Some("pre-compact"),
-                        TextLifecyclePhase::Compacted => Some("post-compact"),
-                        _ => None,
+                    let label = match phase {
+                        TextLifecyclePhase::PreCompact => "pre-compact",
+                        TextLifecyclePhase::Compacted => "post-compact",
                     };
-                    if let Some(label) = state {
-                        routing_states.push(fts_routing_state(
-                            label,
-                            ExpectedTiers::UserOnly,
-                            lifecycle_consumer,
-                            lifecycle_meter,
-                            &built,
-                        ));
-                    }
+                    routing_states.push(fts_routing_state(
+                        label,
+                        ExpectedTiers::UserOnly,
+                        lifecycle_consumer,
+                        lifecycle_meter,
+                        &built,
+                    ));
                     if !matches!(phase, TextLifecyclePhase::Compacted) {
                         return;
                     }
@@ -1784,10 +1692,7 @@ pub mod fts {
                     cold_post = cold;
                 },
             );
-            drop(delta_batch);
             drop(corpus.take());
-            drain_stats = Some(drain);
-            delta_stats = Some(delta);
             compaction_stats = Some(compaction);
             (warm_post, cold_post)
         } else {
@@ -1854,15 +1759,20 @@ pub mod fts {
                         Some(&cold_vec)
                     },
                     pre_refs,
-                    run_lifecycle,
-                    store_phases_lifecycle(
-                        cold_measured,
-                        drain_stats,
-                        delta_stats,
-                        compaction_stats,
-                        &routing_states,
-                    ),
+                    // Compaction-only text lifecycle: not a full-maintenance
+                    // (drain/delta) cell, so drain/delta ledger rows never render.
+                    false,
+                    store_phases_lifecycle(cold_measured, compaction_stats, &routing_states),
                     None,
+                    // Serving/monthly priced per query-family from the same
+                    // battery the search table reports (reconciles by
+                    // construction); the drain/delta ledger rows never apply.
+                    Some(&[
+                        ("OR queries", exec_fts::OR_QUERIES),
+                        ("AND queries", exec_fts::AND_QUERIES),
+                        ("Must/should queries", exec_fts::CLAUSE_QUERIES),
+                        ("Phrase queries", exec_fts::PHRASE_QUERIES),
+                    ]),
                 );
             }
         }
@@ -4304,6 +4214,9 @@ pub mod vector {
                     true,
                     store,
                     Some(bucket_stored),
+                    // Vector keeps its single-config per-lifecycle-state
+                    // serving rows (one search config, not a query battery).
+                    None,
                 );
             }
 
@@ -4463,44 +4376,30 @@ pub mod sql {
             None
         };
 
-        let mut drain_stats = None;
-        let mut delta_stats = None;
         let mut compaction_stats = None;
         let mut routing_states: Vec<RoutingStateStat> = Vec::new();
         let (warm_sets_post, cold_post) = if run_lifecycle {
-            let delta_batch = supertable::sql_delta_batch(
-                corpus
-                    .as_ref()
-                    .expect("SQL lifecycle retains text corpus for delta"),
-            );
             let mut warm_sets_post = None;
             let mut cold_post = None;
-            let (drain, delta, compaction) = run_metered_text_lifecycle(
+            // SQL scans never route to hidden data and the scalar/FTS path
+            // has no drain; the lifecycle is compaction-only, measuring just
+            // pre-compact and post-compact and emitting only the post-compact
+            // query battery (pre-compact already ran).
+            let compaction = run_metered_text_lifecycle(
                 "supertable_sql",
                 Modality::Sql,
                 &built,
-                &delta_batch,
                 |phase, lifecycle_consumer, lifecycle_meter| {
-                    // SQL scans never route to hidden data: drain/delta leave
-                    // the user-table scalar scan path untouched, so those
-                    // states duplicate the post-ingest layout. The only
-                    // meaningful transition for the scan path is compaction,
-                    // so collect routing-state rows for just the two states
-                    // that differ — pre-compact and post-compact — and emit
-                    // only the post-compact query battery (pre-compact already ran).
-                    let state = match phase {
-                        TextLifecyclePhase::PreDrain => Some("pre-compact"),
-                        TextLifecyclePhase::Compacted => Some("post-compact"),
-                        _ => None,
+                    let label = match phase {
+                        TextLifecyclePhase::PreCompact => "pre-compact",
+                        TextLifecyclePhase::Compacted => "post-compact",
                     };
-                    if let Some(label) = state {
-                        routing_states.push(sql_routing_state(
-                            label,
-                            lifecycle_consumer,
-                            lifecycle_meter,
-                            &built,
-                        ));
-                    }
+                    routing_states.push(sql_routing_state(
+                        label,
+                        lifecycle_consumer,
+                        lifecycle_meter,
+                        &built,
+                    ));
                     if !matches!(phase, TextLifecyclePhase::Compacted) {
                         return;
                     }
@@ -4554,10 +4453,7 @@ pub mod sql {
                     cold_post = cold;
                 },
             );
-            drop(delta_batch);
             drop(corpus.take());
-            drain_stats = Some(drain);
-            delta_stats = Some(delta);
             compaction_stats = Some(compaction);
             (warm_sets_post, cold_post)
         } else {
@@ -4619,15 +4515,14 @@ pub mod sql {
                 warm_vec,
                 (!cold_vec.is_empty()).then_some(cold_vec),
                 pre_latencies,
-                run_lifecycle,
-                store_phases_lifecycle(
-                    cold_measured,
-                    drain_stats,
-                    delta_stats,
-                    compaction_stats,
-                    &routing_states,
-                ),
+                // Compaction-only text lifecycle: not a full-maintenance
+                // (drain/delta) cell, so drain/delta ledger rows never render.
+                false,
+                store_phases_lifecycle(cold_measured, compaction_stats, &routing_states),
                 None,
+                // Serving/monthly priced from the SQL scalar battery (same
+                // measurement the SQL cold table reports), one group.
+                Some(&[("Scalar queries", exec_sql::SQL_QUERY_NAMES)]),
             );
         }
 
