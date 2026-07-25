@@ -440,18 +440,19 @@ fn usd_per_query_both_scales(per_query: f64) -> String {
     format!("{}/query ({})", usd(per_query), usd_per_million(per_query))
 }
 
-/// Latency per dollar: seconds of query latency per dollar of per-query
-/// cost (`p50 ÷ $/query`). Not delta-tracked — cost and latency pull it in
-/// opposite directions, so neither day-over-day direction is "better".
-fn latency_secs_per_usd(per_query_usd: f64, latency_s: f64) -> f64 {
-    latency_s / per_query_usd.max(f64::MIN_POSITIVE)
+/// Speed per dollar: `1 ÷ (p50 seconds × $/query)`. A joint figure of
+/// merit — getting faster OR cheaper raises it (a plain latency÷cost
+/// ratio rewards slowness), so higher is always better and the cell is
+/// delta-tracked.
+fn speed_per_usd(per_query_usd: f64, latency_s: f64) -> f64 {
+    1.0 / (latency_s.max(f64::MIN_POSITIVE) * per_query_usd.max(f64::MIN_POSITIVE))
 }
 
-/// `s/$` cell rendered at count scale (`11.7K`).
-fn latency_per_usd_cell(per_query_usd: f64, latency_s: f64) -> Cell {
-    text(fmt_count(
-        latency_secs_per_usd(per_query_usd, latency_s) as usize
-    ))
+/// `1/(s·$)` cell rendered at count scale (`11.7K`), delta-tracked
+/// higher-is-better.
+fn speed_per_usd_cell(per_query_usd: f64, latency_s: f64) -> Cell {
+    let v = speed_per_usd(per_query_usd, latency_s);
+    metric(v, fmt_count(v as usize), Better::Higher)
 }
 
 /// Event count for the maintenance cadence line: integers plain, fractional
@@ -1034,12 +1035,17 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             );
         }
     }
-    averaged_row(
-        &mut io_rows,
-        "Filtered warm (~10%)",
-        c.store.filtered_query,
-        c.store.filtered_query_iters,
-    );
+    // Filtered search (~10% allow-set) is a vector-only battery; FTS/SQL
+    // never run it, so only cells that carry filtered data render the row
+    // (prevents a spurious NOT-METERED row in the text lifecycles).
+    if c.store.filtered_query.is_some() || c.store.filtered_query_iters > 0 {
+        averaged_row(
+            &mut io_rows,
+            "Filtered warm (~10%)",
+            c.store.filtered_query,
+            c.store.filtered_query_iters,
+        );
+    }
     let io_ledger = (!io_rows.is_empty()).then(|| Block {
         subtitle: "Object-store I/O — measured requests and transfer bytes.".into(),
         headers: vec![
@@ -1367,7 +1373,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                     format!("{queries_per_usd:.0}"),
                     Better::Higher,
                 ),
-                latency_per_usd_cell(per_q, *p50_s),
+                speed_per_usd_cell(per_q, *p50_s),
                 text(usd(per_q * PER_MILLION)),
             ])
         }));
@@ -1390,7 +1396,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                     format!("{queries_per_usd:.0}"),
                     Better::Higher,
                 ),
-                latency_per_usd_cell(per_q, q.search_s),
+                speed_per_usd_cell(per_q, q.search_s),
                 text(usd(per_q * PER_MILLION)),
             ]);
             steady_cold = Some((format!("cold ({})", q.name), per_q));
@@ -1410,7 +1416,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                         format!("{queries_per_usd:.0}"),
                         Better::Higher,
                     ),
-                    latency_per_usd_cell(per_q, p50_s),
+                    speed_per_usd_cell(per_q, p50_s),
                     text(usd(per_q * PER_MILLION)),
                 ]);
                 steady_warm = Some((format!("warm — {label}"), per_q));
@@ -1437,7 +1443,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                         format!("{queries_per_usd:.0}"),
                         Better::Higher,
                     ),
-                    latency_per_usd_cell(per_q, wall_s),
+                    speed_per_usd_cell(per_q, wall_s),
                     text(usd(per_q * PER_MILLION)),
                 ]);
                 // Fallback steady leg when no second-query window was metered.
@@ -1464,7 +1470,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
                         format!("{queries_per_usd:.0}"),
                         Better::Higher,
                     ),
-                    latency_per_usd_cell(per_q, wall_s),
+                    speed_per_usd_cell(per_q, wall_s),
                     text(usd(per_q * PER_MILLION)),
                 ]);
                 steady_cold = Some((
@@ -1475,14 +1481,14 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         }
     }
     let serving = Block {
-        subtitle: "Serving — query latency and cost by lifecycle state; s/$ is \
-                   latency per dollar (p50 seconds ÷ $/query)."
+        subtitle: "Serving — query latency and cost by lifecycle state; 1/(s·$) is \
+                   speed per dollar (1 ÷ (p50 seconds × $/query)), higher is better."
             .into(),
         headers: vec![
             "Query".into(),
             "p50".into(),
             "queries/$".into(),
-            "s/$".into(),
+            "1/(s·$)".into(),
             "$/1M queries".into(),
         ],
         rows: serving_rows,
