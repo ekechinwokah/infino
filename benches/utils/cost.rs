@@ -996,7 +996,12 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         );
     } else {
         for state in &query_states {
-            let label = state.io.label.expect("filtered query state has a label");
+            // The array is fixed at 4 slots; a lifecycle with fewer states
+            // (FTS/SQL run pre-compact + post-compact only) leaves the tail
+            // slots unlabeled — skip them rather than render empty rows.
+            let Some(label) = state.io.label else {
+                continue;
+            };
             one_time_row(
                 &mut io_rows,
                 &format!("Open — {label}"),
