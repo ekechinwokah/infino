@@ -62,14 +62,6 @@ const SUMMARY_QUERIES_PER_MONTH: f64 = 1.0e6;
 /// Warm fraction of the blended monthly read line (the rest pay the cold
 /// per-query cost).
 const SUMMARY_READ_WARM_FRACTION: f64 = 0.95;
-/// Maintenance cadence assumed by the monthly summary: one full-corpus
-/// optimize (compaction) pass per this many monthly write cycles. The steady
-/// state writes — and, on the drain path, drains — the whole corpus once per
-/// month, so both the drain-based and compaction-only branches optimize on
-/// this fixed, corpus-size-independent horizon (a `commits`-based cadence
-/// would scale with `n_commits` and mis-weight the whole-corpus pass past the
-/// 16-commit floor).
-const SUMMARY_DRAINS_PER_COMPACTION: f64 = 16.0;
 /// Padding on the per-query RAM-hold window: a query holds the resident set
 /// a little longer than its own p50 (dispatch, response write, scheduler
 /// slack between overlapped queries), so the hold is billed at fudge × p50.
@@ -1719,10 +1711,12 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     ]);
     // Maintenance: per-event rates for open / drain / compaction, then one
     // billed line at the steady-state cadence — the whole corpus is drained
-    // once per month (drain_pass_usd is a whole-corpus pass), a full optimize
-    // runs every `SUMMARY_DRAINS_PER_COMPACTION` drains, one table open per
-    // pass. The compaction-only (text) path has no drain and instead optimizes
-    // the whole corpus once per `SUMMARY_DRAINS_PER_COMPACTION` write cycles.
+    // and fully optimized once per month each (both `drain_pass_usd` and
+    // `compact_pass_usd` are whole-corpus passes), one table open per pass.
+    // Compaction tracks the write/drain cadence because the summary prices
+    // reads at the post-compact query latencies, which a rarer optimize could
+    // not sustain. The compaction-only (text) path has no drain and just
+    // optimizes the whole corpus once per month.
     let drain_pass_usd = has_drain.then(|| drain_compute.unwrap_or(0.0) + drain_req_usd);
     let compact_pass_usd =
         has_compaction.then(|| compaction_compute.unwrap_or(0.0) + compaction_req_usd);
@@ -1769,24 +1763,26 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     let maintenance_month = if let Some(drain) = drain_pass_usd {
         // Steady state on the Writes basis (the whole table is (re)written, and
         // therefore drained, once per month): `drain_pass_usd` already measures
-        // ONE whole-corpus drain, so it is billed once per month, and a full
-        // optimize runs once per SUMMARY_DRAINS_PER_COMPACTION drains. The old
+        // ONE whole-corpus drain, so it is billed once per month. The old
         // weighting (n_commits / 16) treated the whole-corpus drain as a
         // 16-commit pass, which only equalled 1.0 at n_commits == 16 (i.e.
         // <= 50M, where n_commits is pinned at the 16-commit floor) and
         // double-counted the drain past that (2x at 100M, growing with scale).
         // Normalizing to the corpus is scale-stable and identical at <= 50M.
         let drains_mo = 1.0;
-        let compacts_mo = drains_mo / SUMMARY_DRAINS_PER_COMPACTION;
+        // Compaction tracks the drain/write cadence. The summary prices reads
+        // at the POST-COMPACT (fully-optimized) query latencies, and those are
+        // only sustainable if the table is re-optimized about as often as it is
+        // drained — a rarer horizon would leave un-merged deltas accumulating
+        // and degrade the very latencies being priced. So a full optimize runs
+        // once per month too, at the same weight as the drain.
+        let compacts_mo = drains_mo;
         let opens_mo = drains_mo + compacts_mo;
         let month = drains_mo * drain
             + compacts_mo * compact_pass_usd.unwrap_or(0.0)
             + opens_mo * steady_open_usd.unwrap_or(0.0);
         summary_rows.push(vec![
-            text(format!(
-                "Maintenance — drain 1×/mo (full corpus), compaction / {} drains",
-                fmt_events(SUMMARY_DRAINS_PER_COMPACTION),
-            )),
+            text("Maintenance — drain + full-corpus optimize, 1×/mo each"),
             text(format!(
                 "{} drains + {} compactions + {} opens/mo",
                 fmt_events(drains_mo),
@@ -1798,19 +1794,16 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         Some(month)
     } else if let Some(compact) = compact_pass_usd {
         // Compaction-only (text) cadence: no drain, so the whole corpus is
-        // fully optimized once per SUMMARY_DRAINS_PER_COMPACTION monthly write
-        // cycles — the same effective interval as the drain-based branch — and
-        // one open per pass. Corpus-normalized so it is scale-stable: the old
-        // form (n_commits / 256) only matched this at the 16-commit floor
-        // (<= 50M) and over-counted the whole-corpus optimize 2x at 100M.
-        let compacts_mo = 1.0 / SUMMARY_DRAINS_PER_COMPACTION;
+        // fully optimized once per monthly write cycle — same rationale as the
+        // drain-based branch (sustains the post-compact query latencies the
+        // summary prices) and corpus-normalized (scale-stable, vs the old
+        // n_commits / 256 form that over-counted the whole-corpus optimize 2x
+        // at 100M), one open per pass.
+        let compacts_mo = 1.0;
         let opens_mo = compacts_mo;
         let month = compacts_mo * compact + opens_mo * steady_open_usd.unwrap_or(0.0);
         summary_rows.push(vec![
-            text(format!(
-                "Maintenance — full-corpus optimize / {} write-cycles",
-                fmt_events(SUMMARY_DRAINS_PER_COMPACTION),
-            )),
+            text("Maintenance — full-corpus optimize, 1×/mo"),
             text(format!(
                 "{} compactions + {} opens/mo",
                 fmt_events(compacts_mo),
