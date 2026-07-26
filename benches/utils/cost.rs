@@ -62,17 +62,14 @@ const SUMMARY_QUERIES_PER_MONTH: f64 = 1.0e6;
 /// Warm fraction of the blended monthly read line (the rest pay the cold
 /// per-query cost).
 const SUMMARY_READ_WARM_FRACTION: f64 = 0.95;
-/// Maintenance cadence assumed by the monthly summary: one drain pass per
-/// this many commits.
-const SUMMARY_COMMITS_PER_DRAIN: f64 = 16.0;
-/// Maintenance cadence assumed by the monthly summary: one compaction
-/// (optimize) pass per this many drains.
+/// Maintenance cadence assumed by the monthly summary: one full-corpus
+/// optimize (compaction) pass per this many monthly write cycles. The steady
+/// state writes — and, on the drain path, drains — the whole corpus once per
+/// month, so both the drain-based and compaction-only branches optimize on
+/// this fixed, corpus-size-independent horizon (a `commits`-based cadence
+/// would scale with `n_commits` and mis-weight the whole-corpus pass past the
+/// 16-commit floor).
 const SUMMARY_DRAINS_PER_COMPACTION: f64 = 16.0;
-/// Maintenance cadence for a compaction-only (no-drain) lifecycle — FTS
-/// and SQL never drain, so a compaction (optimize) pass every this many
-/// commits, the same effective compaction interval as the drain path.
-const SUMMARY_COMMITS_PER_COMPACTION: f64 =
-    SUMMARY_COMMITS_PER_DRAIN * SUMMARY_DRAINS_PER_COMPACTION;
 /// Padding on the per-query RAM-hold window: a query holds the resident set
 /// a little longer than its own p50 (dispatch, response write, scheduler
 /// slack between overlapped queries), so the hold is billed at fudge × p50.
@@ -634,6 +631,17 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     } else {
         0.0
     };
+    // The write-compute figure is COMPLETE only if every write phase that ran
+    // had its CPU sampled. An unsampled phase must read NOT METERED — the model
+    // never back-fills it with a wall-clock guess (see the comment above) — so
+    // a tier that skips CPU sampling (e.g. the in-memory superfile micro-bench,
+    // which passes `ingest_cpu_s: None`) must not render `unwrap_or(0.0)` as a
+    // misleading $0 build cost. Ingest always runs; drain/delta/optimize only
+    // when their wall time is present.
+    let write_compute_metered = c.ingest_cpu_s.is_some()
+        && (c.store.drain_wall_s.is_none() || c.store.drain_cpu_s.is_some())
+        && (c.store.delta_commit_wall_s.is_none() || c.store.delta_commit_cpu_s.is_some())
+        && (c.store.compaction_wall_s.is_none() || c.store.compaction_cpu_s.is_some());
     // "$X per 1M docs" for a one-time maintenance phase's requests.
     let per_million_docs = |usd_total: f64| {
         if c.n_docs > 0 {
@@ -770,13 +778,24 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         ],
         vec![
             text(write_label),
-            text(format!(
-                "{} compute + {} requests → {} total ({}/1M docs)",
-                usd(write_compute),
-                usd(write_requests),
-                usd(write_total),
-                usd(write_per_million_docs),
-            )),
+            text(if write_compute_metered {
+                format!(
+                    "{} compute + {} requests → {} total ({}/1M docs)",
+                    usd(write_compute),
+                    usd(write_requests),
+                    usd(write_total),
+                    usd(write_per_million_docs),
+                )
+            } else {
+                // A write phase ran but its CPU wasn't sampled: show requests
+                // only and flag compute NOT METERED, never a $0 that reads as
+                // "the build was free".
+                format!(
+                    "compute NOT METERED + {} requests ({}/1M docs requests)",
+                    usd(write_requests),
+                    usd(per_million_docs(write_requests)),
+                )
+            }),
         ],
     ];
     if query_states.is_empty() {
@@ -1674,24 +1693,36 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     }
     // Writes priced at the corpus scale the bench actually measured — the
     // whole table written once per month — covering COMMITS only (ingest +
-    // the delta commit). Drain and compaction move to the maintenance lines
-    // below so the total never double-counts them.
+    // the delta commit). The hidden-index BUILD (drain) and the fold
+    // (optimize) are the dominant make-queryable cost but are billed on the
+    // Maintenance lines below, so this line is commit compute only and the
+    // total never double-counts them. Read the make-searchable cost as
+    // Writes + Maintenance, not Writes alone.
     let writes_month = ingest_compute.unwrap_or(0.0)
         + ingest_req_usd
         + delta_compute.unwrap_or(0.0)
         + delta_req_usd;
     summary_rows.push(vec![
         text(format!(
-            "Writes — {} docs/mo (commits)",
+            "Writes — {} docs/mo (commit compute only; drain/optimize in Maintenance)",
             fmt_count(c.n_docs)
         )),
-        text(format!("{}/1M docs", usd(per_million_docs(writes_month)))),
+        text(if write_compute_metered {
+            format!("{}/1M docs", usd(per_million_docs(writes_month)))
+        } else {
+            format!(
+                "{}/1M docs (compute NOT METERED)",
+                usd(per_million_docs(writes_month))
+            )
+        }),
         metric(writes_month, usd(writes_month), Better::Lower),
     ]);
     // Maintenance: per-event rates for open / drain / compaction, then one
-    // billed line at the stated cadence — a drain pass every
-    // `SUMMARY_COMMITS_PER_DRAIN` commits, a compaction pass every
-    // `SUMMARY_DRAINS_PER_COMPACTION` drains, one table open per pass.
+    // billed line at the steady-state cadence — the whole corpus is drained
+    // once per month (drain_pass_usd is a whole-corpus pass), a full optimize
+    // runs every `SUMMARY_DRAINS_PER_COMPACTION` drains, one table open per
+    // pass. The compaction-only (text) path has no drain and instead optimizes
+    // the whole corpus once per `SUMMARY_DRAINS_PER_COMPACTION` write cycles.
     let drain_pass_usd = has_drain.then(|| drain_compute.unwrap_or(0.0) + drain_req_usd);
     let compact_pass_usd =
         has_compaction.then(|| compaction_compute.unwrap_or(0.0) + compaction_req_usd);
@@ -1723,10 +1754,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     }
     if let Some(drain) = drain_pass_usd {
         summary_rows.push(vec![
-            text(format!(
-                "Drain — one pass over {} commits",
-                fmt_events(SUMMARY_COMMITS_PER_DRAIN)
-            )),
+            text("Drain — one full-corpus pass"),
             text(format!("{}/pass", usd(drain))),
             text(""),
         ]);
@@ -1739,10 +1767,16 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         ]);
     }
     let maintenance_month = if let Some(drain) = drain_pass_usd {
-        // Full-maintenance (drain-based) cadence: a drain every
-        // SUMMARY_COMMITS_PER_DRAIN commits, a compaction every
-        // SUMMARY_DRAINS_PER_COMPACTION drains, one open per pass.
-        let drains_mo = c.n_commits.max(1) as f64 / SUMMARY_COMMITS_PER_DRAIN;
+        // Steady state on the Writes basis (the whole table is (re)written, and
+        // therefore drained, once per month): `drain_pass_usd` already measures
+        // ONE whole-corpus drain, so it is billed once per month, and a full
+        // optimize runs once per SUMMARY_DRAINS_PER_COMPACTION drains. The old
+        // weighting (n_commits / 16) treated the whole-corpus drain as a
+        // 16-commit pass, which only equalled 1.0 at n_commits == 16 (i.e.
+        // <= 50M, where n_commits is pinned at the 16-commit floor) and
+        // double-counted the drain past that (2x at 100M, growing with scale).
+        // Normalizing to the corpus is scale-stable and identical at <= 50M.
+        let drains_mo = 1.0;
         let compacts_mo = drains_mo / SUMMARY_DRAINS_PER_COMPACTION;
         let opens_mo = drains_mo + compacts_mo;
         let month = drains_mo * drain
@@ -1750,8 +1784,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             + opens_mo * steady_open_usd.unwrap_or(0.0);
         summary_rows.push(vec![
             text(format!(
-                "Maintenance — drain / {} commits, compaction / {} drains",
-                fmt_events(SUMMARY_COMMITS_PER_DRAIN),
+                "Maintenance — drain 1×/mo (full corpus), compaction / {} drains",
                 fmt_events(SUMMARY_DRAINS_PER_COMPACTION),
             )),
             text(format!(
@@ -1764,15 +1797,19 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         ]);
         Some(month)
     } else if let Some(compact) = compact_pass_usd {
-        // Compaction-only (text) cadence: no drain, so one compaction
-        // every SUMMARY_COMMITS_PER_COMPACTION commits, one open per pass.
-        let compacts_mo = c.n_commits.max(1) as f64 / SUMMARY_COMMITS_PER_COMPACTION;
+        // Compaction-only (text) cadence: no drain, so the whole corpus is
+        // fully optimized once per SUMMARY_DRAINS_PER_COMPACTION monthly write
+        // cycles — the same effective interval as the drain-based branch — and
+        // one open per pass. Corpus-normalized so it is scale-stable: the old
+        // form (n_commits / 256) only matched this at the 16-commit floor
+        // (<= 50M) and over-counted the whole-corpus optimize 2x at 100M.
+        let compacts_mo = 1.0 / SUMMARY_DRAINS_PER_COMPACTION;
         let opens_mo = compacts_mo;
         let month = compacts_mo * compact + opens_mo * steady_open_usd.unwrap_or(0.0);
         summary_rows.push(vec![
             text(format!(
-                "Maintenance — compaction / {} commits",
-                fmt_events(SUMMARY_COMMITS_PER_COMPACTION),
+                "Maintenance — full-corpus optimize / {} write-cycles",
+                fmt_events(SUMMARY_DRAINS_PER_COMPACTION),
             )),
             text(format!(
                 "{} compactions + {} opens/mo",
