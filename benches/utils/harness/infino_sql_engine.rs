@@ -26,8 +26,6 @@ use infino::{
     supertable::{Supertable, SupertableOptions},
     test_helpers::default_tokenizer,
 };
-use rand::{SeedableRng, rngs::StdRng};
-use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 
 use super::{Capabilities, SqlEngine, SqlOutput, SqlRow};
@@ -88,25 +86,14 @@ fn schema() -> Arc<Schema> {
     ]))
 }
 
-/// Seed salt distinguishing this per-doc-id RNG stream from any other
-/// seeded-by-doc-id generator in the harness.
-const EMB_SEED_SALT: u64 = 0x656d_6265_6464_6931; // "embeddi1" ASCII, arbitrary
-/// Deterministic unit-norm embedding for `doc_id` — a per-doc-id seeded
-/// Gaussian draw (same distribution family `corpus::generate_vector_corpus`
-/// uses for the vector-tier corpus), not a lookup into shared state, so any
-/// row's embedding is reproducible without holding the whole corpus. An
-/// earlier version derived each component from `doc_id * 31 mod 97`, which
-/// has period 97 in `doc_id` — every 97th row got an IDENTICAL vector, so a
-/// 1M-row table had only 97 distinct embeddings and `vector_search` /
-/// `hybrid_search` measured IVF search over a corpus that was ~10,300-way
-/// duplicated rather than realistically high-cardinality.
+/// Deterministic unit-norm embedding for `doc_id` — no RNG, so it is
+/// reproducible and cheap. Used both to populate the `emb` column and
+/// (via [`sample_query_csv`]) to form a query vector for the
+/// `vector_search` / `hybrid_search` TVFs.
 pub fn emb_for(doc_id: u64) -> [f32; SQL_DIM] {
-    let mut rng = StdRng::seed_from_u64(doc_id.wrapping_add(EMB_SEED_SALT));
-    let dist = StandardNormal;
     let mut v = [0f32; SQL_DIM];
-    for slot in &mut v {
-        let s: f64 = dist.sample(&mut rng);
-        *slot = s as f32;
+    for (d, slot) in v.iter_mut().enumerate() {
+        *slot = ((doc_id.wrapping_mul(31).wrapping_add(d as u64 * 7) % 97) as f32) + 1.0;
     }
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {

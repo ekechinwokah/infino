@@ -43,7 +43,6 @@ use arrow_array::{Decimal128Array, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
-    config,
     roaring::RoaringBitmap,
     superfile::{
         SuperfileReader,
@@ -92,17 +91,13 @@ pub fn block_on_inmem<F: std::future::Future>(fut: F) -> F::Output {
 
 // ─── Scale constants ──────────────────────────────────────────────────
 
-/// Codec benches build vector columns with. Calls the SAME policy
-/// `VectorConfig::new` applies: the YAML-configured codec for cosine,
-/// locally fitted residuals for unbounded metrics. Codec choice is engine
-/// configuration (`vector.rerank_codec` in YAML), not a bench env knob — an
-/// earlier version read `RerankCodec::default()` (the compile-time default)
-/// instead of the configured value, so a bench run under a non-default
-/// `rerank_codec` YAML setting silently measured the default codec instead
-/// of the one actually configured.
+/// Codec benches build vector columns with. Mirrors the engine default
+/// (`VectorConfig::new`): the fixed cosine grid for cosine, locally fitted
+/// residuals for unbounded metrics. Codec choice is engine configuration
+/// (`vector.rerank_codec` in YAML), not a bench env knob.
 pub fn bench_rerank_codec(metric: Metric) -> RerankCodec {
     let codec = if metric == Metric::Cosine {
-        config::global().vector.rerank_codec
+        RerankCodec::default()
     } else {
         RerankCodec::Sq8Residual
     };

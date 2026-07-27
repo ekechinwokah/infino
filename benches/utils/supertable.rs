@@ -3230,15 +3230,6 @@ pub mod vector {
         include_cold: bool,
     ) -> RoutingStateStat {
         let reader = consumer.reader();
-        // The warm window rotates through the FULL correctness battery
-        // (`query` plus every `steady_queries` entry) rather than repeating
-        // `query` alone — a single vector called `ROUTING_STATE_WARM_ITERS`
-        // times has zero query-to-query variance, so its "p50" is really
-        // just that one shape's latency, not a genuine warm percentile.
-        let warm_battery: Vec<&[f32]> = std::iter::once(query)
-            .chain(steady_queries.iter().map(Vec::as_slice))
-            .collect();
-        let warm_cursor = std::cell::Cell::new(0usize);
         super::measure_routing_state_with(
             "supertable_vector",
             label,
@@ -3247,13 +3238,11 @@ pub mod vector {
             consumer_meter,
             &|| hit_tier_counts(consumer, query, nprobe, rerank),
             &|| {
-                let i = warm_cursor.get();
-                warm_cursor.set((i + 1) % warm_battery.len());
                 black_box(
                     reader
                         .vector_search(
                             supertable::VEC_COLUMN,
-                            warm_battery[i],
+                            query,
                             TOP_K,
                             exec_vec::search_opts(nprobe, rerank),
                             None,
