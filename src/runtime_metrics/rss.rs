@@ -49,6 +49,15 @@ const PERCENT_SCALE: f64 = 100.0;
 const PROC_SELF_STATUS: &str = "/proc/self/status";
 /// Aggregated smaps rollup (Anonymous / Rss / Shmem).
 const PROC_SELF_SMAPS_ROLLUP: &str = "/proc/self/smaps_rollup";
+/// `PeakSampler`'s anon/file split is diagnostic-only (`peak_anon_rss_bytes`
+/// / `peak_file_rss_bytes`) — pricing bills `peak_rss_bytes` (total VmRSS),
+/// sampled every tick from the cheap `/proc/self/status` read. The split
+/// comes from `PROC_SELF_SMAPS_ROLLUP`, a full page-table walk whose cost
+/// scales with the mapped set; sampling it every tick can measurably inflate
+/// whatever CPU window runs alongside the sampler (e.g. an ingest phase).
+/// Sampled once every this many ticks; skipped ticks carry the last split
+/// forward.
+const ANON_SPLIT_SAMPLE_STRIDE: u32 = 4;
 
 /// One-shot read of the calling process's current VmRSS in bytes.
 pub fn current_rss_bytes() -> Option<u64> {
@@ -152,15 +161,21 @@ impl PeakSampler {
             .name("rss-sampler".into())
             .spawn(move || {
                 let mut samples = vec![initial];
+                let mut last_anon = initial.1;
+                let mut tick: u32 = 0;
                 while !stop_t.load(Ordering::Acquire) {
                     if let Some(rss) = current_rss_bytes() {
-                        samples.push((rss, anon_rss_bytes_fast().unwrap_or(0)));
+                        if tick.is_multiple_of(ANON_SPLIT_SAMPLE_STRIDE) {
+                            last_anon = anon_rss_bytes_fast().unwrap_or(last_anon);
+                        }
+                        samples.push((rss, last_anon));
+                        tick = tick.wrapping_add(1);
                     }
                     // Interruptible wait so `stop_stats` can unpark promptly.
                     thread::park_timeout(interval);
                 }
                 if let Some(rss) = current_rss_bytes() {
-                    samples.push((rss, anon_rss_bytes_fast().unwrap_or(0)));
+                    samples.push((rss, anon_rss_bytes_fast().unwrap_or(last_anon)));
                 }
                 samples
             })
