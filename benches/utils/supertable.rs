@@ -2190,7 +2190,7 @@ pub mod vector {
         sync::atomic::Ordering as AtomicOrdering,
     };
 
-    use infino::storage::io_counters;
+    use infino::{roaring::RoaringBitmap, storage::io_counters};
 
     use super::*;
     use crate::{
@@ -3367,7 +3367,12 @@ pub mod vector {
             let nprobe = fixed_nprobe();
             let rerank = fixed_rerank_mult();
 
-            let (q_correct, q_cal, gt_correct, gt_cal, filtered_gt, augmented_gt) = {
+            // `_modular_filtered_gt`: `lifecycle_ground_truth_cached` computes
+            // base/filtered/augmented in one pass; its `filtered` field is the
+            // OLD modular (`doc_id % N`) selection, unused here — the
+            // filtered-vector block below computes its own ground truth for
+            // the contiguous block `FILTER_COLUMN` actually selects.
+            let (q_correct, q_cal, gt_correct, gt_cal, _modular_filtered_gt, augmented_gt) = {
                 let corpus = corpus
                     .as_ref()
                     .expect("vector benches always prepare a corpus");
@@ -3736,8 +3741,25 @@ pub mod vector {
             // shared consumer above — `Modality::Vector` stays vector-only
             // for the Vector-vs-Lance ingest comparison.
             if phases.warm
-                && let Some(filtered_gt) = filtered_gt.as_ref()
+                && let Some(prepared_corpus) = corpus.as_ref()
+                && let Some(vectors) = prepared_corpus.vectors()
             {
+                // A dedicated ground truth for the CONTIGUOUS bucket-0 block
+                // `FILTER_COLUMN` actually selects (see its doc comment) —
+                // the shared, tier-agnostic brute-force helper the superfile
+                // tier's own filtered-recall table already uses, so both
+                // compute a filtered ground truth identically. Reuses this
+                // corpus's vectors: same seed/params as the
+                // `Modality::VectorFiltered` build below, so both carry
+                // byte-identical vectors at identical doc-id positions.
+                let vslice = &vectors.as_slice()[..n_docs * DIM];
+                let block_size = supertable::filter_block_size(n_docs) as u32;
+                let mut allow = RoaringBitmap::new();
+                for doc_id in 0..block_size.min(n_docs as u32) {
+                    allow.insert(doc_id);
+                }
+                let filtered_gt = corpus::filtered_ground_truth(vslice, &allow, &q_correct, TOP_K);
+                let filtered_gt = &filtered_gt;
                 let filtered_corpus = supertable::prepare_corpus(Modality::VectorFiltered);
                 let filtered_built =
                     supertable::build_on_storage(Modality::VectorFiltered, &filtered_corpus);
@@ -3746,18 +3768,27 @@ pub mod vector {
                     filtered_meter.provider(),
                     Some(filtered_built.total_index_bytes),
                 );
-                let filtered_consumer = tiers::open_consumer(tiers::consumer_options(
+                // `allow_summary_knob = false`: this handle is about to drive
+                // a drain (a mutation) — the consumer-memory-mode knob is a
+                // read-only-consumer contract (see `consumer_options_with_knob`).
+                let filtered_consumer = tiers::open_consumer(tiers::consumer_options_with_knob(
                     supertable::options_for(Modality::VectorFiltered, None),
                     filtered_meter.provider(),
                     filtered_cache,
+                    false,
                 ));
+                // Every other recall/latency number in this file is measured
+                // post-drain (the routed, steady-state hidden-index grid) —
+                // the engine-default nprobe and the recall floor below are
+                // calibrated against that state. Without this, the table
+                // stays pre-drain (fan-out across every one of its own user
+                // superfiles' small local IVF grids), which the default
+                // nprobe badly under-probes.
+                drain_hidden_incoming(&filtered_consumer);
                 let filtered_id_to_dense = corpus::engine_id_to_dense(&filtered_consumer, n_docs);
                 let filtered_reader = filtered_consumer.reader();
-                // Bucket 0 is exactly the every-`FILTER_KEEP_EVERY`th-row
-                // selection the ground truth (`filtered_gt`) was computed
-                // over — the SAME vector corpus seed/params as the shared
-                // `Modality::Vector` build above, so this table's rows carry
-                // identical vectors at identical doc-id-ordered positions.
+                // Bucket 0 is exactly the contiguous doc-id block `allow`
+                // (and so `filtered_gt`) was built from above.
                 let filter_term = supertable::filter_bucket_term(0);
                 let filter = || VectorFilter {
                     column: supertable::FILTER_COLUMN,
@@ -3910,10 +3941,13 @@ pub mod vector {
                             "Filtered kNN over the PUBLIC predicate-based filter — \
                              `vector_search` with a real `VectorFilter{{column,query,mode}}`, \
                              resolved fresh on every call (a dedicated `Modality::VectorFiltered` \
-                             table: vector index + one small FTS-indexed bucket column, ~1/{} \
-                             selectivity). The timed window includes predicate resolution — this \
-                             is the full end-to-end cost a caller pays. recall@{TOP_K} = \
-                             {mean_recall:.3}. Δ is vs the previous run.",
+                             table: vector index + one small FTS-indexed bucket column, a \
+                             contiguous ~1/{} of doc ids — correlated with ingest order like a \
+                             real time/batch-tagged filter, so the manifest term-bloom prune does \
+                             real work instead of fanning out to every superfile). The timed \
+                             window includes predicate resolution — this is the full end-to-end \
+                             cost a caller pays. recall@{TOP_K} = {mean_recall:.3}. Δ is vs the \
+                             previous run.",
                             FILTER_KEEP_EVERY
                         ),
                         blocks: vec![Block {

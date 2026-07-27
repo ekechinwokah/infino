@@ -74,16 +74,38 @@ pub const SQL_RATING_COLUMN: &str = "rating";
 /// FTS-indexed low-cardinality bucket column for [`Modality::VectorFiltered`]
 /// — the column the filtered-vector bench resolves a real `VectorFilter`
 /// predicate against, mirroring `infino_sql_engine`'s `bucket` column.
+///
+/// Buckets are CONTIGUOUS doc-id ranges (`doc_id / filter_block_size(n_docs)`),
+/// never a modular residue (`doc_id % N`). A modular residue is, by
+/// construction, uniformly present over *any* contiguous doc-id range — so
+/// it is present in literally every superfile regardless of size or
+/// boundary, which defeats the exact optimization `VectorFilter` resolution
+/// relies on: a manifest-only per-superfile term-bloom prune
+/// (`select_superfiles` / `PruneLeaf::TermPresence`, "no superfile reads")
+/// that should exclude most superfiles *before* any of them are opened. A
+/// contiguous block instead correlates with ingest order — the shape a
+/// real time- or batch-correlated categorical filter has — so most
+/// superfiles' term blooms correctly exclude bucket 0 and the prune does
+/// real, measurable work. A modular predicate can never exercise that path
+/// at all; it was tried first and always fans out to every superfile,
+/// regardless of how well the real pruning works.
 pub const FILTER_COLUMN: &str = "filter_bucket";
-/// [`FILTER_COLUMN`] bucket count: `doc_id % FILTER_KEEP_EVERY` names the
-/// bucket, so the term naming bucket 0 (see [`filter_bucket_term`]) selects
-/// exactly this fraction of rows. Also the filtered-recall ground truth's
-/// selectivity.
+/// [`FILTER_COLUMN`] bucket count. The term naming bucket 0 (see
+/// [`filter_bucket_term`]) selects exactly `1/FILTER_KEEP_EVERY` of rows —
+/// the ~10% selectivity the filtered-vector bench's ground truth targets.
 pub const FILTER_KEEP_EVERY: usize = 10;
 
-/// The FTS query term selecting [`FILTER_COLUMN`] bucket 0 — a real
-/// `VectorFilter{column: FILTER_COLUMN, query: ..., mode}` predicate resolves
-/// to exactly this ~`1/FILTER_KEEP_EVERY` selectivity.
+/// Row count of one [`FILTER_COLUMN`] bucket — the contiguous
+/// `[bucket * filter_block_size(n_docs), (bucket + 1) * filter_block_size(n_docs))`
+/// doc-id range [`filter_bucket_term`] names. At least 1, so a degenerate
+/// `n_docs` never divides to an empty block.
+pub fn filter_block_size(n_docs: usize) -> usize {
+    (n_docs / FILTER_KEEP_EVERY).max(1)
+}
+
+/// The FTS query term selecting [`FILTER_COLUMN`] bucket `bucket` — a real
+/// `VectorFilter{column: FILTER_COLUMN, query: ..., mode}` predicate
+/// resolves to exactly the contiguous doc-id block named above.
 pub fn filter_bucket_term(bucket: u64) -> String {
     format!("bucket{bucket}")
 }
@@ -843,10 +865,15 @@ fn chunk_batch(
         ));
     }
     if modality == Modality::VectorFiltered {
-        // `doc_id % FILTER_KEEP_EVERY` names the bucket; bucket 0 is the
-        // ~1/FILTER_KEEP_EVERY selection the filtered-vector bench queries.
+        // Contiguous block, not a modular residue — see FILTER_COLUMN's doc
+        // comment for why a modular assignment would defeat the
+        // manifest-level term-bloom prune the filtered-vector bench means
+        // to measure. Bucket 0 is the ~1/FILTER_KEEP_EVERY selection the
+        // bench queries.
+        let block_size = filter_block_size(n_docs()) as u64;
+        let max_bucket = FILTER_KEEP_EVERY as u64 - 1;
         let bucket_vals: Vec<String> = (start..end)
-            .map(|doc_id| filter_bucket_term(doc_id as u64 % FILTER_KEEP_EVERY as u64))
+            .map(|doc_id| filter_bucket_term((doc_id as u64 / block_size).min(max_bucket)))
             .collect();
         columns.push(Arc::new(LargeStringArray::from(
             bucket_vals.iter().map(String::as_str).collect::<Vec<_>>(),
