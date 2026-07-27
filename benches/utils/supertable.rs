@@ -2183,13 +2183,13 @@ pub mod vector {
         sync::atomic::Ordering as AtomicOrdering,
     };
 
-    use infino::storage::io_counters;
+    use infino::{VectorFilter, roaring::RoaringBitmap, storage::io_counters};
 
     use super::*;
     use crate::{
         corpus,
         executors::{
-            vector as exec_vec,
+            fts as exec_fts, vector as exec_vec,
             vector::{SupertableVectorRead, VectorRead},
         },
     };
@@ -3930,6 +3930,153 @@ pub mod vector {
                             ]],
                         }],
                     });
+                }
+            }
+
+            // The PUBLIC predicate-filtered path: `vector_search` with a real
+            // `VectorFilter`, which resolves the predicate (one `token_match`
+            // per surviving superfile) on EVERY call. The prepared-allow-set
+            // table above hoists exactly that step out of its timed window, so
+            // its p50 omits it; this measures the end-to-end cost a caller
+            // actually pays. Needs a table with both an FTS column and a
+            // vector column — `Modality::Combined` already is one (the
+            // vector-only table the rest of this file measures has no text
+            // column to filter on), so no new corpus or schema shape is
+            // introduced here.
+            if phases.warm {
+                let rep = exec_fts::FTS_BATTERY
+                    .iter()
+                    .find(|q| q.name == "single_rare")
+                    .expect("battery keeps its rare-term representative");
+                let filter_query = rep.terms.join(" ");
+                let filter_mode = exec_fts::to_infino_mode(rep.mode);
+
+                let combined_corpus = supertable::prepare_corpus(Modality::Combined);
+                let combined_built =
+                    supertable::build_on_storage(Modality::Combined, &combined_corpus);
+                let (_combined_cache_dir, combined_consumer) =
+                    open_consumer(Modality::Combined, &combined_built);
+                // Post-drain, matching every other search number in this file.
+                drain_hidden_incoming(&combined_consumer);
+                let combined_ids = corpus::engine_id_to_dense(&combined_consumer, n_docs);
+                let combined_reader = combined_consumer.reader();
+
+                // Allow-set = the ENGINE's own `token_match` over the same
+                // column/term/mode the filter carries — the identical
+                // resolution the filtered kNN runs internally, so the graded
+                // ground truth and the measured path agree by construction.
+                let matched_hits = combined_reader
+                    .token_match(supertable::TEXT_COLUMN, &filter_query, filter_mode)
+                    .expect("filter predicate token_match");
+                let mut allow = RoaringBitmap::new();
+                for (dense, _) in
+                    hits_to_dense_u32(&combined_consumer, &combined_ids, &matched_hits)
+                {
+                    allow.insert(dense);
+                }
+                let matched = allow.len();
+                let selectivity = matched as f64 / n_docs.max(1) as f64;
+
+                let combined_vectors = combined_corpus
+                    .vectors()
+                    .expect("combined corpus carries vectors");
+                let vslice = &combined_vectors.as_slice()[..n_docs * DIM];
+                let gt = corpus::filtered_ground_truth(vslice, &allow, &q_correct, TOP_K);
+
+                let filter = || VectorFilter {
+                    column: supertable::TEXT_COLUMN,
+                    query: filter_query.as_str(),
+                    mode: filter_mode,
+                };
+                let run_query = |q: &Vec<f32>| {
+                    combined_reader
+                        .vector_search(
+                            supertable::VEC_COLUMN,
+                            q,
+                            TOP_K,
+                            exec_vec::default_search_opts(),
+                            Some(filter()),
+                            None,
+                        )
+                        .expect("predicate-filtered vector_search")
+                };
+                // Untimed prewarm, matching the table above.
+                for q in q_correct.iter() {
+                    let _ = run_query(q);
+                }
+                let mut recalls = Vec::with_capacity(q_correct.len());
+                let mut latencies = Vec::with_capacity(q_correct.len());
+                for (q, truth) in q_correct.iter().zip(&gt) {
+                    let t0 = Instant::now();
+                    let batches = run_query(q);
+                    latencies.push(t0.elapsed());
+                    // Stable `_id`s straight off the public projection,
+                    // mapped through the engine's own id ordering.
+                    let hits: Vec<(u32, f32)> = corpus::id_scores_from_vector_search(&batches)
+                        .into_iter()
+                        .filter_map(|(id, score)| {
+                            combined_ids.get(&id).copied().map(|dense| (dense, score))
+                        })
+                        .collect();
+                    recalls.push(corpus::recall_at_k(&hits, truth));
+                }
+                if !recalls.is_empty() {
+                    let mean_recall: f32 = recalls.iter().sum::<f32>() / recalls.len() as f32;
+                    latencies.sort_unstable();
+                    let p50_ns = latencies[latencies.len() / 2].as_secs_f64() * 1e9;
+                    eprintln!(
+                        "[supertable_vector] predicate-filtered ({}, {matched} of {} rows = \
+                         {:.2}% selectivity): recall@{TOP_K}={mean_recall:.3} p50={:.2}ms",
+                        rep.name,
+                        fmt_count(n_docs),
+                        selectivity * 100.0,
+                        p50_ns / 1e6,
+                    );
+                    report.emit(&Section {
+                        anchor: "bench/vector/supertable/filtered-predicate".into(),
+                        title: format!(
+                            "Supertable vector — predicate-filtered search ({} docs × dim={})",
+                            fmt_count(n_docs),
+                            DIM
+                        ),
+                        note: format!(
+                            "The PUBLIC filtered path: `vector_search` with a real \
+                             `VectorFilter{{column,query,mode}}` over a `Modality::Combined` \
+                             table, resolved fresh on every call — so unlike the \
+                             prepared-allow-set table above, the timed window INCLUDES the \
+                             predicate resolution (`token_match` per surviving superfile) a \
+                             caller pays. Predicate is the `{}` battery term over `{}`, \
+                             matching {matched} of {} rows as measured (no target selectivity \
+                             is engineered). Δ is vs the previous run.",
+                            rep.name,
+                            supertable::TEXT_COLUMN,
+                            fmt_count(n_docs),
+                        ),
+                        blocks: vec![Block {
+                            subtitle: String::new(),
+                            headers: vec![
+                                "Filter".into(),
+                                "Requested".into(),
+                                "selectivity".into(),
+                                "recall@10".into(),
+                                "p50".into(),
+                            ],
+                            rows: vec![vec![
+                                text(format!(
+                                    "VectorFilter: {} = {filter_query:?}",
+                                    supertable::TEXT_COLUMN
+                                )),
+                                text("engine default"),
+                                text(format!("{:.2}%", selectivity * 100.0)),
+                                text(format!("{mean_recall:.3}")),
+                                metric(p50_ns, fmt_time(p50_ns), Better::Lower),
+                            ]],
+                        }],
+                    });
+                }
+                drop(combined_consumer);
+                if let Some(cleanup) = &combined_built.cleanup {
+                    tiers::cleanup_prefix(cleanup);
                 }
             }
 
