@@ -91,7 +91,10 @@ pub struct InfinoVectorIndex {
     dim: usize,
     metric: VectorMetric,
     n_cent: usize,
-    bytes: Option<Vec<u8>>,
+    // `Bytes`, not `Vec<u8>`: the reader is opened from a `.clone()` of this
+    // handle (an `Arc`-backed refcount bump), so the measured build window
+    // never pays for a second full-buffer copy of the built superfile.
+    bytes: Option<Bytes>,
     reader: Option<SuperfileReader>,
 }
 
@@ -133,16 +136,17 @@ impl VectorEngine for InfinoVectorEngine {
     }
 
     fn write(index: &mut Self::Index, vectors: &[f32]) {
-        let bytes = build_superfile(
+        let bytes = Bytes::from(build_superfile(
             &index.column,
             vectors,
             index.dim,
             index.metric,
             index.n_cent,
             0,
-        );
-        index.reader =
-            Some(SuperfileReader::open(Bytes::from(bytes.clone())).expect("open SuperfileReader"));
+        ));
+        // `Bytes::clone` shares the same allocation (refcount bump); the
+        // build window pays for the superfile bytes exactly once.
+        index.reader = Some(SuperfileReader::open(bytes.clone()).expect("open SuperfileReader"));
         index.bytes = Some(bytes);
     }
 

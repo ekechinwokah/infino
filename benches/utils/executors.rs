@@ -17,12 +17,36 @@ use std::{
     time::{Duration, Instant},
 };
 
+use arrow_array::{Array, RecordBatch};
+
 use crate::{
     cpu,
     markdown::fmt_time,
     report::{Better, Cell, context, metric, text},
     rss::{self, RssStats},
 };
+
+/// Rows and logical payload bytes of a query's returned batches — the values
+/// the caller actually receives. `ArrayData::get_slice_memory_size` is
+/// slice-aware (a batch sliced to its top-k counts only those rows) and sizes
+/// the data exactly, so this is neither allocation footprint
+/// (`get_array_memory_size`, which counts capacity slack) nor a serialized
+/// wire size: the engine returns in-memory `RecordBatch`es and never
+/// serializes, so transport framing belongs to whatever protocol the
+/// embedding application speaks.
+pub fn payload_bytes(batches: &[RecordBatch]) -> (u64, u64) {
+    let rows = batches.iter().map(|b| b.num_rows() as u64).sum();
+    let bytes = batches
+        .iter()
+        .flat_map(|batch| batch.columns())
+        .map(|column| {
+            let data = column.to_data();
+            data.get_slice_memory_size()
+                .unwrap_or_else(|_| data.get_buffer_memory_size()) as u64
+        })
+        .sum();
+    (rows, bytes)
+}
 
 /// A warm-latency cell. All three warm metrics (p50 / p90 / p99) are
 /// Δ-tracked equally here; which one *gates* the A/B regression decision is
@@ -132,27 +156,21 @@ pub struct Stats {
     pub p99: Duration,
 }
 
-/// Batch sub-µs ops up to this span so per-call `Instant::now` overhead
-/// (tens of ns) can't dominate the sample.
-const MIN_SAMPLE_NS: u64 = 50_000;
-/// Cap on the auto-chosen batch size.
-const MAX_BATCH: u64 = 100_000;
-
-/// Collect `iters` per-call timings of `op`, batching calls so each timed
-/// window spans at least [`MIN_SAMPLE_NS`]. A heavy op runs one call per
-/// sample; a sub-µs op runs many and divides out — accurate either way.
+/// Collect `iters` timings of `op`, ONE call per sample.
+///
+/// Calls are timed individually rather than in batches. A batched sampler
+/// records each window's mean, so the percentiles computed from it are
+/// percentiles OF MEANS: with a batch of 100, one slow call is diluted
+/// hundredfold and the tail it represents disappears — exactly the signal
+/// p90/p99 exist to show. Per-call timing costs one `Instant::now` pair per
+/// sample (tens of ns, ~4% on the fastest sub-µs shapes measured here and
+/// far less on the rest), which is the honest price of real tail numbers.
 pub fn sample_batched<T>(iters: usize, mut op: impl FnMut() -> T) -> Vec<Duration> {
-    let probe = Instant::now();
-    std::hint::black_box(op());
-    let per_call_ns = (probe.elapsed().as_nanos() as u64).max(1);
-    let batch = (MIN_SAMPLE_NS / per_call_ns).clamp(1, MAX_BATCH) as u32;
     let mut samples = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t = Instant::now();
-        for _ in 0..batch {
-            std::hint::black_box(op());
-        }
-        samples.push(t.elapsed() / batch);
+        std::hint::black_box(op());
+        samples.push(t.elapsed());
     }
     samples
 }
@@ -209,21 +227,14 @@ pub fn sample_batched_cpu<T>(
     iters: usize,
     mut op: impl FnMut() -> T,
 ) -> (Vec<Duration>, Option<f64>) {
-    let probe = Instant::now();
-    std::hint::black_box(op());
-    let per_call_ns = (probe.elapsed().as_nanos() as u64).max(1);
-    let batch = (MIN_SAMPLE_NS / per_call_ns).clamp(1, MAX_BATCH) as u32;
     let mut samples = Vec::with_capacity(iters);
     let cpu0 = cpu::process_cpu_ns();
     for _ in 0..iters {
         let t = Instant::now();
-        for _ in 0..batch {
-            std::hint::black_box(op());
-        }
-        samples.push(t.elapsed() / batch);
+        std::hint::black_box(op());
+        samples.push(t.elapsed());
     }
-    let total_calls = (iters as f64) * (batch as f64);
-    let cpu_s = cpu::cpu_seconds_since(cpu0).map(|s| s / total_calls);
+    let cpu_s = cpu::cpu_seconds_since(cpu0).map(|s| s / iters as f64);
     (samples, cpu_s)
 }
 
@@ -633,6 +644,17 @@ pub mod fts {
             mode: InfinoBoolMode,
         ) -> usize;
 
+        /// `(rows, payload_bytes)` of each phase's returned result — the
+        /// search phase (id + score) and the fetch phase (+ top-k text) —
+        /// so each cost class carries the payload it actually returns.
+        fn bm25_payloads(
+            &self,
+            column: &str,
+            query: &str,
+            k: usize,
+            mode: InfinoBoolMode,
+        ) -> ((u64, u64), (u64, u64));
+
         /// Count phase: the matching-doc count from the dedicated count
         /// primitives — single-term `term_df` (O(1) from the dictionary
         /// header), multi-term `token_match` cardinality — with no BM25
@@ -640,6 +662,12 @@ pub mod fts {
         /// string so `+must` clause sigils resolve exactly as the
         /// production count path resolves them.
         fn count_matching(&self, column: &str, query: &str, mode: InfinoBoolMode) -> u64;
+
+        /// Settle any background work the preceding query kicked off, so the
+        /// next cold iteration's fresh-cache open/search doesn't race an
+        /// in-flight background fill from this one. No-op for tiers with no
+        /// background machinery (e.g. the in-memory superfile reader).
+        fn settle_warm(&self) {}
     }
 
     /// Fetch-phase measurement for a raw superfile reader: kernel hits,
@@ -680,6 +708,33 @@ pub mod fts {
             mode: InfinoBoolMode,
         ) -> usize {
             superfile_rows_fetched(self, column, query, k, mode)
+        }
+
+        fn bm25_payloads(
+            &self,
+            column: &str,
+            query: &str,
+            k: usize,
+            mode: InfinoBoolMode,
+        ) -> ((u64, u64), (u64, u64)) {
+            // Raw-kernel tier: the query phase hands back `(doc, score)`
+            // pairs — a caller payload like any other, just not Arrow-shaped.
+            // The fetch phase additionally materializes the text column.
+            let hits = crate::tiers::block_on(self.bm25_hits_async(column, query, k, mode))
+                .expect("superfile bm25_search");
+            // Measure the value actually handed back, not a per-hit constant.
+            let search = (
+                hits.len() as u64,
+                std::mem::size_of_val(hits.as_slice()) as u64,
+            );
+            if hits.is_empty() {
+                return (search, (0, 0));
+            }
+            let locals: Vec<u32> = hits.iter().map(|&(doc, _)| doc).collect();
+            let batch = self
+                .take_by_local_doc_ids(&locals, &[column])
+                .expect("superfile take rows");
+            (search, payload_bytes(std::slice::from_ref(&batch)))
         }
 
         fn count_matching(&self, column: &str, query: &str, mode: InfinoBoolMode) -> u64 {
@@ -751,22 +806,52 @@ pub mod fts {
                 .sum()
         }
 
+        fn bm25_payloads(
+            &self,
+            column: &str,
+            query: &str,
+            k: usize,
+            mode: InfinoBoolMode,
+        ) -> ((u64, u64), (u64, u64)) {
+            let search = self
+                .bm25_search(column, query, k, mode, None)
+                .expect("supertable bm25_search payload");
+            let fetched = self
+                .bm25_search(column, query, k, mode, Some(&["_id", column, "score"]))
+                .expect("supertable bm25_search fetched payload");
+            (payload_bytes(&search), payload_bytes(&fetched))
+        }
+
         fn count_matching(&self, column: &str, query: &str, mode: InfinoBoolMode) -> u64 {
             self.count(column, query, mode).expect("supertable count")
         }
     }
 
     /// Warm timing (+ RSS) for one query: `warm` is the query phase (id +
-    /// score), `fetched_p50` the fetch phase (+ top-k text).
+    /// score), `fetched` the fetch phase (+ top-k text).
     #[derive(Clone, Debug)]
     pub struct FtsQueryStat {
         pub name: &'static str,
         pub warm: Stats,
-        pub fetched_p50: Duration,
+        /// Fetch-phase (query + top-k text materialization) latency
+        /// percentiles.
+        pub fetched: Stats,
         /// Amortized on-CPU seconds of one warm query-phase search — the
         /// query's measured compute (cache hot, 0 GET), the basis for both the
         /// warm and cold query CPU cost.
         pub cpu_s: Option<f64>,
+        /// Amortized on-CPU seconds of one warm fetch-phase call (query +
+        /// top-k column materialization) — prices the retrieval class.
+        pub fetched_cpu_s: Option<f64>,
+        /// Return-payload of the query phase (id + score, no text): what a
+        /// search-only caller receives.
+        pub search_payload_rows: u64,
+        pub search_payload_bytes: u64,
+        /// Return-payload of the fetch phase (materialized top-k): row count
+        /// and logical value bytes — the retrieval result the client
+        /// receives, priced for egress.
+        pub fetched_payload_rows: u64,
+        pub fetched_payload_bytes: u64,
         pub rss: RssStats,
     }
 
@@ -792,14 +877,26 @@ pub mod fts {
         for _ in 0..WARMUP_ITERS {
             std::hint::black_box(reader.bm25_rows_fetched(column, &query, k, mode));
         }
-        let mut fetched_samples =
-            sample_batched(iters, || reader.bm25_rows_fetched(column, &query, k, mode));
+        let (mut fetched_samples, fetched_cpu_s) =
+            sample_batched_cpu(iters, || reader.bm25_rows_fetched(column, &query, k, mode));
+        // Both phases' return payloads, read from the ENGINE's result ledger
+        // (untimed calls). Payload is cache-independent, so these warm figures
+        // are the egress payloads for the cold path too.
+        let (
+            (search_payload_rows, search_payload_bytes),
+            (fetched_payload_rows, fetched_payload_bytes),
+        ) = reader.bm25_payloads(column, &query, k, mode);
         let rss = sampler.stop_stats();
         FtsQueryStat {
             name: q.name,
             warm: summarize(&mut samples),
-            fetched_p50: summarize(&mut fetched_samples).p50,
+            fetched: summarize(&mut fetched_samples),
             cpu_s,
+            fetched_cpu_s,
+            search_payload_rows,
+            search_payload_bytes,
+            fetched_payload_rows,
+            fetched_payload_bytes,
             rss,
         }
     }
@@ -826,22 +923,39 @@ pub mod fts {
     /// implements [`FtsRead`] and owns the cache/consumer resources it
     /// must drop after the timed read; the guard's constructor performs
     /// the full open (consumer + superfile readers).
+    /// Cold timings for one FTS shape, one per cost class: the query phase
+    /// (search: id + score) and the fetch phase (retrieval: + top-k text),
+    /// each measured on its OWN fresh opens so neither phase warms the
+    /// other's cache.
+    #[derive(Clone, Copy)]
+    pub struct FtsColdStat {
+        pub search: ColdTiming,
+        /// `None` when the tier cannot run the fetch phase cold (the
+        /// superfile tier's raw cold reader has no lazy row-take path; the
+        /// production cold-fetch cost is measured at the supertable tier
+        /// through the public `bm25_search` projection).
+        pub fetched: Option<ColdTiming>,
+    }
+
     pub fn measure_cold<G: FtsRead>(
         open_fresh: impl Fn() -> G,
         battery: &[FtsQuery],
         column: &str,
         k: usize,
         iters: usize,
+        fetch_phase: bool,
         log_prefix: &str,
-    ) -> HashMap<&'static str, ColdTiming> {
+    ) -> HashMap<&'static str, FtsColdStat> {
         let mut out = HashMap::new();
         for q in battery {
             eprintln!(
-                "[{log_prefix}] cold: query {} — {iters} fresh-cache iters...",
-                q.name
+                "[{log_prefix}] cold: query {} — {iters} fresh-cache iters × {} phase(s)...",
+                q.name,
+                if fetch_phase { 2 } else { 1 },
             );
             let query = q.terms.join(" ");
             let mode = to_infino_mode(q.mode);
+            // Query phase (search: id + score) on its own fresh opens.
             let mut cold = ColdSamples::with_capacity(iters);
             for _ in 0..iters {
                 let (guard, open_wall, open_cpu) = cpu::timed(&open_fresh);
@@ -856,71 +970,179 @@ pub mod fts {
                 cold.push_search(search_wall, search_cpu);
                 cold.push_search_io(io.get_count, io.get_bytes);
                 std::hint::black_box(rows);
+                // Outside the timed window: drain this iteration's
+                // background fills before the next iteration opens, so
+                // iteration N+1's cold window never races iteration N's
+                // in-flight cache writes.
+                guard.settle_warm();
                 drop(guard);
             }
-            out.insert(q.name, cold.finish());
+            // Fetch phase (retrieval: + top-k text) on SEPARATE fresh opens —
+            // its cold cost includes the scalar column-page fetches the query
+            // phase never pays.
+            let fetched = fetch_phase.then(|| {
+                let mut cold_fetch = ColdSamples::with_capacity(iters);
+                for _ in 0..iters {
+                    let (guard, open_wall, open_cpu) = cpu::timed(&open_fresh);
+                    cold_fetch.push_open(open_wall, open_cpu);
+                    let io_before = io_counters::snapshot();
+                    let (rows, search_wall, search_cpu) =
+                        cpu::timed(|| guard.bm25_rows_fetched(column, &query, k, mode));
+                    let io = io_counters::snapshot().since(&io_before);
+                    cold_fetch.push_search(search_wall, search_cpu);
+                    cold_fetch.push_search_io(io.get_count, io.get_bytes);
+                    std::hint::black_box(rows);
+                    guard.settle_warm();
+                    drop(guard);
+                }
+                cold_fetch.finish()
+            });
+            out.insert(
+                q.name,
+                FtsColdStat {
+                    search: cold.finish(),
+                    fetched,
+                },
+            );
         }
         out
     }
 
-    fn warm_cells(stat: Option<&FtsQueryStat>) -> Vec<Cell> {
-        match stat {
-            Some(q) => {
-                let p50_ns = q.warm.p50.as_secs_f64() * NS_PER_SEC;
-                let p90_ns = q.warm.p90.as_secs_f64() * NS_PER_SEC;
-                let p99_ns = q.warm.p99.as_secs_f64() * NS_PER_SEC;
-                let fetched_ns = q.fetched_p50.as_secs_f64() * NS_PER_SEC;
-                let mut cells = vec![
-                    warm_time_cell(p50_ns),
-                    warm_time_cell(p90_ns),
-                    warm_time_cell(p99_ns),
-                    context(fetched_ns, fmt_time(fetched_ns), Better::Lower),
-                ];
-                cells.extend(rss_cells(&q.rss));
-                cells
-            }
-            None => vec![
-                text("—"),
-                text("—"),
-                text("—"),
-                text("—"),
-                text("—"),
-                text("—"),
-                text("—"),
-            ],
+    /// "N / bytes" cell for a cold search's object-store reads.
+    fn cold_io_cell(t: Option<&ColdTiming>) -> Cell {
+        match t {
+            Some(t) => text(format!(
+                "{} / {}",
+                t.search_get_count,
+                crate::rss::fmt_bytes(t.search_get_bytes)
+            )),
+            None => text("—"),
         }
     }
 
+    fn time_cell_opt(d: Option<Duration>) -> Cell {
+        match d {
+            Some(d) => {
+                let ns = d.as_secs_f64() * NS_PER_SEC;
+                metric(ns, fmt_time(ns), Better::Lower)
+            }
+            None => text("—"),
+        }
+    }
+
+    /// ONE row per shape. Both cost classes ride as columns — the query phase
+    /// (search: id + score) and the fetch phase (`+fetch`: same search plus
+    /// materializing the top-k text) — and warm and cold sit side by side, so
+    /// a shape's full economics read across a single line.
     fn search_row(
         name: &'static str,
         warm: Option<&HashMap<&'static str, FtsQueryStat>>,
-        cold: Option<&HashMap<&'static str, ColdTiming>>,
+        cold: Option<&HashMap<&'static str, FtsColdStat>>,
+        resident: u64,
     ) -> Vec<Cell> {
+        let w = warm.and_then(|m| m.get(&name));
+        let c = cold.and_then(|m| m.get(&name));
+        // Payload is only ever measured on the warm pass; a cold-only run
+        // (`w` is `None`) has genuinely never sized this shape's result, so
+        // its Payload/Egress cells render "—", never a fabricated "0 B"/"$0"
+        // that reads as "this query returns nothing and costs nothing".
+        let payloads = w.map(|q| (q.search_payload_bytes, q.fetched_payload_bytes));
+        let search_payload = payloads.map(|(s, _)| s).unwrap_or(0);
+        let fetch_payload = payloads.map(|(_, f)| f).unwrap_or(0);
         let mut cells = vec![text(name)];
-        if let Some(warm) = warm {
-            cells.extend(warm_cells(warm.get(&name)));
-        }
-        if let Some(cold) = cold {
-            match cold.get(&name) {
-                Some(t) => {
-                    let open_ns = t.open.as_secs_f64() * NS_PER_SEC;
-                    let search_ns = t.search.as_secs_f64() * NS_PER_SEC;
-                    cells.push(context(open_ns, fmt_time(open_ns), Better::Lower));
-                    cells.push(metric(search_ns, fmt_time(search_ns), Better::Lower));
-                }
-                None => {
-                    cells.push(text("—"));
-                    cells.push(text("—"));
-                }
+
+        // ---- search phase (id + score)
+        match payloads {
+            Some((search_payload, _)) => {
+                cells.push(text(crate::rss::fmt_bytes(search_payload)));
+                cells.push(text(crate::cost::egress_cell_per_million(search_payload)));
             }
+            None => cells.extend([text("—"), text("—")]),
         }
+        match w {
+            Some(q) => {
+                for d in [q.warm.p50, q.warm.p90, q.warm.p99] {
+                    cells.push(warm_time_cell(d.as_secs_f64() * NS_PER_SEC));
+                }
+                cells.push(text(crate::cost::warm_cell_per_million(
+                    q.cpu_s,
+                    q.warm.p50.as_secs_f64(),
+                    resident,
+                    search_payload,
+                )));
+            }
+            None => cells.extend([text("—"), text("—"), text("—"), text("—")]),
+        }
+
+        // ---- fetch phase (+ top-k text)
+        match payloads {
+            Some((_, fetch_payload)) => cells.push(text(crate::rss::fmt_bytes(fetch_payload))),
+            None => cells.push(text("—")),
+        }
+        match w {
+            Some(q) => {
+                cells.push(context(
+                    q.fetched.p50.as_secs_f64() * NS_PER_SEC,
+                    fmt_time(q.fetched.p50.as_secs_f64() * NS_PER_SEC),
+                    Better::Lower,
+                ));
+                cells.push(text(crate::cost::warm_cell_per_million(
+                    q.fetched_cpu_s,
+                    q.fetched.p50.as_secs_f64(),
+                    resident,
+                    fetch_payload,
+                )));
+            }
+            None => cells.extend([text("—"), text("—")]),
+        }
+
+        // ---- cold, both phases. RAM-hold window = the same-config warm p50.
+        let warm_window = w.map(|q| q.warm.p50.as_secs_f64()).unwrap_or(0.0);
+        let fetch_window = w.map(|q| q.fetched.p50.as_secs_f64()).unwrap_or(0.0);
+        cells.push(time_cell_opt(c.map(|s| s.search.open)));
+        cells.push(time_cell_opt(c.map(|s| s.search.search)));
+        cells.push(cold_io_cell(c.map(|s| &s.search)));
+        cells.push(match c {
+            Some(s) => text(crate::cost::cold_cell_per_million(
+                s.search.search_cpu_s,
+                if warm_window > 0.0 {
+                    warm_window
+                } else {
+                    s.search.search.as_secs_f64()
+                },
+                resident,
+                s.search.search_get_count,
+                search_payload,
+            )),
+            None => text("—"),
+        });
+        let cf = c.and_then(|s| s.fetched.as_ref());
+        cells.push(time_cell_opt(cf.map(|t| t.search)));
+        cells.push(cold_io_cell(cf));
+        cells.push(match cf {
+            Some(t) => text(crate::cost::cold_cell_per_million(
+                t.search_cpu_s,
+                if fetch_window > 0.0 {
+                    fetch_window
+                } else {
+                    t.search.as_secs_f64()
+                },
+                resident,
+                t.search_get_count,
+                fetch_payload,
+            )),
+            None => text("—"),
+        });
         cells
     }
 
-    /// Render the OR/AND search table for either tier. `warm`/`cold` are
-    /// each optional so a warm-only or cold-only run renders just its
-    /// columns; `probes` is the infino-only per-algorithm block (passed
-    /// only by the superfile runner).
+    /// Render the unified per-family queries + cost table for either tier:
+    /// one row per shape, with both cost classes as columns (search = id +
+    /// score, `+fetch` = same search plus top-k text) and warm and cold side
+    /// by side. Every row carries the payload it returns, its egress, and
+    /// full per-query dollars (compute + requests + egress). `warm`/`cold`
+    /// are each optional so a warm-only or cold-only run renders "—" in the
+    /// other side's columns; `probes` is the infino-only per-algorithm block.
     #[allow(clippy::too_many_arguments)]
     pub fn emit_search(
         report: &mut Report,
@@ -928,64 +1150,61 @@ pub mod fts {
         title: String,
         note: &str,
         warm: Option<&[FtsQueryStat]>,
-        cold: Option<&HashMap<&'static str, ColdTiming>>,
+        cold: Option<&HashMap<&'static str, FtsColdStat>>,
         probes: Option<&[(&'static str, Duration, Duration)]>,
     ) {
         let warm_map: Option<HashMap<&'static str, FtsQueryStat>> =
             warm.map(|w| w.iter().map(|q| (q.name, q.clone())).collect());
+        let resident = crate::rss::current_anon_rss_bytes().unwrap_or(0);
 
-        let mut header_cols = vec!["Query".to_string()];
-        if warm_map.is_some() {
-            header_cols.extend(
-                [
-                    "warm p50",
-                    "warm p90",
-                    "warm p99",
-                    "+fetch p50",
-                    "Peak RSS",
-                    "Median RSS",
-                    "P90 RSS",
-                ]
+        let header_cols: Vec<String> = [
+            "Query",
+            "Payload",
+            "Egress $/1M",
+            "warm p50",
+            "warm p90",
+            "warm p99",
+            "Warm $/1M",
+            "+fetch Payload",
+            "+fetch p50",
+            "+fetch $/1M",
+            "cold open",
+            "cold search",
+            "cold GET/bytes",
+            "Cold $/1M",
+            "+fetch cold",
+            "+fetch cold GET/bytes",
+            "+fetch cold $/1M",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let family_rows = |names: &[&'static str]| -> Vec<Vec<Cell>> {
+            names
                 .iter()
-                .map(|s| s.to_string()),
-            );
-        }
-        if cold.is_some() {
-            header_cols.push("cold open".to_string());
-            header_cols.push("cold search".to_string());
-        }
+                .map(|&n| search_row(n, warm_map.as_ref(), cold, resident))
+                .collect()
+        };
 
         let or_block = Block {
             subtitle: "OR queries".into(),
             headers: header_cols.clone(),
-            rows: OR_QUERIES
-                .iter()
-                .map(|&n| search_row(n, warm_map.as_ref(), cold))
-                .collect(),
+            rows: family_rows(OR_QUERIES),
         };
         let and_block = Block {
             subtitle: "AND queries".into(),
             headers: header_cols.clone(),
-            rows: AND_QUERIES
-                .iter()
-                .map(|&n| search_row(n, warm_map.as_ref(), cold))
-                .collect(),
+            rows: family_rows(AND_QUERIES),
         };
         let clause_block = Block {
             subtitle: "Must/should queries (+must, bare should)".into(),
             headers: header_cols.clone(),
-            rows: CLAUSE_QUERIES
-                .iter()
-                .map(|&n| search_row(n, warm_map.as_ref(), cold))
-                .collect(),
+            rows: family_rows(CLAUSE_QUERIES),
         };
         let phrase_block = Block {
             subtitle: "Phrase queries (exact adjacency)".into(),
             headers: header_cols,
-            rows: PHRASE_QUERIES
-                .iter()
-                .map(|&n| search_row(n, warm_map.as_ref(), cold))
-                .collect(),
+            rows: family_rows(PHRASE_QUERIES),
         };
         let mut blocks = vec![or_block, and_block, clause_block, phrase_block];
         if let Some(probes) = probes {
@@ -1194,11 +1413,36 @@ pub mod vector {
             rerank: usize,
         ) -> Vec<(u32, f32)>;
 
+        /// `(rows, payload_bytes)` of the returned id + score result — what a
+        /// vector search hands back. The default measures the raw-kernel
+        /// result (`(doc, score)` pairs); tiers returning Arrow override it.
+        fn topk_payload(
+            &self,
+            column: &str,
+            query: &[f32],
+            k: usize,
+            nprobe: usize,
+            rerank: usize,
+        ) -> (u64, u64) {
+            let hits = self.topk_global(column, query, k, nprobe, rerank);
+            // Measure the returned value itself, not a per-hit constant.
+            (
+                hits.len() as u64,
+                std::mem::size_of_val(hits.as_slice()) as u64,
+            )
+        }
+
         /// Parameters the reader actually applies. Supertables may translate
         /// the requested IVF probe count into table-level cell routing.
         fn search_params(&self, nprobe: usize, rerank: usize) -> String {
             format!("p={nprobe}, r={rerank}")
         }
+
+        /// Settle any background work the preceding query kicked off, so the
+        /// next cold iteration's fresh-cache open/search doesn't race an
+        /// in-flight background fill from this one. No-op for tiers with no
+        /// background machinery (e.g. the in-memory superfile reader).
+        fn settle_warm(&self) {}
 
         /// Time the PUBLIC `vector_search` path (routing + rerank + stable
         /// `_id` resolution + Arrow materialization) — the surface a real
@@ -1315,6 +1559,22 @@ pub mod vector {
                     (dense, score)
                 })
                 .collect()
+        }
+
+        fn topk_payload(
+            &self,
+            column: &str,
+            query: &[f32],
+            k: usize,
+            nprobe: usize,
+            rerank: usize,
+        ) -> (u64, u64) {
+            let batches = self
+                .table
+                .reader()
+                .vector_search(column, query, k, search_opts(nprobe, rerank), None, None)
+                .expect("supertable vector_search payload");
+            super::payload_bytes(&batches)
         }
 
         fn search_params(&self, nprobe: usize, rerank: usize) -> String {
@@ -1561,6 +1821,11 @@ pub mod vector {
     pub struct VecTiming {
         pub warm: Stats,
         pub cpu_s: Option<f64>,
+        /// Return-payload (id + score) of one query: rows and logical value
+        /// bytes — the egress quantity. `(0, 0)` at the superfile tier (raw
+        /// kernel, no Arrow result materialized).
+        pub payload_rows: u64,
+        pub payload_bytes: u64,
         pub rss: RssStats,
     }
 
@@ -1608,6 +1873,9 @@ pub mod vector {
             })
         };
         let rss = sampler.stop_stats();
+        // One untimed call; payload comes from the ENGINE's result ledger.
+        // Cache-independent, so this warm figure is the cold egress payload too.
+        let (payload_rows, payload_bytes) = reader.topk_payload(column, query, k, nprobe, rerank);
         if dump_phases && !phase_sums.is_empty() {
             let n = WARM_SAMPLE_ITERS as f64;
             let mut names: Vec<_> = phase_sums.keys().copied().collect();
@@ -1627,6 +1895,8 @@ pub mod vector {
         VecTiming {
             warm: summarize(&mut samples),
             cpu_s,
+            payload_rows,
+            payload_bytes,
             rss,
         }
     }
@@ -1646,10 +1916,19 @@ pub mod vector {
         for _ in 0..iters {
             let (guard, open_wall, open_cpu) = cpu::timed(open_fresh);
             cold.push_open(open_wall, open_cpu);
+            // Meter the search window's object-store GETs, as the FTS and SQL
+            // cold loops do — without this a cold vector query is priced with
+            // no request leg at all, which is the dominant cold cost.
+            let io_before = io_counters::snapshot();
             let (hits, search_wall, search_cpu) =
                 cpu::timed(|| guard.topk_global(column, query, k, nprobe, rerank));
+            let io = io_counters::snapshot().since(&io_before);
             cold.push_search(search_wall, search_cpu);
+            cold.push_search_io(io.get_count, io.get_bytes);
             black_box(hits);
+            // Outside the timed window: drain this iteration's background
+            // fills before the next iteration opens (see `FtsRead::settle_warm`).
+            guard.settle_warm();
             drop(guard);
         }
         cold.finish()
@@ -1693,10 +1972,16 @@ pub mod vector {
         include_warm: bool,
         include_cold: bool,
     ) {
+        // Same column contract as the FTS and SQL tables: what the query
+        // returns (payload), what that costs to ship (egress), and the full
+        // per-query dollars warm and cold — one row per measured config.
+        let resident = crate::rss::current_anon_rss_bytes().unwrap_or(0);
         let mut headers = vec![
             "Recall target".to_string(),
             "Search parameters".to_string(),
             "recall".to_string(),
+            "Payload".to_string(),
+            "Egress $/1M".to_string(),
         ];
         if include_warm {
             headers.extend(
@@ -1704,6 +1989,7 @@ pub mod vector {
                     "warm p50",
                     "warm p90",
                     "warm p99",
+                    "Warm $/1M",
                     "Peak RSS",
                     "Median RSS",
                     "P90 RSS",
@@ -1715,11 +2001,31 @@ pub mod vector {
         if include_cold {
             headers.push("cold open".to_string());
             headers.push("cold search".to_string());
+            headers.push("cold GET/bytes".to_string());
+            headers.push("Cold $/1M".to_string());
         }
         let body: Vec<Vec<Cell>> = rows
             .iter()
             .map(|r| {
+                // Payload is only ever measured on the warm pass; a
+                // cold-only run (`r.warm` is `None`) never sized this
+                // config's result, so Payload/Egress render "—", never a
+                // fabricated "0 B"/"$0".
+                let payload_measured = r.warm.as_ref().map(|w| w.payload_bytes);
+                let payload = payload_measured.unwrap_or(0);
+                let warm_window = r
+                    .warm
+                    .as_ref()
+                    .map(|w| w.warm.p50.as_secs_f64())
+                    .unwrap_or(0.0);
                 let mut cells = vec![text(&r.target), text(&r.params), text(&r.recall)];
+                match payload_measured {
+                    Some(p) => {
+                        cells.push(text(crate::rss::fmt_bytes(p)));
+                        cells.push(text(crate::cost::egress_cell_per_million(p)));
+                    }
+                    None => cells.extend([text("—"), text("—")]),
+                }
                 if include_warm {
                     match &r.warm {
                         Some(w) => {
@@ -1729,9 +2035,15 @@ pub mod vector {
                             cells.push(warm_time_cell(p50_ns));
                             cells.push(warm_time_cell(p90_ns));
                             cells.push(warm_time_cell(p99_ns));
+                            cells.push(text(crate::cost::warm_cell_per_million(
+                                w.cpu_s,
+                                w.warm.p50.as_secs_f64(),
+                                resident,
+                                payload,
+                            )));
                             cells.extend(rss_cells(&w.rss));
                         }
-                        None => cells.extend(std::iter::repeat_with(|| text("—")).take(6)),
+                        None => cells.extend(std::iter::repeat_with(|| text("—")).take(7)),
                     }
                 }
                 if include_cold {
@@ -1739,11 +2051,24 @@ pub mod vector {
                         Some(t) => {
                             cells.push(ctx_time_cell(t.open.as_secs_f64() * NS_PER_SEC));
                             cells.push(time_cell(t.search.as_secs_f64() * NS_PER_SEC));
+                            cells.push(text(format!(
+                                "{} / {}",
+                                t.search_get_count,
+                                crate::rss::fmt_bytes(t.search_get_bytes)
+                            )));
+                            cells.push(text(crate::cost::cold_cell_per_million(
+                                t.search_cpu_s,
+                                if warm_window > 0.0 {
+                                    warm_window
+                                } else {
+                                    t.search.as_secs_f64()
+                                },
+                                resident,
+                                t.search_get_count,
+                                payload,
+                            )));
                         }
-                        None => {
-                            cells.push(text("—"));
-                            cells.push(text("—"));
-                        }
+                        None => cells.extend(std::iter::repeat_with(|| text("—")).take(4)),
                     }
                 }
                 cells
@@ -2020,6 +2345,168 @@ pub mod sql {
     /// columns behind a predicate, so they scan and fetch the row data
     /// a real lookup/range pays for. Shared by the warm WHERE-scan block
     /// and the cold battery so warm and cold measure the same shapes.
+    /// Bulk row-set shape names — queries whose result scales with the match
+    /// set (O(selectivity × corpus)), so their cost is dominated by GB
+    /// returned. Named once here so the battery definitions and the serving
+    /// family split can never drift apart.
+    pub const BULK_RANGE_SCAN: &str = "WHERE rating < N (range scan, returns rows)";
+    pub const BULK_TOKEN_MATCH_ALL: &str = "token_match (all rows)";
+
+    /// The one classification of a bulk row-set shape by name. Both the
+    /// warm/cold query table (this module) and the serving-cost family
+    /// split (`supertable.rs`) call this rather than each re-deriving the
+    /// same `name == BULK_RANGE_SCAN || name == BULK_TOKEN_MATCH_ALL` check,
+    /// so the two tables can never classify the same shape differently.
+    pub fn is_bulk_shape(name: &str) -> bool {
+        name == BULK_RANGE_SCAN || name == BULK_TOKEN_MATCH_ALL
+    }
+
+    /// Scan-backed aggregates — realistic analytics shapes that provably
+    /// DEFEAT the manifest-statistics fold (`covered_agg`), so they price the
+    /// real cost of aggregation: column scans (warm CPU; cold data GETs).
+    /// The manifest-answered battery ([`SQL_BATTERY`]) is the fold's
+    /// best case — every shape there satisfies the fold's preconditions by
+    /// corpus construction and touches zero data — so without these the
+    /// reported "aggregation cost" is the fast-path floor, not the cost of
+    /// aggregation. Fold-defeat mechanisms, per shape:
+    ///   * rollup: the grouped fold accepts exactly `[COUNT(*)]` — AVG in the
+    ///     aggregate list disqualifies it (full 2-column scan + hash agg);
+    ///   * filtered metric: AVG is not the COUNT-only value-count shortcut,
+    ///     and every segment's category min/max straddles `'rust'`, so all
+    ///     segments classify boundary → the rewrite declines → full scan;
+    ///   * title window: COUNT+SUM over a corpus-order range whose edges land
+    ///     mid-segment — interior segments fold from stats, the two straddled
+    ///     segments scan (the designed O(boundary) regime, otherwise
+    ///     unmeasured);
+    ///   * crosstab: two group columns — the grouped fold accepts exactly one.
+    pub const SCAN_AGG_ROLLUP: &str = "AVG(rating) GROUP BY category (scan rollup)";
+    pub const SCAN_AGG_FILTERED_AVG: &str = "AVG(rating) WHERE category=? (scan agg)";
+    pub const SCAN_AGG_WINDOW: &str = "COUNT+SUM over title window (boundary scan)";
+    pub const SCAN_AGG_CROSSTAB: &str = "COUNT(*) GROUP BY bucket, category (crosstab)";
+
+    /// The boundary window spans the middle half of the corpus, with each
+    /// edge offset to an odd multiple of `n_docs / 32`: ingest commits in
+    /// `n_docs / 16` chunks, so odd multiples of `n_docs / 32` are chunk
+    /// midpoints — the edges provably land inside a segment (boundary scan),
+    /// never on a commit boundary (which would fold cleanly).
+    const WINDOW_EDGE_32NDS: (usize, usize) = (9, 25);
+
+    /// Search-TVF battery: top-k id + score through the SQL surface.
+    pub fn tvf_battery(inputs: &QueryInputs) -> Vec<(&'static str, String)> {
+        let qv = inputs.qv.as_str();
+        let sample_title = inputs.sample_title.as_str();
+        vec![
+            (
+                "bm25_search",
+                "SELECT _id FROM bm25_search('title', 'term00001', 10)".to_string(),
+            ),
+            (
+                "vector_search",
+                format!("SELECT _id FROM vector_search('emb', '{qv}', 10)"),
+            ),
+            (
+                "hybrid_search",
+                format!("SELECT _id FROM hybrid_search('title', 'term00001', 'emb', '{qv}', 10)"),
+            ),
+            (
+                BULK_TOKEN_MATCH_ALL,
+                "SELECT _id FROM token_match('title', 'term00001 term00002', 'and')".to_string(),
+            ),
+            (
+                // doc-unique token for doc 0 — df=1 at any scale (a higher
+                // fixed id would match zero rows below that many docs and
+                // measure an empty candidate set as a "selective" lookup).
+                "token_match (selective)",
+                "SELECT _id FROM token_match('title', 'doc0000000', 'and')".to_string(),
+            ),
+            (
+                "exact_match",
+                format!("SELECT _id FROM exact_match('title', '{sample_title}')"),
+            ),
+        ]
+    }
+
+    /// Aggregates over an FTS-pushdown candidate set (key=? one-row shapes
+    /// plus the all-matching bucket IN scan).
+    pub fn agg_candidates_battery(inputs: &QueryInputs) -> Vec<(&'static str, String)> {
+        let sample_key = inputs.sample_key.as_str();
+        vec![
+            (
+                "COUNT(*)            key=? (1 row)",
+                format!("SELECT COUNT(*) AS a FROM supertable WHERE key = '{sample_key}'"),
+            ),
+            (
+                "SUM(rating)         key=? (1 row)",
+                format!("SELECT SUM(rating) AS a FROM supertable WHERE key = '{sample_key}'"),
+            ),
+            (
+                "MAX(rating)         key=? (1 row)",
+                format!("SELECT MAX(rating) AS a FROM supertable WHERE key = '{sample_key}'"),
+            ),
+            (
+                "AVG(rating)         key=? (1 row)",
+                format!("SELECT AVG(rating) AS a FROM supertable WHERE key = '{sample_key}'"),
+            ),
+            (
+                // `bucket` is b{id % 10}, so `IN (b0..b9)` matches every row:
+                // this scans+aggregates the whole table (n_docs rows, not a
+                // fixed 1M) — the label states the shape, not a row count.
+                "SUM(rating) bucket IN all (whole-table scan)",
+                format!("SELECT SUM(rating) AS a FROM supertable WHERE bucket IN {BUCKET_IN_ALL}"),
+            ),
+        ]
+    }
+
+    /// The COMPLETE warm battery as (name, sql) — every shape the warm sets
+    /// measure, in QuerySets order. The cold battery runs this verbatim so
+    /// warm and cold cover identical shapes (one table, both sides).
+    pub fn full_battery(inputs: &QueryInputs) -> Vec<(&'static str, String)> {
+        SQL_BATTERY
+            .iter()
+            .map(|q| (q.name, q.sql.to_string()))
+            .chain(scan_agg_battery(inputs.n_docs))
+            .chain(scan_battery(&inputs.sample_key, &inputs.sample_title))
+            .chain(agg_candidates_battery(inputs))
+            .chain(tvf_battery(inputs))
+            .collect()
+    }
+
+    /// Realistic scan-backed aggregate battery (see the shape consts above).
+    /// Titles are `doc{doc_id:07}` in corpus order, so a title range is the
+    /// bench's time-window analog. (Zero-padding keeps lexicographic ==
+    /// numeric order up to 10M docs; past that the window degrades to an
+    /// approximate range but still exercises the boundary-scan regime.)
+    pub fn scan_agg_battery(n_docs: usize) -> Vec<(&'static str, String)> {
+        let lo = WINDOW_EDGE_32NDS.0 * n_docs / 32;
+        let hi = WINDOW_EDGE_32NDS.1 * n_docs / 32;
+        vec![
+            (
+                SCAN_AGG_ROLLUP,
+                "SELECT category, AVG(rating) AS avg_rating, COUNT(*) AS n FROM supertable \
+                 GROUP BY category"
+                    .to_string(),
+            ),
+            (
+                SCAN_AGG_FILTERED_AVG,
+                "SELECT AVG(rating) AS avg_rating FROM supertable WHERE category = 'rust'"
+                    .to_string(),
+            ),
+            (
+                SCAN_AGG_WINDOW,
+                format!(
+                    "SELECT COUNT(*) AS n, SUM(rating) AS s FROM supertable \
+                     WHERE title >= 'doc{lo:07}' AND title < 'doc{hi:07}'"
+                ),
+            ),
+            (
+                SCAN_AGG_CROSSTAB,
+                "SELECT bucket, category, COUNT(*) AS n FROM supertable \
+                 GROUP BY bucket, category"
+                    .to_string(),
+            ),
+        ]
+    }
+
     pub fn scan_battery(sample_key: &str, sample_title: &str) -> Vec<(&'static str, String)> {
         let k = sample_key.replace('\'', "''");
         let t = sample_title.replace('\'', "''");
@@ -2033,7 +2520,7 @@ pub mod sql {
                 format!("SELECT key, rating FROM supertable WHERE title = '{t}'"),
             ),
             (
-                "WHERE rating < N (range scan, returns rows)",
+                BULK_RANGE_SCAN,
                 "SELECT title, rating FROM supertable WHERE rating < 10".to_string(),
             ),
         ]
@@ -2057,6 +2544,9 @@ pub mod sql {
         pub qv: String,
         pub sample_title: String,
         pub sample_key: String,
+        /// Corpus row count — sizes the boundary-window aggregate's title
+        /// range so its edges land mid-segment at any scale.
+        pub n_docs: usize,
     }
 
     /// A reader the SQL executor runs `query_sql` against (returns the
@@ -2064,6 +2554,8 @@ pub mod sql {
     /// table or an object-store supertable consumer.
     pub trait SqlRead {
         fn query_rows(&self, sql: &str) -> usize;
+        /// `(rows, payload_bytes)` of the returned result set.
+        fn query_payload(&self, sql: &str) -> (u64, u64);
         /// Run a one-row `SELECT COUNT(*)`-shaped aggregate and return the
         /// scalar `Int64` value — used by the correctness gate.
         fn query_count(&self, sql: &str) -> i64;
@@ -2076,6 +2568,15 @@ pub mod sql {
     impl SqlRead for InfinoSqlIndex {
         fn query_rows(&self, sql: &str) -> usize {
             InfinoSqlEngine::read(self, sql).rows
+        }
+        fn query_payload(&self, sql: &str) -> (u64, u64) {
+            payload_bytes(
+                &self
+                    .table()
+                    .reader()
+                    .query_sql(sql)
+                    .expect("query_sql payload"),
+            )
         }
         fn query_count(&self, sql: &str) -> i64 {
             scalar_i64(
@@ -2097,6 +2598,9 @@ pub mod sql {
                 .map(|b| b.num_rows())
                 .sum()
         }
+        fn query_payload(&self, sql: &str) -> (u64, u64) {
+            payload_bytes(&self.reader().query_sql(sql).expect("query_sql payload"))
+        }
         fn query_count(&self, sql: &str) -> i64 {
             scalar_i64(&self.reader().query_sql(sql).expect("query_sql count"))
         }
@@ -2108,8 +2612,10 @@ pub mod sql {
 
     /// Generous ceiling for settling a single query's background fills;
     /// scoped to the query's own working set, so the typical wait is the
-    /// few files that query opened — not the table.
-    const WARM_SETTLE_TIMEOUT: Duration = Duration::from_secs(600);
+    /// few files that query opened — not the table. Also reused by the
+    /// FTS/vector/SQL cold-battery settle-between-iterations barrier in
+    /// `supertable.rs`.
+    pub(crate) const WARM_SETTLE_TIMEOUT: Duration = Duration::from_secs(600);
 
     /// Extract the single `Int64` aggregate value from a one-row result.
     fn scalar_i64(batches: &[arrow_array::RecordBatch]) -> i64 {
@@ -2149,6 +2655,10 @@ pub mod sql {
         /// Amortized on-CPU seconds of one warm query — the query's measured
         /// compute (cache hot), the basis for both warm and cold query CPU.
         pub cpu_s: Option<f64>,
+        /// Logical value bytes of the result set (the egress quantity; row
+        /// count is `rows`). Cache-independent, so it is the egress payload
+        /// for the cold path too.
+        pub payload_bytes: u64,
         pub rss: RssStats,
     }
 
@@ -2163,6 +2673,10 @@ pub mod sql {
         pub tvf: Vec<SqlQueryStat>,
         pub fts_pushdown: Vec<SqlQueryStat>,
         pub agg_idx: Vec<SqlQueryStat>,
+        /// Scan-backed aggregates ([`scan_agg_battery`]) — fold-ineligible
+        /// shapes pricing real aggregation, vs the manifest-answered `scalar`
+        /// battery which folds from statistics without touching data.
+        pub agg_scan: Vec<SqlQueryStat>,
     }
 
     fn timed<R: SqlRead>(reader: &R, name: &'static str, sql: &str, iters: usize) -> SqlQueryStat {
@@ -2176,11 +2690,14 @@ pub mod sql {
         let sampler = PeakSampler::start_default();
         let (mut samples, cpu_s) = sample_batched_cpu(iters, || reader.query_rows(sql));
         let rss = sampler.stop_stats();
+        // Result payload from the ENGINE's ledger (one extra untimed call).
+        let (_, payload_bytes) = reader.query_payload(sql);
         SqlQueryStat {
             name,
             warm: summarize(&mut samples),
             rows: warm_rows,
             cpu_s,
+            payload_bytes,
             rss,
         }
     }
@@ -2194,7 +2711,6 @@ pub mod sql {
         log_prefix: &str,
         extra_scalar: &[SqlQuery],
     ) -> QuerySets {
-        let qv = inputs.qv.as_str();
         let sample_title = inputs.sample_title.as_str();
         let sample_key = inputs.sample_key.as_str();
 
@@ -2211,47 +2727,10 @@ pub mod sql {
         eprintln!(
             "[{log_prefix}] search table functions (bm25 / vector / hybrid / token / exact)..."
         );
-        let tvf = vec![
-            timed(
-                reader,
-                "bm25_search",
-                "SELECT _id FROM bm25_search('title', 'term00001', 10)",
-                iters,
-            ),
-            timed(
-                reader,
-                "vector_search",
-                &format!("SELECT _id FROM vector_search('emb', '{qv}', 10)"),
-                iters,
-            ),
-            timed(
-                reader,
-                "hybrid_search",
-                &format!("SELECT _id FROM hybrid_search('title', 'term00001', 'emb', '{qv}', 10)"),
-                iters,
-            ),
-            timed(
-                reader,
-                "token_match (all rows)",
-                "SELECT _id FROM token_match('title', 'term00001 term00002', 'and')",
-                iters,
-            ),
-            timed(
-                reader,
-                // doc-unique token for doc 0 — df=1 at any scale (a higher
-                // fixed id would match zero rows below that many docs and
-                // measure an empty candidate set as a "selective" lookup).
-                "token_match (selective)",
-                "SELECT _id FROM token_match('title', 'doc0000000', 'and')",
-                iters,
-            ),
-            timed(
-                reader,
-                "exact_match",
-                &format!("SELECT _id FROM exact_match('title', '{sample_title}')"),
-                iters,
-            ),
-        ];
+        let tvf = tvf_battery(inputs)
+            .iter()
+            .map(|(name, sql)| timed(reader, name, sql, iters))
+            .collect::<Vec<_>>();
 
         eprintln!("[{log_prefix}] FTS-pushdown equality (sorted title vs unsorted key)...");
         // Realistic row-returning WHERE scans (point lookups + range),
@@ -2264,115 +2743,151 @@ pub mod sql {
             .collect::<Vec<_>>();
 
         eprintln!("[{log_prefix}] aggregate shapes over a token_match candidate set...");
-        let agg_idx = vec![
-            timed(
-                reader,
-                "COUNT(*)            key=? (1 row)",
-                &format!("SELECT COUNT(*) AS a FROM supertable WHERE key = '{sample_key}'"),
-                iters,
-            ),
-            timed(
-                reader,
-                "SUM(rating)         key=? (1 row)",
-                &format!("SELECT SUM(rating) AS a FROM supertable WHERE key = '{sample_key}'"),
-                iters,
-            ),
-            timed(
-                reader,
-                "MAX(rating)         key=? (1 row)",
-                &format!("SELECT MAX(rating) AS a FROM supertable WHERE key = '{sample_key}'"),
-                iters,
-            ),
-            timed(
-                reader,
-                "AVG(rating)         key=? (1 row)",
-                &format!("SELECT AVG(rating) AS a FROM supertable WHERE key = '{sample_key}'"),
-                iters,
-            ),
-            timed(
-                reader,
-                // `bucket` is b{id % 10}, so `IN (b0..b9)` matches every row:
-                // this scans+aggregates the whole table (n_docs rows, not a
-                // fixed 1M) — the label states the shape, not a row count.
-                "SUM(rating) bucket IN all (whole-table scan)",
-                &format!("SELECT SUM(rating) AS a FROM supertable WHERE bucket IN {BUCKET_IN_ALL}"),
-                iters,
-            ),
-        ];
+        let agg_idx = agg_candidates_battery(inputs)
+            .iter()
+            .map(|(name, sql)| timed(reader, name, sql, iters))
+            .collect::<Vec<_>>();
+
+        eprintln!("[{log_prefix}] scan-backed aggregates (fold-ineligible)...");
+        let agg_scan = scan_agg_battery(inputs.n_docs)
+            .iter()
+            .map(|(name, sql)| timed(reader, name, sql, iters))
+            .collect::<Vec<_>>();
 
         QuerySets {
             scalar,
             tvf,
             fts_pushdown,
             agg_idx,
+            agg_scan,
         }
     }
 
-    fn query_row(stat: &SqlQueryStat) -> Vec<Cell> {
+    /// One unified row: latency percentiles, rows, payload, egress, and full
+    /// per-query dollars, warm and cold.
+    fn query_row(
+        stat: &SqlQueryStat,
+        cold: Option<&HashMap<&'static str, ColdTiming>>,
+        resident: u64,
+    ) -> Vec<Cell> {
         let p50_ns = stat.warm.p50.as_secs_f64() * 1e9;
         let p90_ns = stat.warm.p90.as_secs_f64() * 1e9;
         let p99_ns = stat.warm.p99.as_secs_f64() * 1e9;
         let mut cells = vec![
             text(stat.name),
+            text(fmt_count(stat.rows)),
+            text(crate::rss::fmt_bytes(stat.payload_bytes)),
+            text(crate::cost::egress_cell_per_million(stat.payload_bytes)),
             warm_time_cell(p50_ns),
             warm_time_cell(p90_ns),
             warm_time_cell(p99_ns),
-            text(fmt_count(stat.rows)),
+            text(crate::cost::warm_cell_per_million(
+                stat.cpu_s,
+                stat.warm.p50.as_secs_f64(),
+                resident,
+                stat.payload_bytes,
+            )),
         ];
-        cells.extend(rss_cells(&stat.rss));
+        match cold.and_then(|m| m.get(stat.name)) {
+            Some(t) => {
+                let open_ns = t.open.as_secs_f64() * 1e9;
+                let search_ns = t.search.as_secs_f64() * 1e9;
+                cells.push(context(open_ns, fmt_time(open_ns), Better::Lower));
+                cells.push(metric(search_ns, fmt_time(search_ns), Better::Lower));
+                cells.push(text(format!(
+                    "{} / {}",
+                    t.search_get_count,
+                    crate::rss::fmt_bytes(t.search_get_bytes)
+                )));
+                cells.push(text(crate::cost::cold_cell_per_million(
+                    t.search_cpu_s,
+                    stat.warm.p50.as_secs_f64(),
+                    resident,
+                    t.search_get_count,
+                    stat.payload_bytes,
+                )));
+            }
+            None => cells.extend([text("—"), text("—"), text("—"), text("—")]),
+        }
         cells
     }
 
     fn query_headers() -> Vec<String> {
-        vec![
-            "Query".into(),
-            "warm p50".into(),
-            "warm p90".into(),
-            "warm p99".into(),
-            "Rows".into(),
-            "Peak RSS".into(),
-            "Median RSS".into(),
-            "P90 RSS".into(),
+        [
+            "Query",
+            "Rows",
+            "Payload",
+            "Egress $/1M",
+            "warm p50",
+            "warm p90",
+            "warm p99",
+            "Warm $/1M",
+            "cold open",
+            "cold search",
+            "cold GET/bytes",
+            "Cold $/1M",
         ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
     }
 
-    fn block(subtitle: &str, stats: &[SqlQueryStat]) -> Block {
-        Block {
-            subtitle: subtitle.into(),
-            headers: query_headers(),
-            rows: stats.iter().map(query_row).collect(),
-        }
-    }
-
-    /// Render the full warm SQL query table (same blocks for both tiers).
+    /// Render the full unified SQL queries + cost table (same class blocks
+    /// for both tiers, warm and cold sides of every shape in one table).
+    /// Bulk row-set shapes are split into their own block so no
+    /// bounded-result class's rows sit next to a 100+ MiB result.
     pub fn emit_query(
         report: &mut Report,
         anchor: &str,
         title: String,
         note: &str,
         sets: &QuerySets,
+        cold: Option<&HashMap<&'static str, ColdTiming>>,
     ) {
+        let resident = crate::rss::current_anon_rss_bytes().unwrap_or(0);
+        let block = |subtitle: &str, stats: &[&SqlQueryStat]| -> Block {
+            Block {
+                subtitle: subtitle.into(),
+                headers: query_headers(),
+                rows: stats.iter().map(|s| query_row(s, cold, resident)).collect(),
+            }
+        };
+        let (bulk_scans, lookups): (Vec<&SqlQueryStat>, Vec<&SqlQueryStat>) = sets
+            .fts_pushdown
+            .iter()
+            .partition(|s| is_bulk_shape(s.name));
+        let (bulk_tvfs, tvf_idscore): (Vec<&SqlQueryStat>, Vec<&SqlQueryStat>) =
+            sets.tvf.iter().partition(|s| is_bulk_shape(s.name));
+        let bulk: Vec<&SqlQueryStat> = bulk_scans.into_iter().chain(bulk_tvfs).collect();
+        let scalar: Vec<&SqlQueryStat> = sets.scalar.iter().collect();
+        let agg_scan: Vec<&SqlQueryStat> = sets.agg_scan.iter().collect();
+        let agg_idx: Vec<&SqlQueryStat> = sets.agg_idx.iter().collect();
         report.emit(&Section {
             anchor: anchor.into(),
             title,
             note: note.into(),
             blocks: vec![
                 block(
-                    "Aggregations & count-filters (read + compute, return few rows)",
-                    &sets.scalar,
+                    "Analytics — manifest-answered (statistics fold, no scan)",
+                    &scalar,
                 ),
                 block(
-                    "WHERE equality, FTS-pushdown — selective, 1 row (sorted vs unsorted col)",
-                    &sets.fts_pushdown,
+                    "Aggregates — scan-backed, fold-ineligible (rollup / filtered metric / window / crosstab)",
+                    &agg_scan,
+                ),
+                block(
+                    "Retrieval — point lookups (top-k rows; sorted vs unsorted col)",
+                    &lookups,
                 ),
                 block(
                     "Aggregate over FTS candidates — FTS-pushdown (token_match)",
-                    &sets.agg_idx,
+                    &agg_idx,
                 ),
                 block(
-                    "Search table functions (bm25 / vector / hybrid / token / exact)",
-                    &sets.tvf,
+                    "Search TVFs, id+score (bm25 / vector / hybrid / token / exact)",
+                    &tvf_idscore,
                 ),
+                block("Bulk row sets — GB-returned dominated", &bulk),
             ],
         });
     }
@@ -2402,50 +2917,12 @@ pub mod sql {
                 cold.push_search(search_wall, search_cpu);
                 cold.push_search_io(io.get_count, io.get_bytes);
                 black_box(rows);
+                guard.settle_warm();
                 drop(guard);
             }
             out.insert(*name, cold.finish());
         }
         out
-    }
-
-    /// Render the cold table in `battery` order (the same `(name, sql)`
-    /// battery that was measured), so the rows track whatever cold set the
-    /// caller ran rather than a fixed list.
-    pub fn emit_cold(
-        report: &mut Report,
-        anchor: &str,
-        title: String,
-        note: &str,
-        cold: &HashMap<&'static str, ColdTiming>,
-        battery: &[(&'static str, &str)],
-    ) {
-        let time_cell = |ns: f64| {
-            if ns.is_finite() {
-                metric(ns, fmt_time(ns), Better::Lower)
-            } else {
-                text("—")
-            }
-        };
-        report.emit(&Section {
-            anchor: anchor.into(),
-            title,
-            note: note.into(),
-            blocks: vec![Block {
-                subtitle: String::new(),
-                headers: vec!["Query".into(), "cold open".into(), "cold search".into()],
-                rows: battery
-                    .iter()
-                    .map(|(name, _sql)| {
-                        let (open_ns, search_ns) = cold
-                            .get(name)
-                            .map(|t| (t.open.as_secs_f64() * 1e9, t.search.as_secs_f64() * 1e9))
-                            .unwrap_or((f64::NAN, f64::NAN));
-                        vec![text(*name), time_cell(open_ns), time_cell(search_ns)]
-                    })
-                    .collect(),
-            }],
-        });
     }
 }
 

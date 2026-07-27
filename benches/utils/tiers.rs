@@ -747,7 +747,12 @@ fn fresh_disk_cache_with_mode(
         mmap_cold_threshold_secs: MMAP_TIMER_DISABLED_SECS,
         mmap_sweep_interval_secs: MMAP_TIMER_DISABLED_SECS,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: false,
+        // Matches the shipped default (`DiskCacheConfig::default()`,
+        // `config.yaml`): CRC verification runs on every open, exactly the
+        // cost a real deployment pays. A prior version disabled it, so
+        // every measured open/latency row silently priced a configuration
+        // the product does not ship.
+        verify_crc_on_open: true,
     };
     let cache = DiskCacheStore::new_unpinned(storage, cfg).expect("DiskCacheStore");
     (dir, cache)

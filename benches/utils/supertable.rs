@@ -50,7 +50,7 @@ use std::{
 };
 
 use infino::{
-    OptimizeOptions,
+    BoolMode, OptimizeOptions, VectorFilter,
     supertable::{
         Supertable,
         manifest::{ClusterCentroids, SuperfileEntry},
@@ -1299,6 +1299,9 @@ fn query_state_costs(states: &[RoutingStateStat]) -> [cost::QueryStateCost; 4] {
     for (slot, state) in out.iter_mut().zip(states) {
         let cold = state.cold;
         *slot = cost::QueryStateCost {
+            // Vector states carry a numeric recall; FTS/SQL states carry a
+            // tier-attribution string that intentionally parses to None.
+            recall: state.recall.as_deref().and_then(|s| s.parse::<f32>().ok()),
             io: cost::QueryStateIo {
                 label: Some(state.label),
                 cold_open: cold.map(|value| value.split.open),
@@ -1507,6 +1510,7 @@ pub mod fts {
         executors::{
             fts as exec_fts,
             fts::{FTS_BATTERY, FtsRead},
+            sql as exec_sql,
         },
         harness::driver::FtsQuery,
     };
@@ -1588,7 +1592,7 @@ pub mod fts {
                 (
                     "bench/fts/supertable/search/pre-compact",
                     format!(
-                        "Supertable FTS — search pre-compact, multi-superfile / object-store ({} docs)",
+                        "Supertable FTS — queries + cost, pre-compact / object-store ({} docs)",
                         fmt_count(n_docs)
                     ),
                     "Pre-compact (post-ingest fanout): warm = shared consumer + disk cache; \
@@ -1599,7 +1603,7 @@ pub mod fts {
                 (
                     "bench/fts/supertable/search",
                     format!(
-                        "Supertable FTS — search, multi-superfile / object-store ({} docs)",
+                        "Supertable FTS — queries + cost, multi-superfile / object-store ({} docs)",
                         fmt_count(n_docs)
                     ),
                     "Warm = shared consumer + disk cache; every battery shape is prewarmed then \
@@ -1702,7 +1706,7 @@ pub mod fts {
                             &mut report,
                             "bench/fts/supertable/search/post-compact",
                             format!(
-                                "Supertable FTS — search post-compact, multi-superfile / object-store ({} docs)",
+                                "Supertable FTS — queries + cost, post-compact / object-store ({} docs)",
                                 fmt_count(n_docs)
                             ),
                             "Post-compact (after optimize): fewer, larger user superfiles; same \
@@ -1754,7 +1758,7 @@ pub mod fts {
                             .unwrap_or_default(),
                         cold_pre
                             .as_ref()
-                            .map(cost::cold_from_timings)
+                            .map(cost::cold_from_fts_timings)
                             .unwrap_or_default(),
                     )),
                 )
@@ -1763,12 +1767,47 @@ pub mod fts {
             };
             let warm_vec = cost::warm_from_fts(warm_for_cost);
             let cold_vec = cold_for_cost
-                .map(cost::cold_from_timings)
+                .map(cost::cold_from_fts_timings)
                 .unwrap_or_default();
             let cold_measured = phases.cold.then(|| measure_cold_store(&built)).flatten();
             let pre_refs = pre_latencies
                 .as_ref()
                 .map(|(w, c)| (w.as_slice(), c.as_slice()));
+            // Retrieval-class name lists: each family's shapes with the fetch
+            // suffix, matching the second entry `warm_from_fts` emits per
+            // shape (fetched p50 / CPU / payload). The un-suffixed families
+            // are the search class (id + score); cold rows exist only for
+            // search (the cold battery runs the query phase).
+            let fetch_names = |names: &[&str]| -> Vec<String> {
+                names
+                    .iter()
+                    .map(|n| format!("{n}{}", cost::FTS_FETCH_SUFFIX))
+                    .collect()
+            };
+            let or_fetch = fetch_names(exec_fts::OR_QUERIES);
+            let and_fetch = fetch_names(exec_fts::AND_QUERIES);
+            let clause_fetch = fetch_names(exec_fts::CLAUSE_QUERIES);
+            let phrase_fetch = fetch_names(exec_fts::PHRASE_QUERIES);
+            let or_fetch_refs: Vec<&str> = or_fetch.iter().map(String::as_str).collect();
+            let and_fetch_refs: Vec<&str> = and_fetch.iter().map(String::as_str).collect();
+            let clause_fetch_refs: Vec<&str> = clause_fetch.iter().map(String::as_str).collect();
+            let phrase_fetch_refs: Vec<&str> = phrase_fetch.iter().map(String::as_str).collect();
+            // Shape-first: OR / AND / must-should / phrase are the primary
+            // families; the two cost classes (search = id+score, retrieval =
+            // +text fetch) are adjacent rows within each.
+            let fts_groups: [(&str, &[&str]); 8] = [
+                ("OR — search (id+score)", exec_fts::OR_QUERIES),
+                ("OR — retrieval (+text)", or_fetch_refs.as_slice()),
+                ("AND — search (id+score)", exec_fts::AND_QUERIES),
+                ("AND — retrieval (+text)", and_fetch_refs.as_slice()),
+                ("Must/should — search (id+score)", exec_fts::CLAUSE_QUERIES),
+                (
+                    "Must/should — retrieval (+text)",
+                    clause_fetch_refs.as_slice(),
+                ),
+                ("Phrase — search (id+score)", exec_fts::PHRASE_QUERIES),
+                ("Phrase — retrieval (+text)", phrase_fetch_refs.as_slice()),
+            ];
             if !warm_vec.is_empty() || !cold_vec.is_empty() {
                 emit_cost_warm(
                     &mut report,
@@ -1791,13 +1830,9 @@ pub mod fts {
                     None,
                     // Serving/monthly priced per query-family from the same
                     // battery the search table reports (reconciles by
-                    // construction); the drain/delta ledger rows never apply.
-                    Some(&[
-                        ("OR queries", exec_fts::OR_QUERIES),
-                        ("AND queries", exec_fts::AND_QUERIES),
-                        ("Must/should queries", exec_fts::CLAUSE_QUERIES),
-                        ("Phrase queries", exec_fts::PHRASE_QUERIES),
-                    ]),
+                    // construction), split into the two cost classes (search
+                    // vs retrieval); the drain/delta ledger rows never apply.
+                    Some(&fts_groups),
                 );
             }
         }
@@ -1994,13 +2029,14 @@ pub mod fts {
 
     fn measure_cold(
         built: &supertable::IngestResult,
-    ) -> std::collections::HashMap<&'static str, crate::executors::ColdTiming> {
+    ) -> std::collections::HashMap<&'static str, exec_fts::FtsColdStat> {
         exec_fts::measure_cold(
             || SupertableColdGuard::open(built),
             FTS_BATTERY,
             supertable::TEXT_COLUMN,
             TOP_K,
             COLD_ITERS,
+            true,
             "supertable_fts",
         )
     }
@@ -2119,6 +2155,16 @@ pub mod fts {
                 .sum()
         }
 
+        fn bm25_payloads(
+            &self,
+            column: &str,
+            query: &str,
+            k: usize,
+            mode: infino::superfile::fts::reader::BoolMode,
+        ) -> ((u64, u64), (u64, u64)) {
+            self.consumer.reader().bm25_payloads(column, query, k, mode)
+        }
+
         fn count_matching(
             &self,
             column: &str,
@@ -2126,6 +2172,12 @@ pub mod fts {
             mode: infino::superfile::fts::reader::BoolMode,
         ) -> u64 {
             self.consumer.reader().count_matching(column, query, mode)
+        }
+
+        fn settle_warm(&self) {
+            self.consumer
+                .wait_until_warm(exec_sql::WARM_SETTLE_TIMEOUT)
+                .expect("settle background fills");
         }
     }
 }
@@ -2144,7 +2196,7 @@ pub mod vector {
     use crate::{
         corpus,
         executors::{
-            vector as exec_vec,
+            sql as exec_sql, vector as exec_vec,
             vector::{SupertableVectorRead, VectorRead},
         },
     };
@@ -2346,48 +2398,12 @@ pub mod vector {
             }
             .topk_global(column, query, k, nprobe, rerank)
         }
-    }
 
-    fn hits_to_dense_u32(
-        st: &Supertable,
-        id_to_dense: &HashMap<i128, u32>,
-        hits: &[infino::supertable::query::SuperfileHit],
-    ) -> Vec<(u32, f32)> {
-        let reader = st.reader();
-        let manifest = reader.manifest();
-        let mut contiguous_min_by_uri: HashMap<_, i128> = HashMap::new();
-        for entry in manifest.get_all_superfiles() {
-            let span = entry.id_max.saturating_sub(entry.id_min).saturating_add(1);
-            if span == entry.n_docs as i128 {
-                contiguous_min_by_uri.insert(entry.uri, entry.id_min);
-            }
+        fn settle_warm(&self) {
+            self.consumer
+                .wait_until_warm(exec_sql::WARM_SETTLE_TIMEOUT)
+                .expect("settle background fills");
         }
-        if let Some(hidden) = st.vector_index_table() {
-            let hidden_reader = hidden.pinned_reader();
-            let hidden_manifest = hidden_reader.manifest();
-            for entry in hidden_manifest.get_all_superfiles() {
-                let span = entry.id_max.saturating_sub(entry.id_min).saturating_add(1);
-                if span == entry.n_docs as i128 {
-                    contiguous_min_by_uri.insert(entry.uri, entry.id_min);
-                }
-            }
-        }
-        hits.iter()
-            .filter_map(|h| {
-                let stable_id = h.stable_id.or_else(|| {
-                    contiguous_min_by_uri
-                        .get(&h.superfile)
-                        .copied()
-                        .map(|id_min| id_min + i128::from(h.local_doc_id))
-                })?;
-                let dense = id_to_dense.get(&stable_id).copied().or_else(|| {
-                    u32::try_from(stable_id)
-                        .ok()
-                        .filter(|id| *id < supertable::n_docs() as u32)
-                })?;
-                Some((dense, h.score))
-            })
-            .collect()
     }
 
     fn distribution(values: &mut [u64]) -> Option<(u64, u64, u64, u64)> {
@@ -3185,6 +3201,15 @@ pub mod vector {
         include_cold: bool,
     ) -> RoutingStateStat {
         let reader = consumer.reader();
+        // The warm window rotates through the FULL correctness battery
+        // (`query` plus every `steady_queries` entry) rather than repeating
+        // `query` alone — a single vector called `ROUTING_STATE_WARM_ITERS`
+        // times has zero query-to-query variance, so its "p50" is really
+        // just that one shape's latency, not a genuine warm percentile.
+        let warm_battery: Vec<&[f32]> = std::iter::once(query)
+            .chain(steady_queries.iter().map(Vec::as_slice))
+            .collect();
+        let warm_cursor = std::cell::Cell::new(0usize);
         super::measure_routing_state_with(
             "supertable_vector",
             label,
@@ -3193,11 +3218,13 @@ pub mod vector {
             consumer_meter,
             &|| hit_tier_counts(consumer, query, nprobe, rerank),
             &|| {
+                let i = warm_cursor.get();
+                warm_cursor.set((i + 1) % warm_battery.len());
                 black_box(
                     reader
                         .vector_search(
                             supertable::VEC_COLUMN,
-                            query,
+                            warm_battery[i],
                             TOP_K,
                             exec_vec::search_opts(nprobe, rerank),
                             None,
@@ -3240,7 +3267,7 @@ pub mod vector {
                 DIM
             ),
             format!(
-                "One search configuration across the full lifecycle. Data-path assertions use cold GET classes. Recall is the same 20-query brute-force metric in every state; the follow-up commit adds {} normal rows from the corpus distribution.",
+                "One search configuration across the full lifecycle. Data-path assertions use cold GET classes. Recall is the same {N_CORRECTNESS_QUERIES}-query brute-force metric in every state; the follow-up commit adds {} normal rows from the corpus distribution.",
                 supertable::docs_per_commit(),
             ),
             "Recall@10",
@@ -3701,60 +3728,93 @@ pub mod vector {
                     note,
                 )
             };
-            // Filtered vector recall + latency mirrors the superfile tier:
-            // same every-Nth-row allow-set, same brute-force filtered ground
-            // truth, same default config.
+            // Filtered vector recall + latency measures the PUBLIC
+            // predicate-based path: a real `VectorFilter{column,query,mode}`
+            // resolved fresh on every call, exactly what a caller gets. Built
+            // on its own dedicated `Modality::VectorFiltered` table (vector
+            // index + one small FTS-indexed bucket column) rather than the
+            // shared consumer above — `Modality::Vector` stays vector-only
+            // for the Vector-vs-Lance ingest comparison.
             if phases.warm
                 && let Some(filtered_gt) = filtered_gt.as_ref()
             {
-                let consumer_reader = consumer.reader();
-                let mut allow_stable_ids: Vec<i128> = id_to_dense
-                    .iter()
-                    .filter_map(|(stable_id, dense_id)| {
-                        ((*dense_id as usize).is_multiple_of(FILTER_KEEP_EVERY))
-                            .then_some(*stable_id)
-                    })
-                    .collect();
-                allow_stable_ids.sort_unstable();
-                allow_stable_ids.dedup();
-                let prepared_allow = tiers::block_on(
-                    consumer_reader.prepare_vector_stable_allow_async(Arc::new(allow_stable_ids)),
-                )
-                .expect("prepare stable-id allow bitmaps");
+                let filtered_corpus = supertable::prepare_corpus(Modality::VectorFiltered);
+                let filtered_built =
+                    supertable::build_on_storage(Modality::VectorFiltered, &filtered_corpus);
+                let filtered_meter = storage_meter::wrap(Arc::clone(&filtered_built.storage));
+                let (_filtered_cache_dir, filtered_cache) = tiers::fresh_supertable_search_cache(
+                    filtered_meter.provider(),
+                    Some(filtered_built.total_index_bytes),
+                );
+                let filtered_consumer = tiers::open_consumer(tiers::consumer_options(
+                    supertable::options_for(Modality::VectorFiltered, None),
+                    filtered_meter.provider(),
+                    filtered_cache,
+                ));
+                let filtered_id_to_dense = corpus::engine_id_to_dense(&filtered_consumer, n_docs);
+                let filtered_reader = filtered_consumer.reader();
+                // Bucket 0 is exactly the every-`FILTER_KEEP_EVERY`th-row
+                // selection the ground truth (`filtered_gt`) was computed
+                // over — the SAME vector corpus seed/params as the shared
+                // `Modality::Vector` build above, so this table's rows carry
+                // identical vectors at identical doc-id-ordered positions.
+                let filter_term = supertable::filter_bucket_term(0);
+                let filter = || VectorFilter {
+                    column: supertable::FILTER_COLUMN,
+                    query: filter_term.as_str(),
+                    mode: BoolMode::And,
+                };
+                // Resolves the public path's stable `_id` + score result via
+                // the engine's own `ORDER BY _id` resolution
+                // (`engine_id_to_dense`) — an id with no dense mapping is a
+                // hard error (a real correctness bug), never silently
+                // dropped.
+                let resolve = |batches: &[arrow_array::RecordBatch]| -> Vec<(u32, f32)> {
+                    corpus::id_scores_from_vector_search(batches)
+                        .into_iter()
+                        .map(|(id, score)| {
+                            let dense = *filtered_id_to_dense.get(&id).unwrap_or_else(|| {
+                                panic!("filtered vector_search returned unresolvable _id {id}")
+                            });
+                            (dense, score)
+                        })
+                        .collect()
+                };
                 let mut recalls = Vec::new();
                 let mut latencies = Vec::new();
                 // Untimed prewarm: fault the filtered path's routed cells into
                 // the resident cache first, so the metered window below reflects
                 // steady-state warm I/O (not the one-time cache fill).
                 for q in q_correct.iter() {
-                    let _ =
-                        tiers::block_on(consumer_reader.vector_hits_prepared_global_allow_async(
+                    let _ = filtered_reader
+                        .vector_search(
                             supertable::VEC_COLUMN,
                             q,
                             TOP_K,
                             exec_vec::default_search_opts(),
-                            &prepared_allow,
-                        ))
+                            Some(filter()),
+                            None,
+                        )
                         .expect("filtered prewarm query");
                 }
-                let filtered_before = consumer_meter.snapshot();
+                let filtered_before = filtered_meter.snapshot();
                 // Drop phases accumulated by the prewarm loop so the dump
                 // below covers exactly the measured window.
                 let _ = io_counters::phase_take_summed();
                 for (q, gt) in q_correct.iter().zip(filtered_gt) {
                     let t0 = Instant::now();
-                    let hits =
-                        tiers::block_on(consumer_reader.vector_hits_prepared_global_allow_async(
+                    let batches = filtered_reader
+                        .vector_search(
                             supertable::VEC_COLUMN,
                             q,
                             TOP_K,
                             exec_vec::default_search_opts(),
-                            &prepared_allow,
-                        ))
+                            Some(filter()),
+                            None,
+                        )
                         .expect("filtered recall query");
                     latencies.push(t0.elapsed());
-                    let dense_hits = hits_to_dense_u32(&consumer, &id_to_dense, &hits);
-                    recalls.push(corpus::recall_at_k(&dense_hits, gt));
+                    recalls.push(corpus::recall_at_k(&resolve(&batches), gt));
                 }
                 let filtered_phases = io_counters::phase_take_summed();
                 if !filtered_phases.is_empty() && !q_correct.is_empty() {
@@ -3770,7 +3830,7 @@ pub mod vector {
                         parts.join("  ")
                     );
                 }
-                let filtered_io = consumer_meter.snapshot().since(&filtered_before);
+                let filtered_io = filtered_meter.snapshot().since(&filtered_before);
                 if !q_correct.is_empty() {
                     filtered_stats = Some((filtered_io, q_correct.len() as u64));
                     eprintln!(
@@ -3785,26 +3845,25 @@ pub mod vector {
                 // is cell coverage (selection misses the matching
                 // neighbors' cells); if it stays flat, the loss sits
                 // inside the probed cells (kernel shortlist/rerank under
-                // the allow-set). Diagnostic print only — the gate above
+                // the predicate). Diagnostic print only — the gate above
                 // stays on the engine default.
                 for width in FILTERED_DIAG_PROBE_WIDTHS {
                     let mut wide_recalls = Vec::with_capacity(q_correct.len());
                     let mut wide_lat = Vec::with_capacity(q_correct.len());
                     for (q, gt) in q_correct.iter().zip(filtered_gt) {
                         let t0 = Instant::now();
-                        let hits = tiers::block_on(
-                            consumer_reader.vector_hits_prepared_global_allow_async(
+                        let batches = filtered_reader
+                            .vector_search(
                                 supertable::VEC_COLUMN,
                                 q,
                                 TOP_K,
                                 exec_vec::search_opts(*width, exec_vec::ENGINE_DEFAULT),
-                                &prepared_allow,
-                            ),
-                        )
-                        .expect("filtered width-sweep query");
+                                Some(filter()),
+                                None,
+                            )
+                            .expect("filtered width-sweep query");
                         wide_lat.push(t0.elapsed());
-                        let dense_hits = hits_to_dense_u32(&consumer, &id_to_dense, &hits);
-                        wide_recalls.push(corpus::recall_at_k(&dense_hits, gt));
+                        wide_recalls.push(corpus::recall_at_k(&resolve(&batches), gt));
                     }
                     if !wide_recalls.is_empty() {
                         let mean: f32 =
@@ -3835,9 +3894,9 @@ pub mod vector {
                     assert!(
                         mean_recall >= FILTERED_RECALL_FLOOR,
                         "filtered vector recall@{TOP_K} {mean_recall:.3} < floor \
-                         {FILTERED_RECALL_FLOOR:.2} — the allow-set fan regressed (this class \
-                         previously shipped unasserted: the selectivity-blind postings target \
-                         measured 0.722 for weeks as a print-only line)"
+                         {FILTERED_RECALL_FLOOR:.2} — the predicate-filtered fan regressed (this \
+                         class previously shipped unasserted: the selectivity-blind postings \
+                         target measured 0.722 for weeks as a print-only line)"
                     );
 
                     report.emit(&Section {
@@ -3848,7 +3907,13 @@ pub mod vector {
                             DIM
                         ),
                         note: format!(
-                            "Filtered kNN (~10% selectivity, every {}th row). recall@{TOP_K} = {mean_recall:.3}. Δ is vs the previous run.",
+                            "Filtered kNN over the PUBLIC predicate-based filter — \
+                             `vector_search` with a real `VectorFilter{{column,query,mode}}`, \
+                             resolved fresh on every call (a dedicated `Modality::VectorFiltered` \
+                             table: vector index + one small FTS-indexed bucket column, ~1/{} \
+                             selectivity). The timed window includes predicate resolution — this \
+                             is the full end-to-end cost a caller pays. recall@{TOP_K} = \
+                             {mean_recall:.3}. Δ is vs the previous run.",
                             FILTER_KEEP_EVERY
                         ),
                         blocks: vec![Block {
@@ -3862,7 +3927,7 @@ pub mod vector {
                                 "p50".into(),
                             ],
                             rows: vec![vec![
-                                text("filtered (~10%)"),
+                                text("VectorFilter predicate (public path, resolved per call)"),
                                 text("engine default"),
                                 text(warm_reader.routing_label(
                                     exec_vec::ENGINE_DEFAULT,
@@ -3874,6 +3939,10 @@ pub mod vector {
                             ]],
                         }],
                     });
+                }
+                drop(filtered_consumer);
+                if let Some(cleanup) = &filtered_built.cleanup {
+                    tiers::cleanup_prefix(cleanup);
                 }
             }
 
@@ -4309,16 +4378,21 @@ pub mod sql {
                 .sql_sample_key
                 .clone()
                 .expect("sql ingest sets sample_key"),
+            n_docs,
         };
 
         // Cold battery: realistic row-returning WHERE scans (shared with the
-        // warm scan block so warm/cold reconcile) plus COUNT(*) as the one
-        // manifest-answered aggregate, so the cold cost reflects real scans
-        // rather than the metadata-answered aggregate battery.
-        let scan_qs = exec_sql::scan_battery(&inputs.sample_key, &inputs.sample_title);
-        let mut cold_battery: Vec<(&'static str, &str)> =
-            scan_qs.iter().map(|(n, s)| (*n, s.as_str())).collect();
-        cold_battery.push(("count_star", "SELECT COUNT(*) AS n FROM supertable"));
+        // warm scan block so warm/cold reconcile), two scan-backed aggregates
+        // (a full-scan metric and the boundary window — the real cold
+        // aggregation cost: column-chunk GETs), plus COUNT(*) kept as the
+        // explicit manifest-answered contrast (a fold, ~zero data GETs).
+        // Cold battery = the COMPLETE warm battery, so warm and cold sides of
+        // every shape land in one table. The manifest-answered aggregates are
+        // the labelled ~0-GET contrast rows; the scan-backed shapes pay real
+        // cold column-chunk fetches.
+        let full_qs = exec_sql::full_battery(&inputs);
+        let cold_battery: Vec<(&'static str, &str)> =
+            full_qs.iter().map(|(n, s)| (*n, s.as_str())).collect();
 
         // Full lifecycle (pre-drain → drain → post-drain → delta → post-delta
         // → compact → post-compact) on a fresh ingest in this process —
@@ -4348,62 +4422,41 @@ pub mod sql {
             );
             drop(consumer);
             drop(cache_dir);
-            let (anchor, title, note) = if run_lifecycle {
-                (
-                    "bench/sql/supertable/warm/pre-compact",
-                    format!(
-                        "Supertable SQL — warm queries pre-compact, warm cache / object-store ({} rows)",
-                        fmt_count(n_docs)
-                    ),
-                    "Pre-compact (post-ingest fanout): each query once untimed (cache fill), then p50 / p90 / p99. Δ vs previous run.",
-                )
-            } else {
-                (
-                    "bench/sql/supertable/warm",
-                    format!(
-                        "Supertable SQL — warm queries, warm cache / object-store ({} rows)",
-                        fmt_count(n_docs)
-                    ),
-                    "Warm = committed table reopened with a disk cache sized to the index; each query runs once untimed (cache fill), then p50 / p90 / p99 over repeated `query_sql` calls (Δ gates on `p50`), all through infino's own path (the DataFusion-only control arms are not run here). Δ is vs the previous run.",
-                )
-            };
-            exec_sql::emit_query(&mut report, anchor, title, note, &sets);
             Some(sets)
         } else {
             None
         };
 
-        let cold_pre = if phases.cold {
-            let cold = exec_sql::measure_cold(
+        let cold_pre = phases.cold.then(|| {
+            exec_sql::measure_cold(
                 || SupertableSqlColdGuard::open(&built),
                 &cold_battery,
                 COLD_ITERS,
                 "supertable_sql",
-            );
+            )
+        });
+        if let Some(sets) = &warm_sets_pre {
             let (anchor, title, note) = if run_lifecycle {
                 (
-                    "bench/sql/supertable/cold/pre-compact",
+                    "bench/sql/supertable/queries/pre-compact",
                     format!(
-                        "Supertable SQL — cold queries pre-compact, fresh cache / object-store ({} rows)",
+                        "Supertable SQL — queries + cost, pre-compact / object-store ({} rows)",
                         fmt_count(n_docs)
                     ),
-                    "Pre-compact cold: open = construct only; search is the first query on that cold consumer. The WHERE rows scan and fetch row data; `count_star` answers from manifest statistics (~0 row fetch) — it is the labelled special case, not a scan. Δ vs previous run.",
+                    "Pre-compact (post-ingest fanout), warm + cold per shape in one table. Warm = warm cache, p50/p90/p99 over repeated `query_sql`; cold = fresh cache + consumer per iteration (open = construct only, search = first query). $/1M = compute + object-store requests + egress on the returned payload. Manifest-answered aggregates fold from statistics (~0 cold GETs) — the labelled fast-path contrast to the scan-backed shapes. Δ gates on warm/cold p50.",
                 )
             } else {
                 (
-                    "bench/sql/supertable/cold",
+                    "bench/sql/supertable/queries",
                     format!(
-                        "Supertable SQL — cold queries, fresh cache / object-store ({} rows)",
+                        "Supertable SQL — queries + cost / object-store ({} rows)",
                         fmt_count(n_docs)
                     ),
-                    "Cold = fresh disk cache + consumer per iteration (open = construct only; search is the first query on that cold consumer — no pre-open of all superfiles). Δ is vs the previous run.",
+                    "Warm + cold per shape in one table (warm cache p50/p90/p99; cold = fresh cache per iteration). $/1M = compute + requests + egress on the returned payload. Δ gates on warm/cold p50.",
                 )
             };
-            exec_sql::emit_cold(&mut report, anchor, title, note, &cold, &cold_battery);
-            Some(cold)
-        } else {
-            None
-        };
+            exec_sql::emit_query(&mut report, anchor, title, note, sets, cold_pre.as_ref());
+        }
 
         let mut compaction_stats = None;
         let mut routing_states: Vec<RoutingStateStat> = Vec::new();
@@ -4444,42 +4497,31 @@ pub mod sql {
                         );
                         drop(c);
                         drop(cache_dir);
-                        exec_sql::emit_query(
-                            &mut report,
-                            "bench/sql/supertable/warm/post-compact",
-                            format!(
-                                "Supertable SQL — warm queries post-compact, warm cache / object-store ({} rows)",
-                                fmt_count(n_docs)
-                            ),
-                            "Post-compact (after optimize): fewer, larger user superfiles; same warm recipe as pre-compact. Steady-state layout the cost model prices. Δ vs previous run.",
-                            &sets,
-                        );
                         Some(sets)
                     } else {
                         None
                     };
-                    let cold = if phases.cold {
-                        let cold = exec_sql::measure_cold(
+                    let cold = phases.cold.then(|| {
+                        exec_sql::measure_cold(
                             || SupertableSqlColdGuard::open(&built),
                             &cold_battery,
                             COLD_ITERS,
                             "supertable_sql",
-                        );
-                        exec_sql::emit_cold(
+                        )
+                    });
+                    if let Some(sets) = &warm {
+                        exec_sql::emit_query(
                             &mut report,
-                            "bench/sql/supertable/cold/post-compact",
+                            "bench/sql/supertable/queries/post-compact",
                             format!(
-                                "Supertable SQL — cold queries post-compact, fresh cache / object-store ({} rows)",
+                                "Supertable SQL — queries + cost, post-compact / object-store ({} rows)",
                                 fmt_count(n_docs)
                             ),
-                            "Post-compact cold: open = construct only; search is the first query on the merged layout. The WHERE rows scan and fetch row data; `count_star` answers from manifest statistics (~0 row fetch) — the labelled special case, not a scan. Δ vs previous run.",
-                            &cold,
-                            &cold_battery,
+                            "Post-compact (after optimize): fewer, larger user superfiles — the steady-state layout the cost model prices. Warm + cold per shape in one table; $/1M = compute + requests + egress on the returned payload. Δ vs previous run.",
+                            sets,
+                            cold.as_ref(),
                         );
-                        Some(cold)
-                    } else {
-                        None
-                    };
+                    }
                     warm_sets_post = warm;
                     cold_post = cold;
                 },
@@ -4556,15 +4598,35 @@ pub mod sql {
         let tvf_names = names_of(|s| &s.tvf);
         let pushdown_names = names_of(|s| &s.fts_pushdown);
         let agg_names = names_of(|s| &s.agg_idx);
-        // Lead with the realistic row-returning WHERE scans (the family the
-        // cold battery shares), then the aggregate-over-candidate scans and
-        // search TVFs; the pure aggregates are labelled as manifest-answered
-        // so their near-free cost isn't mistaken for a scan.
-        let sql_groups: [(&str, &[&str]); 4] = [
-            ("Row-returning WHERE scans", pushdown_names.as_slice()),
+        let agg_scan_names = names_of(|s| &s.agg_scan);
+        // Families are cost-homogeneous classes: bulk row-set shapes (results
+        // scale with the match set, so GB-returned dominates their cost) are
+        // split from the bounded-result families — otherwise one 100+ MiB
+        // result drags a family's mean payload/egress into meaninglessness.
+        // The pure aggregates are labelled as manifest-answered so their
+        // near-free cost isn't mistaken for a scan.
+        let (bulk_scans, lookup_names): (Vec<&str>, Vec<&str>) = pushdown_names
+            .iter()
+            .copied()
+            .partition(|n| exec_sql::is_bulk_shape(n));
+        let (bulk_tvfs, tvf_idscore_names): (Vec<&str>, Vec<&str>) = tvf_names
+            .iter()
+            .copied()
+            .partition(|n| exec_sql::is_bulk_shape(n));
+        let bulk_names: Vec<&str> = bulk_scans.into_iter().chain(bulk_tvfs).collect();
+        let sql_groups: [(&str, &[&str]); 6] = [
+            (
+                "Retrieval — point lookups (top-k rows)",
+                lookup_names.as_slice(),
+            ),
             ("Aggregate over candidates", agg_names.as_slice()),
-            ("Search TVFs", tvf_names.as_slice()),
-            ("Analytics (manifest-answered)", scalar_names.as_slice()),
+            ("Aggregates — scan-backed", agg_scan_names.as_slice()),
+            ("Search TVFs (id+score)", tvf_idscore_names.as_slice()),
+            (
+                "Analytics — manifest-answered (no scan)",
+                scalar_names.as_slice(),
+            ),
+            ("Bulk row sets (GB-returned)", bulk_names.as_slice()),
         ];
         if !warm_vec.is_empty() || !cold_vec.is_empty() {
             emit_cost_warm(
@@ -4736,8 +4798,14 @@ pub mod sql {
         fn query_rows(&self, sql: &str) -> usize {
             self.consumer.query_rows(sql)
         }
+        fn query_payload(&self, sql: &str) -> (u64, u64) {
+            self.consumer.query_payload(sql)
+        }
         fn query_count(&self, sql: &str) -> i64 {
             self.consumer.query_count(sql)
+        }
+        fn settle_warm(&self) {
+            self.consumer.settle_warm()
         }
     }
 }

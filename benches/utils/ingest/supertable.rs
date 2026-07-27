@@ -71,6 +71,22 @@ pub const TEXT_COLUMN: &str = "title";
 pub const VEC_COLUMN: &str = "emb";
 pub const SQL_CATEGORY_COLUMN: &str = "category";
 pub const SQL_RATING_COLUMN: &str = "rating";
+/// FTS-indexed low-cardinality bucket column for [`Modality::VectorFiltered`]
+/// — the column the filtered-vector bench resolves a real `VectorFilter`
+/// predicate against, mirroring `infino_sql_engine`'s `bucket` column.
+pub const FILTER_COLUMN: &str = "filter_bucket";
+/// [`FILTER_COLUMN`] bucket count: `doc_id % FILTER_KEEP_EVERY` names the
+/// bucket, so the term naming bucket 0 (see [`filter_bucket_term`]) selects
+/// exactly this fraction of rows. Also the filtered-recall ground truth's
+/// selectivity.
+pub const FILTER_KEEP_EVERY: usize = 10;
+
+/// The FTS query term selecting [`FILTER_COLUMN`] bucket 0 — a real
+/// `VectorFilter{column: FILTER_COLUMN, query: ..., mode}` predicate resolves
+/// to exactly this ~`1/FILTER_KEEP_EVERY` selectivity.
+pub fn filter_bucket_term(bucket: u64) -> String {
+    format!("bucket{bucket}")
+}
 
 pub(crate) const CORPUS_VEC_SEED: u64 = 1;
 const CORPUS_TEXT_SEED: u64 = 1;
@@ -166,6 +182,13 @@ pub enum Modality {
     Vector,
     Sql,
     Combined,
+    /// Vector index plus one small FTS-indexed bucket column
+    /// ([`FILTER_COLUMN`]), for measuring the PUBLIC predicate-based
+    /// `VectorFilter` search path. Deliberately separate from `Vector`
+    /// (which stays vector-only for a fair apples-to-apples comparison
+    /// against Lance) — this shape is Infino-only diagnostic, never part
+    /// of a cross-engine comparison.
+    VectorFiltered,
 }
 
 pub fn modality_label(modality: Modality) -> &'static str {
@@ -174,6 +197,7 @@ pub fn modality_label(modality: Modality) -> &'static str {
         Modality::Vector => "vector-only",
         Modality::Sql => "SQL",
         Modality::Combined => "combined FTS + vector",
+        Modality::VectorFiltered => "vector + filter predicate",
     }
 }
 
@@ -185,7 +209,10 @@ impl Modality {
         matches!(self, Modality::Fts | Modality::Combined)
     }
     pub fn has_vector(self) -> bool {
-        matches!(self, Modality::Vector | Modality::Combined)
+        matches!(
+            self,
+            Modality::Vector | Modality::Combined | Modality::VectorFiltered
+        )
     }
     pub fn has_sql(self) -> bool {
         matches!(self, Modality::Sql)
@@ -197,6 +224,7 @@ impl Modality {
             Modality::Vector => "vector",
             Modality::Sql => "sql",
             Modality::Combined => "combined",
+            Modality::VectorFiltered => "vector_filtered",
         }
     }
 }
@@ -209,6 +237,9 @@ fn schema_for(modality: Modality) -> Arc<Schema> {
     if modality.has_sql() {
         fields.push(Field::new(SQL_CATEGORY_COLUMN, DataType::LargeUtf8, false));
         fields.push(Field::new(SQL_RATING_COLUMN, DataType::Int64, false));
+    }
+    if modality == Modality::VectorFiltered {
+        fields.push(Field::new(FILTER_COLUMN, DataType::LargeUtf8, false));
     }
     if modality.has_vector() {
         fields.push(Field::new(
@@ -269,6 +300,13 @@ pub fn options_for(
             column: TEXT_COLUMN.into(),
             positions: true,
         }]
+    } else if modality == Modality::VectorFiltered {
+        // No positions needed: the filter predicate is a plain term-equality
+        // lookup, never a phrase.
+        vec![FtsConfig {
+            column: FILTER_COLUMN.into(),
+            positions: false,
+        }]
     } else {
         vec![]
     };
@@ -328,6 +366,12 @@ pub fn current_knobs(modality: Modality) -> crate::dataset::Knobs {
 pub struct PreparedCorpus {
     text: Option<MmapTextCorpus>,
     vectors: Option<MmapVectorCorpus>,
+    // The SQL shape's `emb` column (see `harness::infino_sql_engine`) is
+    // generated inline per-row by `chunk_batch`/`emb_for`, not through the
+    // `vectors` mmap corpus above (`Modality::Sql.has_vector()` is false) —
+    // so its bytes are tracked here instead, or `byte_size()` would ignore
+    // the largest column the SQL shape actually ingests.
+    sql_embed_bytes: u64,
 }
 
 impl PreparedCorpus {
@@ -339,7 +383,8 @@ impl PreparedCorpus {
     }
 
     /// Logical size of the raw input corpus fed to ingest — text bytes
-    /// plus vector f32 bytes. This is the *source* data size, distinct
+    /// plus vector f32 bytes (plus the SQL shape's inline `emb` column,
+    /// see `sql_embed_bytes`). This is the *source* data size, distinct
     /// from the index bytes the supertable writes to object storage.
     pub fn byte_size(&self) -> u64 {
         let text = self.text.as_ref().map(|t| t.total_bytes()).unwrap_or(0);
@@ -348,7 +393,7 @@ impl PreparedCorpus {
             .as_ref()
             .map(|_| (n_docs() * DIM * size_of::<f32>()) as u64)
             .unwrap_or(0);
-        text + vec
+        text + vec + self.sql_embed_bytes
     }
 }
 
@@ -397,7 +442,20 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
             MmapVectorCorpus::generate(corpus_docs, corpus::n_cent(n_docs), CORPUS_VEC_SEED, true)
         }
     });
-    PreparedCorpus { text, vectors }
+    // `Modality::Sql` is the one shape that ingests an embedding column
+    // without going through the `vectors` mmap corpus above (it has no
+    // vector index, so `has_vector()` is false) — sized here so
+    // `byte_size()` still counts it.
+    let sql_embed_bytes = if modality.has_sql() {
+        (n_docs * DIM * size_of::<f32>()) as u64
+    } else {
+        0
+    };
+    PreparedCorpus {
+        text,
+        vectors,
+        sql_embed_bytes,
+    }
 }
 
 /// The next normal vector commit after the measured base ingest.
@@ -783,6 +841,16 @@ fn chunk_batch(
             )
             .expect("sql emb FixedSizeList"),
         ));
+    }
+    if modality == Modality::VectorFiltered {
+        // `doc_id % FILTER_KEEP_EVERY` names the bucket; bucket 0 is the
+        // ~1/FILTER_KEEP_EVERY selection the filtered-vector bench queries.
+        let bucket_vals: Vec<String> = (start..end)
+            .map(|doc_id| filter_bucket_term(doc_id as u64 % FILTER_KEEP_EVERY as u64))
+            .collect();
+        columns.push(Arc::new(LargeStringArray::from(
+            bucket_vals.iter().map(String::as_str).collect::<Vec<_>>(),
+        )));
     }
     if modality.has_vector() {
         let all = corpus
