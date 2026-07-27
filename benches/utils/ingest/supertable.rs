@@ -71,44 +71,6 @@ pub const TEXT_COLUMN: &str = "title";
 pub const VEC_COLUMN: &str = "emb";
 pub const SQL_CATEGORY_COLUMN: &str = "category";
 pub const SQL_RATING_COLUMN: &str = "rating";
-/// FTS-indexed low-cardinality bucket column for [`Modality::VectorFiltered`]
-/// — the column the filtered-vector bench resolves a real `VectorFilter`
-/// predicate against, mirroring `infino_sql_engine`'s `bucket` column.
-///
-/// Buckets are CONTIGUOUS doc-id ranges (`doc_id / filter_block_size(n_docs)`),
-/// never a modular residue (`doc_id % N`). A modular residue is, by
-/// construction, uniformly present over *any* contiguous doc-id range — so
-/// it is present in literally every superfile regardless of size or
-/// boundary, which defeats the exact optimization `VectorFilter` resolution
-/// relies on: a manifest-only per-superfile term-bloom prune
-/// (`select_superfiles` / `PruneLeaf::TermPresence`, "no superfile reads")
-/// that should exclude most superfiles *before* any of them are opened. A
-/// contiguous block instead correlates with ingest order — the shape a
-/// real time- or batch-correlated categorical filter has — so most
-/// superfiles' term blooms correctly exclude bucket 0 and the prune does
-/// real, measurable work. A modular predicate can never exercise that path
-/// at all; it was tried first and always fans out to every superfile,
-/// regardless of how well the real pruning works.
-pub const FILTER_COLUMN: &str = "filter_bucket";
-/// [`FILTER_COLUMN`] bucket count. The term naming bucket 0 (see
-/// [`filter_bucket_term`]) selects exactly `1/FILTER_KEEP_EVERY` of rows —
-/// the ~10% selectivity the filtered-vector bench's ground truth targets.
-pub const FILTER_KEEP_EVERY: usize = 10;
-
-/// Row count of one [`FILTER_COLUMN`] bucket — the contiguous
-/// `[bucket * filter_block_size(n_docs), (bucket + 1) * filter_block_size(n_docs))`
-/// doc-id range [`filter_bucket_term`] names. At least 1, so a degenerate
-/// `n_docs` never divides to an empty block.
-pub fn filter_block_size(n_docs: usize) -> usize {
-    (n_docs / FILTER_KEEP_EVERY).max(1)
-}
-
-/// The FTS query term selecting [`FILTER_COLUMN`] bucket `bucket` — a real
-/// `VectorFilter{column: FILTER_COLUMN, query: ..., mode}` predicate
-/// resolves to exactly the contiguous doc-id block named above.
-pub fn filter_bucket_term(bucket: u64) -> String {
-    format!("bucket{bucket}")
-}
 
 pub(crate) const CORPUS_VEC_SEED: u64 = 1;
 const CORPUS_TEXT_SEED: u64 = 1;
@@ -204,13 +166,6 @@ pub enum Modality {
     Vector,
     Sql,
     Combined,
-    /// Vector index plus one small FTS-indexed bucket column
-    /// ([`FILTER_COLUMN`]), for measuring the PUBLIC predicate-based
-    /// `VectorFilter` search path. Deliberately separate from `Vector`
-    /// (which stays vector-only for a fair apples-to-apples comparison
-    /// against Lance) — this shape is Infino-only diagnostic, never part
-    /// of a cross-engine comparison.
-    VectorFiltered,
 }
 
 pub fn modality_label(modality: Modality) -> &'static str {
@@ -219,7 +174,6 @@ pub fn modality_label(modality: Modality) -> &'static str {
         Modality::Vector => "vector-only",
         Modality::Sql => "SQL",
         Modality::Combined => "combined FTS + vector",
-        Modality::VectorFiltered => "vector + filter predicate",
     }
 }
 
@@ -231,10 +185,7 @@ impl Modality {
         matches!(self, Modality::Fts | Modality::Combined)
     }
     pub fn has_vector(self) -> bool {
-        matches!(
-            self,
-            Modality::Vector | Modality::Combined | Modality::VectorFiltered
-        )
+        matches!(self, Modality::Vector | Modality::Combined)
     }
     pub fn has_sql(self) -> bool {
         matches!(self, Modality::Sql)
@@ -246,7 +197,6 @@ impl Modality {
             Modality::Vector => "vector",
             Modality::Sql => "sql",
             Modality::Combined => "combined",
-            Modality::VectorFiltered => "vector_filtered",
         }
     }
 }
@@ -259,9 +209,6 @@ fn schema_for(modality: Modality) -> Arc<Schema> {
     if modality.has_sql() {
         fields.push(Field::new(SQL_CATEGORY_COLUMN, DataType::LargeUtf8, false));
         fields.push(Field::new(SQL_RATING_COLUMN, DataType::Int64, false));
-    }
-    if modality == Modality::VectorFiltered {
-        fields.push(Field::new(FILTER_COLUMN, DataType::LargeUtf8, false));
     }
     if modality.has_vector() {
         fields.push(Field::new(
@@ -321,13 +268,6 @@ pub fn options_for(
         vec![FtsConfig {
             column: TEXT_COLUMN.into(),
             positions: true,
-        }]
-    } else if modality == Modality::VectorFiltered {
-        // No positions needed: the filter predicate is a plain term-equality
-        // lookup, never a phrase.
-        vec![FtsConfig {
-            column: FILTER_COLUMN.into(),
-            positions: false,
         }]
     } else {
         vec![]
@@ -863,21 +803,6 @@ fn chunk_batch(
             )
             .expect("sql emb FixedSizeList"),
         ));
-    }
-    if modality == Modality::VectorFiltered {
-        // Contiguous block, not a modular residue — see FILTER_COLUMN's doc
-        // comment for why a modular assignment would defeat the
-        // manifest-level term-bloom prune the filtered-vector bench means
-        // to measure. Bucket 0 is the ~1/FILTER_KEEP_EVERY selection the
-        // bench queries.
-        let block_size = filter_block_size(n_docs()) as u64;
-        let max_bucket = FILTER_KEEP_EVERY as u64 - 1;
-        let bucket_vals: Vec<String> = (start..end)
-            .map(|doc_id| filter_bucket_term((doc_id as u64 / block_size).min(max_bucket)))
-            .collect();
-        columns.push(Arc::new(LargeStringArray::from(
-            bucket_vals.iter().map(String::as_str).collect::<Vec<_>>(),
-        )));
     }
     if modality.has_vector() {
         let all = corpus

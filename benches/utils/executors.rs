@@ -662,12 +662,6 @@ pub mod fts {
         /// string so `+must` clause sigils resolve exactly as the
         /// production count path resolves them.
         fn count_matching(&self, column: &str, query: &str, mode: InfinoBoolMode) -> u64;
-
-        /// Settle any background work the preceding query kicked off, so the
-        /// next cold iteration's fresh-cache open/search doesn't race an
-        /// in-flight background fill from this one. No-op for tiers with no
-        /// background machinery (e.g. the in-memory superfile reader).
-        fn settle_warm(&self) {}
     }
 
     /// Fetch-phase measurement for a raw superfile reader: kernel hits,
@@ -970,11 +964,6 @@ pub mod fts {
                 cold.push_search(search_wall, search_cpu);
                 cold.push_search_io(io.get_count, io.get_bytes);
                 std::hint::black_box(rows);
-                // Outside the timed window: drain this iteration's
-                // background fills before the next iteration opens, so
-                // iteration N+1's cold window never races iteration N's
-                // in-flight cache writes.
-                guard.settle_warm();
                 drop(guard);
             }
             // Fetch phase (retrieval: + top-k text) on SEPARATE fresh opens —
@@ -992,7 +981,6 @@ pub mod fts {
                     cold_fetch.push_search(search_wall, search_cpu);
                     cold_fetch.push_search_io(io.get_count, io.get_bytes);
                     std::hint::black_box(rows);
-                    guard.settle_warm();
                     drop(guard);
                 }
                 cold_fetch.finish()
@@ -1437,12 +1425,6 @@ pub mod vector {
         fn search_params(&self, nprobe: usize, rerank: usize) -> String {
             format!("p={nprobe}, r={rerank}")
         }
-
-        /// Settle any background work the preceding query kicked off, so the
-        /// next cold iteration's fresh-cache open/search doesn't race an
-        /// in-flight background fill from this one. No-op for tiers with no
-        /// background machinery (e.g. the in-memory superfile reader).
-        fn settle_warm(&self) {}
 
         /// Time the PUBLIC `vector_search` path (routing + rerank + stable
         /// `_id` resolution + Arrow materialization) — the surface a real
@@ -1926,9 +1908,6 @@ pub mod vector {
             cold.push_search(search_wall, search_cpu);
             cold.push_search_io(io.get_count, io.get_bytes);
             black_box(hits);
-            // Outside the timed window: drain this iteration's background
-            // fills before the next iteration opens (see `FtsRead::settle_warm`).
-            guard.settle_warm();
             drop(guard);
         }
         cold.finish()
@@ -2612,10 +2591,8 @@ pub mod sql {
 
     /// Generous ceiling for settling a single query's background fills;
     /// scoped to the query's own working set, so the typical wait is the
-    /// few files that query opened — not the table. Also reused by the
-    /// FTS/vector/SQL cold-battery settle-between-iterations barrier in
-    /// `supertable.rs`.
-    pub(crate) const WARM_SETTLE_TIMEOUT: Duration = Duration::from_secs(600);
+    /// few files that query opened — not the table.
+    const WARM_SETTLE_TIMEOUT: Duration = Duration::from_secs(600);
 
     /// Extract the single `Int64` aggregate value from a one-row result.
     fn scalar_i64(batches: &[arrow_array::RecordBatch]) -> i64 {
@@ -2917,7 +2894,6 @@ pub mod sql {
                 cold.push_search(search_wall, search_cpu);
                 cold.push_search_io(io.get_count, io.get_bytes);
                 black_box(rows);
-                guard.settle_warm();
                 drop(guard);
             }
             out.insert(*name, cold.finish());

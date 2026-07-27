@@ -50,7 +50,7 @@ use std::{
 };
 
 use infino::{
-    BoolMode, OptimizeOptions, VectorFilter,
+    OptimizeOptions,
     supertable::{
         Supertable,
         manifest::{ClusterCentroids, SuperfileEntry},
@@ -1510,7 +1510,6 @@ pub mod fts {
         executors::{
             fts as exec_fts,
             fts::{FTS_BATTERY, FtsRead},
-            sql as exec_sql,
         },
         harness::driver::FtsQuery,
     };
@@ -2173,12 +2172,6 @@ pub mod fts {
         ) -> u64 {
             self.consumer.reader().count_matching(column, query, mode)
         }
-
-        fn settle_warm(&self) {
-            self.consumer
-                .wait_until_warm(exec_sql::WARM_SETTLE_TIMEOUT)
-                .expect("settle background fills");
-        }
     }
 }
 
@@ -2190,13 +2183,13 @@ pub mod vector {
         sync::atomic::Ordering as AtomicOrdering,
     };
 
-    use infino::{roaring::RoaringBitmap, storage::io_counters};
+    use infino::storage::io_counters;
 
     use super::*;
     use crate::{
         corpus,
         executors::{
-            sql as exec_sql, vector as exec_vec,
+            vector as exec_vec,
             vector::{SupertableVectorRead, VectorRead},
         },
     };
@@ -2398,12 +2391,48 @@ pub mod vector {
             }
             .topk_global(column, query, k, nprobe, rerank)
         }
+    }
 
-        fn settle_warm(&self) {
-            self.consumer
-                .wait_until_warm(exec_sql::WARM_SETTLE_TIMEOUT)
-                .expect("settle background fills");
+    fn hits_to_dense_u32(
+        st: &Supertable,
+        id_to_dense: &HashMap<i128, u32>,
+        hits: &[infino::supertable::query::SuperfileHit],
+    ) -> Vec<(u32, f32)> {
+        let reader = st.reader();
+        let manifest = reader.manifest();
+        let mut contiguous_min_by_uri: HashMap<_, i128> = HashMap::new();
+        for entry in manifest.get_all_superfiles() {
+            let span = entry.id_max.saturating_sub(entry.id_min).saturating_add(1);
+            if span == entry.n_docs as i128 {
+                contiguous_min_by_uri.insert(entry.uri, entry.id_min);
+            }
         }
+        if let Some(hidden) = st.vector_index_table() {
+            let hidden_reader = hidden.pinned_reader();
+            let hidden_manifest = hidden_reader.manifest();
+            for entry in hidden_manifest.get_all_superfiles() {
+                let span = entry.id_max.saturating_sub(entry.id_min).saturating_add(1);
+                if span == entry.n_docs as i128 {
+                    contiguous_min_by_uri.insert(entry.uri, entry.id_min);
+                }
+            }
+        }
+        hits.iter()
+            .filter_map(|h| {
+                let stable_id = h.stable_id.or_else(|| {
+                    contiguous_min_by_uri
+                        .get(&h.superfile)
+                        .copied()
+                        .map(|id_min| id_min + i128::from(h.local_doc_id))
+                })?;
+                let dense = id_to_dense.get(&stable_id).copied().or_else(|| {
+                    u32::try_from(stable_id)
+                        .ok()
+                        .filter(|id| *id < supertable::n_docs() as u32)
+                })?;
+                Some((dense, h.score))
+            })
+            .collect()
     }
 
     fn distribution(values: &mut [u64]) -> Option<(u64, u64, u64, u64)> {
@@ -3367,12 +3396,7 @@ pub mod vector {
             let nprobe = fixed_nprobe();
             let rerank = fixed_rerank_mult();
 
-            // `_modular_filtered_gt`: `lifecycle_ground_truth_cached` computes
-            // base/filtered/augmented in one pass; its `filtered` field is the
-            // OLD modular (`doc_id % N`) selection, unused here — the
-            // filtered-vector block below computes its own ground truth for
-            // the contiguous block `FILTER_COLUMN` actually selects.
-            let (q_correct, q_cal, gt_correct, gt_cal, _modular_filtered_gt, augmented_gt) = {
+            let (q_correct, q_cal, gt_correct, gt_cal, filtered_gt, augmented_gt) = {
                 let corpus = corpus
                     .as_ref()
                     .expect("vector benches always prepare a corpus");
@@ -3733,119 +3757,60 @@ pub mod vector {
                     note,
                 )
             };
-            // Filtered vector recall + latency measures the PUBLIC
-            // predicate-based path: a real `VectorFilter{column,query,mode}`
-            // resolved fresh on every call, exactly what a caller gets. Built
-            // on its own dedicated `Modality::VectorFiltered` table (vector
-            // index + one small FTS-indexed bucket column) rather than the
-            // shared consumer above — `Modality::Vector` stays vector-only
-            // for the Vector-vs-Lance ingest comparison.
+            // Filtered vector recall + latency mirrors the superfile tier:
+            // same every-Nth-row allow-set, same brute-force filtered ground
+            // truth, same default config.
             if phases.warm
-                && let Some(prepared_corpus) = corpus.as_ref()
-                && let Some(vectors) = prepared_corpus.vectors()
+                && let Some(filtered_gt) = filtered_gt.as_ref()
             {
-                // A dedicated ground truth for the CONTIGUOUS bucket-0 block
-                // `FILTER_COLUMN` actually selects (see its doc comment) —
-                // the shared, tier-agnostic brute-force helper the superfile
-                // tier's own filtered-recall table already uses, so both
-                // compute a filtered ground truth identically. Reuses this
-                // corpus's vectors: same seed/params as the
-                // `Modality::VectorFiltered` build below, so both carry
-                // byte-identical vectors at identical doc-id positions.
-                let vslice = &vectors.as_slice()[..n_docs * DIM];
-                let block_size = supertable::filter_block_size(n_docs) as u32;
-                let mut allow = RoaringBitmap::new();
-                for doc_id in 0..block_size.min(n_docs as u32) {
-                    allow.insert(doc_id);
-                }
-                let filtered_gt = corpus::filtered_ground_truth(vslice, &allow, &q_correct, TOP_K);
-                let filtered_gt = &filtered_gt;
-                let filtered_corpus = supertable::prepare_corpus(Modality::VectorFiltered);
-                let filtered_built =
-                    supertable::build_on_storage(Modality::VectorFiltered, &filtered_corpus);
-                let filtered_meter = storage_meter::wrap(Arc::clone(&filtered_built.storage));
-                let (_filtered_cache_dir, filtered_cache) = tiers::fresh_supertable_search_cache(
-                    filtered_meter.provider(),
-                    Some(filtered_built.total_index_bytes),
-                );
-                // `allow_summary_knob = false`: this handle is about to drive
-                // a drain (a mutation) — the consumer-memory-mode knob is a
-                // read-only-consumer contract (see `consumer_options_with_knob`).
-                let filtered_consumer = tiers::open_consumer(tiers::consumer_options_with_knob(
-                    supertable::options_for(Modality::VectorFiltered, None),
-                    filtered_meter.provider(),
-                    filtered_cache,
-                    false,
-                ));
-                // Every other recall/latency number in this file is measured
-                // post-drain (the routed, steady-state hidden-index grid) —
-                // the engine-default nprobe and the recall floor below are
-                // calibrated against that state. Without this, the table
-                // stays pre-drain (fan-out across every one of its own user
-                // superfiles' small local IVF grids), which the default
-                // nprobe badly under-probes.
-                drain_hidden_incoming(&filtered_consumer);
-                let filtered_id_to_dense = corpus::engine_id_to_dense(&filtered_consumer, n_docs);
-                let filtered_reader = filtered_consumer.reader();
-                // Bucket 0 is exactly the contiguous doc-id block `allow`
-                // (and so `filtered_gt`) was built from above.
-                let filter_term = supertable::filter_bucket_term(0);
-                let filter = || VectorFilter {
-                    column: supertable::FILTER_COLUMN,
-                    query: filter_term.as_str(),
-                    mode: BoolMode::And,
-                };
-                // Resolves the public path's stable `_id` + score result via
-                // the engine's own `ORDER BY _id` resolution
-                // (`engine_id_to_dense`) — an id with no dense mapping is a
-                // hard error (a real correctness bug), never silently
-                // dropped.
-                let resolve = |batches: &[arrow_array::RecordBatch]| -> Vec<(u32, f32)> {
-                    corpus::id_scores_from_vector_search(batches)
-                        .into_iter()
-                        .map(|(id, score)| {
-                            let dense = *filtered_id_to_dense.get(&id).unwrap_or_else(|| {
-                                panic!("filtered vector_search returned unresolvable _id {id}")
-                            });
-                            (dense, score)
-                        })
-                        .collect()
-                };
+                let consumer_reader = consumer.reader();
+                let mut allow_stable_ids: Vec<i128> = id_to_dense
+                    .iter()
+                    .filter_map(|(stable_id, dense_id)| {
+                        ((*dense_id as usize).is_multiple_of(FILTER_KEEP_EVERY))
+                            .then_some(*stable_id)
+                    })
+                    .collect();
+                allow_stable_ids.sort_unstable();
+                allow_stable_ids.dedup();
+                let prepared_allow = tiers::block_on(
+                    consumer_reader.prepare_vector_stable_allow_async(Arc::new(allow_stable_ids)),
+                )
+                .expect("prepare stable-id allow bitmaps");
                 let mut recalls = Vec::new();
                 let mut latencies = Vec::new();
                 // Untimed prewarm: fault the filtered path's routed cells into
                 // the resident cache first, so the metered window below reflects
                 // steady-state warm I/O (not the one-time cache fill).
                 for q in q_correct.iter() {
-                    let _ = filtered_reader
-                        .vector_search(
+                    let _ =
+                        tiers::block_on(consumer_reader.vector_hits_prepared_global_allow_async(
                             supertable::VEC_COLUMN,
                             q,
                             TOP_K,
                             exec_vec::default_search_opts(),
-                            Some(filter()),
-                            None,
-                        )
+                            &prepared_allow,
+                        ))
                         .expect("filtered prewarm query");
                 }
-                let filtered_before = filtered_meter.snapshot();
+                let filtered_before = consumer_meter.snapshot();
                 // Drop phases accumulated by the prewarm loop so the dump
                 // below covers exactly the measured window.
                 let _ = io_counters::phase_take_summed();
                 for (q, gt) in q_correct.iter().zip(filtered_gt) {
                     let t0 = Instant::now();
-                    let batches = filtered_reader
-                        .vector_search(
+                    let hits =
+                        tiers::block_on(consumer_reader.vector_hits_prepared_global_allow_async(
                             supertable::VEC_COLUMN,
                             q,
                             TOP_K,
                             exec_vec::default_search_opts(),
-                            Some(filter()),
-                            None,
-                        )
+                            &prepared_allow,
+                        ))
                         .expect("filtered recall query");
                     latencies.push(t0.elapsed());
-                    recalls.push(corpus::recall_at_k(&resolve(&batches), gt));
+                    let dense_hits = hits_to_dense_u32(&consumer, &id_to_dense, &hits);
+                    recalls.push(corpus::recall_at_k(&dense_hits, gt));
                 }
                 let filtered_phases = io_counters::phase_take_summed();
                 if !filtered_phases.is_empty() && !q_correct.is_empty() {
@@ -3861,7 +3826,7 @@ pub mod vector {
                         parts.join("  ")
                     );
                 }
-                let filtered_io = filtered_meter.snapshot().since(&filtered_before);
+                let filtered_io = consumer_meter.snapshot().since(&filtered_before);
                 if !q_correct.is_empty() {
                     filtered_stats = Some((filtered_io, q_correct.len() as u64));
                     eprintln!(
@@ -3876,25 +3841,26 @@ pub mod vector {
                 // is cell coverage (selection misses the matching
                 // neighbors' cells); if it stays flat, the loss sits
                 // inside the probed cells (kernel shortlist/rerank under
-                // the predicate). Diagnostic print only — the gate above
+                // the allow-set). Diagnostic print only — the gate above
                 // stays on the engine default.
                 for width in FILTERED_DIAG_PROBE_WIDTHS {
                     let mut wide_recalls = Vec::with_capacity(q_correct.len());
                     let mut wide_lat = Vec::with_capacity(q_correct.len());
                     for (q, gt) in q_correct.iter().zip(filtered_gt) {
                         let t0 = Instant::now();
-                        let batches = filtered_reader
-                            .vector_search(
+                        let hits = tiers::block_on(
+                            consumer_reader.vector_hits_prepared_global_allow_async(
                                 supertable::VEC_COLUMN,
                                 q,
                                 TOP_K,
                                 exec_vec::search_opts(*width, exec_vec::ENGINE_DEFAULT),
-                                Some(filter()),
-                                None,
-                            )
-                            .expect("filtered width-sweep query");
+                                &prepared_allow,
+                            ),
+                        )
+                        .expect("filtered width-sweep query");
                         wide_lat.push(t0.elapsed());
-                        wide_recalls.push(corpus::recall_at_k(&resolve(&batches), gt));
+                        let dense_hits = hits_to_dense_u32(&consumer, &id_to_dense, &hits);
+                        wide_recalls.push(corpus::recall_at_k(&dense_hits, gt));
                     }
                     if !wide_recalls.is_empty() {
                         let mean: f32 =
@@ -3925,9 +3891,9 @@ pub mod vector {
                     assert!(
                         mean_recall >= FILTERED_RECALL_FLOOR,
                         "filtered vector recall@{TOP_K} {mean_recall:.3} < floor \
-                         {FILTERED_RECALL_FLOOR:.2} — the predicate-filtered fan regressed (this \
-                         class previously shipped unasserted: the selectivity-blind postings \
-                         target measured 0.722 for weeks as a print-only line)"
+                         {FILTERED_RECALL_FLOOR:.2} — the allow-set fan regressed (this class \
+                         previously shipped unasserted: the selectivity-blind postings target \
+                         measured 0.722 for weeks as a print-only line)"
                     );
 
                     report.emit(&Section {
@@ -3938,16 +3904,7 @@ pub mod vector {
                             DIM
                         ),
                         note: format!(
-                            "Filtered kNN over the PUBLIC predicate-based filter — \
-                             `vector_search` with a real `VectorFilter{{column,query,mode}}`, \
-                             resolved fresh on every call (a dedicated `Modality::VectorFiltered` \
-                             table: vector index + one small FTS-indexed bucket column, a \
-                             contiguous ~1/{} of doc ids — correlated with ingest order like a \
-                             real time/batch-tagged filter, so the manifest term-bloom prune does \
-                             real work instead of fanning out to every superfile). The timed \
-                             window includes predicate resolution — this is the full end-to-end \
-                             cost a caller pays. recall@{TOP_K} = {mean_recall:.3}. Δ is vs the \
-                             previous run.",
+                            "Filtered kNN (~10% selectivity, every {}th row). recall@{TOP_K} = {mean_recall:.3}. Δ is vs the previous run.",
                             FILTER_KEEP_EVERY
                         ),
                         blocks: vec![Block {
@@ -3961,7 +3918,7 @@ pub mod vector {
                                 "p50".into(),
                             ],
                             rows: vec![vec![
-                                text("VectorFilter predicate (public path, resolved per call)"),
+                                text("filtered (~10%)"),
                                 text("engine default"),
                                 text(warm_reader.routing_label(
                                     exec_vec::ENGINE_DEFAULT,
@@ -3973,10 +3930,6 @@ pub mod vector {
                             ]],
                         }],
                     });
-                }
-                drop(filtered_consumer);
-                if let Some(cleanup) = &filtered_built.cleanup {
-                    tiers::cleanup_prefix(cleanup);
                 }
             }
 
@@ -4837,9 +4790,6 @@ pub mod sql {
         }
         fn query_count(&self, sql: &str) -> i64 {
             self.consumer.query_count(sql)
-        }
-        fn settle_warm(&self) {
-            self.consumer.settle_warm()
         }
     }
 }
