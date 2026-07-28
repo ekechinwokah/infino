@@ -1717,15 +1717,37 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         // The ranged (sub-range fan-out) path carries no negation in v1.
-        self.run_max_score_bmm_range(
-            column_id,
-            cursors,
-            k,
-            doc_id_start,
-            doc_id_end,
-            None,
-            floor.next_down(),
-        )
+        //
+        // Mirror `dispatch_multi_term_or`'s kernel choice instead of
+        // hardcoding MaxScore+BMM: on a broad OR over uniform-upper-bound
+        // terms BMM cannot prune (every block max ties), so it degrades to
+        // per-doc min-scan bookkeeping over ~the whole union — the exact
+        // shape `run_windowed_union` exists for, and it is natively ranged.
+        // Hardcoding BMM here made the SAME query run a different kernel
+        // depending on whether the fan-out sliced (few large superfiles,
+        // i.e. post-compaction) or not (many small ones, pre-compaction) —
+        // measured at 1M as the 11-24x post-compact broad-OR regression.
+        if prefer_windowed_union(&cursors) {
+            self.run_windowed_union(
+                column_id,
+                cursors,
+                k,
+                None,
+                floor.next_down(),
+                doc_id_start,
+                doc_id_end,
+            )
+        } else {
+            self.run_max_score_bmm_range(
+                column_id,
+                cursors,
+                k,
+                doc_id_start,
+                doc_id_end,
+                None,
+                floor.next_down(),
+            )
+        }
     }
 
     /// Multi-column BM25 search (most_fields semantics): each
@@ -5997,6 +6019,133 @@ mod tests {
             [2u32, 3, 4].into_iter().collect(),
             "only docs in [2,5) returned"
         );
+    }
+
+    /// Regression: the ranged OR entry must produce the same results as
+    /// the un-ranged path for ANY partition of the doc space, on BOTH of
+    /// the kernels its dispatch can now pick. Before the fix it hardcoded
+    /// MaxScore+BMM, so a query sliced into sub-ranges (the fan-out shape
+    /// a compacted table takes) ran a different kernel than the same query
+    /// un-ranged — uniform broad ORs degraded 11-24x post-compaction.
+    #[tokio::test]
+    async fn search_or_range_partitions_agree_with_unranged() {
+        /// Docs in the planted corpus — spans several 4096-doc OR windows
+        /// and many 128-doc posting blocks.
+        const N_DOCS: u32 = 6_000;
+        /// Ask for every match so partition union == full result set.
+        const K_ALL: usize = N_DOCS as usize;
+        /// Top-k size for the truncated comparison.
+        const K_TOP: usize = 10;
+
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            // Deterministic mixed-df corpus: four uniform terms with
+            // varying tf (windowed-union shape), plus one rare term
+            // (dominant-UB / BMM shape when queried with two commons).
+            let mut text = String::new();
+            for (t, name) in ["alpha", "beta", "gamma", "delta"].iter().enumerate() {
+                let h = i.wrapping_mul(31).wrapping_add(t as u32 * 17) % 5;
+                for _ in 0..h {
+                    text.push_str(name);
+                    text.push(' ');
+                }
+            }
+            if i % 2000 == 7 {
+                text.push_str("rareterm ");
+            }
+            if text.is_empty() {
+                text.push_str("filler");
+            }
+            b.add_doc(0, i, &text).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        // Uniform 4-term OR routes to the windowed union; the
+        // rare+common mix keeps a dominant term UB and stays on BMM.
+        // Assert the routing rather than assume it — a corpus tweak that
+        // silently stopped exercising one branch would otherwise turn
+        // this into a test of the other branch twice.
+        let shapes: [&[&str]; 2] = [
+            &["alpha", "beta", "gamma", "delta"],
+            &["rareterm", "alpha", "beta"],
+        ];
+        let column_id = r.resolve_column_id("body").expect("column");
+        let uniform_cursors = r
+            .build_term_cursors(column_id, shapes[0])
+            .await
+            .expect("cursors");
+        assert!(
+            prefer_windowed_union(&uniform_cursors),
+            "uniform shape must route to the windowed ranged branch"
+        );
+        let dominant_cursors = r
+            .build_term_cursors(column_id, shapes[1])
+            .await
+            .expect("cursors");
+        assert!(
+            !prefer_windowed_union(&dominant_cursors),
+            "dominant-UB shape must route to the BMM ranged branch"
+        );
+        // Uneven partitions, including window-boundary-crossing cuts.
+        let partitions: [&[(u32, u32)]; 3] = [
+            &[(0, N_DOCS)],
+            &[(0, 3_000), (3_000, N_DOCS)],
+            &[(0, 100), (100, 4_097), (4_097, 5_000), (5_000, N_DOCS)],
+        ];
+
+        for terms in shapes {
+            let full = r
+                .search("body", terms, K_ALL, BoolMode::Or)
+                .await
+                .expect("un-ranged search");
+            let mut full_sorted: Vec<(u32, u32)> =
+                full.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+            full_sorted.sort_unstable();
+
+            for cuts in partitions {
+                let mut merged: Vec<(u32, f32)> = Vec::new();
+                for &(lo, hi) in cuts {
+                    merged.extend(
+                        r.search_or_range_pretokenized("body", terms, K_ALL, lo, hi)
+                            .await
+                            .expect("ranged search"),
+                    );
+                }
+                let mut merged_sorted: Vec<(u32, u32)> =
+                    merged.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+                merged_sorted.sort_unstable();
+                assert_eq!(
+                    merged_sorted, full_sorted,
+                    "partition union must equal the un-ranged result \
+                     (terms={terms:?}, cuts={cuts:?})"
+                );
+
+                // Top-k contract: resorting the merged pool by
+                // (score desc, doc asc) reproduces the un-ranged top-k.
+                let mut pool = merged.clone();
+                pool.sort_unstable_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .expect("BM25 scores are finite")
+                        .then(a.0.cmp(&b.0))
+                });
+                pool.truncate(K_TOP);
+                let top: Vec<(u32, u32)> = pool.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+                let full_top: Vec<(u32, u32)> = full
+                    .iter()
+                    .take(K_TOP)
+                    .map(|&(d, s)| (d, s.to_bits()))
+                    .collect();
+                assert_eq!(
+                    top, full_top,
+                    "merged top-{K_TOP} must equal un-ranged top-{K_TOP} \
+                     (terms={terms:?}, cuts={cuts:?})"
+                );
+            }
+        }
     }
 
     #[tokio::test]
