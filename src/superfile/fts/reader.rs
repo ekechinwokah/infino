@@ -163,7 +163,10 @@ pub(crate) const OR_WINDOW_MIN_TERMS: usize = 3;
 /// term upper bound — i.e. no single term dominates. Uniform terms sit at
 /// ~1.0× the average (MaxScore can't prune them → windowed wins); a
 /// dominant rare term sits well above it (MaxScore prunes hard → it stays
-/// on MaxScore). Calibrated on the 1M tier.
+/// on MaxScore). Calibrated on the 1M tier; re-measured on every bench
+/// run by the superfile tier's per-algorithm probes
+/// (`benches/utils/superfile.rs`), whose shapes sit on both sides of
+/// this threshold.
 const OR_WINDOW_DOMINANCE_MULT: f32 = 1.5;
 
 /// Largest `k` for which a 2-term OR routes to WAND+BMW instead of
@@ -3268,9 +3271,9 @@ impl FtsReader {
     /// block skipping — every doc in the union of the cursor postings
     /// is scored and offered to the top-K heap.
     ///
-    /// **Not on the production path.** `dispatch_multi_term_or` always
-    /// routes to MaxScore+BMM; this function is reachable only via
-    /// `search_with_algo_for_bench(OrAlgo::Exhaustive)`. It exists
+    /// **Not on the production path.** `dispatch_multi_term_or` routes
+    /// to MaxScore+BMM or the windowed union; this function is reachable
+    /// only via `search_with_algo_for_bench(OrAlgo::Exhaustive)`. It exists
     /// because the supertable bench surfaced one specific shape where
     /// it narrowly wins, and we want the option available for future
     /// re-routing work without re-implementing it.
@@ -3468,10 +3471,11 @@ impl FtsReader {
     }
 
     /// Bench/dev helper: force the multi-term OR path to use a specific
-    /// algorithm regardless of the dispatcher's heuristic. Used by
-    /// `benches/fts_search.rs` to compare WAND+BMW, MaxScore+BMM, and
-    /// exhaustive-union under identical inputs so the heuristic
-    /// threshold can be validated against measured numbers.
+    /// algorithm regardless of the dispatcher's heuristic. Used by the
+    /// superfile tier's per-algorithm probes
+    /// (`benches/utils/superfile.rs`) to compare WAND+BMW, MaxScore+BMM,
+    /// and the windowed union under identical inputs so the dispatch
+    /// thresholds are validated against measured numbers every run.
     ///
     /// **Not part of the stable API** — production code should use
     /// `search`, which routes through `dispatch_multi_term_or`.
