@@ -70,7 +70,7 @@
 use std::{
     borrow::Cow,
     cmp::{Ordering, Reverse},
-    collections::BinaryHeap,
+    collections::{BinaryHeap, HashMap},
     slice,
     sync::{
         Arc, Mutex,
@@ -82,6 +82,7 @@ use std::{
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, LargeStringArray};
 use roaring::RoaringBitmap;
+use tokio::sync::OnceCell;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -91,7 +92,7 @@ use crate::{
     superfile::{
         SuperfileReader,
         error::{FtsError, ReadError},
-        fts::reader::ClauseLists,
+        fts::reader::{ClauseLists, OrCursorSet},
     },
     supertable::{
         error::QueryError,
@@ -388,6 +389,15 @@ impl SupertableReader {
         let tombstones = self.tombstone_cache.clone();
         let now = Instant::now();
 
+        // Ranged units are slices of ONE superfile: share its cursor build
+        // across them (keyed by superfile id) instead of re-fetching and
+        // re-parsing every term's postings per slice — measured at 1M as
+        // 2.5x cold bytes when slicing widened. The OnceCell coalesces
+        // concurrent slices of a file; un-ranged units never touch this.
+        type SharedCursorCell = Arc<OnceCell<Arc<OrCursorSet>>>;
+        let cursor_sets: Arc<Mutex<HashMap<Uuid, SharedCursorCell>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
         // One shared fan-out (`query::dispatch::fanout`) — the same
         // orchestrator the vector path uses. It warms the tombstone
         // sidecars in one batch, opens each superfile reader and runs the
@@ -404,6 +414,7 @@ impl SupertableReader {
             let should_ph_arc = Arc::clone(&should_ph_arc);
             let neg_ph_arc = Arc::clone(&neg_ph_arc);
             let shared = Arc::clone(&shared);
+            let cursor_sets = Arc::clone(&cursor_sets);
             let tombstones = tombstones.clone();
             async move {
                 // Share the global kth-best floor with every superfile —
@@ -423,18 +434,23 @@ impl SupertableReader {
                     // queries (`fanout_for` never slices when a must
                     // or negated clause exists).
                     Some((start, end)) => {
-                        let should_refs: Vec<&str> =
-                            should_arc.iter().map(|s| s.as_str()).collect();
-                        r.bm25_search_or_range_pretokenized_with_floor(
-                            &column_arc,
-                            &should_refs,
-                            k,
-                            start,
-                            end,
-                            floor,
-                        )
-                        .await
-                        .map_err(fts_read_error)?
+                        let cell = {
+                            let mut sets =
+                                cursor_sets.lock().expect("cursor-set map lock poisoned");
+                            Arc::clone(sets.entry(suid).or_default())
+                        };
+                        let set = cell
+                            .get_or_try_init(|| async {
+                                let should_refs: Vec<&str> =
+                                    should_arc.iter().map(|s| s.as_str()).collect();
+                                r.bm25_or_cursor_set(&column_arc, &should_refs)
+                                    .await
+                                    .map(Arc::new)
+                                    .map_err(fts_read_error)
+                            })
+                            .await?;
+                        r.bm25_search_or_range_prebuilt(set, k, start, end, floor)
+                            .map_err(fts_read_error)?
                     }
                     None => {
                         let must_refs: Vec<&str> = must_arc.iter().map(|s| s.as_str()).collect();
@@ -1176,51 +1192,52 @@ fn fanout_for(n_musts: usize, n_shoulds: usize, has_negatives: bool) -> FanOut {
 /// Slice the kept superfiles into parallel work units — one
 /// [`WorkUnit`] per (superfile, doc_id sub-range) tuple.
 ///
-/// `FanOut::SubRanges` slices only when:
-///   1. The reader pool has more threads than kept superfiles —
-///      otherwise every thread is already saturated by one superfile
-///      and splitting just adds overhead.
-///   2. The candidate sub-range width is at least
-///      `SUBRANGE_MIN_DOCS` — below that, BMM bookkeeping +
-///      cross-sub-range top-K merge dominate the parallel win.
+/// Sub-range count is allocated by **doc mass**: a superfile holding
+/// `f` of the surviving docs gets `round(f × pool_threads)` slices.
+/// Splitting the pool evenly per *file* instead leaves a compacted
+/// table — one large merged superfile plus small remnants — with the
+/// same one-or-two units the merged file had when it was dozens of
+/// balanced files, so most of the pool idles on remnants while a
+/// couple of threads walk nearly the whole corpus. Slices share one
+/// cursor build per superfile (see the fan-out's cursor-set cache), so
+/// extra units cost decode buffers, not postings fetches.
 ///
-/// Otherwise each kept superfile becomes a single un-ranged work unit
-/// — identical to the original `par_iter` over superfiles shape.
+/// Two limits still apply:
+///   1. `FanOut::PerSuperfile` (no range-aware kernel for the shape)
+///      and a single-threaded pool both collapse to one un-ranged unit
+///      per superfile — the original `par_iter` over superfiles shape.
+///   2. No slice is narrower than `SUBRANGE_MIN_DOCS`; below that, BMM
+///      bookkeeping + the cross-sub-range top-K merge dominate the
+///      parallel win.
 fn build_work_units(
     kept: &[&Arc<SuperfileEntry>],
     fanout: FanOut,
     pool_threads: usize,
 ) -> Vec<WorkUnit> {
-    let want_subranges = pool_threads.div_ceil(kept.len().max(1)).max(1);
-    if matches!(fanout, FanOut::PerSuperfile) || want_subranges <= 1 {
-        return kept
-            .iter()
-            .map(|e| WorkUnit {
-                entry: Arc::clone(e),
-                range: None,
-            })
-            .collect();
+    let un_ranged = |entry: &Arc<SuperfileEntry>| WorkUnit {
+        entry: Arc::clone(entry),
+        range: None,
+    };
+    let total_docs: u64 = kept.iter().map(|e| e.n_docs).sum();
+    if matches!(fanout, FanOut::PerSuperfile) || pool_threads <= 1 || total_docs == 0 {
+        return kept.iter().map(|e| un_ranged(e)).collect();
     }
 
-    let mut units: Vec<WorkUnit> = Vec::with_capacity(kept.len() * want_subranges);
+    let mut units: Vec<WorkUnit> = Vec::with_capacity(kept.len() + pool_threads);
     for entry in kept {
         let n_docs = entry.n_docs as u32;
         if n_docs == 0 {
             continue;
         }
-        // Round the sub-range count down to avoid producing
-        // narrower-than-floor slices. With `want_subranges = 2` on
-        // a 1.25M-doc superfile, stride = 625K (well above floor) so
-        // both sub-ranges fire. With a tiny superfile (e.g., 10K
-        // docs, well below `SUBRANGE_MIN_DOCS`), the division
-        // collapses to 1 sub-range = full superfile.
+        // Integer round-half-up of `n_docs / total_docs × pool_threads`.
+        // A file holding ~all the docs asks for the whole pool; a
+        // remnant holding ~none rounds to 0 and is clamped to one
+        // whole-file unit.
+        let by_mass = ((entry.n_docs * pool_threads as u64 + total_docs / 2) / total_docs) as usize;
         let cap_by_floor = (n_docs / SUBRANGE_MIN_DOCS).max(1) as usize;
-        let n_sub = want_subranges.min(cap_by_floor);
+        let n_sub = by_mass.clamp(1, cap_by_floor);
         if n_sub <= 1 {
-            units.push(WorkUnit {
-                entry: Arc::clone(entry),
-                range: None,
-            });
+            units.push(un_ranged(entry));
             continue;
         }
         let stride = n_docs.div_ceil(n_sub as u32);
@@ -2285,6 +2302,88 @@ mod tests {
         let units = build_work_units(&kept, FanOut::SubRanges, 16);
         assert_eq!(units.len(), 2);
         assert!(units.iter().all(|u| u.range.is_none()));
+    }
+
+    /// The compacted shape: one merged superfile holding essentially the
+    /// whole corpus plus small remnants. Even-per-file allocation gave
+    /// the merged file `ceil(threads / n_files)` slices — 2 of 8 on the
+    /// 5-superfile table the 1M bench produces post-compaction — while
+    /// remnants took units they could not fill. Doc-mass allocation must
+    /// hand the merged file the pool and leave remnants whole.
+    #[test]
+    fn build_work_units_allocates_by_doc_mass_not_file_count() {
+        use std::collections::HashMap;
+
+        use uuid::Uuid;
+
+        use crate::supertable::manifest::{SuperfileEntry, SuperfileUri};
+
+        /// Threads in the simulated reader pool.
+        const POOL: usize = 8;
+        /// Docs in the merged superfile (compaction output).
+        const MERGED_DOCS: u64 = 1_000_000;
+        /// Docs in each post-merge remnant — below `SUBRANGE_MIN_DOCS`.
+        const REMNANT_DOCS: u64 = 10_000;
+
+        let entry = |n_docs: u64| {
+            let id = Uuid::new_v4();
+            Arc::new(SuperfileEntry {
+                birth_version: 0,
+                superfile_id: id,
+                uri: SuperfileUri(id),
+                n_docs,
+                id_min: 0,
+                id_max: n_docs as i128 - 1,
+                scalar_stats: HashMap::new(),
+                fts_summary: HashMap::new(),
+                vector_summary: HashMap::new(),
+                partition_key: Vec::new(),
+                partition_hint: None,
+                vector_layout: VectorLayout::Ivf,
+                subsection_offsets: None,
+            })
+        };
+        let merged = entry(MERGED_DOCS);
+        let remnants = [
+            entry(REMNANT_DOCS),
+            entry(REMNANT_DOCS),
+            entry(REMNANT_DOCS),
+            entry(REMNANT_DOCS),
+        ];
+        let mut kept = vec![&merged];
+        kept.extend(remnants.iter());
+
+        let units = build_work_units(&kept, FanOut::SubRanges, POOL);
+        let merged_units: Vec<_> = units
+            .iter()
+            .filter(|u| u.entry.superfile_id == merged.superfile_id)
+            .collect();
+        assert_eq!(
+            merged_units.len(),
+            POOL,
+            "merged superfile holds ~all docs so it must take the whole pool"
+        );
+        for remnant in &remnants {
+            let n: Vec<_> = units
+                .iter()
+                .filter(|u| u.entry.superfile_id == remnant.superfile_id)
+                .collect();
+            assert_eq!(n.len(), 1, "sub-floor remnant stays one unit");
+            assert!(n[0].range.is_none(), "remnant unit must be un-ranged");
+        }
+        // The merged file's slices tile [0, MERGED_DOCS) without gaps.
+        let mut ranges: Vec<(u32, u32)> = merged_units
+            .iter()
+            .map(|u| u.range.expect("merged units are ranged"))
+            .collect();
+        ranges.sort_unstable();
+        let mut cursor = 0u32;
+        for (start, end) in ranges {
+            assert_eq!(start, cursor, "sub-ranges tile without gaps");
+            assert!(end > start, "sub-range is non-empty");
+            cursor = end;
+        }
+        assert_eq!(cursor, MERGED_DOCS as u32, "sub-ranges cover every doc");
     }
 
     #[test]

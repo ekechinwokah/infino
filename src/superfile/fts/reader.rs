@@ -1708,28 +1708,60 @@ impl FtsReader {
         doc_id_end: u32,
         floor: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
+        let set = self.build_or_cursor_set(column, terms).await?;
+        self.search_or_range_prebuilt(&set, k, doc_id_start, doc_id_end, floor)
+    }
+
+    /// Build the OR cursors for `terms` once — the postings fetch and
+    /// skip-table parse — for reuse across doc-id sub-ranges via
+    /// [`Self::search_or_range_prebuilt`]. An intra-superfile fan-out
+    /// that builds per slice re-fetches every term's full posting bytes
+    /// and re-parses its skip table per slice (measured at 1M as 2.5x
+    /// cold bytes when slicing widened); clones of these cursors share
+    /// `bytes` and the `Arc` skip table instead.
+    pub(crate) async fn build_or_cursor_set(
+        &self,
+        column: &str,
+        terms: &[&str],
+    ) -> Result<OrCursorSet, FtsError> {
         let column_id = self.resolve_column_id(column)?;
-        if terms.is_empty() || k == 0 || doc_id_start >= doc_id_end {
+        let cursors = if terms.is_empty() {
+            Vec::new()
+        } else {
+            self.build_term_cursors(column_id, terms).await?
+        };
+        Ok(OrCursorSet { column_id, cursors })
+    }
+
+    /// Multi-term OR over `[doc_id_start, doc_id_end)` against prebuilt
+    /// cursors — the ranged fan-out's per-slice call;
+    /// [`Self::search_or_range_pretokenized_with_floor`] delegates here.
+    /// The ranged path carries no negation in v1.
+    ///
+    /// Kernel choice mirrors `dispatch_multi_term_or` instead of
+    /// hardcoding MaxScore+BMM: on a broad OR over uniform-upper-bound
+    /// terms BMM cannot prune (every block max ties), so it degrades to
+    /// per-doc min-scan bookkeeping over ~the whole union — the exact
+    /// shape `run_windowed_union` exists for, and it is natively ranged.
+    /// Hardcoding BMM here made the SAME query run a different kernel
+    /// depending on whether the fan-out sliced (few large superfiles,
+    /// i.e. post-compaction) or not (many small ones, pre-compaction) —
+    /// measured at 1M as the 11-24x post-compact broad-OR regression.
+    pub(crate) fn search_or_range_prebuilt(
+        &self,
+        set: &OrCursorSet,
+        k: usize,
+        doc_id_start: u32,
+        doc_id_end: u32,
+        floor: f32,
+    ) -> Result<Vec<(u32, f32)>, FtsError> {
+        if set.cursors.is_empty() || k == 0 || doc_id_start >= doc_id_end {
             return Ok(Vec::new());
         }
-        let cursors = self.build_term_cursors(column_id, terms).await?;
-        if cursors.is_empty() {
-            return Ok(Vec::new());
-        }
-        // The ranged (sub-range fan-out) path carries no negation in v1.
-        //
-        // Mirror `dispatch_multi_term_or`'s kernel choice instead of
-        // hardcoding MaxScore+BMM: on a broad OR over uniform-upper-bound
-        // terms BMM cannot prune (every block max ties), so it degrades to
-        // per-doc min-scan bookkeeping over ~the whole union — the exact
-        // shape `run_windowed_union` exists for, and it is natively ranged.
-        // Hardcoding BMM here made the SAME query run a different kernel
-        // depending on whether the fan-out sliced (few large superfiles,
-        // i.e. post-compaction) or not (many small ones, pre-compaction) —
-        // measured at 1M as the 11-24x post-compact broad-OR regression.
+        let cursors = set.cursors.clone();
         if prefer_windowed_union(&cursors) {
             self.run_windowed_union(
-                column_id,
+                set.column_id,
                 cursors,
                 k,
                 None,
@@ -1739,7 +1771,7 @@ impl FtsReader {
             )
         } else {
             self.run_max_score_bmm_range(
-                column_id,
+                set.column_id,
                 cursors,
                 k,
                 doc_id_start,
@@ -3469,6 +3501,15 @@ impl FtsReader {
     }
 }
 
+/// One query's built OR cursors for one superfile: the postings fetch
+/// and skip-table parse done once, cheaply cloneable per doc-id
+/// sub-range. Produced by [`FtsReader::build_or_cursor_set`], consumed
+/// by [`FtsReader::search_or_range_prebuilt`].
+pub(crate) struct OrCursorSet {
+    column_id: u32,
+    cursors: Vec<TermCursor>,
+}
+
 /// Top-k min-heap entry `(score, doc_id)`, shared by every search
 /// path (single-term BMW, WAND+BMW, MaxScore+BMM, exhaustive union,
 /// AND intersection, and the `search_multi` combiner).
@@ -4544,6 +4585,7 @@ struct BlockMeta {
 /// `current_doc_id() == u32::MAX` is the "exhausted" sentinel; the
 /// WAND loop drops cursors that are exhausted at the top of each
 /// iteration.
+#[derive(Clone)]
 struct TermCursor {
     /// Precomputed `idf * (K1 + 1)` — the score numerator's
     /// per-cursor constant. Computed once at cursor build so the
@@ -4559,8 +4601,10 @@ struct TermCursor {
     /// the 2-term OR router to detect a rare anchor term (short list),
     /// where WAND+BMW can skip the other term's long list.
     df: u64,
-    /// Per-block metadata.
-    blocks: Vec<BlockMeta>,
+    /// Per-block metadata (the parsed skip table). Read-only after
+    /// build and `Arc`-shared, so cloning a cursor for another doc-id
+    /// sub-range costs the ~1 KiB decode buffers, never a re-parse.
+    blocks: Arc<[BlockMeta]>,
     /// Decoded buffers for the current block. Reused across decodes.
     block_doc_ids: Vec<u32>,
     block_tfs: Vec<u32>,
@@ -4631,7 +4675,7 @@ impl TermCursor {
             idf_x_k1p1: idf * (bm25::K1 + 1.0),
             term_max_bm25,
             df: term_meta.df,
-            blocks,
+            blocks: blocks.into(),
             block_doc_ids: vec![0u32; BLOCK_LEN],
             block_tfs: vec![0u32; BLOCK_LEN],
             block_n: 0,
@@ -4658,7 +4702,7 @@ impl TermCursor {
         let idf_x_k1p1 = idf * (bm25::K1 + 1.0);
         let block_max_bm25 = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
 
-        let blocks = vec![BlockMeta {
+        let blocks: Arc<[BlockMeta]> = Arc::from(vec![BlockMeta {
             last_doc_id: doc_id,
             // No postings-region bytes back this cursor; the decoded
             // buffer is pre-filled below so `decode_current_block` is
@@ -4666,7 +4710,7 @@ impl TermCursor {
             block_byte_offset: 0,
             block_byte_end: 0,
             block_max_bm25,
-        }];
+        }]);
 
         let mut block_doc_ids = vec![0u32; BLOCK_LEN];
         let mut block_tfs = vec![0u32; BLOCK_LEN];
@@ -6145,6 +6189,63 @@ mod tests {
                      (terms={terms:?}, cuts={cuts:?})"
                 );
             }
+        }
+    }
+
+    /// The prebuilt-cursor ranged path must be byte-identical to fresh
+    /// per-call builds — it is the same search minus the redundant fetch
+    /// and parse, so any divergence is a sharing bug (walk state leaking
+    /// between clones, stale first-block decode, ...). One set serves
+    /// overlapping windows and a repeated window to force reuse.
+    #[tokio::test]
+    async fn search_or_range_prebuilt_matches_fresh_calls() {
+        /// Docs in the planted corpus (multiple OR windows and blocks).
+        const N_DOCS: u32 = 6_000;
+        /// Ask for every match so whole result sets are compared.
+        const K_ALL: usize = N_DOCS as usize;
+
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::new();
+            for (t, name) in ["alpha", "beta", "gamma", "delta"].iter().enumerate() {
+                let h = i.wrapping_mul(31).wrapping_add(t as u32 * 17) % 5;
+                for _ in 0..h {
+                    text.push_str(name);
+                    text.push(' ');
+                }
+            }
+            if text.is_empty() {
+                text.push_str("filler");
+            }
+            b.add_doc(0, i, &text).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let terms: &[&str] = &["alpha", "beta", "gamma", "delta"];
+        let set = r.build_or_cursor_set("body", terms).await.expect("set");
+        let windows = [
+            (0u32, N_DOCS),
+            (0, 3_000),
+            (2_000, 4_097),
+            (3_000, N_DOCS),
+            (0, N_DOCS),
+        ];
+        for (lo, hi) in windows {
+            let fresh = r
+                .search_or_range_pretokenized("body", terms, K_ALL, lo, hi)
+                .await
+                .expect("fresh ranged search");
+            let pre = r
+                .search_or_range_prebuilt(&set, K_ALL, lo, hi, f32::NEG_INFINITY)
+                .expect("prebuilt ranged search");
+            let fresh_bits: Vec<(u32, u32)> =
+                fresh.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+            let pre_bits: Vec<(u32, u32)> = pre.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+            assert_eq!(pre_bits, fresh_bits, "window ({lo},{hi})");
         }
     }
 
