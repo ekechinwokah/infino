@@ -82,9 +82,21 @@ use std::{
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, LargeStringArray};
 use roaring::RoaringBitmap;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, oneshot};
 use tracing::debug;
 use uuid::Uuid;
+
+/// Fewest should-terms for which a ranged kernel is shipped to the
+/// reader pool (oneshot bridge) instead of running inline on the tokio
+/// worker. Multi-term kernels are multi-millisecond sync blocks — run
+/// inline they starve woken tasks (one slice per query measured waiting
+/// ~6 ms for a worker at 1M post-compaction). Below this many terms the
+/// kernel is sub-millisecond and the bridge round-trip costs more than
+/// it saves (`two_term_or` measured +~0.1 ms when bridged). Reuses
+/// [`OR_WINDOW_MIN_TERMS`]: the same boundary below which the windowed
+/// union kernel isn't worth its bookkeeping, so the two thresholds
+/// cannot drift apart.
+const RANGED_KERNEL_POOL_MIN_TERMS: usize = OR_WINDOW_MIN_TERMS;
 
 pub use crate::superfile::fts::reader::BoolMode;
 use crate::{
@@ -92,7 +104,7 @@ use crate::{
     superfile::{
         SuperfileReader,
         error::{FtsError, ReadError},
-        fts::reader::{ClauseLists, OrCursorSet},
+        fts::reader::{ClauseLists, OR_WINDOW_MIN_TERMS, OrCursorSet},
     },
     supertable::{
         error::QueryError,
@@ -397,6 +409,14 @@ impl SupertableReader {
         type SharedCursorCell = Arc<OnceCell<Arc<OrCursorSet>>>;
         let cursor_sets: Arc<Mutex<HashMap<Uuid, SharedCursorCell>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        // Ranged kernels are multi-millisecond SYNC scans; run them as a
+        // rayon wave on the reader pool, bridged with a oneshot, per the
+        // concurrency contract. Inline on tokio workers they block the
+        // runtime: with 8 slices the OnceCell wake of one waiter reliably
+        // lost the worker race and sat a full kernel duration in a run
+        // queue — measured at 1M post-compact as one ~6 ms-starved slice
+        // per query gating a 9.6 ms wall over ~6 ms of actual work.
+        let reader_pool = Arc::clone(&manifest.options.reader_pool);
 
         // One shared fan-out (`query::dispatch::fanout`) — the same
         // orchestrator the vector path uses. It warms the tombstone
@@ -415,6 +435,7 @@ impl SupertableReader {
             let neg_ph_arc = Arc::clone(&neg_ph_arc);
             let shared = Arc::clone(&shared);
             let cursor_sets = Arc::clone(&cursor_sets);
+            let reader_pool = Arc::clone(&reader_pool);
             let tombstones = tombstones.clone();
             async move {
                 // Share the global kth-best floor with every superfile —
@@ -449,8 +470,29 @@ impl SupertableReader {
                                     .map_err(fts_read_error)
                             })
                             .await?;
-                        r.bm25_search_or_range_prebuilt(set, k, start, end, floor)
-                            .map_err(fts_read_error)?
+                        // Heavy kernels go to the reader pool; trivial ones
+                        // run inline where the oneshot round-trip would cost
+                        // more than the scan — see the gate's doc comment.
+                        if should_arc.len() >= RANGED_KERNEL_POOL_MIN_TERMS {
+                            let (tx, rx) = oneshot::channel();
+                            let kernel_reader = Arc::clone(&r);
+                            let kernel_set = Arc::clone(set);
+                            reader_pool.spawn(move || {
+                                let _ = tx.send(kernel_reader.bm25_search_or_range_prebuilt(
+                                    &kernel_set,
+                                    k,
+                                    start,
+                                    end,
+                                    floor,
+                                ));
+                            });
+                            rx.await
+                                .expect("reader-pool ranged kernel dropped its result channel")
+                                .map_err(fts_read_error)?
+                        } else {
+                            r.bm25_search_or_range_prebuilt(set, k, start, end, floor)
+                                .map_err(fts_read_error)?
+                        }
                     }
                     None => {
                         let must_refs: Vec<&str> = must_arc.iter().map(|s| s.as_str()).collect();

@@ -154,8 +154,10 @@ const OR_WINDOW_WORDS: usize = (OR_WINDOW as usize).div_ceil(64);
 
 /// Multi-term OR dispatch floor. A 2-term OR is already sub-millisecond
 /// on MaxScore, so the window's per-window bookkeeping isn't worth it
-/// below this many terms.
-const OR_WINDOW_MIN_TERMS: usize = 3;
+/// below this many terms. `pub(crate)`: the supertable fan-out reuses
+/// this same boundary to decide when a ranged kernel is heavy enough to
+/// ship to the reader pool (see `RANGED_KERNEL_POOL_MIN_TERMS`).
+pub(crate) const OR_WINDOW_MIN_TERMS: usize = 3;
 /// Route a multi-term OR to the windowed union scorer only when the top
 /// term's score upper bound is at most this multiple of the *average*
 /// term upper bound — i.e. no single term dominates. Uniform terms sit at
