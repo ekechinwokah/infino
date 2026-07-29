@@ -4892,30 +4892,37 @@ impl TermCursor {
             _ => None,
         };
 
-        let mut blocks: Vec<BlockMeta> = Vec::with_capacity(term_meta.num_blocks);
+        // Collect straight into the `Arc` allocation: `0..num_blocks` is
+        // an exact-size iterator, so this writes each entry in place —
+        // one allocation, no intermediate `Vec` + copy. The skip table
+        // is ~a quarter of a long term's cursor-build bytes (one 32-byte
+        // entry per 128-doc block), so the doubled write showed up on
+        // common-term queries.
         let mut term_max_bm25: f32 = 0.0;
-        for i in 0..term_meta.num_blocks {
-            let (last_doc_id, block_offset_in_term, raw_block_max) =
-                term_meta.skip_entry(postings, i);
-            let block_max_bm25 = match idf_rescale {
-                Some(ratio) => raw_block_max * ratio,
-                None => raw_block_max,
-            };
-            term_max_bm25 = term_max_bm25.max(block_max_bm25);
+        let blocks: Arc<[BlockMeta]> = (0..term_meta.num_blocks)
+            .map(|i| {
+                let (last_doc_id, block_offset_in_term, raw_block_max) =
+                    term_meta.skip_entry(postings, i);
+                let block_max_bm25 = match idf_rescale {
+                    Some(ratio) => raw_block_max * ratio,
+                    None => raw_block_max,
+                };
+                term_max_bm25 = term_max_bm25.max(block_max_bm25);
 
-            blocks.push(BlockMeta {
-                last_doc_id,
-                block_byte_offset: metadata_offset + block_offset_in_term,
-                block_byte_end: metadata_offset + term_meta.block_end_in_term(postings, i),
-                block_max_bm25,
-            });
-        }
+                BlockMeta {
+                    last_doc_id,
+                    block_byte_offset: metadata_offset + block_offset_in_term,
+                    block_byte_end: metadata_offset + term_meta.block_end_in_term(postings, i),
+                    block_max_bm25,
+                }
+            })
+            .collect();
 
         let mut cursor = Self {
             idf_x_k1p1: idf * (bm25::K1 + 1.0),
             term_max_bm25,
             df: term_meta.df,
-            blocks: blocks.into(),
+            blocks,
             block_doc_ids: vec![0u32; BLOCK_LEN],
             block_tfs: vec![0u32; BLOCK_LEN],
             block_n: 0,
@@ -4948,7 +4955,7 @@ impl TermCursor {
         let idf_x_k1p1 = idf * (bm25::K1 + 1.0);
         let block_max_bm25 = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
 
-        let blocks: Arc<[BlockMeta]> = Arc::from(vec![BlockMeta {
+        let blocks: Arc<[BlockMeta]> = Arc::from([BlockMeta {
             last_doc_id: doc_id,
             // No postings-region bytes back this cursor; the decoded
             // buffer is pre-filled below so `decode_current_block` is
