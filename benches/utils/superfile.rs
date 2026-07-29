@@ -2024,7 +2024,7 @@ pub mod sql {
             .with_disk_cache(cache.clone())
             .with_cache_prepopulation(false);
         let table = build_supertable_with_options(rows, opts, rows.len().max(1));
-        let reader = table.reader();
+        let reader = table.reader().expect("reader");
         let total_index_bytes: u64 = reader
             .manifest()
             .superfiles
@@ -2144,6 +2144,7 @@ pub mod sql {
         index
             .table()
             .reader()
+            .expect("reader")
             .manifest()
             .superfiles
             .iter()

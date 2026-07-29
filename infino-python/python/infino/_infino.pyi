@@ -5,6 +5,7 @@ from pyarrow import RecordBatch, Schema, Table as ArrowTable
 
 Metric: TypeAlias = Literal["cosine", "l2sq", "l2", "negdot", "dot"]
 BoolMode: TypeAlias = Literal["or", "and"]
+Bm25Stats: TypeAlias = Literal["per_superfile", "global"]
 ColdFetchMode: TypeAlias = Literal[
     "hybrid_with_prefetch",
     "range_only",
@@ -38,6 +39,7 @@ class ConnectionMemoryBudgetError(InfinoError):
     it and back off, e.g. narrow the query, split the ingest, or raise the budget."""
 
 class Connection:
+    def create_database(self) -> None: ...
     def create_table(self, name: str, schema: Schema, indexes: IndexSpec) -> Table: ...
     def open_table(self, name: str) -> Table: ...
     def drop_table(self, name: str, purge: bool = ...) -> None: ...
@@ -59,6 +61,7 @@ class Table:
         k: int,
         mode: BoolMode | None = ...,
         projection: Sequence[str] | None = ...,
+        stats: Bm25Stats | None = ...,
     ) -> ArrowTable: ...
     def vector_search(
         self,
