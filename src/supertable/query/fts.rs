@@ -1657,13 +1657,18 @@ impl Supertable {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, future::Future, sync::Arc};
+    use std::{
+        collections::{HashMap, HashSet},
+        future::Future,
+        sync::Arc,
+    };
 
     use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use bytes::Bytes;
     use datafusion::prelude::{col, lit};
     use tokio::runtime::Builder;
+    use uuid::Uuid;
 
     use super::{Bm25Stats, BoolMode, FanOut, build_work_units, fanout_for};
     use crate::{
@@ -1671,15 +1676,38 @@ mod tests {
         superfile::{
             SuperfileReader,
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+            fts::reader::top_k_initial_capacity,
             vector::layout::VectorLayout,
         },
         supertable::{
             Supertable, SupertableOptions,
             error::QueryError,
+            manifest::{SuperfileEntry, SuperfileUri},
             options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
         },
         test_helpers::default_tokenizer as tok,
     };
+
+    /// Manifest entry fixture for the work-unit tests. `n_docs` is the
+    /// only field the fan-out's slicing reads; everything else is inert.
+    fn manifest_entry(n_docs: u64) -> Arc<SuperfileEntry> {
+        let id = Uuid::new_v4();
+        Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: id,
+            uri: SuperfileUri(id),
+            n_docs,
+            id_min: 0,
+            id_max: n_docs.saturating_sub(1) as i128,
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
+            subsection_offsets: None,
+        })
+    }
 
     /// Drive an async future to completion on a throwaway current-thread
     /// runtime. Used only for the single-superfile `SuperfileReader`
@@ -2837,33 +2865,8 @@ mod tests {
 
     #[test]
     fn build_work_units_per_superfile_is_one_unranged_unit_each() {
-        use std::collections::HashMap;
-
-        use uuid::Uuid;
-
-        use crate::supertable::manifest::{SuperfileEntry, SuperfileUri};
-
-        fn entry(n_docs: u64) -> Arc<SuperfileEntry> {
-            let id = Uuid::new_v4();
-            Arc::new(SuperfileEntry {
-                birth_version: 0,
-                superfile_id: id,
-                uri: SuperfileUri(id),
-                n_docs,
-                id_min: 0,
-                id_max: n_docs.saturating_sub(1) as i128,
-                scalar_stats: HashMap::new(),
-                fts_summary: HashMap::new(),
-                vector_summary: HashMap::new(),
-                partition_key: Vec::new(),
-                partition_hint: None,
-                vector_layout: VectorLayout::Ivf,
-                subsection_offsets: None,
-            })
-        }
-
-        let e0 = entry(100);
-        let e1 = entry(200);
+        let e0 = manifest_entry(100);
+        let e1 = manifest_entry(200);
         let kept = vec![&e0, &e1];
 
         // PerSuperfile always yields exactly one un-ranged unit per kept
@@ -2893,12 +2896,6 @@ mod tests {
     /// hand the merged file the pool and leave remnants whole.
     #[test]
     fn build_work_units_allocates_by_doc_mass_not_file_count() {
-        use std::collections::HashMap;
-
-        use uuid::Uuid;
-
-        use crate::supertable::manifest::{SuperfileEntry, SuperfileUri};
-
         /// Threads in the simulated reader pool.
         const POOL: usize = 8;
         /// Docs in the merged superfile (compaction output).
@@ -2906,30 +2903,12 @@ mod tests {
         /// Docs in each post-merge remnant — below `SUBRANGE_MIN_DOCS`.
         const REMNANT_DOCS: u64 = 10_000;
 
-        let entry = |n_docs: u64| {
-            let id = Uuid::new_v4();
-            Arc::new(SuperfileEntry {
-                birth_version: 0,
-                superfile_id: id,
-                uri: SuperfileUri(id),
-                n_docs,
-                id_min: 0,
-                id_max: n_docs as i128 - 1,
-                scalar_stats: HashMap::new(),
-                fts_summary: HashMap::new(),
-                vector_summary: HashMap::new(),
-                partition_key: Vec::new(),
-                partition_hint: None,
-                vector_layout: VectorLayout::Ivf,
-                subsection_offsets: None,
-            })
-        };
-        let merged = entry(MERGED_DOCS);
+        let merged = manifest_entry(MERGED_DOCS);
         let remnants = [
-            entry(REMNANT_DOCS),
-            entry(REMNANT_DOCS),
-            entry(REMNANT_DOCS),
-            entry(REMNANT_DOCS),
+            manifest_entry(REMNANT_DOCS),
+            manifest_entry(REMNANT_DOCS),
+            manifest_entry(REMNANT_DOCS),
+            manifest_entry(REMNANT_DOCS),
         ];
         let mut kept = vec![&merged];
         kept.extend(remnants.iter());
@@ -2965,6 +2944,98 @@ mod tests {
             cursor = end;
         }
         assert_eq!(cursor, MERGED_DOCS as u32, "sub-ranges cover every doc");
+    }
+
+    /// Regression: a sliced fan-out must preallocate top-k heap slots for
+    /// the docs it can actually rank, not one whole-superfile heap **per
+    /// slice**. Before the fix the slices requested
+    /// `slices × min(k, superfile docs)` — 61 MiB against 7.6 MiB
+    /// rankable at the 1M × 8-thread shape below, and a pool-sized
+    /// multiple (GBs) on a compacted table with a wide reader pool.
+    ///
+    /// All three trigger conditions are just what a compacted table under
+    /// an everyday query looks like:
+    ///   1. a bare two-or-more-term OR — `fanout_for(0, >= 2, false)` is
+    ///      `SubRanges`, so any two-word query slices;
+    ///   2. one merged superfile holding ~all the doc mass, which
+    ///      doc-mass allocation hands the entire pool (see
+    ///      `build_work_units_allocates_by_doc_mass_not_file_count`) —
+    ///      i.e. the shape `optimize` produces;
+    ///   3. a large `k`, which the fan-out passes to every slice
+    ///      unchanged.
+    ///
+    /// The slices tile the doc space exactly once, so the slots the query
+    /// needs is bounded by `min(k, docs)`. Capacity is computed through
+    /// the same `top_k_initial_capacity` both ranged kernels call
+    /// (`run_max_score_bmm_range`, `run_windowed_union`), each passing
+    /// its own `[start, end)`.
+    #[test]
+    fn ranged_slice_heaps_are_sized_by_their_own_range() {
+        /// Threads in the reader pool = slices the merged file takes.
+        const POOL: usize = 8;
+        /// Docs in the merged superfile a full optimize produces.
+        const MERGED_DOCS: u64 = 1_000_000;
+        /// Result size. Large `k` is what makes the over-allocation bite:
+        /// at small `k` the cap is `k` and the waste is negligible.
+        const K: usize = MERGED_DOCS as usize;
+        /// Bytes per heap slot — `TopKEntry` is `(f32, u32)`.
+        const SLOT_BYTES: usize = 8;
+
+        let merged = manifest_entry(MERGED_DOCS);
+        let kept = vec![&merged];
+        let units = build_work_units(&kept, FanOut::SubRanges, POOL);
+        assert_eq!(units.len(), POOL, "merged superfile takes the whole pool");
+
+        // What the slices collectively ask for, computed exactly as the
+        // ranged kernels do — each scoped to its own sub-range.
+        let requested: usize = units
+            .iter()
+            .map(|u| top_k_initial_capacity(K, u.entry.n_docs, u.range))
+            .sum();
+        // What the query can possibly need: the slices tile the doc space
+        // once, so no more than `min(k, docs)` distinct docs are rankable.
+        let needed = top_k_initial_capacity(K, MERGED_DOCS, None);
+
+        let mib = |slots: usize| (slots * SLOT_BYTES) as f64 / (1024.0 * 1024.0);
+        assert_eq!(
+            requested,
+            needed,
+            "sliced fan-out requested {requested} top-k slots ({:.1} MiB) for \
+             a doc space needing {needed} ({:.1} MiB): a slice must be sized \
+             by its own range, not by the whole superfile",
+            mib(requested),
+            mib(needed),
+        );
+    }
+
+    /// Control for the regression above: the same corpus and the same `k`
+    /// on the un-sliced path allocate exactly once. This pinned the
+    /// blow-up to slicing rather than to large `k` on its own, and now
+    /// pins the fixed sliced case to the same total.
+    #[test]
+    fn unsliced_fanout_preallocates_one_top_k_heap_per_superfile() {
+        /// Docs in the merged superfile a full optimize produces.
+        const MERGED_DOCS: u64 = 1_000_000;
+        /// Same large `k` as the sliced repro.
+        const K: usize = MERGED_DOCS as usize;
+        /// Reader-pool threads; irrelevant under `PerSuperfile`.
+        const POOL: usize = 8;
+
+        let merged = manifest_entry(MERGED_DOCS);
+        let kept = vec![&merged];
+        // A query carrying a must or a negation stays whole-superfile.
+        let units = build_work_units(&kept, FanOut::PerSuperfile, POOL);
+        assert_eq!(units.len(), 1, "un-ranged fan-out is one unit per file");
+
+        let requested: usize = units
+            .iter()
+            .map(|u| top_k_initial_capacity(K, u.entry.n_docs, u.range))
+            .sum();
+        assert_eq!(
+            requested,
+            top_k_initial_capacity(K, MERGED_DOCS, None),
+            "un-sliced scan allocates exactly the docs it can rank"
+        );
     }
 
     #[test]

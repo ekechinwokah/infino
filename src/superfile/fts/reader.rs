@@ -294,6 +294,36 @@ fn prefer_windowed_union(cursors: &[TermCursor]) -> bool {
     cursors.len() >= OR_WINDOW_MIN_TERMS && no_dominant_term_ub(cursors)
 }
 
+/// Initial capacity for a scan's top-k heap, in [`TopKEntry`] slots.
+///
+/// `docs_in_scope` bounds the distinct doc_ids that can ever enter the
+/// heap. It exists because callers may pass `k = usize::MAX`
+/// (`search_multi` gathers every match before weighting across
+/// columns), and `usize::MAX * size_of::<TopKEntry>()` is not an
+/// allocation any machine will serve; the heap still grows on demand.
+///
+/// `range` is the doc-id window the scan will visit; `None` is a
+/// whole-superfile scan, whose scope is `n_docs`. **Every ranged kernel
+/// must pass its own `Some((start, end))`** — a slice can only rank the
+/// docs inside its window, so sizing it by `n_docs` instead makes a
+/// sliced fan-out preallocate `slices × min(k, n_docs)` slots for a doc
+/// space its slices collectively walk exactly once. That is a
+/// pool-sized multiple on a compacted table, where doc-mass allocation
+/// hands one merged superfile the entire reader pool: measured at 1M
+/// docs × 8 threads as 61 MiB requested against 7.6 MiB rankable.
+/// Guarded by `ranged_slice_heaps_are_sized_by_their_own_range`.
+///
+/// An un-ranged caller that still has a window handy may pass it — the
+/// `min` against `n_docs` makes `Some((0, u32::MAX))` and `None`
+/// equivalent.
+pub(crate) fn top_k_initial_capacity(k: usize, n_docs: u64, range: Option<(u32, u32)>) -> usize {
+    let docs_in_scope = match range {
+        Some((start, end)) => (end.saturating_sub(start) as usize).min(n_docs as usize),
+        None => n_docs as usize,
+    };
+    k.min(docs_in_scope).max(1)
+}
+
 /// True for a 2-term cursor set where one term's posting list is at least
 /// [`WAND_BMW_2TERM_DF_RATIO`]× shorter than the other's — a rare anchor
 /// WAND+BMW can pivot on to skip the common term's long list. The whole
@@ -1126,7 +1156,7 @@ impl FtsReader {
         floor_eff: f32,
     ) -> Result<Vec<(u32, f32)>, FtsError> {
         let dl_norm_k1 = &self.columns[column_id as usize].dl_norm_k1;
-        let initial_cap = k.min(self.n_docs as usize).max(1);
+        let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
 
         // Per-atom pruning slack: an atom only needs to contribute
@@ -2262,7 +2292,7 @@ impl FtsReader {
         // capacity at n_docs (the upper bound on distinct doc_ids in
         // the heap) so we don't try to allocate `usize::MAX * size_of::<TopKEntry>()`.
         // The BinaryHeap grows on demand if needed.
-        let initial_cap = k.min(self.n_docs as usize).max(1);
+        let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         let mut threshold: f32 = 0.0;
 
@@ -2520,7 +2550,7 @@ impl FtsReader {
         // expected number of leapfrog bumps per candidate.
         cursors.sort_by_key(|c| c.block_count());
 
-        let initial_cap = k.min(self.n_docs as usize).max(1);
+        let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         let mut sink = ScoreSink {
             heap: &mut heap,
@@ -2556,7 +2586,7 @@ impl FtsReader {
         let dl_norm_k1 = &col_meta.dl_norm_k1;
         must_cursors.sort_by_key(|c| c.block_count());
 
-        let initial_cap = k.min(self.n_docs as usize).max(1);
+        let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         let should_ub = should_cursors.iter().map(|c| c.term_max_bm25).sum();
         let mut sink = MustShouldSink {
@@ -2952,7 +2982,11 @@ impl FtsReader {
             partial_max[i] = partial_max[i + 1] + cursors[i].term_max_bm25;
         }
 
-        let initial_cap = k.min(self.n_docs as usize).max(1);
+        // Sized by this slice's own window: only docs inside it can be
+        // ranked here, and a sliced fan-out would otherwise preallocate
+        // one whole-superfile heap per slice.
+        let initial_cap =
+            top_k_initial_capacity(k, u64::from(self.n_docs), Some((doc_id_start, doc_id_end)));
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         // Seed the pruning threshold with the caller's floor: docs
         // strictly below it can never matter, so the MaxScore
@@ -3319,7 +3353,11 @@ impl FtsReader {
             }
         }
 
-        let initial_cap = k.min(self.n_docs as usize).max(1);
+        // This scan's own window, as in the MaxScore path. Un-ranged
+        // callers pass `[0, u32::MAX)`, which the `n_docs` cap collapses
+        // back to a whole-superfile scope.
+        let initial_cap =
+            top_k_initial_capacity(k, u64::from(self.n_docs), Some((doc_id_start, doc_id_end)));
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         // Floor-seeded threshold, identical to the MaxScore path.
         let mut threshold: f32 = floor_eff.max(0.0);
@@ -3501,7 +3539,7 @@ impl FtsReader {
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = &col_meta.dl_norm_k1;
 
-        let initial_cap = k.min(self.n_docs as usize).max(1);
+        let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         let mut threshold: f32 = 0.0;
 
@@ -6296,6 +6334,50 @@ mod tests {
             ids,
             [2u32, 3, 4].into_iter().collect(),
             "only docs in [2,5) returned"
+        );
+    }
+
+    /// A scan's top-k heap is preallocated for the docs it can actually
+    /// rank: the whole superfile un-ranged, the window's width when
+    /// ranged. Sizing a ranged scan by `n_docs` is what made a sliced
+    /// fan-out preallocate one whole-superfile heap per slice.
+    #[test]
+    fn top_k_capacity_is_scoped_to_the_range_the_scan_visits() {
+        /// Docs in the notional superfile.
+        const N_DOCS: u64 = 1_000_000;
+        /// Result size large enough that the scope, not `k`, is the cap.
+        const BIG_K: usize = N_DOCS as usize;
+
+        // Un-ranged: scope is the whole superfile.
+        assert_eq!(top_k_initial_capacity(BIG_K, N_DOCS, None), N_DOCS as usize);
+        // Ranged: scope is the window, not the file — an eighth of the
+        // doc space preallocates an eighth of the slots.
+        let eighth = (N_DOCS / 8) as u32;
+        assert_eq!(
+            top_k_initial_capacity(BIG_K, N_DOCS, Some((0, eighth))),
+            eighth as usize
+        );
+        assert_eq!(
+            top_k_initial_capacity(BIG_K, N_DOCS, Some((eighth, 2 * eighth))),
+            eighth as usize
+        );
+        // A window wider than the file (un-ranged callers pass
+        // `[0, u32::MAX)`) collapses back to the whole-superfile scope.
+        assert_eq!(
+            top_k_initial_capacity(BIG_K, N_DOCS, Some((0, u32::MAX))),
+            N_DOCS as usize
+        );
+        // Small `k` still wins over the scope, and the floor is 1 slot so
+        // a `k = 0` or empty-range caller never asks for a zero-capacity
+        // heap.
+        assert_eq!(top_k_initial_capacity(10, N_DOCS, Some((0, eighth))), 10);
+        assert_eq!(top_k_initial_capacity(0, N_DOCS, None), 1);
+        assert_eq!(top_k_initial_capacity(BIG_K, N_DOCS, Some((5, 5))), 1);
+        // `k = usize::MAX` (`search_multi`) is capped by the scope, never
+        // turned into an unservable allocation.
+        assert_eq!(
+            top_k_initial_capacity(usize::MAX, N_DOCS, None),
+            N_DOCS as usize
         );
     }
 
