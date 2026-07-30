@@ -601,6 +601,15 @@ fn occupancy_replicas() -> u32 {
         .get_or_init(|| parse_replicas(std::env::var("INFINO_BENCH_COST_REPLICAS").ok().as_deref()))
 }
 
+/// The tenant's composed serving cost per month: marginal work (storage +
+/// blended reads + writes + maintenance, egress excluded as pass-through)
+/// plus the keep-warm floor (idle-retained NVMe × R) that buys the blend's
+/// warm-hit rate. `None` floor (NVMe cache unmeasured) yields `None` — the
+/// composed number is withheld rather than silently missing its floor.
+fn serving_cogs_month(marginal_ex_egress: f64, idle_floor_total: Option<f64>) -> Option<f64> {
+    idle_floor_total.map(|floor| marginal_ex_egress + floor)
+}
+
 /// Network egress rate ($/GB out), env-overridable like [`storage_months`]
 /// (it is a rate-card rate, not an instance attribute, so it is read here and
 /// not in `Instance::from_env`). Set `INFINO_BENCH_COST_EGRESS_USD_PER_GB=0`
@@ -2600,6 +2609,67 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
         rows: occupancy_rows,
     });
 
+    // ---- Block 7: serving COGS (the composed per-tenant number) ----
+    // The one number the two blocks above only imply: what serving this
+    // tenant costs per month. Marginal work (storage + blended reads +
+    // writes + maintenance) PLUS the keep-warm floor that buys the blend's
+    // warm-hit rate (idle-retained NVMe × R). Egress is excluded — it is
+    // passed through to the customer, so it is revenue-neutral, not COGS.
+    // The floor requires a measured NVMe cache size; when unmeasured the
+    // total is withheld, never guessed low.
+    let marginal_ex_egress = storage_month
+        + blended_read_q
+            .map(|q| q * SUMMARY_QUERIES_PER_MONTH)
+            .unwrap_or(0.0)
+        + writes_month
+        + maintenance_month.unwrap_or(0.0);
+    let idle_floor_total = nvme_sh.map(|s| s * node_month * f64::from(replicas));
+    let serving_cogs = {
+        let warm_pct = SUMMARY_READ_WARM_FRACTION * 100.0;
+        let mut rows = vec![vec![
+            text(format!(
+                "Marginal work — storage + blended reads ({warm_pct:.0}/{:.0}) + writes + maintenance",
+                100.0 - warm_pct,
+            )),
+            text("summary lines above, egress excluded (passed through to the customer)"),
+            context(marginal_ex_egress, usd(marginal_ex_egress), Better::Lower),
+        ]];
+        match idle_floor_total {
+            Some(floor) => {
+                rows.push(vec![
+                    text(format!(
+                        "Keep-warm floor — idle-retained NVMe × R={replicas}"
+                    )),
+                    text("the occupancy row that buys the blend's warm-hit rate"),
+                    context(floor, usd(floor), Better::Lower),
+                ]);
+                let total = serving_cogs_month(marginal_ex_egress, idle_floor_total)
+                    .expect("floor is Some in this branch");
+                rows.push(vec![
+                    text("Serving COGS (marginal + keep-warm floor, ex-egress)"),
+                    text("—"),
+                    metric(total, usd(total), Better::Lower),
+                ]);
+            }
+            None => rows.push(vec![
+                text("Serving COGS (marginal + keep-warm floor, ex-egress)"),
+                text("NVMe cache unmeasured this run — total withheld, never guessed"),
+                text("—"),
+            ]),
+        }
+        Block {
+            subtitle: format!(
+                "Serving COGS — per tenant-month at {} queries/mo, {:.0}% warm blend, \
+                 keep-warm-NVMe policy. The composed number the marginal summary and the \
+                 occupancy view each show one half of.",
+                fmt_count(SUMMARY_QUERIES_PER_MONTH as usize),
+                SUMMARY_READ_WARM_FRACTION * 100.0,
+            ),
+            headers: vec!["Line".into(), "Basis".into(), "$/month".into()],
+            rows,
+        }
+    };
+
     let mut blocks = vec![rate_card];
     if let Some(io_ledger) = io_ledger {
         blocks.push(io_ledger);
@@ -2610,6 +2680,7 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     if let Some(occupancy) = occupancy {
         blocks.push(occupancy);
     }
+    blocks.push(serving_cogs);
 
     report.emit(&Section {
         anchor: anchor.into(),
@@ -2924,6 +2995,17 @@ mod tests {
         assert!((inst.usd_per_month() - 0.3629 * HOURS_PER_MONTH).abs() < 1e-9);
         let billed = 0.5 * inst.usd_per_month() * 2.0;
         assert!((billed - inst.usd_per_month()).abs() < 1e-9);
+    }
+
+    /// The composed serving-COGS number: marginal-ex-egress plus the
+    /// keep-warm floor, and withheld (not guessed at marginal-only) when
+    /// the floor is unmeasured. Values mirror the 100K FTS reference run:
+    /// $4.18 marginal + $0.78 idle-NVMe floor = $4.96/mo.
+    #[test]
+    fn serving_cogs_composes_marginal_plus_floor_or_withholds() {
+        let composed = serving_cogs_month(4.18, Some(0.78)).expect("floor measured");
+        assert!((composed - 4.96).abs() < 1e-9);
+        assert_eq!(serving_cogs_month(4.18, None), None);
     }
 
     #[test]
