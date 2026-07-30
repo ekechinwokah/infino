@@ -543,8 +543,19 @@ impl SupertableReader {
                                     floor,
                                 ));
                             });
+                            // A dropped `tx` means the pool task died before
+                            // sending (it can't happen short of a kernel
+                            // panic, which the shared pool's default rayon
+                            // handler turns into an abort first) — but
+                            // surface it as an error rather than a second
+                            // panic, matching the resolve-decode bridge in
+                            // `exec::common`.
                             rx.await
-                                .expect("reader-pool ranged kernel dropped its result channel")
+                                .map_err(|_| {
+                                    QueryError::Execute(
+                                        "ranged fts kernel: reader pool dropped result".into(),
+                                    )
+                                })?
                                 .map_err(fts_read_error)?
                         } else {
                             r.bm25_search_or_range_prebuilt(set, k, start, end, floor)
@@ -1367,6 +1378,12 @@ fn fanout_for(n_musts: usize, n_shoulds: usize, has_negatives: bool) -> FanOut {
 /// couple of threads walk nearly the whole corpus. Slices share one
 /// cursor build per superfile (see the fan-out's cursor-set cache), so
 /// extra units cost decode buffers, not postings fetches.
+///
+/// `pool_threads` is a target, not a budget: per-file round-half-up
+/// plus the ≥ 1-unit clamp can emit up to `kept − 1` units more than
+/// there are threads (e.g. three equal files on an 8-thread pool yield
+/// 3 × 3 = 9). Excess units queue on the pool — scheduling slop, never
+/// extra concurrency.
 ///
 /// Two limits still apply:
 ///   1. `FanOut::PerSuperfile` (no range-aware kernel for the shape)
@@ -3036,6 +3053,48 @@ mod tests {
             top_k_initial_capacity(K, MERGED_DOCS, None),
             "un-sliced scan allocates exactly the docs it can rank"
         );
+    }
+
+    /// Pins the documented "target, not a budget" slop: per-file
+    /// round-half-up with the ≥ 1 clamp may emit up to `kept − 1` units
+    /// beyond the pool. Three equal files on an 8-thread pool round to
+    /// 3 slices each; the excess unit queues, it never adds concurrency.
+    #[test]
+    fn build_work_units_may_oversubscribe_pool_by_kept_minus_one() {
+        /// Threads in the simulated reader pool.
+        const POOL: usize = 8;
+        /// Docs per superfile — equal thirds, each well above the
+        /// `SUBRANGE_MIN_DOCS` floor so rounding alone decides.
+        const DOCS_EACH: u64 = 400_000;
+
+        let files = [
+            manifest_entry(DOCS_EACH),
+            manifest_entry(DOCS_EACH),
+            manifest_entry(DOCS_EACH),
+        ];
+        let kept: Vec<_> = files.iter().collect();
+        let units = build_work_units(&kept, FanOut::SubRanges, POOL);
+        // round(1/3 × 8) = 3 slices per file.
+        assert_eq!(units.len(), 9, "3 equal files each round to 3 slices");
+        assert!(
+            units.len() <= POOL + (kept.len() - 1),
+            "oversubscription is bounded by kept − 1"
+        );
+        // Every file's slices still tile its own doc space exactly.
+        for f in &files {
+            let mut ranges: Vec<(u32, u32)> = units
+                .iter()
+                .filter(|u| u.entry.superfile_id == f.superfile_id)
+                .map(|u| u.range.expect("equal thirds are sliced"))
+                .collect();
+            ranges.sort_unstable();
+            let mut cursor = 0u32;
+            for (start, end) in ranges {
+                assert_eq!(start, cursor, "sub-ranges tile without gaps");
+                cursor = end;
+            }
+            assert_eq!(cursor, DOCS_EACH as u32, "sub-ranges cover every doc");
+        }
     }
 
     #[test]
