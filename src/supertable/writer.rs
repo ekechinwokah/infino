@@ -57,8 +57,10 @@ use std::{
     io::{self, BufReader, BufWriter, Read, Write},
     marker::PhantomData,
     mem,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, atomic::Ordering},
+    thread::available_parallelism,
     time,
 };
 
@@ -109,7 +111,6 @@ use super::{
         },
     },
 };
-#[cfg(test)]
 use crate::superfile::ReadError;
 use crate::{
     InfinoError,
@@ -2269,7 +2270,6 @@ impl PreparedSuperfile {
     /// Open a `SuperfileReader` directly on this superfile's bytes.
     /// Returns `None` if no bytes are held (cache-attached path with
     /// no prepopulation — bytes went to storage only).
-    #[cfg(test)]
     pub(crate) fn open_reader(&self) -> Option<Result<SuperfileReader, ReadError>> {
         let bytes = self
             .bytes_for_store
@@ -2635,25 +2635,40 @@ async fn persist_superfile_publish_batch_async(
     Ok(())
 }
 
-/// Single-thread rayon pool for incoming-routing CPU work (cell assignment + per-cell
-/// superfile encode). Installing the build under this pool pins all its nested
-/// `par_iter`/`join` to one thread instead of fanning out across every core, so
-/// routing can't starve foreground ingest CPU.
+/// Rayon pool for maintenance-compaction CPU work — split k-means and
+/// the probe-law recalibration scan, all reached from the `optimize()` /
+/// hidden-compaction path (nothing on the ingest commit path rides this
+/// pool). Width from `vector.maintenance_threads`; `auto` (default) =
+/// all hardware threads, cap it only when optimize runs concurrently
+/// with latency-critical foreground work. Sized once, at first use.
 static MAINT_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
 
 fn maint_pool() -> Result<&'static ThreadPool, BuildError> {
     if let Some(pool) = MAINT_POOL.get() {
         return Ok(pool);
     }
+    let threads = config::global()
+        .vector
+        .maintenance_threads
+        .resolve_or_default(available_parallelism().map(NonZeroUsize::get).unwrap_or(1));
     // Build outside `get_or_init` so a spawn failure propagates instead of
     // panicking the maintenance path (`OnceLock::get_or_try_init` is not
     // stable). A racing initializer wins harmlessly; ours is dropped.
     let pool = ThreadPoolBuilder::new()
-        .num_threads(1)
+        .num_threads(threads)
         .thread_name(|_| "hidden-maint-cpu".into())
         .build()
         .map_err(|e| BuildError::Store(format!("hidden maintenance rayon pool: {e}")))?;
     Ok(MAINT_POOL.get_or_init(|| pool))
+}
+
+test_visible! {
+    /// Effective maintenance-pool width — bench/test introspection so a
+    /// run's log can record the compute width its optimize measurements
+    /// were taken at.
+    fn maintenance_pool_width() -> usize {
+        maint_pool().map(ThreadPool::current_num_threads).unwrap_or(1)
+    }
 }
 
 /// No-staging drain: read committed user superfiles, assign their encoded rows
@@ -3784,9 +3799,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .cloned()
             .ok_or_else(|| BuildError::Store("drain pack requires a vector column".into()))?;
         // All batches spilled: freeze the calibration sample so the pack
-        // fan-out below can score cells against a stable query set.
+        // fan-out below can score cells against a stable query set. The
+        // grid is final here — every spill is already assigned to its
+        // cells — so the rerank-law pools rank against what queries will
+        // actually sweep.
         if let Some(cal) = width_law.as_mut() {
-            cal.freeze();
+            cal.freeze(&running_clusters, vector_config.rot_seed);
         }
         let width_law_ref = width_law.as_ref();
         let prepared_shards: Vec<PreparedSuperfile> = fanout_shards(
@@ -3830,7 +3848,24 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     };
                     packed.push((*cell_id, cell));
                 }
-                build_prepared_from_spilled_cells(&hidden_inner, scratch, *shard_id, &packed)
+                let prepared: PreparedSuperfile =
+                    build_prepared_from_spilled_cells(&hidden_inner, scratch, *shard_id, &packed)?;
+                // Depth-law observation: fine clusters exist only now that
+                // the shard is packed; record each surviving candidate's
+                // fine-centroid rank from the shard's own bytes.
+                if let Some(cal) = width_law_ref
+                    && let Some(reader) = prepared.open_reader()
+                {
+                    let reader = reader
+                        .map_err(|e| BuildError::Store(format!("depth-law shard reopen: {e}")))?;
+                    if let Some(views) = reader
+                        .vec()
+                        .and_then(|v| v.cell_fine_calibration_views(&vector_config.column))
+                    {
+                        cal.observe_shard_views(&views);
+                    }
+                }
+                Ok::<_, BuildError>(prepared)
             },
         )?;
         local_checkpoint = checkpoint
@@ -3977,14 +4012,25 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // The alternative (rescoring every packed cell per incremental
         // drain) would make drain cost track table size, not delta size.
         if let Some(cal) = width_law.take()
-            && let Some(law) = cal.finish(&running_clusters)
+            && let Some(laws) = cal.finish(&running_clusters)
         {
-            for (slot, measured) in routing.width_for_k.iter_mut().zip(law) {
+            for (slot, measured) in routing.width_for_k.iter_mut().zip(laws.width_for_k) {
+                *slot = (*slot).max(measured);
+            }
+            for (slot, measured) in routing.fine_for_k.iter_mut().zip(laws.fine_for_k) {
+                *slot = (*slot).max(measured);
+            }
+            for (slot, measured) in routing.rerank_for_k.iter_mut().zip(laws.rerank_for_k) {
                 *slot = (*slot).max(measured);
             }
             info!(
-                "supertable drain: probe-width law (cells for 0.99 top-k coverage at k={WIDTH_LAW_KS:?}): measured {law:?}, stamped {:?}",
-                routing.width_for_k
+                "supertable drain: probe laws at k={WIDTH_LAW_KS:?}: width measured {:?} stamped {:?}; fine depth measured {:?} stamped {:?}; rerank measured {:?} stamped {:?}",
+                laws.width_for_k,
+                routing.width_for_k,
+                laws.fine_for_k,
+                routing.fine_for_k,
+                laws.rerank_for_k,
+                routing.rerank_for_k
             );
         }
         let list_metadata = CommitListMetadata {
@@ -5604,6 +5650,227 @@ pub(in crate::supertable) async fn split_overflow_cells(
         );
     }
     Ok(())
+}
+
+/// Re-measure both probe laws (width + fine depth) over the CURRENT cell
+/// geometry, from stored bytes, and stamp them into the manifest routing.
+///
+/// Compaction reshapes exactly what the drain-time law was measured
+/// against: splits spread the true top-k over more, smaller cells
+/// (widening the width a query needs), and merges rebuild each merged
+/// cell's fine IVF (reshuffling the fine ranks the depth law counts).
+/// A law stamped pre-split therefore goes stale precisely when the
+/// hidden index is optimized — measured at 10M as post-optimize recall
+/// 0.982 against 0.993 under a fresh law. This pass reruns the drain's
+/// calibration machinery over live stored rows: a deterministic stride
+/// sample over the cell-ordered live-row enumeration picks the query
+/// rows (proportional-to-size per cell, reads only the sampled cells —
+/// the drain's reservoir needs a stream that is already flowing; here a
+/// full pre-read just to sample would double the pass), then ONE full
+/// sweep scores every live cell and observes fine ranks per superfile.
+/// The result REPLACES the stamped law point-for-point (the fresh
+/// full-table measurement is authoritative; the drain's max-merge stamp
+/// may carry bias from a small residual drain). Points the fresh sample
+/// could not support (measured `0`) keep their previous value. Skipped
+/// for never-calibrated tables (all-zero width law): the drain gate is
+/// the calibration entry point; this pass only refreshes.
+///
+/// Returns whether a new law was stamped.
+pub(in crate::supertable) async fn recalibrate_probe_laws(
+    inner: &Arc<SupertableInner>,
+) -> Result<bool, BuildError> {
+    let manifest = inner.manifest.load_full();
+    let (clusters, column, mut routing, metric, rot_seed) = match manifest.get_partition_strategy()
+    {
+        PartitionStrategy::VectorCell {
+            clusters,
+            column,
+            routing,
+        } => {
+            let Some(vec_col) = inner.options.vector_columns.first() else {
+                return Ok(false);
+            };
+            (clusters, column, routing, vec_col.metric, vec_col.rot_seed)
+        }
+        _ => return Ok(false),
+    };
+    if clusters.n_cent == 0 || clusters.dim == 0 {
+        return Ok(false);
+    }
+    if routing.width_for_k.iter().all(|&w| w == 0) {
+        return Ok(false);
+    }
+    let Some(storage) = inner.options.storage.clone() else {
+        return Ok(false);
+    };
+
+    let now = time::Instant::now();
+    let superseded_map = manifest.get_superseded_cells();
+    // Live (entry, (cell, docs)) work list — superseded and empty cells
+    // excluded, exactly as split selection excludes them.
+    let mut work: Vec<(Arc<SuperfileEntry>, Vec<(u32, u32)>)> = Vec::new();
+    let mut total_docs = 0u64;
+    for entry in manifest.superfiles.iter() {
+        let superseded = superseded_map.and_then(|m| m.get(&entry.superfile_id));
+        let cells: Vec<(u32, u32)> = cell_doc_counts_for_entry(inner, entry, superseded)
+            .await?
+            .into_iter()
+            .filter(|&(_, n)| n > 0)
+            .collect();
+        if !cells.is_empty() {
+            total_docs += cells.iter().map(|&(_, n)| u64::from(n)).sum::<u64>();
+            work.push((Arc::clone(entry), cells));
+        }
+    }
+    if work.is_empty() || total_docs == 0 {
+        return Ok(false);
+    }
+
+    let mut cal = opann::WidthLawCalibration::new(clusters.dim as usize, metric);
+    // Query-sample pass: every `step`-th row of the cell-ordered live-row
+    // enumeration, WIDTH_LAW_QUERY_SAMPLE picks total. Counts are physical
+    // (tombstones included), the loaded rows are live — clamping a picked
+    // ordinal onto the live rows keeps the pick, on a neighbouring row.
+    let step = (total_docs / opann::WIDTH_LAW_QUERY_SAMPLE as u64).max(1);
+    let mut picks: BTreeMap<(usize, u32), Vec<u32>> = BTreeMap::new();
+    let mut base = 0u64;
+    let mut next_pick = 0u64;
+    'outer: for (ei, (_, cells)) in work.iter().enumerate() {
+        for &(cell, n) in cells {
+            let end = base + u64::from(n);
+            while next_pick < end {
+                picks
+                    .entry((ei, cell))
+                    .or_default()
+                    .push((next_pick - base) as u32);
+                next_pick += step;
+                if next_pick >= total_docs {
+                    break 'outer;
+                }
+            }
+            base = end;
+        }
+    }
+    for (&(ei, cell), ordinals) in &picks {
+        let (entry, _) = &work[ei];
+        let rows =
+            load_materialized_rows_from_ivf_superfile(inner, entry, &column, now, Some(&[cell]))
+                .await?;
+        if rows.is_empty() {
+            continue;
+        }
+        for &ordinal in ordinals {
+            let row = &rows[(ordinal as usize).min(rows.len() - 1)];
+            cal.offer(row);
+        }
+    }
+    cal.freeze(&clusters, rot_seed);
+
+    // Single full sweep: score every live cell against the frozen queries,
+    // then observe fine ranks from each superfile's own bytes (mirrors the
+    // drain's per-shard observe: a superfile's candidates are always merged
+    // before its views are read). Cells are scored in pool-width chunks —
+    // loads stay sequential (async), the CPU fans out across the chunk on
+    // the maintenance pool (`vector.maintenance_threads`), and transient
+    // memory stays bounded at one chunk of materialized cells.
+    let pool = maint_pool()?;
+    let chunk_cells = pool.current_num_threads().max(1);
+    for (entry, cells) in &work {
+        for chunk in cells.chunks(chunk_cells) {
+            let mut loaded: Vec<(u32, Vec<MaterializedIvfRow>)> = Vec::with_capacity(chunk.len());
+            for &(cell, _) in chunk {
+                let rows = load_materialized_rows_from_ivf_superfile(
+                    inner,
+                    entry,
+                    &column,
+                    now,
+                    Some(&[cell]),
+                )
+                .await?;
+                loaded.push((cell, rows));
+            }
+            pool.install(|| {
+                loaded
+                    .par_iter()
+                    .try_for_each(|(cell, rows)| cal.score_rows(*cell, rows))
+            })?;
+        }
+        let (reader, _bitmap) = open_ivf_reader_with_tombstones(inner, entry, now).await?;
+        // Resident-only read: `None` (cold bytes, or a legacy single-cell
+        // layout) skips this superfile's depth observation — the finish
+        // fallback below keeps the previous depth law rather than
+        // shallowing it on partial evidence.
+        if let Some(views) = reader
+            .vec()
+            .and_then(|v| v.cell_fine_calibration_views(&column))
+        {
+            cal.observe_shard_views(&views);
+        }
+    }
+    let Some(laws) = cal.finish(&clusters) else {
+        return Ok(false);
+    };
+
+    let mut changed = false;
+    for (slot, measured) in routing.width_for_k.iter_mut().zip(laws.width_for_k) {
+        if measured > 0 && *slot != measured {
+            *slot = measured;
+            changed = true;
+        }
+    }
+    for (slot, measured) in routing.fine_for_k.iter_mut().zip(laws.fine_for_k) {
+        if measured > 0 && *slot != measured {
+            *slot = measured;
+            changed = true;
+        }
+    }
+    for (slot, measured) in routing.rerank_for_k.iter_mut().zip(laws.rerank_for_k) {
+        if measured > 0 && *slot != measured {
+            *slot = measured;
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(false);
+    }
+
+    // Reload the freshest grid for the stamp commit: the split pass this
+    // recalibration follows has already swapped the strategy, and OCC
+    // re-applies this metadata verbatim on retries, so it must carry the
+    // current clusters rather than this function's entry snapshot.
+    let manifest = inner.manifest.load_full();
+    let clusters = match manifest.get_partition_strategy() {
+        PartitionStrategy::VectorCell { clusters, .. } => clusters,
+        _ => return Ok(false),
+    };
+    let list_metadata = CommitListMetadata {
+        partition_strategy: Some(PartitionStrategy::VectorCell {
+            column: column.clone(),
+            clusters: clusters.clone(),
+            routing,
+        }),
+        drained_ranges: None,
+        global_vector_index: None,
+        superseded_cells_additions: None,
+    };
+    let no_removals: Vec<Arc<SuperfileEntry>> = Vec::new();
+    let new_manifest = persist_commit_async(
+        inner,
+        storage,
+        Vec::new(),
+        &no_removals,
+        Vec::new(),
+        Vec::new(),
+        list_metadata,
+    )
+    .await
+    .map_err(BuildError::from)?;
+    inner.manifest.store(Arc::new(new_manifest));
+    info!(
+        "supertable optimize: probe laws recalibrated over {} cells at k={WIDTH_LAW_KS:?}: width {:?}, fine depth {:?}, rerank {:?}",
+        clusters.n_cent, routing.width_for_k, routing.fine_for_k, routing.rerank_for_k
+    );
+    Ok(true)
 }
 
 // OCC retry budget — read from

@@ -1407,6 +1407,36 @@ impl SupertableReader {
             // must be per-table and per-k, never a constant. A law width
             // of 1 resolves to `None` and keeps the fine-first p=1 path
             // byte-for-byte.
+            // Fine-depth law: a measured floor on runs-per-probed-cell for
+            // the unfiltered hidden path. Applied to the BASE routing before
+            // any pin — pin arms then lift depth to MAX on top, so the law
+            // only matters where no pin engages (the width<=1 default path,
+            // exactly where a flat config floor was measured scale-fragile:
+            // 10M post-drain 0.982 at floor 4 vs 0.996 at 8, identical
+            // latency).
+            if hidden_vector_index
+                && !filtered
+                && let Some(fine) = hidden_routing.and_then(|r| r.fine_for_k_at(k))
+            {
+                cell_routing.fine_nprobe = cell_routing.fine_nprobe.max(fine);
+            }
+            // Rerank law: the measured global survivor budget replaces the
+            // `k x rerank_mult` DEFAULT on the unfiltered hidden path —
+            // expressed as the equivalent multiplier so the divided cold
+            // budget and the global shortlist cap below both inherit it
+            // through `resolve`. Adaptive both ways: a table whose top-k
+            // hides deeper in the 1-bit estimate order gets MORE survivors
+            // than the constant, an easy table gets fewer. A caller-set
+            // `rerank_mult` wins over the law, exactly as a caller-set
+            // `nprobe` wins over the width law.
+            let options = if hidden_vector_index && !filtered && options.rerank_mult().is_none() {
+                match hidden_routing.and_then(|r| r.rerank_for_k_at(k)) {
+                    Some(n) => options.with_rerank_mult(n.div_ceil(k.max(1)).max(1)),
+                    None => options,
+                }
+            } else {
+                options
+            };
             let law_width: Option<usize> =
                 if hidden_vector_index && !filtered && options.nprobe.is_none() {
                     hidden_routing

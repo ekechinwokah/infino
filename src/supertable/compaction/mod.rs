@@ -9,7 +9,7 @@
 //! re-compacted.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     mem,
     sync::{
         Arc,
@@ -45,8 +45,8 @@ use crate::{
         },
         writer::{
             NewEntryBirthVersions, PreparedSuperfile, ShardOutput, backoff_delay,
-            finalize_compaction_commit, prepare_superfile, refresh_slow_vector_state,
-            split_overflow_cells, try_commit_attempt,
+            finalize_compaction_commit, prepare_superfile, recalibrate_probe_laws,
+            refresh_slow_vector_state, split_overflow_cells, try_commit_attempt,
         },
     },
 };
@@ -276,7 +276,26 @@ impl Supertable {
         // merged just to be re-split (the merge output would be discarded), and
         // the split runs as its own snapshot-consistent phase, so it can't remove
         // a superfile a later merge job in this pass planned to use.
-        if is_hidden_vector_index_table(&inner.options) {
+        let hidden_ivf = is_hidden_vector_index_table(&inner.options);
+        // Superfile-id snapshot for the recalibration trigger below: splits
+        // and merges both change the id set, and both invalidate a stamped
+        // probe law (splits change the cell geometry, merges rebuild the
+        // merged cells' fine IVFs).
+        let snapshot_ids = || -> HashSet<Uuid> {
+            inner
+                .manifest
+                .load()
+                .superfiles
+                .iter()
+                .map(|e| e.superfile_id)
+                .collect()
+        };
+        let pre_pass_ids = if hidden_ivf {
+            snapshot_ids()
+        } else {
+            HashSet::new()
+        };
+        if hidden_ivf {
             split_overflow_cells(Arc::clone(inner))
                 .await
                 .map_err(|e| CompactionError::Build(e.to_string()))?;
@@ -364,6 +383,16 @@ impl Supertable {
                     .await
                     .map_err(|e| CompactionError::Refresh(e.to_string()))?;
             }
+        }
+
+        // The pass reshaped the hidden index (split children and/or merge
+        // outputs committed): the probe laws were measured against the old
+        // geometry, so re-measure and restamp both (width + fine depth)
+        // while the compaction slot still serializes hidden reorgs.
+        if hidden_ivf && snapshot_ids() != pre_pass_ids {
+            recalibrate_probe_laws(inner)
+                .await
+                .map_err(|e| CompactionError::Build(e.to_string()))?;
         }
 
         Ok(())
