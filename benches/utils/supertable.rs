@@ -53,7 +53,8 @@ use infino::{
     OptimizeOptions,
     supertable::{
         Supertable,
-        manifest::{ClusterCentroids, SuperfileEntry},
+        manifest::{ClusterCentroids, SuperfileEntry, list::PartitionStrategy},
+        writer::maintenance_pool_width,
     },
 };
 use tempfile::TempDir;
@@ -2285,7 +2286,7 @@ pub mod vector {
     use crate::{
         corpus,
         executors::{
-            fts as exec_fts, vector as exec_vec,
+            vector as exec_vec,
             vector::{SupertableVectorRead, VectorRead},
         },
     };
@@ -3060,8 +3061,18 @@ pub mod vector {
             Some((fine_min, fine_p50, fine_p90, fine_max)),
         ) = (cell_dist, fine_dist)
         {
+            // The stamped probe laws travel with every hidden-stats line so
+            // a post-compact battery can be read against the RECALIBRATED
+            // laws, not the drain-time stamp the post-drain label showed.
+            let laws = match hidden_reader.manifest().get_partition_strategy() {
+                PartitionStrategy::VectorCell { routing, .. } => format!(
+                    "law={:?} finelaw={:?} reranklaw={:?}",
+                    routing.width_for_k, routing.fine_for_k, routing.rerank_for_k
+                ),
+                _ => "law=n/a".to_string(),
+            };
             eprintln!(
-                "[supertable_vector] hidden {label}: {} files, {} cells, {} fine clusters, {}; cell rows min/p50/p90/max={cell_min}/{cell_p50}/{cell_p90}/{cell_max}; fine rows={fine_min}/{fine_p50}/{fine_p90}/{fine_max}",
+                "[supertable_vector] hidden {label}: {} files, {} cells, {} fine clusters, {}; cell rows min/p50/p90/max={cell_min}/{cell_p50}/{cell_p90}/{cell_max}; fine rows={fine_min}/{fine_p50}/{fine_p90}/{fine_max}; {laws}",
                 entries.len(),
                 cell_rows.len(),
                 rows_by_fine_cluster.len(),
@@ -4081,58 +4092,57 @@ pub mod vector {
             // per surviving superfile) on EVERY call. The prepared-allow-set
             // table above hoists exactly that step out of its timed window, so
             // its p50 omits it; this measures the end-to-end cost a caller
-            // actually pays. Needs a table with both an FTS column and a
-            // vector column — `Modality::Combined` already is one (the
-            // vector-only table the rest of this file measures has no text
-            // column to filter on), so no new corpus or schema shape is
-            // introduced here.
+            // actually pays. The primary table's `filter_bucket` column
+            // (one FTS-indexed token per row) exists for exactly this
+            // measurement, so it runs on the SAME table as every other
+            // vector number — no second build.
             if phases.warm {
-                let rep = exec_fts::FTS_BATTERY
-                    .iter()
-                    .find(|q| q.name == "single_rare")
-                    .expect("battery keeps its rare-term representative");
-                let filter_query = rep.terms.join(" ");
-                let filter_mode = exec_fts::to_infino_mode(rep.mode);
-
-                let combined_corpus = supertable::prepare_corpus(Modality::Combined);
-                let combined_built =
-                    supertable::build_on_storage(Modality::Combined, &combined_corpus);
-                let (_combined_cache_dir, combined_consumer) =
-                    open_consumer(Modality::Combined, &combined_built);
-                // Post-drain, matching every other search number in this file.
-                drain_hidden_incoming(&combined_consumer);
-                let combined_ids = corpus::engine_id_to_dense(&combined_consumer, n_docs);
-                let combined_reader = combined_consumer.reader().expect("reader");
+                // One representative bucket term — every bucket matches
+                // exactly 1/VECTOR_FILTER_BUCKET_TERMS of the corpus, the
+                // 0.2% `single_rare` selectivity class this battery has
+                // always measured. Runs against the PRIMARY table (its
+                // `filter_bucket` column exists for exactly this), post-drain
+                // like every other search number in this file — a second
+                // full table just to host a text predicate doubled ingest
+                // and was untenable at 100M/1B.
+                let filter_query = supertable::vector_filter_bucket_term(42);
+                let filter_mode = infino::BoolMode::And;
+                let primary_reader = consumer.reader().expect("reader");
 
                 // Allow-set = the ENGINE's own `token_match` over the same
                 // column/term/mode the filter carries — the identical
                 // resolution the filtered kNN runs internally, so the graded
                 // ground truth and the measured path agree by construction.
-                let matched_hits = combined_reader
-                    .token_match(supertable::TEXT_COLUMN, &filter_query, filter_mode)
+                // Timed once here purely as a decomposition aid: the same
+                // resolution runs INSIDE every timed `VectorFilter` query
+                // below, so `p50 - this` bounds the constrained-kNN share.
+                let t_resolve = Instant::now();
+                let matched_hits = primary_reader
+                    .token_match(supertable::VECTOR_FILTER_COLUMN, &filter_query, filter_mode)
                     .expect("filter predicate token_match");
+                let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1e3;
                 let mut allow = RoaringBitmap::new();
-                for (dense, _) in
-                    hits_to_dense_u32(&combined_consumer, &combined_ids, &matched_hits)
-                {
+                for (dense, _) in hits_to_dense_u32(&consumer, &id_to_dense, &matched_hits) {
                     allow.insert(dense);
                 }
                 let matched = allow.len();
                 let selectivity = matched as f64 / n_docs.max(1) as f64;
 
-                let combined_vectors = combined_corpus
+                let primary_vectors = corpus
+                    .as_ref()
+                    .expect("vector benches always prepare a corpus")
                     .vectors()
-                    .expect("combined corpus carries vectors");
-                let vslice = &combined_vectors.as_slice()[..n_docs * DIM];
+                    .expect("vector corpus carries vectors");
+                let vslice = &primary_vectors.as_slice()[..n_docs * DIM];
                 let gt = corpus::filtered_ground_truth(vslice, &allow, &q_correct, TOP_K);
 
                 let filter = || VectorFilter {
-                    column: supertable::TEXT_COLUMN,
+                    column: supertable::VECTOR_FILTER_COLUMN,
                     query: filter_query.as_str(),
                     mode: filter_mode,
                 };
                 let run_query = |q: &Vec<f32>| {
-                    combined_reader
+                    primary_reader
                         .vector_search(
                             supertable::VEC_COLUMN,
                             q,
@@ -4149,6 +4159,12 @@ pub mod vector {
                 }
                 let mut recalls = Vec::with_capacity(q_correct.len());
                 let mut latencies = Vec::with_capacity(q_correct.len());
+                // Metered: a warm battery must PROVE 0 GET — an undersized
+                // or unwarmed cache turns "warm p50" into silent object-store
+                // round-trips (measured: 196-330 ms/query on the old
+                // second-table shape, whose cache was auto-sized before the
+                // drain added the hidden index it then queried).
+                let meter_before = consumer_meter.snapshot();
                 for (q, truth) in q_correct.iter().zip(&gt) {
                     let t0 = Instant::now();
                     let batches = run_query(q);
@@ -4158,7 +4174,7 @@ pub mod vector {
                     let hits: Vec<(u32, f32)> = corpus::id_scores_from_vector_search(&batches)
                         .into_iter()
                         .filter_map(|(id, score)| {
-                            combined_ids.get(&id).copied().map(|dense| (dense, score))
+                            id_to_dense.get(&id).copied().map(|dense| (dense, score))
                         })
                         .collect();
                     recalls.push(corpus::recall_at_k(&hits, truth));
@@ -4167,13 +4183,18 @@ pub mod vector {
                     let mean_recall: f32 = recalls.iter().sum::<f32>() / recalls.len() as f32;
                     latencies.sort_unstable();
                     let p50_ns = latencies[latencies.len() / 2].as_secs_f64() * 1e9;
+                    let io = consumer_meter.snapshot().since(&meter_before);
                     eprintln!(
-                        "[supertable_vector] predicate-filtered ({}, {matched} of {} rows = \
-                         {:.2}% selectivity): recall@{TOP_K}={mean_recall:.3} p50={:.2}ms",
-                        rep.name,
+                        "[supertable_vector] predicate-filtered ({filter_query}, {matched} of {} \
+                         rows = {:.2}% selectivity): recall@{TOP_K}={mean_recall:.3} p50={:.2}ms \
+                         (predicate resolution alone: {resolve_ms:.2}ms; timed window: {} GET / \
+                         {} down over {} queries)",
                         fmt_count(n_docs),
                         selectivity * 100.0,
                         p50_ns / 1e6,
+                        io.get_count,
+                        rss::fmt_bytes(io.get_bytes),
+                        q_correct.len(),
                     );
                     report.emit(&Section {
                         anchor: "bench/vector/supertable/filtered-predicate".into(),
@@ -4184,16 +4205,16 @@ pub mod vector {
                         ),
                         note: format!(
                             "The PUBLIC filtered path: `vector_search` with a real \
-                             `VectorFilter{{column,query,mode}}` over a `Modality::Combined` \
-                             table, resolved fresh on every call — so unlike the \
-                             prepared-allow-set table above, the timed window INCLUDES the \
-                             predicate resolution (`token_match` per surviving superfile) a \
-                             caller pays. Predicate is the `{}` battery term over `{}`, \
-                             matching {matched} of {} rows as measured (no target selectivity \
-                             is engineered). Δ is vs the previous run.",
-                            rep.name,
-                            supertable::TEXT_COLUMN,
+                             `VectorFilter{{column,query,mode}}` over the PRIMARY vector \
+                             table's `{}` column, resolved fresh on every call — so unlike \
+                             the prepared-allow-set table above, the timed window INCLUDES \
+                             the predicate resolution (`token_match` per surviving \
+                             superfile) a caller pays. Predicate is the uniform bucket term \
+                             `{filter_query}`, matching {matched} of {} rows (engineered \
+                             1/{} selectivity). Δ is vs the previous run.",
+                            supertable::VECTOR_FILTER_COLUMN,
                             fmt_count(n_docs),
+                            supertable::VECTOR_FILTER_BUCKET_TERMS,
                         ),
                         blocks: vec![Block {
                             subtitle: String::new(),
@@ -4216,10 +4237,6 @@ pub mod vector {
                             ]],
                         }],
                     });
-                }
-                drop(combined_consumer);
-                if let Some(cleanup) = &combined_built.cleanup {
-                    tiers::cleanup_prefix(cleanup);
                 }
             }
 
@@ -4354,7 +4371,11 @@ pub mod vector {
                 // delta phase ran it first drains that tail. The following
                 // state must therefore be hidden-only in either mode.
                 let compaction_stats = run_compact.then(|| {
-                    eprintln!("[supertable_vector] compacting (optimize: user + hidden)...");
+                    eprintln!(
+                        "[supertable_vector] compacting (optimize: user + hidden, maintenance \
+                         threads {})...",
+                        maintenance_pool_width()
+                    );
                     let before = consumer_meter.snapshot();
                     let sampler = PeakSampler::start_default();
                     let (result, wall, cpu_s) =
