@@ -111,7 +111,6 @@ use super::{
         },
     },
 };
-use crate::superfile::ReadError;
 use crate::{
     InfinoError,
     config::{self, CentroidAlignment, DrainConsolidate, ThreadCount},
@@ -119,7 +118,7 @@ use crate::{
     runtime_bridge::bridge_on_runtime,
     storage::{StorageError, StorageProvider},
     superfile::{
-        BuildError as SuperfileBuildError, SuperfileReader,
+        BuildError as SuperfileBuildError, ReadError, SuperfileReader,
         builder::{SuperfileBuilder, VectorConfig},
         format::{
             CRC_BYTES,
