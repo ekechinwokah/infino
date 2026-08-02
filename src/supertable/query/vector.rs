@@ -65,6 +65,7 @@
 //! this is the difference between seconds and milliseconds.
 
 use std::{
+    borrow::Cow,
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
     future::Future,
@@ -96,7 +97,7 @@ use crate::{
         error::ReadError,
         fts::reader::BoolMode,
         vector::{
-            distance::{Metric, distance, relative_score_window},
+            distance::{Metric, distance, normalize, relative_score_window},
             layout::VectorLayout,
             reader::ScanCandidate,
         },
@@ -1267,6 +1268,27 @@ impl SupertableReader {
         // read Copy `CellRoutingParams` (that clone used to drop the transposed
         // SIMD cache and force a per-query scalar transpose rebuild).
         let hidden_routing = manifest.vector_cell_routing();
+        // Rerank law: the measured global survivor budget replaces the
+        // `k x rerank_mult` DEFAULT on the unfiltered hidden path —
+        // expressed as the equivalent multiplier so the divided cold
+        // budget and the global shortlist cap both inherit it through
+        // `resolve`. A caller-set `rerank_mult` wins over the law, exactly
+        // as a caller-set `nprobe` wins over the width law. MUST live at
+        // fn scope: an earlier form rebound `options` inside the admit
+        // arm, where the shadow died at the arm's brace — the phase-C
+        // budget then resolved the ORIGINAL options and the served
+        // default silently reverted to the constant (measured as
+        // default == rm=256 on a law-stamped table).
+        let options = match rerank_mult_from_law(
+            hidden_vector_index,
+            filtered,
+            options.rerank_mult(),
+            hidden_routing.as_ref(),
+            k,
+        ) {
+            Some(mult) => options.with_rerank_mult(mult),
+            None => options,
+        };
         // The user-table path owns its coarse default (16 cells) for the
         // untagged fallback sweep. The filtered UNDRAINED-tail fan keeps
         // the default user-table search shape (fine-first p=1 + near-tie
@@ -1420,25 +1442,6 @@ impl SupertableReader {
             {
                 cell_routing.fine_nprobe = cell_routing.fine_nprobe.max(fine);
             }
-            // Rerank law: the measured global survivor budget replaces the
-            // `k x rerank_mult` DEFAULT on the unfiltered hidden path —
-            // expressed as the equivalent multiplier so the divided cold
-            // budget and the global shortlist cap below both inherit it
-            // through `resolve`. Adaptive both ways: a table whose top-k
-            // hides deeper in the 1-bit estimate order gets MORE survivors
-            // than the constant, an easy table gets fewer. A caller-set
-            // `rerank_mult` wins over the law, exactly as a caller-set
-            // `nprobe` wins over the width law.
-            let options = match rerank_mult_from_law(
-                hidden_vector_index,
-                filtered,
-                options.rerank_mult(),
-                hidden_routing.as_ref(),
-                k,
-            ) {
-                Some(mult) => options.with_rerank_mult(mult),
-                None => options,
-            };
             let law_width: Option<usize> =
                 if hidden_vector_index && !filtered && options.nprobe.is_none() {
                     hidden_routing
@@ -2881,6 +2884,30 @@ impl SupertableReader {
     }
 }
 
+/// Cosine queries normalize once at the public entry (#512): ranking is
+/// query-norm-invariant (the rerank kernel divides by the per-DOC norm),
+/// but a non-unit query scales every returned score by its own norm —
+/// normalizing keeps scores calibrated cosine. Other metrics pass
+/// through untouched; unit queries are a fp-noise no-op.
+fn calibrated_query<'q>(
+    reader: &SupertableReader,
+    column: &str,
+    query: &'q [f32],
+) -> Cow<'q, [f32]> {
+    let cosine = reader
+        .options()
+        .vector_columns
+        .iter()
+        .any(|c| c.column == column && c.metric == Metric::Cosine);
+    if cosine {
+        let mut q = query.to_vec();
+        normalize(&mut q);
+        Cow::Owned(q)
+    } else {
+        Cow::Borrowed(query)
+    }
+}
+
 impl SupertableReader {
     pub fn vector_search(
         &self,
@@ -2891,6 +2918,8 @@ impl SupertableReader {
         filter: Option<VectorFilter<'_>>,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
+        let query = calibrated_query(self, column, query);
+        let query: &[f32] = &query;
         // Mark a foreground query in flight so background cache-fills yield
         // S3 bandwidth to it; released when this query returns.
         let _fg = crate::supertable::reader_cache::disk::ForegroundQueryGuard::enter();
@@ -2926,6 +2955,8 @@ impl SupertableReader {
         options: VectorSearchOptions,
         filter: Option<VectorFilter<'_>>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let query = calibrated_query(self, column, query);
+        let query: &[f32] = &query;
         // Mark a foreground query in flight so background cache-fills yield
         // S3 bandwidth to it; released when this query returns.
         let _fg = crate::supertable::reader_cache::disk::ForegroundQueryGuard::enter();
@@ -4961,6 +4992,106 @@ mod tests {
             "token \"5\" lives in one row per superfile; global-idf \
              scoring must find all of them"
         );
+    }
+
+    /// Issue #512 regression: a cosine corpus ingested RAW (non-unit)
+    /// must rank identically to the same corpus ingested unit-normalized,
+    /// and a scaled query must return the same hits with the same
+    /// calibrated scores. Before the ingest-normalize seam, the portable
+    /// fixed Sq8 grid silently clamped out-of-range components at encode
+    /// (measured −9.6 pts recall@10 on raw Cohere) and this asserted
+    /// parity did not hold.
+    #[test]
+    fn raw_cosine_corpus_ranks_like_the_normalized_twin() {
+        /// Scale applied to the raw twin — pushes many components far
+        /// outside the fixed grid so pre-fix clamping is severe.
+        const RAW_SCALE: f32 = 3.7;
+        let dim = FIXTURE_DIM;
+        let build = |scale: f32| {
+            let schema = schema_with_vector(dim);
+            let opts = options_one_superfile_per_commit(dim);
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(crate::storage::LocalFsStorageProvider::new(dir.path()).expect("storage"));
+            let st = Supertable::create(opts.with_storage(storage)).expect("create");
+            let mut w = st.writer().expect("writer");
+            // The one-hot fixture batch, scaled: every component of every
+            // doc multiplies by `scale`, so the raw twin is far off the
+            // unit sphere while directions are identical.
+            let base = build_vector_batch(0, FIXTURE_ROWS_PER_COMMIT, dim, schema.clone());
+            let emb = base
+                .column(1)
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .expect("fsl")
+                .clone();
+            let scaled: Vec<f32> = emb
+                .values()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("f32")
+                .values()
+                .iter()
+                .map(|v| v * scale)
+                .collect();
+            let fsl = FixedSizeListArray::try_new(
+                Arc::new(arrow_schema::Field::new(
+                    "item",
+                    arrow_schema::DataType::Float32,
+                    true,
+                )),
+                dim as i32,
+                Arc::new(Float32Array::from(scaled)) as Arc<dyn Array>,
+                None,
+            )
+            .expect("fsl scaled");
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![base.column(0).clone(), Arc::new(fsl)])
+                    .expect("batch");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+            drop(w);
+            st.drain_vectors_to_cells_sync().expect("drain");
+            (dir, st)
+        };
+        let (_d_unit, unit) = build(1.0);
+        let (_d_raw, raw) = build(RAW_SCALE);
+
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        q[1] = 0.7;
+        let scaled_q: Vec<f32> = q.iter().map(|v| v * RAW_SCALE).collect();
+        let unit_hits = unit
+            .reader()
+            .expect("reader")
+            .vector_hits("emb", &q, 8, VectorSearchOptions::new(), None)
+            .expect("unit search");
+        let raw_hits = raw
+            .reader()
+            .expect("reader")
+            .vector_hits("emb", &scaled_q, 8, VectorSearchOptions::new(), None)
+            .expect("raw search");
+        // Stable ids are per-table snowflakes; compare table-relative
+        // positions (ids are minted sequentially over the same ingest
+        // order, so offsets from the smallest returned id identify docs).
+        let positions = |hits: &[SuperfileHit]| -> Vec<i128> {
+            let ids: Vec<i128> = hits.iter().map(|h| h.stable_id.expect("id")).collect();
+            let base = *ids.iter().min().expect("hits");
+            ids.iter().map(|id| id - base).collect()
+        };
+        assert_eq!(
+            positions(&unit_hits),
+            positions(&raw_hits),
+            "raw corpus + scaled query must rank exactly like the unit twin"
+        );
+        for (u, r) in unit_hits.iter().zip(raw_hits.iter()) {
+            assert!(
+                (u.score - r.score).abs() < 1e-3,
+                "calibrated scores must match: {} vs {}",
+                u.score,
+                r.score
+            );
+        }
     }
 
     /// The PUBLIC predicate-filtered path end-to-end: a `VectorFilter`

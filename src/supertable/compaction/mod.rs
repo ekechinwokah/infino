@@ -38,6 +38,7 @@ use crate::{
         error::CompactionError,
         handle::hidden_vector_index_compaction_settings,
         manifest::list::{DrainedVersionRanges, PartitionStrategy},
+        opann::rerank_pool_hint,
         query::dispatch::open_compaction_input,
         wal::{
             Etag, SealRecord, TombstonesSidecar, WalStore,
@@ -401,7 +402,22 @@ impl Supertable {
         // outputs committed): the probe laws were measured against the old
         // geometry, so re-measure and restamp both (width + fine depth)
         // while the compaction slot still serializes hidden reorgs.
-        if hidden_ivf && snapshot_ids() != pre_pass_ids {
+        // Repair trigger, independent of reshapes: a width law whose
+        // rerank points sit CLEARED (the stamped width outgrew the pool
+        // that measured them) never self-heals on a table that doesn't
+        // split or merge — the load -> optimize flow would otherwise
+        // leave the default path on the constant budget forever.
+        let rerank_lags = || match inner.manifest.load().partition_strategy() {
+            Some(PartitionStrategy::VectorCell {
+                routing, clusters, ..
+            }) => {
+                let achievable =
+                    rerank_pool_hint(&routing.width_for_k, clusters.n_cent as usize) as u32;
+                routing.rerank_law_lags_pool(achievable)
+            }
+            _ => false,
+        };
+        if hidden_ivf && (snapshot_ids() != pre_pass_ids || rerank_lags()) {
             recalibrate_probe_laws(inner)
                 .await
                 .map_err(|e| CompactionError::Build(e.to_string()))?;

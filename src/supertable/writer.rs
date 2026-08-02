@@ -3844,9 +3844,15 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // with the frozen state — no clone of the centroid bytes.
         if let Some(mut cal) = width_law.take() {
             let rot_seed = vector_config.rot_seed;
+            // Pool from the PRIOR stamp: an incremental drain calibrates
+            // against a grid whose width law is already known; a clean
+            // drain has no prior (all-zero -> legacy floor) and the first
+            // optimize's recalibration re-pools from its fresh stamp.
+            let pool_hint =
+                opann::rerank_pool_hint(&routing.width_for_k, running_clusters.n_cent as usize);
             let clusters_for_freeze = running_clusters;
             let (frozen, clusters_back) = run_on_pool(None, "width-law freeze", move || {
-                cal.freeze(&clusters_for_freeze, rot_seed);
+                cal.freeze(&clusters_for_freeze, rot_seed, pool_hint);
                 (cal, clusters_for_freeze)
             })
             .await
@@ -4083,10 +4089,21 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             for (slot, measured) in routing.fine_for_k.iter_mut().zip(laws.fine_for_k) {
                 *slot = (*slot).max(measured);
             }
-            for (slot, measured) in routing.rerank_for_k.iter_mut().zip(laws.rerank_for_k) {
-                *slot = (*slot).max(measured);
-            }
-            opann::clear_rerank_beyond_pool(&routing.width_for_k, &mut routing.rerank_for_k);
+            // Per-knot max-merge with pool provenance: each kept value
+            // carries the pool of the calibration that measured it, so a
+            // surviving old point can't invalidate fresh wide-pool
+            // neighbors and vice versa.
+            opann::merge_rerank_with_pools(
+                &mut routing.rerank_for_k,
+                &mut routing.rerank_pool_cells,
+                &laws.rerank_for_k,
+                laws.pool_cells,
+            );
+            opann::clear_rerank_beyond_pool(
+                &routing.width_for_k,
+                &mut routing.rerank_for_k,
+                &routing.rerank_pool_cells,
+            );
             info!(
                 "supertable drain: probe laws at k={WIDTH_LAW_KS:?}: width measured {:?} stamped {:?}; fine depth measured {:?} stamped {:?}; rerank measured {:?} stamped {:?}",
                 laws.width_for_k,
@@ -7081,9 +7098,15 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     // moves into the task and comes back with the frozen state: no
     // centroid clone.
     let pool = maint_pool()?;
+    // Pool from the entry stamp: recalibration always has the width law
+    // in hand, so the distractor pool covers the geometry queries
+    // actually sweep — the fix for the cleared-law default (a fixed
+    // 64-cell pool under-covers fine grids and disables the law-served
+    // budget exactly where it saves the most).
+    let pool_hint = opann::rerank_pool_hint(&routing.width_for_k, clusters.n_cent as usize);
     let clusters_for_freeze = clusters;
     let (cal, clusters) = run_on_pool(Some(pool), "recalibration freeze", move || {
-        cal.freeze(&clusters_for_freeze, rot_seed);
+        cal.freeze(&clusters_for_freeze, rot_seed, pool_hint);
         (cal, clusters_for_freeze)
     })
     .await
@@ -7240,10 +7263,18 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         for (slot, measured) in routing.fine_for_k.iter_mut().zip(laws.fine_for_k) {
             *slot = (*slot).max(measured);
         }
-        for (slot, measured) in routing.rerank_for_k.iter_mut().zip(laws.rerank_for_k) {
-            *slot = (*slot).max(measured);
-        }
-        opann::clear_rerank_beyond_pool(&routing.width_for_k, &mut routing.rerank_for_k);
+        // Same per-knot merge + provenance as the drain stamp.
+        opann::merge_rerank_with_pools(
+            &mut routing.rerank_for_k,
+            &mut routing.rerank_pool_cells,
+            &laws.rerank_for_k,
+            laws.pool_cells,
+        );
+        opann::clear_rerank_beyond_pool(
+            &routing.width_for_k,
+            &mut routing.rerank_for_k,
+            &routing.rerank_pool_cells,
+        );
         if routing == fresh_routing {
             // The live stamp already carries everything this pass measured
             // (e.g. a concurrent drain max-merged past us) — nothing to
