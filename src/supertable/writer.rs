@@ -138,7 +138,7 @@ use crate::{
                 build_merged_subsection_from_materialized,
                 build_merged_subsection_from_spilled_materialized,
             },
-            cell_posting::{EncodedCellRow, MaterializedIvfRow},
+            cell_posting::{EncodedCellRow, MaterializedIvfRow, transcode_clamped_components},
             distance::Metric,
             ivf_merge::{
                 MergedIvfSubsection, merge_fragment_subsections, route_clusters_into_cells,
@@ -3383,6 +3383,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         && local_checkpoint.spills.is_empty();
     let mut width_law = clean_uncheckpointed_drain
         .then(|| opann::WidthLawCalibration::new(running_clusters.dim as usize, metric));
+    // #512 invariant tripwire: no re-encode in this drain may saturate its
+    // destination quantizer — cosine rows are unit (ingest-normalized) so
+    // the fixed grid covers them, and data-derived grids are built to cover
+    // their inputs. The transcode kernel tallies violations process-wide;
+    // snapshot here and shout at the end if this drain added any (the
+    // damage is silent otherwise: -9.6 pts recall@10 when it shipped).
+    let transcode_clamp_baseline = transcode_clamped_components();
 
     let mut cell_spills = HashMap::new();
     for (&cell, spill) in &local_checkpoint.spills {
@@ -4195,6 +4202,16 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .map(|v| format!("{v:.0}"))
             .unwrap_or_else(|| "?".into()),
     );
+    let clamped_components = transcode_clamped_components() - transcode_clamp_baseline;
+    if clamped_components > 0 {
+        eprintln!(
+            "[supertable drain] BUG: {clamped_components} component(s) saturated their \
+             destination Sq8 quantizer during this drain's re-encodes (#512 failure \
+             mode). Cosine: an ingest path bypassed normalization; L2/NegDot: a \
+             destination grid failed to cover its inputs. Affected rows' recall \
+             silently degrades — find the source and rebuild the table.",
+        );
+    }
     // Membership has settled: publish the slow-CAS entry blob and stamp its
     // ref (the per-batch `update`s cleared it). Hidden tables have no manifest
     // parts, so publication is required for reopen and cannot degrade to a
