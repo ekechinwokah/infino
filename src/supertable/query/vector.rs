@@ -3058,11 +3058,11 @@ fn apply_width_pin(
 
 /// Deterministic global shortlist selection for deferred-rerank width
 /// sweeps: keep the `limit` best 1-bit estimates pooled across every
-/// scanned unit. Higher estimate = better; ties break on
-/// (unit, cell, pos, did), a total order, so the KEPT SET is
-/// insertion-order independent across concurrent scans. O(n) partition,
-/// not a sort — the winners need no internal order (phase C regroups by
-/// unit and the rerank is exact).
+/// scanned unit, plus each scanned (unit, cell)'s `cell_floor` best.
+/// Higher estimate = better; ties break on (unit, cell, pos, did), a
+/// total order, so the KEPT SET is insertion-order independent across
+/// concurrent scans. O(n) partition, not a sort — the winners need no
+/// internal order (phase C regroups by unit and the rerank is exact).
 fn select_global_shortlist(
     mut pooled: Vec<(usize, ScanCandidate)>,
     limit: usize,
@@ -3074,14 +3074,6 @@ fn select_global_shortlist(
         })
     };
     if pooled.len() <= limit {
-        return pooled;
-    }
-    // Global cut: O(n) partition puts the pooled top-`limit` in the
-    // prefix (unordered — phase C regroups by unit and the rerank is
-    // exact, so the winners need no internal order).
-    pooled.select_nth_unstable_by(limit, cmp);
-    if cell_floor == 0 {
-        pooled.truncate(limit);
         return pooled;
     }
     // Per-cell floor: every scanned (unit, cell) keeps its `cell_floor`
@@ -3096,48 +3088,62 @@ fn select_global_shortlist(
     // one cell, that cell's floor carries it. Cost is bounded and
     // linear: at most `cells x cell_floor` extra survivors for the
     // exact rerank.
-    let mut by_cell: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
-    for (idx, (si, cand)) in pooled.iter().enumerate().skip(limit) {
-        by_cell.entry((*si, cand.cell_idx)).or_default().push(idx);
-    }
-    // A tail candidate survives when it ranks within its cell's
-    // `cell_floor` best across the WHOLE pool (kept + tail): count the
-    // cell's kept-prefix occupants against the floor first.
-    let mut kept_per_cell: HashMap<(usize, usize), usize> = HashMap::new();
-    for (si, cand) in pooled.iter().take(limit) {
-        *kept_per_cell.entry((*si, cand.cell_idx)).or_default() += 1;
-    }
-    let mut rescued: Vec<usize> = Vec::new();
-    for (cell, mut tail_idxs) in by_cell {
-        let already = kept_per_cell.get(&cell).copied().unwrap_or(0);
-        let want = cell_floor.saturating_sub(already);
-        if want == 0 {
-            continue;
-        }
-        if tail_idxs.len() > want {
-            tail_idxs.select_nth_unstable_by(want, |&a, &b| cmp(&pooled[a], &pooled[b]));
-            tail_idxs.truncate(want);
-        }
-        rescued.extend(tail_idxs);
-    }
-    // Keep set = the global prefix plus the rescued tail entries, each
-    // exactly once (prefix and tail index sets are disjoint by
-    // construction).
-    let mut keep = vec![false; pooled.len()];
-    for slot in keep.iter_mut().take(limit) {
-        *slot = true;
-    }
-    let rescued_len = rescued.len();
-    for idx in rescued {
-        keep[idx] = true;
-    }
-    let mut out = Vec::with_capacity(limit + rescued_len);
-    for (idx, item) in pooled.into_iter().enumerate() {
-        if keep[idx] {
-            out.push(item);
+    //
+    // The floor selects in place on the pool's per-cell grouping, BEFORE
+    // the global cut permutes it: each unit's scan emits its cells as
+    // contiguous blocks (cells complete independently and append whole;
+    // completion order varies, contiguity does not), so one boundary
+    // walk partitions each group to its `cell_floor` best — no keys, no
+    // hashing, no extra streaming passes. An earlier form grouped the
+    // post-cut tail with HashMap<(unit, cell), Vec<idx>>; SipHash over
+    // the few-hundred-thousand-candidate tail cost ~7 ms of a 19.8 ms
+    // Cohere-1M k=100 query, several times the floored rows' whole
+    // rerank. If grouping is ever violated (one cell split across R
+    // runs), each run keeps its own floor-best — a SUPERSET of the
+    // guarantee, never fewer survivors: recall-safe, cost bounded by
+    // R x cell_floor.
+    let mut floor_keep: Vec<(usize, ScanCandidate)> = Vec::new();
+    if cell_floor > 0 {
+        let mut start = 0;
+        while start < pooled.len() {
+            let (si, cell) = (pooled[start].0, pooled[start].1.cell_idx);
+            let mut end = start + 1;
+            while end < pooled.len() && pooled[end].0 == si && pooled[end].1.cell_idx == cell {
+                end += 1;
+            }
+            let group = &mut pooled[start..end];
+            if group.len() > cell_floor {
+                group.select_nth_unstable_by(cell_floor, cmp);
+                floor_keep.extend_from_slice(&group[..cell_floor]);
+            } else {
+                floor_keep.extend_from_slice(group);
+            }
+            start = end;
         }
     }
-    out
+    // Global cut: O(n) partition puts the pooled top-`limit` in the
+    // prefix (unordered — phase C regroups by unit and the rerank is
+    // exact, so the winners need no internal order).
+    pooled.select_nth_unstable_by(limit, cmp);
+    pooled.truncate(limit);
+    if floor_keep.is_empty() {
+        return pooled;
+    }
+    // Kept set = global prefix ∪ per-cell floor picks. The two overlap
+    // heavily (a cell's best are usually global winners), so dedup by
+    // the total-order identity key — both sets are shortlist-scale
+    // (~limit + cells x cell_floor keys), not pool-scale, so this is the
+    // one place hashing stays cheap.
+    let kept: HashSet<(usize, usize, u32, u32)> = pooled
+        .iter()
+        .map(|(si, c)| (*si, c.cell_idx, c.pos, c.did))
+        .collect();
+    for (si, cand) in floor_keep {
+        if !kept.contains(&(si, cand.cell_idx, cand.pos, cand.did)) {
+            pooled.push((si, cand));
+        }
+    }
+    pooled
 }
 
 fn top_k_ascending(per_superfile: Vec<Vec<SuperfileHit>>, k: usize) -> Vec<SuperfileHit> {
@@ -4923,6 +4929,85 @@ mod tests {
                  wide {wide_kept:?})"
             );
         }
+    }
+
+    /// Brute-force oracle for the grouped-walk floor: on a seeded
+    /// pseudo-random pool spanning several units and cells, grouped
+    /// per (unit, cell) as the scan wave emits it, the kept set must
+    /// equal the definition computed naively — the global top-`limit`
+    /// by the total order, unioned with every (unit, cell)'s
+    /// `cell_floor` best. On an UNGROUPED pool (the documented
+    /// degradation) the kept set must be a superset of that definition:
+    /// split groups keep more, never fewer.
+    #[test]
+    fn select_global_shortlist_matches_naive_floor_definition() {
+        // Deterministic LCG (numerical-recipes constants) — no RNG dep,
+        // stable across runs.
+        let mut state: u64 = 0x5eed_1234_abcd_9876;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        const POOL: usize = 4_000;
+        const UNITS: usize = 3;
+        const CELLS: usize = 17;
+        const LIMIT: usize = 300;
+        const FLOOR: usize = 9;
+        let mut pooled: Vec<(usize, ScanCandidate)> = Vec::with_capacity(POOL);
+        for i in 0..POOL {
+            let r = next();
+            // Coarse estimate buckets force plenty of exact ties so the
+            // deterministic tie-break is exercised, not just f32 order.
+            let est = ((r >> 32) % 64) as f32 / 64.0;
+            pooled.push((
+                (r % UNITS as u64) as usize,
+                ScanCandidate {
+                    did: i as u32,
+                    estimate: est,
+                    pos: i as u32,
+                    cluster_id: 0,
+                    cell_idx: ((r >> 8) % CELLS as u64) as usize,
+                },
+            ));
+        }
+        let cmp = |a: &(usize, ScanCandidate), b: &(usize, ScanCandidate)| {
+            b.1.estimate.total_cmp(&a.1.estimate).then_with(|| {
+                (a.0, a.1.cell_idx, a.1.pos, a.1.did).cmp(&(b.0, b.1.cell_idx, b.1.pos, b.1.did))
+            })
+        };
+        // Naive reference: full sort, take the global prefix, then each
+        // cell's floor-best from the full sorted order.
+        let mut sorted = pooled.clone();
+        sorted.sort_by(cmp);
+        let mut expect: HashSet<u32> = sorted[..LIMIT].iter().map(|(_, c)| c.did).collect();
+        let mut per_cell: HashMap<(usize, usize), usize> = HashMap::new();
+        for (si, cand) in &sorted {
+            let taken = per_cell.entry((*si, cand.cell_idx)).or_default();
+            if *taken < FLOOR {
+                expect.insert(cand.did);
+                *taken += 1;
+            }
+        }
+        // Grouped input (the production shape): exact equality.
+        let mut grouped = pooled.clone();
+        grouped.sort_by_key(|(si, c)| (*si, c.cell_idx));
+        let kept: HashSet<u32> = select_global_shortlist(grouped, LIMIT, FLOOR)
+            .into_iter()
+            .map(|(_, c)| c.did)
+            .collect();
+        assert_eq!(kept, expect, "kept set must match the naive definition");
+        // Ungrouped input (the documented degradation): a superset —
+        // every guaranteed survivor still kept, extras allowed.
+        let kept_ungrouped: HashSet<u32> = select_global_shortlist(pooled, LIMIT, FLOOR)
+            .into_iter()
+            .map(|(_, c)| c.did)
+            .collect();
+        assert!(
+            kept_ungrouped.is_superset(&expect),
+            "ungrouped pools must never lose a guaranteed survivor"
+        );
     }
 
     /// A clean drain calibrates the probe-width law from the table's own
