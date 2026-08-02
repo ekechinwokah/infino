@@ -3438,11 +3438,20 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // read via `try_get_range_sync` on rayon workers, which needs the whole
         // superfile in memory — a lazy reader yields VectorReadError. Reuse a
         // resident cached reader if present, else fetch the full bytes + open.
-        // `buffer_unordered` yields each open as it completes, so one straggler
-        // read can't stall the fan-out window (order is irrelevant — rows are
-        // bucketed by cell downstream). Routing-id resolution is resident (no
-        // object-store I/O), so it rides each open's future and overlaps the
-        // other reads' in-flight bytes.
+        // `buffered` (NOT `buffer_unordered`): the collect below is a barrier,
+        // so ordered delivery costs no wall time, and the order is load-bearing
+        // twice over. (1) Row order must be deterministic: the drained row
+        // stream feeds the law-calibration reservoir, the per-cell fine-kmeans
+        // spill samples, and the stable-id dedup — an earlier `buffer_unordered`
+        // here made two drains of a byte-identical corpus stamp different laws
+        // (fine [5,6,6,6] vs [7,7,7,7]) and build different fine geometry
+        // (14,134 vs 14,090 clusters), because completion order permuted what
+        // the fixed-seed reservoirs retained. (2) The materialize step below
+        // zips `readers` with `batch_sources` positionally to pair each
+        // superfile's rows with ITS tombstone bitmap — completion order made
+        // that pairing wrong whenever tombstones existed. Routing-id resolution
+        // is resident (no object-store I/O), so it rides each open's future and
+        // overlaps the other reads' in-flight bytes either way.
         let readers: Vec<(Arc<SuperfileReader>, Vec<i128>)> =
             stream::iter(batch_sources.iter().map(|entry| {
                 let entry = Arc::clone(entry);
@@ -3477,7 +3486,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     Ok::<_, BuildError>((reader, stable_ids))
                 }
             }))
-            .buffer_unordered(read_concurrency)
+            .buffered(read_concurrency)
             .collect::<Vec<_>>()
             .await
             .into_iter()
@@ -3556,6 +3565,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     )?;
                 let n_cells = routed.len();
                 let dim = running_clusters.dim as usize;
+                // Accumulate in cell-id order: `routed` is a HashMap, and its
+                // iteration order would otherwise vary run to run, changing the
+                // spliced cells' byte layout on identical input.
+                let mut routed: Vec<_> = routed.into_iter().collect();
+                routed.sort_unstable_by_key(|(cell_id, _)| *cell_id);
                 for (cell_id, (subsection, stable_ids)) in routed {
                     accumulate_splice_cell(
                         &mut packed_cells,
