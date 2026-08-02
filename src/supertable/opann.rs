@@ -729,6 +729,19 @@ pub(crate) const WIDTH_LAW_QUERY_SAMPLE: usize = 256;
 /// three-stage product ≥ 0.991 even when every crossing is tight.
 const LAW_STAGE_TARGET_COVERAGE: f64 = 0.997;
 
+/// Width-walk coverage target: the 0.99 bar itself, NOT the padded
+/// stage target below. Width is the dominant cost term — every probed
+/// cell is a fetch — and the 0.997 pad measured a 2x width tax on
+/// real embeddings (Cohere-1M: width 97 vs 53 at k=100; -7 ms @ k=100
+/// and -2.3 ms @ k=10 at equal recall class when dropped to 0.99).
+/// The padded target exists for PER-STAGE COMPOUNDING, and width is
+/// where compounding is cheapest to absorb: the 10M gate at this
+/// split (2026-08-02, vec10m-width99.log) holds every lifecycle state
+/// at 0.991-0.997 — the historical "width at 0.99 straddles the bar"
+/// measurement predates the recalibration repair and the rerank law
+/// actually serving, both of which carry the margin now.
+const WIDTH_LAW_TARGET_COVERAGE: f64 = 0.99;
+
 /// Rerank-law distractor pool: each calibration query counts 1-bit-estimate
 /// distractors only within its `RERANK_LAW_POOL_CELLS` grid-nearest cells —
 /// the pool a width-law sweep would actually scan. A `k` point whose
@@ -1461,7 +1474,7 @@ impl WidthLawCalibration {
             if support[ki] == 0 {
                 continue;
             }
-            let target = LAW_STAGE_TARGET_COVERAGE * support[ki] as f64;
+            let target = WIDTH_LAW_TARGET_COVERAGE * support[ki] as f64;
             if let Some(rank) = sums.iter().position(|&s| s >= target) {
                 law[ki] = (rank + 1) as u32;
             }
