@@ -3088,17 +3088,19 @@ fn select_global_shortlist(
         return pooled;
     }
     // Per-cell floor: every scanned (unit, cell) keeps its `cell_floor`
-    // best candidates REGARDLESS of the global competition. This is what
-    // makes probe width monotone in recall by construction — a candidate
-    // admitted by its own cell's floor cannot be evicted by far cells'
-    // 1-bit false positives, so widening the sweep only ever ADDS
-    // survivors. Without it the fixed pooled cap is width-blind and
-    // recall INVERTS as nprobe grows (measured at 10M on the post-split
-    // grid: 0.994 at nprobe=2 falling to 0.388 at all cells). The floor
-    // is `k` at the call site: even if the entire true top-k lives in
-    // one cell, that cell's floor carries it. Cost is bounded and
-    // linear: at most `cells x cell_floor` extra survivors for the
-    // exact rerank.
+    // best candidates REGARDLESS of the global competition. The floored
+    // core is monotone by construction — a candidate admitted by its own
+    // cell's floor cannot be evicted by far cells' 1-bit false positives —
+    // which FLOORS the worst case rather than proving end-to-end
+    // monotonicity: a candidate ranked below its cell's floor but inside
+    // the global pool (a band that grows with `rerank_mult`) keeps the
+    // pooled selection's width-blind behavior. Without the floor that
+    // band is the WHOLE selection, and recall inverts as nprobe grows
+    // (measured at 10M on the post-split grid: 0.994 at nprobe=2 falling
+    // to 0.388 at all cells). The floor is `k` at the call site: even if
+    // the entire true top-k lives in one cell, that cell's floor carries
+    // it. Cost is bounded and linear: at most `cells x cell_floor` extra
+    // survivors for the exact rerank.
     //
     // The floor selects in place on the pool's per-cell grouping, BEFORE
     // the global cut permutes it: each unit's scan emits its cells as
@@ -3310,7 +3312,9 @@ mod tests {
     };
 
     use arrow::array::Array;
-    use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch};
+    use arrow_array::{
+        Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
+    };
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
@@ -5196,8 +5200,18 @@ mod tests {
     /// First unit coverage of the public filter entry — the bench battery
     /// exercises it, but benches don't gate. Fixture titles repeat "doc
     /// {0..31}" per commit, so the token "5" matches exactly one row in
-    /// each of the four commits (stable ids 5 + 32k), and a matching-all
-    /// token ("doc") must reproduce a full top-k.
+    /// each of the four commits, and a matching-all token ("doc") must
+    /// reproduce a full top-k.
+    ///
+    /// Hit identity is checked against an `exact_match("doc 5")` oracle,
+    /// never via arithmetic on the generated `_id`s: the fixture has no
+    /// explicit id column, and a minted snowflake id's low sequence bits
+    /// track row position only while each 32-row batch mints with the
+    /// generator's per-millisecond sequence on a multiple of 32 and no
+    /// millisecond tick lands mid-batch. The open-time handle-id mint
+    /// sharing a millisecond with the first commit's batch is enough to
+    /// shift every sequence by one, and parallel test load makes exactly
+    /// that timing likely.
     #[test]
     fn vector_filter_restricts_hits_to_predicate_matches() {
         let (_dir, st, q, _k) = drained_three_direction_fixture();
@@ -5220,10 +5234,28 @@ mod tests {
             FIXTURE_COMMITS as usize,
             "the predicate matches one row per commit — nothing more"
         );
+        // Identity oracle: resolve the predicate rows' stable ids through
+        // the stored-text-verified exact-match surface — a different path
+        // from the token_match fan the filter itself resolves through.
+        let predicate_rows: HashSet<i128> = st
+            .exact_match("title", "doc 5", Some(&["_id"]))
+            .expect("exact-match oracle")
+            .iter()
+            .filter_map(|b| {
+                b.column_by_name("_id")
+                    .and_then(|c| c.as_any().downcast_ref::<Decimal128Array>())
+            })
+            .flat_map(|c| c.values().iter().copied())
+            .collect();
+        assert_eq!(
+            predicate_rows.len(),
+            FIXTURE_COMMITS as usize,
+            "oracle sanity: exactly one \"doc 5\" row per commit"
+        );
         assert!(
             matched
                 .iter()
-                .all(|h| h.stable_id.is_some_and(|id| id % 32 == 5)),
+                .all(|h| h.stable_id.is_some_and(|id| predicate_rows.contains(&id))),
             "every hit is a predicate row, not a nearest neighbor: {matched:?}"
         );
 
