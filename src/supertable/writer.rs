@@ -3453,7 +3453,14 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // here made two drains of a byte-identical corpus stamp different laws
         // (fine [5,6,6,6] vs [7,7,7,7]) and build different fine geometry
         // (14,134 vs 14,090 clusters), because completion order permuted what
-        // the fixed-seed reservoirs retained. (2) The materialize step below
+        // the fixed-seed reservoirs retained. Scope honestly: this pins the
+        // INPUT order (reservoir contents, spill samples, dedup, tombstone
+        // pairing) — it does NOT make the drain bit-deterministic end to
+        // end, because the fine k-means accumulates its centroid sums with
+        // a rayon parallel reduce whose combination order follows the
+        // scheduler; centroid low bits (and occasionally a near-tied
+        // assignment) can still vary between byte-identical drains.
+        // (2) The materialize step below
         // zips `readers` with `batch_sources` positionally to pair each
         // superfile's rows with ITS tombstone bitmap — completion order made
         // that pairing wrong whenever tombstones existed. Routing-id resolution

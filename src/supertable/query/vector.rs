@@ -89,6 +89,8 @@ use super::{
     prune::{PruneLeaf, select_superfiles},
 };
 pub use crate::superfile::reader::VectorSearchOptions;
+#[cfg(feature = "test-helpers")]
+use crate::test_helpers::served_shortlist_probe;
 use crate::{
     config,
     storage::io_counters,
@@ -1992,12 +1994,15 @@ impl SupertableReader {
                 // (replicas never collide inside one cell, so the floor
                 // needs no replica overhead).
                 let cell_floor = if options.nprobe.is_some() { k } else { 0 };
-                flat = select_global_shortlist(
-                    flat,
-                    k.saturating_add(replica_overhead)
-                        .saturating_mul(rerank_mult),
-                    cell_floor,
-                );
+                let shortlist_limit = k
+                    .saturating_add(replica_overhead)
+                    .saturating_mul(rerank_mult);
+                // Regression probe for the serve-the-law scope bug: recall
+                // floors can't see a re-shadowed `options` (the constant
+                // budget only ADDS survivors); the served limit can.
+                #[cfg(feature = "test-helpers")]
+                served_shortlist_probe::record(shortlist_limit, cell_floor);
+                flat = select_global_shortlist(flat, shortlist_limit, cell_floor);
                 let mut winners_by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
                 for (si, cand) in flat {
                     winners_by_seg.entry(si).or_default().push(cand);
@@ -2217,6 +2222,10 @@ impl SupertableReader {
         if k == 0 {
             return Ok(Vec::new());
         }
+        // SQL exec's filtered arm enters here without the sync wrappers —
+        // apply the cosine query calibration (#512) at this seam.
+        let query = calibrated_query(self, column, query);
+        let query: &[f32] = &query;
         let manifest = self.manifest();
         let superfiles = match plan.surviving_superfile_ids(manifest).await? {
             None => manifest
@@ -2585,7 +2594,12 @@ impl SupertableReader {
         options: VectorSearchOptions,
         prepared: &PreparedGlobalAllow,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.vector_hits_prepared_global_allow_inner(column, query, k, options, prepared)
+        // Bench/test entry that bypasses the sync wrappers — apply the
+        // cosine query calibration (#512) so measured scores match the
+        // public path. (The pub(crate) twin is only reached from flows
+        // that already calibrated at their own entry.)
+        let query = calibrated_query(self, column, query);
+        self.vector_hits_prepared_global_allow_inner(column, &query, k, options, prepared)
             .await
     }
 
@@ -2890,17 +2904,24 @@ impl SupertableReader {
         k: usize,
         options: VectorSearchOptions,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.vector_search_global_index_async(column, query, k, options)
+        // SQL exec enters here without passing the sync wrappers — apply
+        // the same cosine query calibration (#512) at this seam.
+        let query = calibrated_query(self, column, query);
+        self.vector_search_global_index_async(column, &query, k, options)
             .await
     }
 }
 
-/// Cosine queries normalize once at the public entry (#512): ranking is
+/// Cosine queries normalize once at each entry seam (#512): ranking is
 /// query-norm-invariant (the rerank kernel divides by the per-DOC norm),
 /// but a non-unit query scales every returned score by its own norm —
 /// normalizing keeps scores calibrated cosine. Other metrics pass
-/// through untouched; unit queries are a fp-noise no-op.
-fn calibrated_query<'q>(
+/// through untouched; unit queries are a fp-noise no-op. The seams are
+/// chosen so every caller path crosses exactly one: the sync wrappers
+/// (`vector_search`/`vector_hits`), the SQL exec arms
+/// (`vector_search_async`, `vector_hits_filtered_by_plan`), the hybrid
+/// path (`hybrid_search_async`), and the test-helpers allow-set entry.
+pub(crate) fn calibrated_query<'q>(
     reader: &SupertableReader,
     column: &str,
     query: &'q [f32],
@@ -2910,6 +2931,14 @@ fn calibrated_query<'q>(
         .vector_columns
         .iter()
         .any(|c| c.column == column && c.metric == Metric::Cosine);
+    calibrated_query_for(cosine, query)
+}
+
+/// The metric-independent half of [`calibrated_query`]: normalize iff the
+/// column's metric is cosine. Split out so the contract — cosine
+/// normalizes, every other metric passes through by reference — is
+/// directly unit-testable without a reader fixture.
+fn calibrated_query_for(cosine: bool, query: &[f32]) -> Cow<'_, [f32]> {
     if cosine {
         let mut q = query.to_vec();
         normalize(&mut q);
@@ -3307,11 +3336,25 @@ impl Supertable {
 #[cfg(test)]
 mod tests {
     use std::{
+        borrow::Cow,
         collections::{BTreeMap, BTreeSet, HashMap, HashSet},
         sync::Arc,
     };
 
     use arrow::array::Array;
+
+    /// Cosine columns normalize the query; every other metric passes the
+    /// caller's slice through untouched, by reference (no copy, no scale).
+    #[test]
+    fn calibrated_query_normalizes_cosine_only() {
+        let q = [3.0f32, 4.0];
+        let cos = calibrated_query_for(true, &q);
+        assert!((cos[0] - 0.6).abs() < 1e-6);
+        assert!((cos[1] - 0.8).abs() < 1e-6);
+        let non_cos = calibrated_query_for(false, &q);
+        assert!(matches!(non_cos, Cow::Borrowed(_)));
+        assert_eq!(&*non_cos, &q[..]);
+    }
     use arrow_array::{
         Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
     };
@@ -3319,10 +3362,10 @@ mod tests {
 
     use super::{
         RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate, VectorFilter,
-        VectorSearchOptions, admit_shortlist_window, apply_width_pin, cells_ranked_by_fine_score,
-        gate_fine_candidates_by_fragment, hidden_hits_user_ids, is_hidden_vector_manifest,
-        postings_by_cell_from_summaries, projection_is_id_score_only, rerank_mult_from_law,
-        score_fine_candidates, select_global_shortlist, union_cell_selection,
+        VectorSearchOptions, admit_shortlist_window, apply_width_pin, calibrated_query_for,
+        cells_ranked_by_fine_score, gate_fine_candidates_by_fragment, hidden_hits_user_ids,
+        is_hidden_vector_manifest, postings_by_cell_from_summaries, projection_is_id_score_only,
+        rerank_mult_from_law, score_fine_candidates, select_global_shortlist, union_cell_selection,
         vector_read_query_error,
     };
     use crate::{
