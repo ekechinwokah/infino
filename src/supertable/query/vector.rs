@@ -1977,15 +1977,26 @@ impl SupertableReader {
                     .into_iter()
                     .flat_map(|(si, _, _, cands)| cands.into_iter().map(move |c| (si, c)))
                     .collect();
-                // Floor = k: even if the entire true top-k concentrates in
-                // one probed cell, that cell's floor carries it into the
-                // exact rerank (replicas never collide inside one cell, so
-                // the floor needs no replica overhead).
+                // Per-cell floor ONLY under an explicit caller nprobe. The
+                // floor exists for the #494 inversion — far cells' 1-bit
+                // noise evicting near cells' true neighbors from the fixed
+                // budget as a CALLER widens the sweep — so it guards
+                // exactly the widths a caller pins. Law-served defaults
+                // are calibrated against realized recall at their own
+                // stamped width and run floor-free: at law widths the
+                // floor measured +0.0001 recall for ~3.4 ms of extra
+                // rerank at k=100 (Cohere-1M), and at width 1-2 it is a
+                // near-no-op by construction. Floor = k when it applies:
+                // even if the entire true top-k concentrates in one probed
+                // cell, that cell's floor carries it into the exact rerank
+                // (replicas never collide inside one cell, so the floor
+                // needs no replica overhead).
+                let cell_floor = if options.nprobe.is_some() { k } else { 0 };
                 flat = select_global_shortlist(
                     flat,
                     k.saturating_add(replica_overhead)
                         .saturating_mul(rerank_mult),
-                    k,
+                    cell_floor,
                 );
                 let mut winners_by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
                 for (si, cand) in flat {
