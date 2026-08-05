@@ -1993,7 +1993,30 @@ impl SupertableReader {
                 // cell, that cell's floor carries it into the exact rerank
                 // (replicas never collide inside one cell, so the floor
                 // needs no replica overhead).
-                let cell_floor = if options.nprobe.is_some() { k } else { 0 };
+                //
+                // (#537) The floor's DEPTH must not shrink as the caller
+                // widens. The global pool splits across probed cells, so a
+                // k-deep floor leaves each cell's retention to its own
+                // 1-bit top-k — and within-cell estimate noise evicts true
+                // neighbors from that at scale (measured: recall falls
+                // monotonically with nprobe past ~5M, 0.534 at all-cells
+                // on 10M, while narrow probes hold 0.99). Hold every
+                // probed cell at the depth the stamp certified for a
+                // served cell — the stamped rerank budget divided by the
+                // stamped width — so widening adds cells at full depth
+                // instead of diluting all of them. Rerank cost then scales
+                // with the width the caller asked for, which is the pin
+                // arm's stated semantics: read amplification is what was
+                // asked for.
+                let cell_floor = if options.nprobe.is_some() {
+                    let stamped_width = hidden_routing
+                        .and_then(|r| r.width_for_k_at(k))
+                        .unwrap_or(1)
+                        .max(1);
+                    k.max(k.saturating_mul(rerank_mult).div_ceil(stamped_width))
+                } else {
+                    0
+                };
                 let shortlist_limit = k
                     .saturating_add(replica_overhead)
                     .saturating_mul(rerank_mult);

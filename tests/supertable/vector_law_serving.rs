@@ -11,7 +11,8 @@
 //! via the `served_shortlist_probe` test-helpers hook.
 //!
 //! The same probe pins the floor scoping from the same PR: law-served
-//! defaults run floor-free; an explicit caller `nprobe` gets `floor = k`.
+//! defaults run floor-free; an explicit caller `nprobe` arms the floor at
+//! the stamped per-cell depth (rerank budget / stamped width, >= k — #537).
 
 #![deny(clippy::unwrap_used)]
 
@@ -145,7 +146,10 @@ async fn law_stamped_table_serves_the_law_not_the_constant() {
         "caller rerank_mult must override the law exactly; recorded: {recs:?}"
     );
 
-    // 3) Explicit caller nprobe re-arms the per-cell floor at k.
+    // 3) Explicit caller nprobe re-arms the per-cell floor — at the
+    //    stamped per-cell DEPTH (#537: rerank budget / stamped width,
+    //    never below k), so widening the probe adds cells at full depth
+    //    instead of diluting a shared pool (the ≥5M recall inversion).
     st.vector_search(
         "emb",
         &query,
@@ -157,7 +161,8 @@ async fn law_stamped_table_serves_the_law_not_the_constant() {
     .expect("pinned-nprobe search");
     let recs = served_shortlist_probe::drain();
     assert!(
-        recs.iter().any(|&(_, floor)| floor == K),
-        "explicit nprobe must arm the per-cell floor at k; recorded: {recs:?}"
+        recs.iter().any(|&(_, floor)| floor >= K),
+        "explicit nprobe must arm the per-cell floor at >= k (stamped \
+         per-cell depth); recorded: {recs:?}"
     );
 }
