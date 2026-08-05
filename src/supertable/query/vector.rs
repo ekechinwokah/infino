@@ -1414,13 +1414,18 @@ impl SupertableReader {
         // budget then resolved the ORIGINAL options and the served
         // default silently reverted to the constant (measured as
         // default == rm=256 on a law-stamped table).
-        let options = match rerank_mult_from_law(
+        let law_rerank = rerank_mult_from_law(
             hidden_vector_index,
             filtered,
             options.rerank_mult(),
             hidden_routing.as_ref(),
             k,
-        ) {
+        );
+        // Whether the rerank budget below is the LAW's (scalable with the
+        // served width, #515) or an explicit caller value (exact request,
+        // never scaled).
+        let law_rerank_served = law_rerank.is_some();
+        let options = match law_rerank {
             Some(mult) => options.with_rerank_mult(mult),
             None => options,
         };
@@ -1520,6 +1525,12 @@ impl SupertableReader {
         // Assigned in both admit arms; used below for the posting-aware
         // budget expand (keep scoring until we cover ≥ k postings).
         let candidate_counts: HashMap<(usize, u32), u64>;
+        // (#515) Served cells over stamped width, set by the law-served
+        // union arm when the serve window extends past the stamp; scales
+        // the pooled rerank budget below so the pool grows with the cells
+        // the evidence actually serves. (1, 1) everywhere else — decisive
+        // geometry, explicit caller values, filtered search.
+        let mut served_cells_over_width: (usize, usize) = (1, 1);
         if let (Some(ranked_scored), true) = (&ranked_cells_scored, any_tagged) {
             // Base routing shape first (per branch), then one shared caller
             // override on top.
@@ -1800,6 +1811,12 @@ impl SupertableReader {
                             HashSet::new(),
                         )
                     };
+                if law_default {
+                    served_cells_over_width = (
+                        selected_cells_ordered.len().max(1),
+                        sweep_width.unwrap_or(1).max(1),
+                    );
+                }
                 let selected_cells: HashSet<u32> = selected_cells_ordered.iter().copied().collect();
                 // Wave-pooled depth is the p=1 read-volume model: keep runs
                 // per drain wave so reads track wave count, not probed-cell
@@ -2258,9 +2275,28 @@ impl SupertableReader {
                 // (replicas never collide inside one cell, so the floor
                 // needs no replica overhead).
                 let cell_floor = if options.nprobe.is_some() { k } else { 0 };
-                let shortlist_limit = k
-                    .saturating_add(replica_overhead)
-                    .saturating_mul(rerank_mult);
+                // (#515) The LAW's rerank budget is calibrated on drain
+                // rows at the stamped width; when the serve window extends
+                // serving past that width, the same budget starves the
+                // widened candidate set — measured at true defaults on
+                // BioASQ-1M: stamped budget serves 0.9510 where the knee
+                // sits at ~3-6x (rm=32 → 0.9820, rm=64 → 0.9880, flat by
+                // 128). Scale the pooled budget by served-cells over
+                // stamped-width, so the pool grows exactly with the cells
+                // the evidence serves: BioASQ lands at the measured knee;
+                // decisive geometry serves width == stamp and is
+                // unchanged. Explicit caller rerank_mult stays an exact,
+                // unscaled request.
+                let (served, stamped_width) = served_cells_over_width;
+                let shortlist_limit = if law_rerank_served && options.nprobe.is_none() {
+                    k.saturating_add(replica_overhead)
+                        .saturating_mul(rerank_mult)
+                        .saturating_mul(served)
+                        .div_ceil(stamped_width)
+                } else {
+                    k.saturating_add(replica_overhead)
+                        .saturating_mul(rerank_mult)
+                };
                 // Regression probe for the serve-the-law scope bug: recall
                 // floors can't see a re-shadowed `options` (the constant
                 // budget only ADDS survivors); the served limit can.
