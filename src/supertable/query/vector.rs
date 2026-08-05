@@ -463,15 +463,19 @@ fn admit_shortlist_window(ranked_cells: usize) -> usize {
 /// not-yet-admitted cells could plausibly hold an exact fine score
 /// inside the serve window, judged by their 1-bit estimate shifted by
 /// the most favorable estimate-to-exact residual OBSERVED ON THIS
-/// QUERY. Constant-free by construction — the residual floor is
-/// measured from the cells already exactly scored (≥ the write-window
-/// floor of them), so the bound is the table's own quantization noise
-/// at this query, not a tuned fraction. Decisive geometry: estimates
-/// cliff, nothing qualifies, admission stays at the write window.
-/// Flat-scored queries (question-vs-passage retrieval): the tie run
-/// qualifies and admission follows the evidence. The caller iterates —
-/// newly admitted cells' exact scores tighten/widen the measurement —
-/// until a round admits nothing; each round admits ≥ 1 new cell, so
+/// QUERY. The shift is an empirical extrapolation, not a proven
+/// over-admit bound: the residual is SIGNED and measured only on the
+/// already-scored (best-estimate) cells, so a distant truth cell whose
+/// estimate is unusually pessimistic can sit outside the extension —
+/// the measured under-admit tail (the #515 diag reads 99% full admit
+/// coverage, not 100%). What does hold: the stamped width stays a
+/// served floor, so admission is expected/measured ≥ the stamped-width
+/// baseline, never below it. Decisive geometry: estimates cliff,
+/// nothing qualifies, admission stays at the write window. Flat-scored
+/// queries (question-vs-passage retrieval): the tie run qualifies and
+/// admission follows the evidence. The caller iterates — newly
+/// admitted cells' exact scores tighten/widen the measurement — until
+/// a round admits nothing; each round admits ≥ 1 new cell, so
 /// termination is bounded by the populated-cell count.
 fn admit_extension_round(
     admit_ranking: &[(u32, f32)],
@@ -732,25 +736,29 @@ fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
     selected
 }
 
-/// Serve-time near-tie window on the exact-fine cell ranking (#515),
-/// law-pinned default path only. Past the law's width, selection keeps
-/// following the ranking while each next cell's best exact fine score
-/// stays within this relative window of the winner's. On decisive
-/// geometry (synthetic, Cohere) fine scores cliff after the law's picks
-/// and the window never opens — serving is byte-identical to the pin.
-/// On flat-scored corpora (question-vs-passage retrieval: BioASQ
-/// measured its truth cells at exact-fine ranks ≤ 48, already inside
-/// the exactly-rescored admit window) the query's own evidence extends
-/// the served set. Bounds are the evidence itself and the admit window
-/// (only admitted cells are ranked) — deliberately no artificial cap: a
-/// constant ceiling would silently truncate exactly the tail queries
-/// this serves. Cost stays bounded per cell instead: extension cells
-/// are read at the pre-pin fine depth (the stamped law's runs-per-cell
-/// floor), never the pin's whole-cell depth. Value = the measured
-/// truth-cell slack p99 (0.287–0.294 across the #515 BioASQ diag
-/// configs); the dial grid read 0.9617 at 0.25 vs 0.9657 at 0.30
-/// (diag metric), Cohere controls unchanged at both.
-const FINE_SERVE_NEAR_TIE_SLACK: f32 = 0.30;
+// Serve-time near-tie window on the exact-fine cell ranking (#515),
+// law-pinned default path only. Past the law's width, selection keeps
+// following the ranking while each next cell's best exact fine score
+// stays within this relative window of the winner's. On decisive
+// geometry (synthetic, Cohere) fine scores cliff after the law's picks
+// and the window never opens — serving is byte-identical to the pin.
+// On flat-scored corpora (question-vs-passage retrieval: BioASQ
+// measured its truth cells at exact-fine ranks ≤ 48, already inside
+// the exactly-rescored admit window) the query's own evidence extends
+// the served set. Bounds are the evidence itself and the admit window
+// (only admitted cells are ranked) — deliberately no artificial cap: a
+// constant ceiling would silently truncate exactly the tail queries
+// this serves. Cost stays bounded per cell instead: extension cells
+// are read at the pre-pin fine depth (the stamped law's runs-per-cell
+// floor), never the pin's whole-cell depth. The window value comes
+// from `config.yaml` (`vector.serve_near_tie_slack`, default = the
+// measured real-query truth-cell slack p99, 0.287–0.294 across the
+// #515 BioASQ diag configs; the dial grid read 0.9617 at 0.25 vs
+// 0.9657 at 0.30 on the diag metric, Cohere controls unchanged at
+// both) — a config default rather than a per-table drain stamp
+// because the drain sample is corpus rows, which measure a different
+// slack distribution than real queries (the same mismatch that
+// under-stamped the width law on question-vs-passage corpora).
 
 /// Default-path cell selection, shared by the hidden (post-drain) and user
 /// (pre-drain) branches: probe the fine-ranked top cell, adding the grid's
@@ -1603,6 +1611,12 @@ impl SupertableReader {
             } else {
                 config::global().vector.fine_nprobe_pct
             };
+            // #515 near-tie serve window, config-defaulted like the
+            // fraction above (config.yaml / ./infino.yaml — no env var,
+            // no rebuild); see the serve-window doc at the top of the
+            // file for why this is a config default and not a drain
+            // stamp.
+            let serve_near_tie_slack = config::global().vector.serve_near_tie_slack;
             let ranked_for_beam: Vec<(u32, f32)> = ranked_scored
                 .iter()
                 .filter(|(cell, _)| postings_by_cell.contains_key(cell))
@@ -1680,8 +1694,7 @@ impl SupertableReader {
                     let Some(&(_, best_exact)) = fine_ranked_now.first() else {
                         break;
                     };
-                    let serve_threshold =
-                        relative_score_window(best_exact, FINE_SERVE_NEAR_TIE_SLACK);
+                    let serve_threshold = relative_score_window(best_exact, serve_near_tie_slack);
                     let exact_best_by_cell: HashMap<u32, f32> =
                         fine_ranked_now.into_iter().collect();
                     let round = admit_extension_round(
@@ -1757,9 +1770,10 @@ impl SupertableReader {
                             .iter()
                             .map(|(cell, _)| *cell)
                             .collect();
-                        match fine_ranked.first().map(|(_, score)| {
-                            relative_score_window(*score, FINE_SERVE_NEAR_TIE_SLACK)
-                        }) {
+                        match fine_ranked
+                            .first()
+                            .map(|(_, score)| relative_score_window(*score, serve_near_tie_slack))
+                        {
                             Some(threshold) => law_floor_serve_selection(
                                 &fine_ranked,
                                 &grid_cells,
@@ -2231,7 +2245,14 @@ impl SupertableReader {
                 // stamped width and run floor-free: at law widths the
                 // floor measured +0.0001 recall for ~3.4 ms of extra
                 // rerank at k=100 (Cohere-1M), and at width 1-2 it is a
-                // near-no-op by construction. Floor = k when it applies:
+                // near-no-op by construction. Re-measured at the WIDENED
+                // widths the #515 admit extension serves (Cohere defaults
+                // with the loop active, diffuse stamps both k): still
+                // floor-free, 0.9955 @ k=100 and 0.9940 @ k=10 — above
+                // the stamped-width baseline, no inversion dip. If a
+                // future gate dips, the targeted fix is arming floor = k
+                // on the extension subset only, not on the law's picks.
+                // Floor = k when it applies:
                 // even if the entire true top-k concentrates in one probed
                 // cell, that cell's floor carries it into the exact rerank
                 // (replicas never collide inside one cell, so the floor
