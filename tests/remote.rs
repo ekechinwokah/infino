@@ -19,7 +19,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::prelude::{col, lit};
 use infino::{
     Bm25SearchOptions, BoolMode, ConnectOptions, IndexSpec, InfinoError, OptimizeError,
-    OptimizeOptions, VectorFilter, VectorSearchOptions,
+    OptimizeOptions, VectorFilter,
 };
 use serde_json::json;
 use wiremock::{
@@ -327,14 +327,7 @@ async fn vector_search_sends_query_filter_and_decodes_arrow() {
             mode: BoolMode::Or,
         };
         table
-            .vector_search(
-                "emb",
-                &[1.0, 0.0],
-                5,
-                VectorSearchOptions::new(),
-                Some(filter),
-                None,
-            )
+            .vector_search("emb", &[1.0, 0.0], 5, Some(filter), None)
             .expect("vector_search")
     })
     .await;
@@ -366,16 +359,7 @@ async fn hybrid_search_sends_text_and_vector_fields() {
     let rows = with_connection(server.uri(), |db| {
         db.open_table("posts")
             .expect("open")
-            .hybrid_search(
-                "id",
-                "hi",
-                BoolMode::Or,
-                "emb",
-                &[1.0, 0.0],
-                VectorSearchOptions::new(),
-                5,
-                None,
-            )
+            .hybrid_search("id", "hi", BoolMode::Or, "emb", &[1.0, 0.0], 5, None)
             .expect("hybrid_search")
     })
     .await;
@@ -567,24 +551,8 @@ async fn remote_client_matches_the_published_api_spec() {
             let _ = table.token_match("id", "x", BoolMode::Or, Some(&["_id"]));
             let _ = table.exact_match("id", "x", Some(&["_id"]));
             let _ = table.count("id", "x", BoolMode::Or);
-            let _ = table.vector_search(
-                "id",
-                &[1.0],
-                1,
-                VectorSearchOptions::new(),
-                None,
-                Some(&["_id"]),
-            );
-            let _ = table.hybrid_search(
-                "id",
-                "x",
-                BoolMode::Or,
-                "id",
-                &[1.0],
-                VectorSearchOptions::new(),
-                1,
-                Some(&["_id"]),
-            );
+            let _ = table.vector_search("id", &[1.0], 1, None, Some(&["_id"]));
+            let _ = table.hybrid_search("id", "x", BoolMode::Or, "id", &[1.0], 1, Some(&["_id"]));
             let _ = table.optimize(&OptimizeOptions::default());
             let _ = table.gc(Duration::from_secs(0));
         }
