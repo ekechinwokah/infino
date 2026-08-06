@@ -2067,6 +2067,28 @@ impl SupertableReader {
         };
         let mut cold_rerank_mult = 0;
         let options = match sweep_width {
+            // (#537) An explicit caller nprobe keeps the FULL per-cell
+            // budget — the divide below is for the law arm only. Divided,
+            // per-cell retention shrinks as the caller widens, and the
+            // 1-bit in-cell ranking is too weak to hold the true
+            // neighbors in a thin cut: on the 10M dense grid (~2.8K-row
+            // cells) measured recall tracks the divided depth down its
+            // ladder — whole-cell at w<=4 serves 0.993, w=16 (~6% of
+            // each cell) serves 0.85, all-cells (20 rows/cell) serves
+            // 0.51 — monotone in DEPTH, inverted in width. Undivided,
+            // widening adds cells at constant depth, so the sweep is
+            // monotone and read cost is linear in the width the caller
+            // asked for: explicit nprobe is a diagnostic surface, and
+            // "probe everything" honestly costs a scan.
+            Some(w) if w > 1 && options.nprobe.is_some() => {
+                if global_shortlist_width.is_some() {
+                    let (_, rerank_mult) = options.resolve(filtered);
+                    cold_rerank_mult = rerank_mult;
+                }
+                options
+            }
+            // Law arm: the stamped budget is calibrated as a TOTAL at the
+            // stamped width, so it divides across the sweep.
             Some(w) if w > 1 => {
                 let (_, rerank_mult) = options.resolve(filtered);
                 let divided = rerank_mult
@@ -2276,25 +2298,22 @@ impl SupertableReader {
                 // needs no replica overhead).
                 //
                 // (#537) The floor's DEPTH must not shrink as the caller
-                // widens. The global pool splits across probed cells, so a
-                // k-deep floor leaves each cell's retention to its own
-                // 1-bit top-k — and within-cell estimate noise evicts true
-                // neighbors from that at scale (measured: recall falls
-                // monotonically with nprobe past ~5M, 0.534 at all-cells
-                // on 10M, while narrow probes hold 0.99). Hold every
-                // probed cell at the depth the stamp certified for a
-                // served cell — the stamped rerank budget divided by the
-                // stamped width — so widening adds cells at full depth
-                // instead of diluting all of them. Rerank cost then scales
-                // with the width the caller asked for, which is the pin
-                // arm's stated semantics: read amplification is what was
-                // asked for.
+                // widens — and the depth that holds recall is the full
+                // per-cell budget, not a share of it. The measured 10M
+                // ladder (see the width-divide comment above the fan-out)
+                // tracks per-cell retention depth almost mechanically:
+                // whole-cell retention serves 0.993, ~6% of a cell serves
+                // 0.85, 20 rows serves 0.51 — in-cell 1-bit ranking is
+                // too weak to concentrate the true neighbors into a thin
+                // cut, so no fixed pool or stamped share survives a wide
+                // sweep. Under an explicit caller nprobe every scanned
+                // cell therefore keeps the same k x rerank_mult depth the
+                // narrow probe would give it: widening adds cells at
+                // constant depth, the exact rerank adjudicates, and cost
+                // is linear in the width the caller asked for — the pin
+                // arm's stated semantics.
                 let cell_floor = if options.nprobe.is_some() {
-                    let stamped_width = hidden_routing
-                        .and_then(|r| r.width_for_k_at(k))
-                        .unwrap_or(1)
-                        .max(1);
-                    k.max(k.saturating_mul(rerank_mult).div_ceil(stamped_width))
+                    k.saturating_mul(rerank_mult)
                 } else {
                     0
                 };

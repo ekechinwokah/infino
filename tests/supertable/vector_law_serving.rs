@@ -12,7 +12,8 @@
 //!
 //! The same probe pins the floor scoping from the same PR: law-served
 //! defaults run floor-free; an explicit caller `nprobe` arms the floor at
-//! the stamped per-cell depth (rerank budget / stamped width, >= k — #537).
+//! the full per-cell budget (`k x rerank_mult`, so per-cell depth never
+//! shrinks as the caller widens — #537).
 
 #![deny(clippy::unwrap_used)]
 
@@ -146,10 +147,10 @@ async fn law_stamped_table_serves_the_law_not_the_constant() {
         "caller rerank_mult must override the law exactly; recorded: {recs:?}"
     );
 
-    // 3) Explicit caller nprobe re-arms the per-cell floor — at the
-    //    stamped per-cell DEPTH (#537: rerank budget / stamped width,
-    //    never below k), so widening the probe adds cells at full depth
-    //    instead of diluting a shared pool (the ≥5M recall inversion).
+    // 3) Explicit caller nprobe re-arms the per-cell floor — at the full
+    //    per-cell budget (#537: k x rerank_mult, width-independent), so
+    //    widening the probe adds cells at constant depth instead of
+    //    diluting a shared pool (the >=5M recall inversion).
     st.vector_search(
         "emb",
         &query,
