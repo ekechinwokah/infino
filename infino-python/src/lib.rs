@@ -644,11 +644,11 @@ impl Table {
 
     /// Hybrid BM25 + vector search fused with reciprocal-rank fusion.
     /// `text_column` / `text_query` (under `mode`) drive BM25;
-    /// `vector_column` / `vector_query` (with optional `nprobe` and
-    /// `rerank_mult`) drive vector kNN. `k` bounds each retriever and the
-    /// fused result. Returns a pyarrow `Table` like `bm25_search`, with
-    /// `score` the fused RRF score (higher is better); `projection`
-    /// follows the same rules.
+    /// `vector_column` / `vector_query` drive vector kNN — probe width
+    /// and rerank budget are engine-decided. `k` bounds each retriever
+    /// and the fused result. Returns a pyarrow `Table` like
+    /// `bm25_search`, with `score` the fused RRF score (higher is
+    /// better); `projection` follows the same rules.
     #[cfg(not(feature = "diagnostics"))]
     #[pyo3(signature = (text_column, text_query, vector_column, vector_query, k, mode=None, projection=None))]
     #[allow(clippy::too_many_arguments)]
