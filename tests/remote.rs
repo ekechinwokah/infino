@@ -19,7 +19,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::prelude::{col, lit};
 use infino::{
     Bm25SearchOptions, BoolMode, ConnectOptions, IndexSpec, InfinoError, OptimizeError,
-    OptimizeOptions, VectorFilter,
+    OptimizeOptions, VectorFilter, VectorSearchOptions,
 };
 use serde_json::json;
 use wiremock::{
@@ -332,6 +332,32 @@ async fn vector_search_sends_query_filter_and_decodes_arrow() {
     })
     .await;
     assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+}
+
+#[tokio::test]
+async fn vector_tuning_overrides_are_rejected_on_the_remote_transport() {
+    // Options never cross the wire; the test-only `_with_options` variants
+    // must fail loudly against a hosted table rather than silently serve
+    // engine defaults (a sweep or oracle run would record wrong numbers).
+    // No search endpoint is mounted: the rejection must precede any wire I/O.
+    let server = MockServer::start().await;
+    mount_schema(&server).await;
+
+    let err = with_connection(server.uri(), |db| {
+        let table = db.open_table("posts").expect("open");
+        table
+            .vector_search_with_options(
+                "emb",
+                &[1.0, 0.0],
+                5,
+                VectorSearchOptions::new().with_nprobe(2),
+                None,
+                None,
+            )
+            .expect_err("override must be refused")
+    })
+    .await;
+    assert!(err.to_string().contains("remote transport"), "got: {err}");
 }
 
 #[tokio::test]
