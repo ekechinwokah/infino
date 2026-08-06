@@ -759,6 +759,9 @@ impl Supertable {
     /// commit. `new_rows.num_rows()` must equal the match count.
     /// Durable when this returns.
     ///
+    /// A predicate matching no rows is a no-op rather than an error — the 1:1
+    /// rule holds at zero, and every returned count is zero.
+    ///
     /// ```
     /// # use std::sync::Arc;
     /// # use infino::arrow_array::{LargeStringArray, RecordBatch};
@@ -788,8 +791,14 @@ impl Supertable {
         let mut w = self
             .writer()
             .map_err(|e| InfinoError::from(e).with_context("update", None))?;
-        w.update(predicate, new_rows.clone())
+        let pending = w
+            .update(predicate, new_rows.clone())
             .map_err(|e| InfinoError::from(e).with_context("update", None))?;
+        // Nothing matched, so nothing was buffered and `commit` would produce no
+        // outcome for `single_outcome` to surface. A no-op is not a fault.
+        if pending.matched == 0 {
+            return Ok(MutationStats::empty());
+        }
         single_outcome(
             w.commit()
                 .map_err(|e| InfinoError::from(e).with_context("update", None))?,
@@ -1181,11 +1190,9 @@ impl SupertableWriter {
 
         // Cardinality 0 is a structurally-impossible update —
         // the WAL pipeline needs `preallocated_superfile_id`
-        // and at least one minted id span. We mint a wal_id so
-        // the caller's `PendingUpdate` is comparable to the
-        // non-zero shape, but skip buffering. The commit's
-        // `CommitResult.outcomes` will reflect `matched: 0` if
-        // the caller routes through the buffer instead.
+        // and at least one minted id span. Nothing is buffered,
+        // so `commit()` yields no outcome for this call; read
+        // the `matched: 0` here instead.
         if matched == 0 {
             return Ok(PendingUpdate { matched: 0 });
         }
@@ -2426,7 +2433,11 @@ pub(super) fn prepare_superfile_with_uri(
                 (Some(min), Some(max)) => (min.clone(), max.clone()),
                 _ => (Vec::new(), Vec::new()),
             };
-            let mut bloom_builder = BloomBuilder::new();
+            // Size the bloom to this superfile's distinct-term count rather
+            // than a fixed 64 KiB, which is ~1000x over-provisioned for a small
+            // superfile. Readers derive the block count from the byte length,
+            // so heterogeneous sizes coexist across superfiles.
+            let mut bloom_builder = BloomBuilder::sized_for_terms(terms.len());
             for term in &terms {
                 bloom_builder.insert(term);
             }
