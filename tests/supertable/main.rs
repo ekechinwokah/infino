@@ -33,4 +33,6 @@ mod query;
 mod storage;
 mod update_crash_property;
 mod vector_law_serving;
+mod vector_phase_profile;
+mod vector_stamp_split;
 mod writer_mutations;

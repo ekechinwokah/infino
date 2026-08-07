@@ -55,7 +55,7 @@ use crate::{
         manifest::{
             ClusterCentroids, RABITQ_ADMIT_CELL_SHORTLIST_FRACTION,
             RABITQ_ADMIT_CELL_SHORTLIST_MIN, RabitqAdmitContext,
-            list::{WIDTH_LAW_KS, WIDTH_LAW_MAX_K},
+            list::{CellRoutingParams, WIDTH_LAW_KS, WIDTH_LAW_MAX_K},
         },
     },
 };
@@ -66,9 +66,45 @@ pub(crate) fn cell_split_doc_cap() -> u64 {
     config::global().vector.cell_split_doc_cap
 }
 
-/// True when a merged cell superfile should be split into two sub-cells.
-pub(crate) fn split_overflow_needed(n_docs: u64) -> bool {
-    n_docs > cell_split_doc_cap()
+/// The `k` the acceptance bar is measured at: recall@10 is the
+/// non-negotiable gate, so the stamped evidence budget at this knot
+/// anchors geometry decisions.
+const STAMP_CAP_ANCHOR_K: usize = 10;
+
+/// Smallest effective row cap a stamp may impose — split children must
+/// stay viable cells (2x the modality sliver guard) whatever the budget
+/// says, or a small-corpus stamp would shred the grid into slivers.
+const STAMP_CAP_FLOOR_DOCS: u64 = 2 * MODALITY_MIN_CELL_DOCS;
+
+/// Effective per-cell row ceiling: the configured hard cap bounded by
+/// the table's OWN stamped rerank budget at the recall@10 knot.
+///
+/// Why the stamp is the right ceiling: on coarse cells the in-cell
+/// 1-bit ranking discriminates weakly, so the drain calibrator must
+/// inflate the rerank budget to hold recall, and warm latency tracks
+/// that budget (measured at 10M on a 256-cell grid: 26.7K-row budget at
+/// k=100, ~69 ms warm per query; the same law on ~2.8K-row cells stamps
+/// ~2.4K rows and serves single-digit milliseconds). Splitting a cell
+/// that holds more rows than the stamped budget is therefore a measured
+/// fixed point — "rows a cell holds" converges toward "rows a query
+/// must exactly score" — with no fitted constant: both sides come from
+/// this table's drain. The modality trigger stays as an additional
+/// split reason (it sees real multimodality the size test cannot), and
+/// the configured cap stays as the backstop for unstamped tables
+/// (pre-drain, no laws yet).
+pub(crate) fn effective_cell_row_cap(routing: Option<&CellRoutingParams>) -> u64 {
+    let cap = cell_split_doc_cap().max(1);
+    match routing.and_then(|r| r.rerank_for_k_at(STAMP_CAP_ANCHOR_K)) {
+        Some(budget) => cap.min((budget as u64).max(STAMP_CAP_FLOOR_DOCS)),
+        None => cap,
+    }
+}
+
+/// True when a merged cell superfile should be split into two sub-cells,
+/// judged against the pass's effective row cap
+/// ([`effective_cell_row_cap`]).
+pub(crate) fn split_overflow_needed(n_docs: u64, effective_cap: u64) -> bool {
+    n_docs > effective_cap
 }
 
 /// Ashman-D threshold that triggers a modality-driven split, or `0.0` when the
@@ -104,8 +140,8 @@ pub(crate) const MODALITY_MIN_CELL_DOCS: u64 = 128;
 /// enough to test. The actual split decision (Ashman D) is made in
 /// [`crate::supertable::writer::split_overflow_cell`], where the rows are
 /// resident; this only gates which cells that decision runs on.
-pub(crate) fn split_candidate(n_docs: u64) -> bool {
-    split_overflow_needed(n_docs)
+pub(crate) fn split_candidate(n_docs: u64, effective_cap: u64) -> bool {
+    split_overflow_needed(n_docs, effective_cap)
         || (cell_split_modality_d() > 0.0 && n_docs >= MODALITY_MIN_CELL_DOCS)
 }
 
@@ -491,9 +527,10 @@ pub(crate) fn cell_split_plan(
     dim: usize,
     split_cell: u32,
     modality_d: f64,
+    effective_cap: u64,
 ) -> Option<(usize, bool)> {
     let n_docs = rows.len() as u64;
-    let cap = cell_split_doc_cap().max(1) as usize;
+    let cap = (effective_cap.max(1)) as usize;
     let k_by_cap = rows.len().div_ceil(cap).max(2);
     let threshold = modality_d;
     // Modality trigger off (default): the caller's over-cap gate is the sole
@@ -506,7 +543,7 @@ pub(crate) fn cell_split_plan(
     // Modality trigger on: a hard-cap overflow still always splits; below the
     // cap, split only a genuinely multimodal cell (Ashman D below), leaving a
     // unimodal cell whole (`None`).
-    if split_overflow_needed(n_docs) {
+    if split_overflow_needed(n_docs, effective_cap) {
         return Some((k_by_cap, true));
     }
     if n_docs < MODALITY_MIN_CELL_DOCS {
@@ -2371,6 +2408,31 @@ mod tests {
             .expect("batch-split grid must reopen from wire bytes");
         assert_eq!(decoded.n_cent, 12);
         assert_eq!(decoded.centroids.len(), 12 * dim);
+    }
+
+    /// The effective row cap is the configured cap bounded by the stamped
+    /// rerank budget at the recall@10 knot, floored so children stay viable.
+    #[test]
+    fn effective_cap_tracks_the_stamped_budget() {
+        let cap = cell_split_doc_cap();
+        // No stamps (pre-drain): the configured cap governs.
+        assert_eq!(effective_cell_row_cap(None), cap);
+        let stamped = |rerank_for_k| CellRoutingParams {
+            rerank_for_k,
+            ..CellRoutingParams::default()
+        };
+        // A stamped budget below the cap becomes the ceiling.
+        assert_eq!(
+            effective_cell_row_cap(Some(&stamped([3000, 3000, 12000, 40000]))),
+            3000
+        );
+        // A tiny stamp is floored: split children must stay viable cells.
+        assert_eq!(
+            effective_cell_row_cap(Some(&stamped([64, 64, 200, 900]))),
+            2 * MODALITY_MIN_CELL_DOCS
+        );
+        // An uncalibrated law (all-zero knots) never RAISES the ceiling.
+        assert_eq!(effective_cell_row_cap(Some(&stamped([0, 0, 0, 0]))), cap);
     }
 
     #[test]

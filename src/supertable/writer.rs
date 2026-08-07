@@ -5540,8 +5540,9 @@ fn select_split_batch(
     dim: u32,
     budget_bytes: u64,
     max_cells: usize,
+    effective_cap: u64,
 ) -> Vec<u32> {
-    let candidates = split_candidates(cell_counts, unsplittable);
+    let candidates = split_candidates(cell_counts, unsplittable, effective_cap);
     let mut batch: Vec<u32> = Vec::new();
     let mut estimated_bytes = 0u64;
     for (cell, n) in candidates {
@@ -5698,11 +5699,12 @@ fn repack_scratch_dir() -> PathBuf {
 fn split_candidates(
     cell_counts: &HashMap<u32, u64>,
     unsplittable: &HashSet<u32>,
+    effective_cap: u64,
 ) -> Vec<(u32, u64)> {
     let mut candidates: Vec<(u32, u64)> = cell_counts
         .iter()
         .filter(|&(cell, &n)| {
-            opann::split_candidate(n)
+            opann::split_candidate(n, effective_cap)
                 && (n as usize) >= MIN_ROWS_TO_SPLIT_CELL
                 && !unsplittable.contains(cell)
         })
@@ -5799,6 +5801,7 @@ fn plan_split_wave(
     clusters: &ClusterCentroids,
     metric: Metric,
     modality_d: f64,
+    effective_cap: u64,
 ) -> Vec<Result<PlannedCellSplit, u32>> {
     plan_inputs
         .into_par_iter()
@@ -5809,9 +5812,13 @@ fn plan_split_wave(
                 rows,
             } = extracted;
             let split_refs: Vec<&EncodedCellRow> = rows.iter().map(|r| &r.encoded).collect();
-            let Some((k, self_tune)) =
-                opann::cell_split_plan(&split_refs, clusters.dim as usize, cell, modality_d)
-            else {
+            let Some((k, self_tune)) = opann::cell_split_plan(
+                &split_refs,
+                clusters.dim as usize,
+                cell,
+                modality_d,
+                effective_cap,
+            ) else {
                 return Err(cell);
             };
             let (sub_centroids, assign) =
@@ -6016,6 +6023,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         }
         _ => return Ok(SplitBatchOutcome::no_op_cells(batch_cells.to_vec())),
     };
+    let effective_cap = opann::effective_cell_row_cap(Some(&routing));
     if clusters.n_cent == 0 || clusters.dim == 0 {
         return Ok(SplitBatchOutcome::no_op_cells(batch_cells.to_vec()));
     }
@@ -6056,7 +6064,15 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
     let planned_or_noop: Vec<Result<PlannedCellSplit, u32>> = run_on_pool(
         Some(maint_pool()?),
         "cell split batch planning",
-        move || plan_split_wave(plan_inputs, &plan_clusters, metric, modality_d),
+        move || {
+            plan_split_wave(
+                plan_inputs,
+                &plan_clusters,
+                metric,
+                modality_d,
+                effective_cap,
+            )
+        },
     )
     .await
     .map_err(|e| BuildError::Store(format!("cell split batch planning: {e}")))?;
@@ -6385,6 +6401,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
     if clusters.n_cent == 0 || clusters.dim == 0 {
         return Ok(SplitBatchOutcome::no_op_cells(all_cells()));
     }
+    let effective_cap = opann::effective_cell_row_cap(Some(&routing));
     let Some(base_cfg) = inner.options.vector_columns.first().cloned() else {
         return Ok(SplitBatchOutcome::no_op_cells(all_cells()));
     };
@@ -6504,7 +6521,13 @@ pub(in crate::supertable) async fn split_repack_bulk(
         let plan_clusters = running_clusters.clone();
         let planned_or_noop: Vec<Result<PlannedCellSplit, u32>> =
             run_on_pool(Some(maint_pool()?), "repack wave planning", move || {
-                plan_split_wave(plan_inputs, &plan_clusters, metric, modality_d)
+                plan_split_wave(
+                    plan_inputs,
+                    &plan_clusters,
+                    metric,
+                    modality_d,
+                    effective_cap,
+                )
             })
             .await
             .map_err(|e| BuildError::Store(format!("repack wave planning: {e}")))?;
@@ -6827,6 +6850,7 @@ fn apply_split_outcome_to_pass(
     unsplittable: &mut HashSet<u32>,
     parents_by_cell: &mut HashMap<u32, Vec<Arc<SuperfileEntry>>>,
     splits_committed: &mut usize,
+    effective_cap: u64,
 ) {
     for (cell, entry) in outcome.new_entries_by_cell {
         parents_by_cell.entry(cell).or_default().push(entry);
@@ -6846,7 +6870,7 @@ fn apply_split_outcome_to_pass(
                     // wasted read per child). Children still over cap stay
                     // selectable so the over-cap backstop re-splits them. No-op for
                     // the doc-cap path (its ≤cap children were never candidates).
-                    if !opann::split_overflow_needed(docs) {
+                    if !opann::split_overflow_needed(docs, effective_cap) {
                         unsplittable.insert(child);
                     }
                 }
@@ -6903,6 +6927,9 @@ pub(in crate::supertable) async fn split_overflow_cells(
     let mut unsplittable: HashSet<u32> = HashSet::new();
     let mut splits_committed = 0usize;
     let budget_bytes = split_batch_memory_budget_bytes();
+    // Per-cell row ceiling for this pass: the configured cap bounded by the
+    // table's own stamped rerank budget (see `opann::effective_cell_row_cap`).
+    let effective_cap = opann::effective_cell_row_cap(manifest.vector_cell_routing().as_ref());
 
     // Bulk-reshape detection: when a large fraction of the grid is
     // split-eligible (a bulk load's first optimize), take the repack path —
@@ -6911,7 +6938,7 @@ pub(in crate::supertable) async fn split_overflow_cells(
     // still-over-cap children. The repack is one pass, not a loop, so the
     // per-optimize split bound doesn't gate it; the loop's bound still
     // applies to everything after.
-    let eligible = split_candidates(&cell_counts, &unsplittable);
+    let eligible = split_candidates(&cell_counts, &unsplittable, effective_cap);
     if !eligible.is_empty()
         && eligible.len() as f64 >= f64::from(n_cent) * SPLIT_BULK_REPACK_MIN_CANDIDATE_FRACTION
     {
@@ -6929,6 +6956,7 @@ pub(in crate::supertable) async fn split_overflow_cells(
             &mut unsplittable,
             &mut parents_by_cell,
             &mut splits_committed,
+            effective_cap,
         );
     }
     loop {
@@ -6941,6 +6969,7 @@ pub(in crate::supertable) async fn split_overflow_cells(
             // split allowance (it is one pass, not a loop, so the bound
             // doesn't gate it — but the remainder must not underflow).
             MAX_SPLITS_PER_OPTIMIZE.saturating_sub(splits_committed),
+            effective_cap,
         );
         if batch.is_empty() {
             break;
@@ -7005,6 +7034,7 @@ pub(in crate::supertable) async fn split_overflow_cells(
             &mut unsplittable,
             &mut parents_by_cell,
             &mut splits_committed,
+            effective_cap,
         );
         if splits_committed >= MAX_SPLITS_PER_OPTIMIZE {
             warn!(
@@ -7020,7 +7050,7 @@ pub(in crate::supertable) async fn split_overflow_cells(
     if splits_committed > 0 {
         let over_cap = cell_counts
             .values()
-            .filter(|&&n| opann::split_overflow_needed(n))
+            .filter(|&&n| opann::split_overflow_needed(n, effective_cap))
             .count();
         let max_cell = cell_counts.values().copied().max().unwrap_or(0);
         debug!(
@@ -10181,12 +10211,37 @@ supertable:
         // middle one — which must be skipped, not stop the packing.
         let budget =
             estimate_split_resident_bytes(1000, dim) + estimate_split_resident_bytes(200, dim);
-        let batch = select_split_batch(&counts, &none, dim, budget, usize::MAX);
+        let batch = select_split_batch(
+            &counts,
+            &none,
+            dim,
+            budget,
+            usize::MAX,
+            opann::cell_split_doc_cap(),
+        );
         assert_eq!(
             batch,
             vec![1, 3],
             "largest first, middle skipped over budget, sub-floor cells (4, 5) excluded"
         );
+    }
+
+    /// A stamped effective cap below a cell's row count makes it a split
+    /// candidate on SIZE alone — the stamp-driven trigger (#548): grids on
+    /// real corpora never trip the modality test, so the budget must.
+    #[test]
+    fn split_candidates_admit_on_stamped_cap_overflow() {
+        let counts: HashMap<u32, u64> = [(1, 400), (2, 250)].into_iter().collect();
+        let none: HashSet<u32> = HashSet::new();
+        // Cap under cell 1 only: cell 1 overflows, cell 2 stays whole
+        // (below the cap; candidacy may still come from the modality
+        // trigger, so assert cell 1 leads as the largest overflow).
+        let candidates = split_candidates(&counts, &none, 300);
+        assert_eq!(candidates.first(), Some(&(1, 400)));
+        // With the cap out of reach neither cell overflows; candidacy is
+        // then the modality trigger's business alone (config default on).
+        let relaxed = split_candidates(&counts, &none, u64::MAX);
+        assert!(relaxed.iter().all(|&(_, n)| n <= 400));
     }
 
     /// The first candidate is always admitted — a cell whose estimate alone
@@ -10196,7 +10251,14 @@ supertable:
     fn select_split_batch_always_admits_one() {
         let counts: HashMap<u32, u64> = [(7, 1000), (9, 900)].into_iter().collect();
         let none: HashSet<u32> = HashSet::new();
-        let batch = select_split_batch(&counts, &none, 128, 1, usize::MAX);
+        let batch = select_split_batch(
+            &counts,
+            &none,
+            128,
+            1,
+            usize::MAX,
+            opann::cell_split_doc_cap(),
+        );
         assert_eq!(batch, vec![7]);
     }
 
@@ -10208,7 +10270,14 @@ supertable:
             .into_iter()
             .collect();
         let unsplittable: HashSet<u32> = [1].into_iter().collect();
-        let batch = select_split_batch(&counts, &unsplittable, 128, u64::MAX, 2);
+        let batch = select_split_batch(
+            &counts,
+            &unsplittable,
+            128,
+            u64::MAX,
+            2,
+            opann::cell_split_doc_cap(),
+        );
         assert_eq!(
             batch,
             vec![3, 6],
