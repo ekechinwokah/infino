@@ -3429,7 +3429,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         && completed_shards.is_empty()
         && local_checkpoint.spills.is_empty();
     let mut width_law = clean_uncheckpointed_drain
-        .then(|| opann::WidthLawCalibration::new(running_clusters.dim as usize, metric));
+        .then(|| opann::WidthLawCalibration::new(running_clusters.dim as usize, metric, false));
     // #512 invariant tripwire: no re-encode in this drain may saturate its
     // destination quantizer — cosine rows are unit (ingest-normalized) so
     // the fixed grid covers them, and data-derived grids are built to cover
@@ -3950,7 +3950,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             // Calibration reads the spill the pack pass is
                             // about to read anyway (before remove_files).
                             if let Some(cal) = width_law_ref {
-                                cal.score_cell(*cell_id, spill)?;
+                                cal.score_cell(*cell_id, spill, None)?;
                             }
                             let cell = build_spilled_packed_cell_from_rows(
                                 scratch,
@@ -7140,7 +7140,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     // this scan measures. A drain that commits between the scan and the
     // stamp adds rows this evidence never saw.
     let scan_ids: HashSet<Uuid> = manifest.superfiles.iter().map(|e| e.superfile_id).collect();
-    let mut cal = opann::WidthLawCalibration::new(clusters.dim as usize, metric);
+    let mut cal = opann::WidthLawCalibration::new(clusters.dim as usize, metric, false);
     // Query-sample pass: exactly `min(total_docs, WIDTH_LAW_QUERY_SAMPLE)`
     // evenly spaced ordinals over the cell-ordered live-row enumeration —
     // the law's noise floor is set by evidence size, and any fixed stride
@@ -7260,7 +7260,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             run_on_pool(Some(pool), "recalibration score", move || {
                 let result = loaded
                     .par_iter()
-                    .try_for_each(|(cell, rows)| chunk_cal.score_rows(*cell, rows));
+                    .try_for_each(|(cell, rows)| chunk_cal.score_rows(*cell, rows, None));
                 // Release the shared handle BEFORE returning — the oneshot
                 // send follows the return, and the awaiting side unwraps
                 // the Arc after the final recv (a send-then-drop order
