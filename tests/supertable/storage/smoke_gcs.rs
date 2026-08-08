@@ -86,6 +86,7 @@ fn gcs_options(dim: usize) -> SupertableOptions {
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         }],
         Some(default_tokenizer()),
     )

@@ -129,6 +129,7 @@ fn build_reader_with_sample_size(
             metric: Metric::Cosine,
             rerank_codec,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
     b.set_kmeans_sample_size(cid, sample_size)
@@ -245,6 +246,7 @@ async fn recall_with_default_reservoir_equivalent_to_full_corpus_training() {
         metric: Metric::Cosine,
         rerank_codec: RerankCodec::Fp32,
         provided_centroids: None,
+        residual_codes: false,
     })
     .expect("register column");
     for i in 0..n_docs {

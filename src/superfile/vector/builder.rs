@@ -36,8 +36,8 @@ use crate::superfile::{
     vector::{
         cell_posting::{MaterializedIvfRow, sq8_residual_norm_sq},
         distance::{
-            Metric, distance, encode_sq16_row, mean_f32_cluster_major, normalize,
-            sq16_decoded_norm_sq,
+            Metric, dequantize_sq8_residual_into, dequantize_sq16_into, distance,
+            encode_sq16_row, mean_f32_cluster_major, normalize, sq16_decoded_norm_sq,
         },
         ivf_merge::MergedIvfSubsection,
         kmeans::{assign_to_centroids, kmeans, kmeans_with_assignments},
@@ -1844,6 +1844,23 @@ fn write_at(file: &mut File, offset: usize, bytes: &[u8]) -> Result<(), BuildErr
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Residual-encode context for one bucket (= one cluster) of a residual
+/// subsection: the pack streamer decodes each row's payload to fp32,
+/// rotates it, and re-encodes the 1-bit code as signs of
+/// `rot(v) − rot(c_cluster)`, writing `‖r‖` into the residual-norm region.
+/// The spilled raw-sign code in the bucket record is overwritten — the
+/// payload is the authority, and re-deriving here keeps the residual rule
+/// inside ONE function for every cell-pack feeder.
+struct ResidualPackCtx<'a> {
+    rotation: &'a RandomRotation,
+    quant: &'a BitQuantizer,
+    /// This bucket's cluster centroid, pre-rotated once by the caller.
+    rot_centroid: &'a [f32],
+    /// Absolute offset of the per-doc residual-norm region.
+    norms_offset: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn stream_bucket_into_subsection(
     output: &mut File,
     bucket_path: &Path,
@@ -1854,6 +1871,7 @@ fn stream_bucket_into_subsection(
     scale: &[f32],
     offset: &[f32],
     norms_offset: Option<usize>,
+    residual: Option<&ResidualPackCtx<'_>>,
 ) -> Result<(), BuildError> {
     let fixed = codec.uses_fixed_quantizer();
     // Single-plane fixed codecs (Sq16) store one `dim*2`-byte `u16` plane whose
@@ -1872,6 +1890,9 @@ fn stream_bucket_into_subsection(
     let encode_consts = (!fixed).then(|| Sq8EncodeConsts::from_scale_offset(scale, offset));
     let mut recon = vec![0.0f32; dim];
     let mut fp_row = vec![0.0f32; dim];
+    // Residual re-encode scratch: the rotated row and the residual buffer.
+    let mut rot_row = vec![0.0f32; dim];
+    let mut res_scratch = vec![0.0f32; dim];
     while rows_done < block.count {
         let take = (block.count - rows_done).min(chunk_rows);
         let mut records = vec![0u8; take * record_bytes];
@@ -1880,6 +1901,7 @@ fn stream_bucket_into_subsection(
         let mut codes = vec![0u8; take * code_bytes];
         let mut rerank = vec![0u8; take * dim * 2];
         let mut norms = norms_offset.map(|_| vec![0u8; take * size_of::<f32>()]);
+        let mut res_norms = residual.map(|_| vec![0u8; take * size_of::<f32>()]);
         for row_idx in 0..take {
             let record = &records[row_idx * record_bytes..(row_idx + 1) * record_bytes];
             let id_end = format::vec::DOC_ID_BYTES;
@@ -1932,6 +1954,38 @@ fn stream_bucket_into_subsection(
                 let start = row_idx * size_of::<f32>();
                 norm_bytes[start..start + size_of::<f32>()].copy_from_slice(&norm.to_le_bytes());
             }
+            if let (Some(res), Some(res_norm_bytes)) = (residual, res_norms.as_mut()) {
+                // Decode the payload to fp32 (the fitted-residual arm above
+                // already decoded the original into `fp_row`), then re-encode
+                // the 1-bit code as the cluster-centroid residual's signs and
+                // record ‖r‖. The payload is the authority: the estimator's
+                // `q·c + κ·‖r‖·sd` then estimates the same vector the exact
+                // rerank scores.
+                if single_plane {
+                    dequantize_sq16_into(rerank_row, &mut fp_row);
+                } else if fixed {
+                    dequantize_sq8_residual_into(
+                        scale,
+                        offset,
+                        &rerank_row[..dim],
+                        &rerank_row[dim..],
+                        codec
+                            .residual_divisor()
+                            .expect("fixed residual codec has divisor"),
+                        &mut fp_row,
+                    );
+                }
+                res.rotation.apply(&fp_row, &mut rot_row);
+                let r_norm = res.quant.encode_residual_into(
+                    &rot_row,
+                    res.rot_centroid,
+                    &mut res_scratch,
+                    &mut codes[row_idx * code_bytes..(row_idx + 1) * code_bytes],
+                );
+                let start = row_idx * size_of::<f32>();
+                res_norm_bytes[start..start + size_of::<f32>()]
+                    .copy_from_slice(&r_norm.to_le_bytes());
+            }
         }
         write_at(output, block.codes_base + rows_done * code_bytes, &codes)?;
         write_at(
@@ -1945,6 +1999,13 @@ fn stream_bucket_into_subsection(
                 output,
                 norms_base + (block.first_row + rows_done) * size_of::<f32>(),
                 &norm_bytes,
+            )?;
+        }
+        if let (Some(res), Some(res_norm_bytes)) = (residual, res_norms) {
+            write_at(
+                output,
+                res.norms_offset + (block.first_row + rows_done) * size_of::<f32>(),
+                &res_norm_bytes,
             )?;
         }
         rows_done += take;
@@ -2051,6 +2112,14 @@ pub(crate) fn build_cell_subsection_from_source(
             "cell IVF build does not support codec {} with metric {:?}",
             cfg.rerank_codec.name(),
             cfg.metric
+        )));
+    }
+    if cfg.residual_codes && !cfg.rerank_codec.writes_full() {
+        // The residual re-encode decodes each row from its rerank payload at
+        // pack time; a payload-less codec (RabitqOnly) cannot supply the row.
+        return Err(BuildError::VectorSchemaMismatch(format!(
+            "residual_codes requires a payload-carrying rerank codec, got {}",
+            cfg.rerank_codec.name()
         )));
     }
     match &source {
@@ -2212,7 +2281,7 @@ pub(crate) fn build_cell_subsection_from_source(
         cluster_stride,
         codec_meta_size,
         stable_ids_region_bytes,
-        false,
+        cfg.residual_codes,
     );
     let cluster_order = centroid_storage_order(&centroids, n_cent, dim);
     let planned = plan_ivf_cluster_blocks(
@@ -2277,6 +2346,14 @@ pub(crate) fn build_cell_subsection_from_source(
             "streamed stable-id bytes {copied} != expected {stable_ids_region_bytes}"
         )));
     }
+    // Residual re-encode context, shared across buckets: the rotation and
+    // quantizer are per-column; each bucket pre-rotates its own cluster
+    // centroid once (rotation is linear, so rot(v − c) = rot(v) − rot(c)).
+    let residual_rotation = cfg
+        .residual_codes
+        .then(|| RandomRotation::new(dim, cfg.rot_seed));
+    let residual_quant = cfg.residual_codes.then(|| BitQuantizer::new(dim));
+    let mut rot_centroid = vec![0.0f32; dim];
     for planned_block in &planned {
         let Some(block) = planned_block.block.as_ref() else {
             continue;
@@ -2285,6 +2362,22 @@ pub(crate) fn build_cell_subsection_from_source(
             .path()
             .join(format!("cluster-{}.bin", planned_block.centroid_id));
         let (scale, offset) = &quantizers[planned_block.centroid_id];
+        let residual_ctx = match (&residual_rotation, &residual_quant) {
+            (Some(rotation), Some(quant)) => {
+                let c = &centroids[planned_block.centroid_id * dim
+                    ..(planned_block.centroid_id + 1) * dim];
+                rotation.apply(c, &mut rot_centroid);
+                Some(ResidualPackCtx {
+                    rotation,
+                    quant,
+                    rot_centroid: &rot_centroid,
+                    norms_offset: layout
+                        .residual_norms_off
+                        .expect("residual layout carries the norm region"),
+                })
+            }
+            _ => None,
+        };
         stream_bucket_into_subsection(
             &mut output,
             &path,
@@ -2295,6 +2388,7 @@ pub(crate) fn build_cell_subsection_from_source(
             scale,
             offset,
             norms_offset,
+            residual_ctx.as_ref(),
         )?;
     }
     output.flush()?;
@@ -4019,6 +4113,134 @@ mod tests {
             .inline_stable_ids_for_locals(&[0, 1, 2])
             .expect("inline stable ids");
         assert_eq!(resolved, ids[0..3]);
+    }
+
+    /// End-to-end residual pack: build a cell subsection with
+    /// `residual_codes = true`, then verify against the raw bytes that for
+    /// EVERY row (1) the stored 1-bit code equals the sign pattern of
+    /// `rot(payload) − rot(assigned cluster centroid)` and (2) the stored
+    /// residual norm equals `‖rot(payload) − rot(centroid)‖` — i.e. the
+    /// code/norm pair is exactly what the query-time estimator
+    /// `q·c + κ·‖r‖·sign_dot` assumes, derived from the same payload the
+    /// exact rerank scores. Also proves the v3 blob opens through
+    /// [`VectorReader`].
+    #[test]
+    fn residual_cell_pack_roundtrips_codes_and_norms() {
+        use bytes::Bytes;
+
+        use crate::superfile::vector::reader::VectorReader;
+
+        let dim = 16usize;
+        let n = 64usize;
+        let mut corpus = Vec::with_capacity(n * dim);
+        for r in 0..n {
+            for c in 0..dim {
+                // Spread rows around the unit sphere-ish so clusters differ.
+                corpus.push(((r * 7 + c * 3) as f32 * 0.37).sin());
+            }
+        }
+        let cfg = VectorConfig {
+            column: "v".into(),
+            dim,
+            rot_seed: 11,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq16,
+            provided_centroids: None,
+            residual_codes: true,
+        };
+        let ids: Vec<i128> = (0..n as i128).map(|i| 40_000 + i).collect();
+        let sub = build_merged_subsection_from_fp32(cfg, 4, Arc::new(corpus), &ids)
+            .expect("residual fp32 cell build");
+        let n_cent = sub.n_cent;
+        let n_docs = sub.n_docs as usize;
+        assert_eq!(n_docs, n);
+        let bytes = &sub.bytes;
+
+        // Header: version 3 + flag set.
+        let u32_at = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        let u64_at = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+        assert_eq!(
+            u32_at(sub_hdr::VERSION_OFF),
+            format::vec::SUBSECTION_VERSION_RESIDUAL
+        );
+        assert_eq!(u32_at(sub_hdr::RESIDUAL_FLAG_OFF), 1);
+
+        // Region offsets per the v3 layout.
+        let centroids_off = u64_at(sub_hdr::CENTROIDS_OFF_OFF) as usize;
+        let cluster_idx_off = u64_at(sub_hdr::CLUSTER_IDX_OFF_OFF) as usize;
+        let blocks_off = u64_at(sub_hdr::PER_CLUSTER_BLOCKS_OFF_OFF) as usize;
+        let codec_meta_size = u32_at(sub_hdr::CODEC_META_SIZE_OFF) as usize;
+        assert_eq!(codec_meta_size, n_docs * 4, "Sq16+Cosine per-doc norms");
+        let codec_meta_off = cluster_idx_off + n_cent * CLUSTER_IDX_ENTRY_BYTES;
+        let residual_norms_off = codec_meta_off + codec_meta_size;
+
+        let quant = BitQuantizer::new(dim);
+        let rotation = RandomRotation::new(dim, 11);
+        let code_bytes = quant.code_bytes();
+        // Cell-pack block layout: each cluster's block is
+        // [codes | doc_ids | rerank payload] contiguous, blocks placed in
+        // storage order, `doc_off * stride` from the region base.
+        let stride = code_bytes + format::vec::DOC_ID_BYTES + dim * 2;
+
+        let mut payload = vec![0.0f32; dim];
+        let mut rot_row = vec![0.0f32; dim];
+        let mut rot_centroid = vec![0.0f32; dim];
+        let mut scratch = vec![0.0f32; dim];
+        let mut expected_code = vec![0u8; code_bytes];
+        let mut rows_seen = 0usize;
+        for c in 0..n_cent {
+            let idx = cluster_idx_off + c * CLUSTER_IDX_ENTRY_BYTES;
+            let doc_off = u32_at(idx) as usize;
+            let count = u32_at(idx + CLUSTER_IDX_COUNT_OFFSET) as usize;
+            if count == 0 {
+                continue;
+            }
+            let centroid: Vec<f32> = bytes
+                [centroids_off + c * dim * 4..centroids_off + (c + 1) * dim * 4]
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            rotation.apply(&centroid, &mut rot_centroid);
+            let block_base = blocks_off + doc_off * stride;
+            let payload_base = block_base + count * (code_bytes + format::vec::DOC_ID_BYTES);
+            for i in 0..count {
+                let stored_code =
+                    &bytes[block_base + i * code_bytes..block_base + (i + 1) * code_bytes];
+                let p = payload_base + i * dim * 2;
+                dequantize_sq16_into(&bytes[p..p + dim * 2], &mut payload);
+                rotation.apply(&payload, &mut rot_row);
+                let expected_norm = quant.encode_residual_into(
+                    &rot_row,
+                    &rot_centroid,
+                    &mut scratch,
+                    &mut expected_code,
+                );
+                assert_eq!(
+                    stored_code, &expected_code[..],
+                    "cluster {c} row {i}: stored code must be the residual signs"
+                );
+                let norm_off = residual_norms_off + (doc_off + i) * 4;
+                let stored_norm =
+                    f32::from_le_bytes(bytes[norm_off..norm_off + 4].try_into().unwrap());
+                assert!(
+                    (stored_norm - expected_norm).abs() <= 1e-5 * expected_norm.max(1.0),
+                    "cluster {c} row {i}: stored ‖r‖ {stored_norm} vs {expected_norm}"
+                );
+                rows_seen += 1;
+            }
+        }
+        assert_eq!(rows_seen, n_docs, "every row verified");
+
+        // The v3 subsection opens through the reader inside a multi-cell blob.
+        let blob = finish_multi_cell_blob(&[(0, sub)]).expect("multi-cell blob");
+        let json = format!(
+            r#"[{{"column":"v","dim":{dim},"n_cent":4,"rot_seed":11,"metric":"cosine","rerank_codec":"sq16"}}]"#
+        );
+        let reader = VectorReader::open(Bytes::from(blob), &json).expect("open residual cell pack");
+        let resolved = reader
+            .inline_stable_ids_for_locals(&[0, 1])
+            .expect("inline stable ids");
+        assert_eq!(resolved.len(), 2);
     }
 
     #[test]

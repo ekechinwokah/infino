@@ -218,6 +218,7 @@ fn options_title_emb() -> SupertableOptions {
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
+            residual_codes: false,
         }],
         Some(default_tokenizer()),
     )

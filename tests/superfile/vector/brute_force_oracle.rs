@@ -149,6 +149,7 @@ fn build_reader_with_codec(
         metric,
         rerank_codec,
         provided_centroids: None,
+        residual_codes: false,
     })
     .expect("register column");
     for v in corpus {

@@ -328,6 +328,7 @@ fn vector_crash_fixture() -> (SupertableOptions, arrow_array::RecordBatch) {
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         }],
         Some(default_tokenizer()),
     )

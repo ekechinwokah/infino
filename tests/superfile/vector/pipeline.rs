@@ -63,6 +63,7 @@ fn build_two_column_blob(n_docs: u32) -> (Bytes, String) {
         metric: Metric::Cosine,
         rerank_codec: RerankCodec::Fp32,
         provided_centroids: None,
+        residual_codes: false,
     })
     .expect("register column");
     b.register_column(VectorConfig {
@@ -72,6 +73,7 @@ fn build_two_column_blob(n_docs: u32) -> (Bytes, String) {
         metric: Metric::L2Sq,
         rerank_codec: RerankCodec::Fp32,
         provided_centroids: None,
+        residual_codes: false,
     })
     .expect("register column");
 
@@ -250,6 +252,7 @@ async fn end_to_end_planted_clusters_recovered() {
         metric: Metric::L2Sq,
         rerank_codec: RerankCodec::Fp32,
         provided_centroids: None,
+        residual_codes: false,
     })
     .expect("register column");
 
