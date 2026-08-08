@@ -3735,16 +3735,7 @@ impl VectorReader {
                 // (measured on Cohere-1M defaults: 25.3K sync lookups
                 // ≈ 8.5 ms of a 22 ms warm query). Any missing span falls
                 // back to the coalesced remote plan, as before.
-                let mut span_by_cluster: HashMap<u32, Range<usize>> = HashMap::new();
-                for (cand, range) in rerank_cands.iter().zip(&ranges) {
-                    span_by_cluster
-                        .entry(cand.cluster_id)
-                        .and_modify(|span| {
-                            span.start = span.start.min(range.start);
-                            span.end = span.end.max(range.end);
-                        })
-                        .or_insert_with(|| range.clone());
-                }
+                let span_by_cluster = survivor_cluster_spans(&rerank_cands, &ranges);
                 let spans: Option<HashMap<u32, (usize, Bytes)>> = span_by_cluster
                     .iter()
                     .map(|(&cid, span)| {
@@ -5011,6 +5002,29 @@ struct RerankCandidate {
     block_idx: usize,
     full_off: usize,
     full_idx: Option<usize>,
+}
+
+/// One min..max byte span per probed cluster, covering every survivor
+/// range in it. The rerank gather resolves each span sync-resident once
+/// and slices per-survivor rows out of it; `range ⊆ span` holds by
+/// construction, so `range.start - span.start` never underflows and the
+/// slice returns byte-identical rows to a per-range fetch (pinned by
+/// `survivor_cluster_spans_slice_byte_identical_to_per_row_fetch`).
+fn survivor_cluster_spans(
+    rerank_cands: &[RerankCandidate],
+    ranges: &[Range<usize>],
+) -> HashMap<u32, Range<usize>> {
+    let mut span_by_cluster: HashMap<u32, Range<usize>> = HashMap::new();
+    for (cand, range) in rerank_cands.iter().zip(ranges) {
+        span_by_cluster
+            .entry(cand.cluster_id)
+            .and_modify(|span| {
+                span.start = span.start.min(range.start);
+                span.end = span.end.max(range.end);
+            })
+            .or_insert_with(|| range.clone());
+    }
+    span_by_cluster
 }
 
 #[inline]
@@ -11120,5 +11134,76 @@ mod tests {
             lazy_errors >= 2,
             "both the cluster-index and block fetch waves must surface LazySource"
         );
+    }
+
+    /// The rerank gather's span rewrite must be byte-identical to the
+    /// per-row path it replaced: for survivors scattered across clusters,
+    /// slicing each row out of its cluster's min..max span returns the
+    /// same bytes as fetching each range individually — including
+    /// duplicate ranges and single-row spans. Recall assertions cannot
+    /// pin this (a wrong-but-plausible row still scores), so the
+    /// equality is asserted directly.
+    #[test]
+    fn survivor_cluster_spans_slice_byte_identical_to_per_row_fetch() {
+        let backing: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let source = Source::InMemory(Bytes::from(backing));
+        let cand = |cluster_id: u32| RerankCandidate {
+            did: 0,
+            pos: 0,
+            cluster_id,
+            block_idx: 0,
+            full_off: 0,
+            full_idx: None,
+        };
+        // Cluster 7: rows at both ends of a wide span; cluster 3: one row;
+        // cluster 9: overlapping + duplicate ranges.
+        let rerank_cands = [cand(7), cand(3), cand(7), cand(9), cand(9), cand(9)];
+        let ranges: Vec<Range<usize>> = vec![
+            100..164,
+            2048..2112,
+            900..964,
+            3000..3064,
+            3032..3096,
+            3000..3064,
+        ];
+
+        let spans = survivor_cluster_spans(&rerank_cands, &ranges);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[&7], 100..964);
+        assert_eq!(spans[&3], 2048..2112);
+        assert_eq!(spans[&9], 3000..3096);
+
+        for (cand, range) in rerank_cands.iter().zip(&ranges) {
+            let span = &spans[&cand.cluster_id];
+            let region = source
+                .try_get_range_sync(span.clone())
+                .expect("in-memory span");
+            let via_span = region.slice(range.start - span.start..range.end - span.start);
+            let direct = source
+                .try_get_range_sync(range.clone())
+                .expect("in-memory range");
+            assert_eq!(via_span, direct, "cluster {} range {range:?}", cand.cluster_id);
+        }
+    }
+
+    /// `NormLookup::Raw` (per-candidate 4-byte reads off the raw norm
+    /// table) must return bit-exactly what the eager arm returns over a
+    /// parsed copy of the same table, at every position — the lazy arm
+    /// replaced a parse-whole-table path and a norm off by one position
+    /// silently corrupts every cosine rerank score. `Absent` stays
+    /// `None`.
+    #[test]
+    fn norm_lookup_raw_matches_parsed_table() {
+        let norms = [0.5f32, -1.25, 3.75e10, f32::MIN_POSITIVE, 0.0, -0.0, 65_504.0];
+        let raw: Vec<u8> = norms.iter().flat_map(|n| n.to_le_bytes()).collect();
+        let raw_lookup = NormLookup::Raw(Bytes::from(raw));
+        let arr_lookup = NormLookup::Arr(Some(Arc::from(norms.as_slice())));
+        for pos in 0..norms.len() as u32 {
+            let raw_val = raw_lookup.get(pos).expect("raw norm");
+            let arr_val = arr_lookup.get(pos).expect("arr norm");
+            assert_eq!(raw_val.to_bits(), arr_val.to_bits(), "pos {pos}");
+        }
+        assert_eq!(NormLookup::Absent.get(0), None);
+        assert_eq!(NormLookup::Arr(None).get(0), None);
     }
 }

@@ -1153,7 +1153,11 @@ impl Sq16Kernel {
 /// [`BitQuantizer::estimate_dot_rotated_with_total`]).
 #[inline]
 fn sq16_cross(q_prime: &[f32], code_bytes: &[u8]) -> f32 {
-    debug_assert_eq!(code_bytes.len(), q_prime.len() * 2);
+    // Release-enforced: the intrinsic tiers below read `2 * dim` code
+    // bytes through unaligned pointer loads, so a short slice would be
+    // an out-of-bounds read, not a panic. One predictable branch per
+    // candidate is free next to the ~dim FMAs that follow.
+    assert_eq!(code_bytes.len(), q_prime.len() * 2);
     #[cfg(target_arch = "x86_64")]
     {
         if avx512_enabled() {
@@ -1166,10 +1170,9 @@ fn sq16_cross(q_prime: &[f32], code_bytes: &[u8]) -> f32 {
             return unsafe { sq16_cross_avx512(q_prime, code_bytes) };
         }
         if avx2_enabled() {
-            // SAFETY: gated on `avx2_enabled()` (AVX2; FMA is checked
-            // by the same gate's platform baseline — see the explicit
-            // `fma` enable on the function). Bounds as above with an
-            // 8-code stride.
+            // SAFETY: gated on `avx2_enabled()`, which detects both
+            // `avx2` and `fma` — the two features the function enables.
+            // Bounds as above with an 8-code stride.
             return unsafe { sq16_cross_avx2(q_prime, code_bytes) };
         }
     }
