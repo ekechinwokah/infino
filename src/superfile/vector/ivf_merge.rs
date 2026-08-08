@@ -236,7 +236,6 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
     let mut bytes = alloc_ivf_subsection_with_header(
         &layout,
         codec_meta_size,
-        0.0,
         &summary_centroid,
         &out_centroids,
     );
@@ -523,7 +522,6 @@ pub(crate) fn splice_fragments_into_cell(
     let mut bytes = alloc_ivf_subsection_with_header(
         &layout,
         codec_meta_size,
-        0.0,
         &summary_centroid,
         &out_centroids,
     );

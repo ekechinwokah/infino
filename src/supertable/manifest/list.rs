@@ -399,6 +399,16 @@ pub struct CellRoutingParams {
     /// surviving next to fresh wide-pool ones). Pre-provenance
     /// manifests decode to the legacy floor.
     pub rerank_pool_cells: [u32; WIDTH_LAW_KS.len()],
+    /// Residual-code scale κ: the drain-calibrated multiplier in the
+    /// 1-bit estimator `est = q·c_cell + κ·‖r‖·sign_dot`, applied when a
+    /// column's codes are cell-centroid residuals (subsection version 3).
+    /// Table-global and calibrated *after* the immutable superfile bytes
+    /// are written, so it lives here — not in the subsection header — and
+    /// is refreshed by the same recalibration that restamps the probe
+    /// laws. `0.0` means "no residual calibration" (raw-code tables, or a
+    /// residual table not yet calibrated); the estimator falls back to the
+    /// raw sign-dot when κ is `0.0`.
+    pub residual_kappa: f32,
 }
 
 impl Default for CellRoutingParams {
@@ -412,6 +422,7 @@ impl Default for CellRoutingParams {
             fine_for_k: [0; WIDTH_LAW_KS.len()],
             rerank_for_k: [0; WIDTH_LAW_KS.len()],
             rerank_pool_cells: [RERANK_LAW_POOL_CELLS as u32; WIDTH_LAW_KS.len()],
+            residual_kappa: 0.0,
         }
     }
 }
@@ -1320,6 +1331,10 @@ struct CellRoutingParamsDto {
     /// them).
     #[serde(default = "legacy_rerank_pool")]
     rerank_pool_cells: [u32; WIDTH_LAW_KS.len()],
+    /// Residual-code scale κ; absent on pre-residual manifests (defaults
+    /// to `0.0` = no residual calibration).
+    #[serde(default)]
+    residual_kappa: f32,
 }
 
 /// Serde default for [`CellRoutingParamsDto::rerank_pool_cells`]: every
@@ -1339,6 +1354,7 @@ impl From<CellRoutingParams> for CellRoutingParamsDto {
             fine_for_k: r.fine_for_k,
             rerank_for_k: r.rerank_for_k,
             rerank_pool_cells: r.rerank_pool_cells,
+            residual_kappa: r.residual_kappa,
         }
     }
 }
@@ -1362,6 +1378,7 @@ impl From<CellRoutingParamsDto> for CellRoutingParams {
         r.fine_for_k = d.fine_for_k;
         r.rerank_for_k = d.rerank_for_k;
         r.rerank_pool_cells = d.rerank_pool_cells.map(|p| p.max(1));
+        r.residual_kappa = d.residual_kappa;
         r.nprobe_max = r.nprobe_max.max(r.nprobe_min);
         r
     }

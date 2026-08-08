@@ -2222,7 +2222,6 @@ pub(crate) fn build_cell_subsection_from_source(
         &mut open_region,
         &layout,
         codec_meta_size,
-        0.0,
         &summary_centroid,
         &centroids,
     );
@@ -2682,7 +2681,7 @@ fn build_subsection_streaming(
     let total_size_before_crc = layout.total_size_before_crc;
 
     let mut bytes =
-        alloc_ivf_subsection_with_header(&layout, codec_meta_size, 0.0, &summary_centroid, &centroids);
+        alloc_ivf_subsection_with_header(&layout, codec_meta_size, &summary_centroid, &centroids);
 
     let sq8_scale_block_off = layout.codec_meta_off;
     let sq8_offset_block_off = sq8_scale_block_off + n_cent * dim * 4;
@@ -3037,19 +3036,11 @@ impl IvfSubsectionLayout {
 pub(crate) fn alloc_ivf_subsection_with_header(
     layout: &IvfSubsectionLayout,
     codec_meta_size: usize,
-    residual_kappa: f32,
     summary_centroid: &[f32],
     centroids: &[f32],
 ) -> Vec<u8> {
     let mut bytes = vec![0u8; layout.total_size_before_crc];
-    write_ivf_subsection_header(
-        &mut bytes,
-        layout,
-        codec_meta_size,
-        residual_kappa,
-        summary_centroid,
-        centroids,
-    );
+    write_ivf_subsection_header(&mut bytes, layout, codec_meta_size, summary_centroid, centroids);
     bytes
 }
 
@@ -3059,25 +3050,23 @@ fn write_ivf_subsection_header(
     bytes: &mut [u8],
     layout: &IvfSubsectionLayout,
     codec_meta_size: usize,
-    residual_kappa: f32,
     summary_centroid: &[f32],
     centroids: &[f32],
 ) {
     debug_assert!(bytes.len() >= layout.codec_meta_off);
     bytes[0..MAGIC_BYTES].copy_from_slice(format::vec::SUB_MAGIC);
-    // Residual columns stamp version 3 and the flag + κ in the reclaimed
-    // reserved slot; raw columns stamp version 2 and leave the slot zero,
-    // byte-identical to pre-residual builds.
-    let (version, residual_flag, kappa) = match layout.residual_norms_off {
-        Some(_) => (format::vec::SUBSECTION_VERSION_RESIDUAL, 1u32, residual_kappa),
-        None => (format::vec::SUBSECTION_VERSION, 0u32, 0.0f32),
+    // Residual columns stamp version 3 and set the flag in the reclaimed
+    // reserved slot; raw columns stamp version 2 and leave it zero,
+    // byte-identical to pre-residual builds. κ is NOT written here — it is
+    // drain-calibrated into the manifest routing after these bytes land.
+    let (version, residual_flag) = match layout.residual_norms_off {
+        Some(_) => (format::vec::SUBSECTION_VERSION_RESIDUAL, 1u32),
+        None => (format::vec::SUBSECTION_VERSION, 0u32),
     };
     bytes[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]
         .copy_from_slice(&version.to_le_bytes());
     bytes[sub_hdr::RESIDUAL_FLAG_OFF..sub_hdr::RESIDUAL_FLAG_OFF + U32_BYTES]
         .copy_from_slice(&residual_flag.to_le_bytes());
-    bytes[sub_hdr::RESIDUAL_KAPPA_OFF..sub_hdr::RESIDUAL_KAPPA_OFF + U32_BYTES]
-        .copy_from_slice(&kappa.to_le_bytes());
     bytes[sub_hdr::CODEC_META_SIZE_OFF..sub_hdr::CODEC_META_SIZE_OFF + U32_BYTES]
         .copy_from_slice(&(codec_meta_size as u32).to_le_bytes());
     bytes[sub_hdr::SUMMARY_OFF_OFF..sub_hdr::SUMMARY_OFF_OFF + U64_BYTES]
@@ -3352,32 +3341,25 @@ mod tests {
             N_DOCS * 4
         );
 
-        // Header writer: residual stamps version 3, flag 1, the passed κ;
-        // raw stamps version 2, flag 0, κ 0 — a zero reserved slot.
-        const KAPPA: f32 = 0.047_36;
+        // Header writer: residual stamps version 3 + flag 1; raw stamps
+        // version 2 + flag 0. κ is NOT in the header (it lives in routing).
         let centroids = vec![0.0f32; N_CENT * DIM];
         let summary = vec![0.0f32; DIM];
         let res_bytes =
-            alloc_ivf_subsection_with_header(&res, codec_meta_size, KAPPA, &summary, &centroids);
+            alloc_ivf_subsection_with_header(&res, codec_meta_size, &summary, &centroids);
         let raw_bytes =
-            alloc_ivf_subsection_with_header(&raw, codec_meta_size, KAPPA, &summary, &centroids);
+            alloc_ivf_subsection_with_header(&raw, codec_meta_size, &summary, &centroids);
 
         let u32_at = |b: &[u8], off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
         let ver = |b: &[u8]| u32_at(b, sub_hdr::VERSION_OFF);
         let flag = |b: &[u8]| u32_at(b, sub_hdr::RESIDUAL_FLAG_OFF);
-        let kappa = |b: &[u8]| {
-            f32::from_le_bytes(
-                b[sub_hdr::RESIDUAL_KAPPA_OFF..sub_hdr::RESIDUAL_KAPPA_OFF + 4]
-                    .try_into()
-                    .unwrap(),
-            )
-        };
         assert_eq!(ver(&res_bytes), format::vec::SUBSECTION_VERSION_RESIDUAL);
         assert_eq!(flag(&res_bytes), 1);
-        assert_eq!(kappa(&res_bytes), KAPPA);
         assert_eq!(ver(&raw_bytes), format::vec::SUBSECTION_VERSION);
         assert_eq!(flag(&raw_bytes), 0, "raw layout leaves the reserved flag zero");
-        assert_eq!(kappa(&raw_bytes), 0.0, "raw layout ignores κ (reserved zero)");
+        // The κ slot [28..32] stays reserved-zero in both.
+        assert_eq!(u32_at(&res_bytes, 28), 0);
+        assert_eq!(u32_at(&raw_bytes, 28), 0);
     }
 
     /// Drive an async reader call to completion. The materialized read-back is

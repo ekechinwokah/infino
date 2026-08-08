@@ -181,8 +181,6 @@ pub struct ColumnReader {
     /// raw-code columns. When set, the scan estimator forms
     /// `est = q·c_cell + residual_kappa·‖r‖·signdot`.
     residual_norms_off: Option<usize>,
-    /// Residual scale κ from the sub-header; `0.0` for raw-code columns.
-    residual_kappa: f32,
     quant: BitQuantizer,
     /// Cached random rotation built once at open from `(dim, rot_seed)`.
     /// Construction is `O(dim³)` for Gram-Schmidt — at dim=384 that's
@@ -1029,11 +1027,6 @@ impl VectorReader {
             let residual_codes = read_u32_le(
                 &sub_header[sub_hdr::RESIDUAL_FLAG_OFF..sub_hdr::RESIDUAL_FLAG_OFF + U32_BYTES],
             ) == 1;
-            let residual_kappa = f32::from_le_bytes(
-                sub_header[sub_hdr::RESIDUAL_KAPPA_OFF..sub_hdr::RESIDUAL_KAPPA_OFF + U32_BYTES]
-                    .try_into()
-                    .expect("4-byte κ slot"),
-            );
             if residual_codes != (subsection_version == format::vec::SUBSECTION_VERSION_RESIDUAL) {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' residual flag {residual_codes} disagrees with subsection \
@@ -1285,7 +1278,6 @@ impl VectorReader {
                 per_cluster_blocks_off,
                 stable_ids_off,
                 residual_norms_off,
-                residual_kappa,
                 quant,
                 rot: RandomRotation::new(dim, rot_seed),
             });
@@ -1707,11 +1699,6 @@ impl VectorReader {
         let residual_codes = read_u32_le(
             &sub_header[sub_hdr::RESIDUAL_FLAG_OFF..sub_hdr::RESIDUAL_FLAG_OFF + U32_BYTES],
         ) == 1;
-        let residual_kappa = f32::from_le_bytes(
-            sub_header[sub_hdr::RESIDUAL_KAPPA_OFF..sub_hdr::RESIDUAL_KAPPA_OFF + U32_BYTES]
-                .try_into()
-                .expect("4-byte κ slot"),
-        );
         if residual_codes != (subsection_version == format::vec::SUBSECTION_VERSION_RESIDUAL) {
             return Err(VectorError::Read(ReadError::MalformedVersion(
                 "cell subsection residual flag disagrees with layout version".into(),
@@ -1906,7 +1893,6 @@ impl VectorReader {
             per_cluster_blocks_off,
             stable_ids_off,
             residual_norms_off,
-            residual_kappa,
             quant,
             rot: RandomRotation::new(dim, rot_seed),
         })

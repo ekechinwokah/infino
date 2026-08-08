@@ -377,12 +377,11 @@ pub mod vec {
         /// `[24..28]` residual-code flag (`u32` LE): `1` when the per-cluster
         /// 1-bit codes are signs of `rot(v − c_cell)` (cell-centroid residual)
         /// and a per-doc residual-norm region is present; `0` (the pre-v3
-        /// value) means raw-vector sign codes and no residual region.
+        /// value) means raw-vector sign codes and no residual region. The
+        /// scale κ is NOT stored here — it is drain-calibrated after these
+        /// immutable bytes are written and lives in the manifest routing
+        /// ([`CellRoutingParams::residual_kappa`]). `[28..32]` stays reserved.
         pub const RESIDUAL_FLAG_OFF: usize = 24;
-        /// `[28..32]` residual scale κ (`f32` LE): the drain-fitted multiplier
-        /// in `est = q·c_cell + κ·‖r‖·signdot`. Meaningful only when
-        /// [`RESIDUAL_FLAG_OFF`] is `1`.
-        pub const RESIDUAL_KAPPA_OFF: usize = 28;
         /// `[32..40]` centroids offset (`u64` LE).
         pub const CENTROIDS_OFF_OFF: usize = 32;
         /// `[40..48]` cluster-index offset (`u64` LE).
