@@ -166,6 +166,36 @@ impl BitQuantizer {
         }
     }
 
+    /// Encode the cell-centroid **residual** of one already-rotated row:
+    /// the sign code of `rot(v) − rot(c_cell)` and the residual's L2 norm
+    /// `‖rot(v) − rot(c_cell)‖` (returned; the drain writes it to the
+    /// per-doc residual-norm region). Rotation is orthonormal, so this
+    /// equals `‖v − c_cell‖` and the code is the sign pattern of the true
+    /// residual — the query-time estimator recovers
+    /// `q·c_cell + κ·‖r‖·sign_dot(q_rot, code)`. `rot_centroid` is the
+    /// row's cell centroid, pre-rotated once per build (rotation is linear,
+    /// so `rot(v − c) = rot(v) − rot(c)`). `scratch` is a caller-owned
+    /// `dim`-length buffer reused across rows.
+    pub fn encode_residual_into(
+        &self,
+        rot_row: &[f32],
+        rot_centroid: &[f32],
+        scratch: &mut [f32],
+        out: &mut [u8],
+    ) -> f32 {
+        debug_assert_eq!(rot_row.len(), self.dim);
+        debug_assert_eq!(rot_centroid.len(), self.dim);
+        debug_assert_eq!(scratch.len(), self.dim);
+        let mut norm_sq = 0.0f32;
+        for d in 0..self.dim {
+            let r = rot_row[d] - rot_centroid[d];
+            scratch[d] = r;
+            norm_sq += r * r;
+        }
+        self.encode_rotated_into(scratch, out);
+        norm_sq.sqrt()
+    }
+
     /// Estimate `<q_rot, doc_rot>` from the bit-encoded `code` of
     /// `doc_rot`. The result is an unbiased estimator of the rotated
     /// dot product (which equals the un-rotated dot product because
@@ -787,6 +817,33 @@ mod tests {
         assert_eq!(BitQuantizer::new(9).code_bytes(), 2);
         assert_eq!(BitQuantizer::new(15).code_bytes(), 2);
         assert_eq!(BitQuantizer::new(17).code_bytes(), 3);
+    }
+
+    /// The residual encoder produces the sign pattern of `rot(v) − rot(c)`
+    /// and its exact L2 norm, and agrees with encoding a pre-differenced
+    /// buffer directly. Uses an identity "rotation" (the encoder is fed
+    /// already-rotated inputs), so `rot(v)=v`, `rot(c)=c`.
+    #[test]
+    fn encode_residual_matches_signs_and_norm_of_the_difference() {
+        let dim = 10;
+        let q = BitQuantizer::new(dim);
+        let row: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.3 - 1.0).collect();
+        let centroid: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.25 - 0.9).collect();
+
+        let mut scratch = vec![0f32; dim];
+        let mut code = vec![0u8; q.code_bytes()];
+        let norm = q.encode_residual_into(&row, &centroid, &mut scratch, &mut code);
+
+        // Reference: difference, then the plain encoder + a scalar norm.
+        let diff: Vec<f32> = row.iter().zip(&centroid).map(|(r, c)| r - c).collect();
+        let mut ref_code = vec![0u8; q.code_bytes()];
+        q.encode_rotated_into(&diff, &mut ref_code);
+        let ref_norm = diff.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+        assert_eq!(code, ref_code, "residual code = signs of (row − centroid)");
+        assert!(approx(norm, ref_norm, 1e-6), "norm {norm} vs {ref_norm}");
+        // scratch holds the residual for the caller to reuse / inspect.
+        assert!(scratch.iter().zip(&diff).all(|(a, b)| approx(*a, *b, 1e-6)));
     }
 
     // --- encode --------------------------------------------------------
