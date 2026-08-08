@@ -166,6 +166,17 @@ impl BitQuantizer {
         }
     }
 
+    /// Analytic scale for the residual 1-bit estimator,
+    /// `κ = sqrt(π/2) / sqrt(dim)`: under a random orthonormal rotation the
+    /// sign-dot `⟨q_rot, sign(r_rot)⟩` concentrates on
+    /// `‖q‖·(q̂·r̂)·sqrt(2·dim/π)`, so `q·r ≈ κ·‖r‖·sign_dot` with this κ.
+    /// Per-table fits on Cohere-768d measured within 5% of the analytic
+    /// value (0.0465–0.0474 vs 0.0452); a calibrated
+    /// `CellRoutingParams::residual_kappa`, when stamped, overrides it.
+    pub fn residual_kappa_analytic(dim: usize) -> f32 {
+        (core::f32::consts::PI / 2.0).sqrt() / (dim.max(1) as f32).sqrt()
+    }
+
     /// Encode the cell-centroid **residual** of one already-rotated row:
     /// the sign code of `rot(v) − rot(c_cell)` and the residual's L2 norm
     /// `‖rot(v) − rot(c_cell)‖` (returned; the drain writes it to the

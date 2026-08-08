@@ -4243,6 +4243,158 @@ mod tests {
         assert_eq!(resolved.len(), 2);
     }
 
+    /// Search parity: the SAME corpus packed raw and packed residual must
+    /// both recover the exact top-k — the residual estimator
+    /// (`q·c + κ·‖r‖·sign_dot`, applied because the v3 flag is set) has to
+    /// rank at least as well as the raw sign-dot it replaces. A mis-wired
+    /// estimator (raw sign-dot on residual codes, wrong centroid, wrong κ
+    /// indexing) collapses recall to noise and fails loudly here.
+    #[tokio::test]
+    async fn residual_search_matches_raw_and_exact() {
+        use bytes::Bytes;
+
+        use crate::superfile::vector::reader::VectorReader;
+
+        const DIM: usize = 24;
+        const N: usize = 600;
+        const K: usize = 10;
+        const N_QUERIES: usize = 24;
+        /// Fine clusters requested for the pack.
+        const N_CENT: usize = 8;
+        /// Rerank budget multiplier: keeps the shortlist well under the
+        /// corpus so the 1-bit estimator quality is what decides recall.
+        const RM: usize = 4;
+
+        fn unit_row(i: usize) -> Vec<f32> {
+            // Real-embedding-shaped corpus: each row = a strong cluster
+            // center (a pseudo-random dense direction, ~80% of the row's
+            // energy — the measured Cohere shape) plus idiosyncratic noise
+            // that decides who is whose neighbor. Raw sign codes spend
+            // their bits on the shared center; residual codes see the
+            // discriminative remainder — the regime the feature is for.
+            let cluster = i % 8;
+            let mut v: Vec<f32> = (0..DIM)
+                .map(|d| {
+                    let center =
+                        (((cluster * 2654435761 + d * 40503) % 1000) as f32 / 500.0 - 1.0) * 2.0;
+                    let noise =
+                        (((i * 2246822519 + d * 3266489917) % 1000) as f32 / 500.0 - 1.0) * 1.0;
+                    center + noise
+                })
+                .collect();
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter_mut().for_each(|x| *x /= n);
+            v
+        }
+
+        let mut corpus = Vec::with_capacity(N * DIM);
+        for i in 0..N {
+            corpus.extend(unit_row(i));
+        }
+        let ids: Vec<i128> = (0..N as i128).collect();
+        let corpus = Arc::new(corpus);
+
+        let build = |residual: bool| {
+            let cfg = VectorConfig {
+                column: "v".into(),
+                dim: DIM,
+                rot_seed: 5,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq16,
+                provided_centroids: None,
+                residual_codes: residual,
+            };
+            let sub = build_merged_subsection_from_fp32(cfg, N_CENT, Arc::clone(&corpus), &ids)
+                .expect("cell build");
+            let blob = finish_multi_cell_blob(&[(0, sub)]).expect("blob");
+            let json = format!(
+                r#"[{{"column":"v","dim":{DIM},"n_cent":{N_CENT},"rot_seed":5,"metric":"cosine","rerank_codec":"sq16"}}]"#
+            );
+            VectorReader::open(Bytes::from(blob), &json).expect("open")
+        };
+        let raw = build(false);
+        let res = build(true);
+
+        let mut raw_hits_total = 0usize;
+        let mut res_hits_total = 0usize;
+        for qi in 0..N_QUERIES {
+            // Query = perturbed corpus row, normalized.
+            let base = unit_row(qi * 23 % N);
+            let mut q: Vec<f32> = base
+                .iter()
+                .enumerate()
+                .map(|(d, x)| x + ((qi * 7 + d * 13) % 53) as f32 / 53.0 * 0.05)
+                .collect();
+            let n = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+            q.iter_mut().for_each(|x| *x /= n);
+
+            // Exact top-K by cosine distance over the corpus.
+            let mut exact: Vec<(u32, f32)> = (0..N)
+                .map(|i| {
+                    let row = &corpus[i * DIM..(i + 1) * DIM];
+                    let dot: f32 = q.iter().zip(row).map(|(a, b)| a * b).sum();
+                    (i as u32, 1.0 - dot)
+                })
+                .collect();
+            exact.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let truth: std::collections::HashSet<u32> =
+                exact[..K].iter().map(|&(d, _)| d).collect();
+
+            let raw_ids: std::collections::HashSet<u32> = raw
+                .search("v", &q, K, N_CENT, RM)
+                .await
+                .expect("raw search")
+                .into_iter()
+                .map(|(d, _)| d)
+                .collect();
+            let res_ids: std::collections::HashSet<u32> = res
+                .search("v", &q, K, N_CENT, RM)
+                .await
+                .expect("residual search")
+                .into_iter()
+                .map(|(d, _)| d)
+                .collect();
+            raw_hits_total += raw_ids.intersection(&truth).count();
+            res_hits_total += res_ids.intersection(&truth).count();
+
+            // Corpus-independent wiring tripwire: with the shortlist budget
+            // covering the whole corpus, the exact rerank adjudicates every
+            // row, so recall must be exact REGARDLESS of estimator quality.
+            // Any mis-wiring (wrong centroid, wrong norm index, raw
+            // sign-dot on residual codes feeding a truncated shortlist)
+            // breaks this; estimator variance cannot.
+            let res_full: std::collections::HashSet<u32> = res
+                .search("v", &q, K, N_CENT, N / K)
+                .await
+                .expect("residual full-budget search")
+                .into_iter()
+                .map(|(d, _)| d)
+                .collect();
+            assert_eq!(
+                res_full.intersection(&truth).count(),
+                K,
+                "query {qi}: full-budget residual search must be exact"
+            );
+        }
+        let raw_recall = raw_hits_total as f64 / (N_QUERIES * K) as f64;
+        let res_recall = res_hits_total as f64 / (N_QUERIES * K) as f64;
+        // Tight-budget parity: the residual estimator with the ANALYTIC κ
+        // (no per-table fit yet — the calibrated routing override is a
+        // later stage) must stay within a small slack of the raw baseline
+        // on this real-embedding-shaped corpus, and far from the ~K/N
+        // noise floor a broken estimator produces. Superiority is a
+        // real-corpus claim, measured by the bench recall gates — not
+        // provable on synthetic data.
+        assert!(
+            res_recall + 0.05 >= raw_recall,
+            "residual recall {res_recall} vs raw {raw_recall}"
+        );
+        assert!(
+            res_recall >= 0.85,
+            "residual recall {res_recall} suspiciously low — estimator mis-wired?"
+        );
+    }
+
     #[test]
     fn finish_two_columns_at_different_dims() {
         let mut b = VectorBuilder::new();
