@@ -314,6 +314,7 @@ pub fn options_for(
     let vector = if modality.has_vector() {
         vec![VectorConfig {
             provided_centroids: None,
+            residual_codes: false,
             column: VEC_COLUMN.into(),
             dim: DIM,
             rot_seed: ROT_SEED,

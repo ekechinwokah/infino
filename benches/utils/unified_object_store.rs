@@ -241,6 +241,7 @@ fn build_superfile_bytes() -> Bytes {
         }],
         vec![VectorConfig {
             provided_centroids: None,
+            residual_codes: false,
             column: VEC_COLUMN.into(),
             dim,
             rot_seed: ROT_SEED,
@@ -1870,6 +1871,7 @@ pub(crate) mod diag {
             }],
             vec![VectorConfig {
                 provided_centroids: None,
+                residual_codes: false,
                 column: VEC_COLUMN.into(),
                 dim: crate::corpus::DIM,
                 rot_seed: ROT_SEED,

@@ -2457,6 +2457,7 @@ mod tests {
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8FixedResidual,
                     provided_centroids: None,
+                    residual_codes: false,
                 }],
                 Some(crate::test_helpers::default_tokenizer()),
             )
@@ -2750,6 +2751,7 @@ mod tests {
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8FixedResidual,
                     provided_centroids: None,
+                    residual_codes: false,
                 }],
                 Some(crate::test_helpers::default_tokenizer()),
             )
@@ -2965,6 +2967,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8FixedResidual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -3067,6 +3070,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -3171,6 +3175,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -3272,6 +3277,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8FixedResidual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -3384,6 +3390,7 @@ mod tests {
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
+                    residual_codes: false,
                 }],
                 None,
             )
@@ -3507,6 +3514,7 @@ mod tests {
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
+                    residual_codes: false,
                 }],
                 None,
             )
@@ -3632,6 +3640,7 @@ mod tests {
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
+                    residual_codes: false,
                 }],
                 Some(crate::test_helpers::default_tokenizer()),
             )
@@ -3821,6 +3830,7 @@ mod tests {
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
+                    residual_codes: false,
                 }],
                 None,
             )
@@ -4020,6 +4030,7 @@ mod tests {
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
+                    residual_codes: false,
                 }],
                 Some(default_tokenizer()),
             )
@@ -4172,6 +4183,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -4266,6 +4278,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -4358,6 +4371,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -4530,6 +4544,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -4731,6 +4746,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -5013,6 +5029,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -5172,6 +5189,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -5275,6 +5293,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -5392,6 +5411,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -5559,6 +5579,7 @@ mod tests {
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
+                    residual_codes: false,
                 }],
                 Some(crate::test_helpers::default_tokenizer()),
             )
@@ -5730,6 +5751,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -5955,6 +5977,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -6194,6 +6217,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -6382,6 +6406,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -6562,6 +6587,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(default_tokenizer()),
         )
@@ -6691,6 +6717,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -6818,6 +6845,7 @@ mod tests {
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
+                    residual_codes: false,
                 }],
                 Some(crate::test_helpers::default_tokenizer()),
             )
@@ -6945,6 +6973,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -7084,6 +7113,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -7216,6 +7246,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -7344,6 +7375,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -7466,6 +7498,7 @@ mod tests {
                     metric: Metric::Cosine,
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
+                    residual_codes: false,
                 }],
                 Some(crate::test_helpers::default_tokenizer()),
             )
@@ -7644,6 +7677,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )
@@ -7783,6 +7817,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(crate::test_helpers::default_tokenizer()),
         )

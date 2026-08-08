@@ -180,6 +180,9 @@ pub struct ColumnReader {
     /// present iff the column stores cell-centroid residual codes. `None` for
     /// raw-code columns. When set, the scan estimator forms
     /// `est = q·c_cell + residual_kappa·‖r‖·signdot`.
+    // Consumed by the scan estimator (next stage); parsed and carried now so
+    // the format/reader plumbing lands and is tested independently.
+    #[allow(dead_code)]
     residual_norms_off: Option<usize>,
     quant: BitQuantizer,
     /// Cached random rotation built once at open from `(dim, rot_seed)`.
@@ -5890,6 +5893,7 @@ mod tests {
             metric,
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
         for i in 0..n_docs {
@@ -5947,6 +5951,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         };
         let first = build_merged_subsection_from_materialized(config.clone(), 2, make_rows(7, 3))
             .expect("first cell subsection");
@@ -6215,6 +6220,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register Sq8 column");
         for i in 0..32u32 {
@@ -6242,6 +6248,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
         let mut all_vecs = Vec::new();
@@ -6536,6 +6543,7 @@ mod tests {
                 },
                 rerank_codec: codec,
                 provided_centroids: None,
+                residual_codes: false,
             })
             .unwrap_or_else(|e| panic!("codec {codec:?} must register, got {e:?}"));
         }
@@ -6560,6 +6568,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
         for i in 0..n_docs {
@@ -6629,6 +6638,7 @@ mod tests {
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8FixedResidual,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
         for i in 0..n_docs {
@@ -6671,6 +6681,7 @@ mod tests {
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
         let make = |i: u32| -> Vec<f32> {
@@ -6720,6 +6731,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8FixedResidual,
                 provided_centroids: None,
+                residual_codes: false,
             })
             .expect("register fixed residual column");
         let make = |i: u32| -> Vec<f32> {
@@ -6853,6 +6865,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         };
         let sub0 =
             build_merged_subsection_from_materialized(cfg(), 2, make_rows(0, 4)).expect("cell 0");
@@ -6933,6 +6946,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         };
         let sub0 =
             build_merged_subsection_from_materialized(cfg(), 2, make_rows(0, 4)).expect("cell 0");
@@ -7005,6 +7019,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         };
         let sub0 =
             build_merged_subsection_from_materialized(cfg(), 2, make_rows(0, 4)).expect("cell 0");
@@ -7057,6 +7072,7 @@ mod tests {
                 metric: Metric::L2Sq,
                 rerank_codec: RerankCodec::Sq8FixedResidual,
                 provided_centroids: None,
+                residual_codes: false,
             })
             .expect_err("fixed residual must reject L2Sq");
         assert!(matches!(error, BuildError::VectorSchemaMismatch(_)));
@@ -7081,6 +7097,7 @@ mod tests {
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
         for i in 0..n_docs {
@@ -7171,6 +7188,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
         let mut planted = Vec::with_capacity(n_docs as usize);
@@ -7271,6 +7289,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
         let make = |i: u32| -> Vec<f32> {
@@ -7335,6 +7354,7 @@ mod tests {
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
         let make = |i: u32| -> Vec<f32> {
@@ -7400,6 +7420,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::RabitqOnly,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register None column");
         for i in 0..n_docs {
@@ -7457,6 +7478,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::RabitqOnly,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register None column");
         // Angularly diverse corpus — hashed-uniform vectors,
@@ -7544,6 +7566,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::RabitqOnly,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register None column");
         for i in 0..n_docs {
@@ -7776,6 +7799,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: codec,
                 provided_centroids: None,
+                residual_codes: false,
             })
             .expect("register");
             for v in &all {
@@ -7910,6 +7934,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
         let mut all = Vec::with_capacity(n_docs as usize);
@@ -8375,6 +8400,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
         let mut v = vec![0f32; dim];
@@ -8866,6 +8892,7 @@ mod tests {
             metric,
             rerank_codec: codec,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
         let mut all = Vec::with_capacity(n_docs as usize);
@@ -9288,6 +9315,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
 
@@ -9344,6 +9372,7 @@ mod tests {
                 metric: Metric::L2Sq,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             })
             .expect("register column");
         for i in 0u32..32 {
@@ -9387,6 +9416,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
         let bytes = b.finish().expect("finish vector builder");
@@ -9484,6 +9514,7 @@ mod tests {
             metric,
             rerank_codec: codec,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
         let mut all = Vec::with_capacity(n_docs as usize);
@@ -10187,6 +10218,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
         let mut planted = Vec::with_capacity(n_docs as usize);

@@ -548,6 +548,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::default(),
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(default_tokenizer()),
         )
@@ -574,6 +575,7 @@ mod tests {
                     metric,
                     rerank_codec: RerankCodec::Sq8Residual,
                     provided_centroids: None,
+                    residual_codes: false,
                 }],
                 Some(default_tokenizer()),
             )
@@ -597,6 +599,7 @@ mod tests {
                     metric: Metric::Cosine,
                     rerank_codec,
                     provided_centroids: None,
+                    residual_codes: false,
                 }],
                 Some(default_tokenizer()),
             )

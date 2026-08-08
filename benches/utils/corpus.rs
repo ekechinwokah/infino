@@ -1510,6 +1510,7 @@ pub fn build_vector_index(vectors: &[f32], n_docs: usize, metric: Metric) -> Vec
     let mut b = VectorBuilder::new();
     b.register_column(VectorConfig {
         provided_centroids: None,
+        residual_codes: false,
         column: "v".into(),
         dim: DIM,
         rot_seed: ROT_SEED,
@@ -1561,6 +1562,7 @@ pub fn build_superfile(docs: &[String], vectors: &[f32]) -> Vec<u8> {
         }],
         vec![SfVectorConfig {
             provided_centroids: None,
+            residual_codes: false,
             column: "emb".into(),
             dim: DIM,
             rot_seed: ROT_SEED,
@@ -1603,6 +1605,7 @@ pub fn build_superfile_with_metric(docs: &[String], vectors: &[f32], metric: Met
         }],
         vec![SfVectorConfig {
             provided_centroids: None,
+            residual_codes: false,
             column: "emb".into(),
             dim: DIM,
             rot_seed: ROT_SEED,

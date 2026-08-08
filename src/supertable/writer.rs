@@ -4939,6 +4939,7 @@ fn drain_cell_vector_config(cfg: &VectorConfig, n_rows: usize) -> (VectorConfig,
     let cell_cfg = VectorConfig {
         rerank_codec,
         provided_centroids: None,
+        residual_codes: false,
         ..cfg.clone()
     };
     (cell_cfg, n_cent)
@@ -9132,6 +9133,7 @@ mod tests {
                 metric: Metric::L2Sq,
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(tok()),
         )
@@ -9604,6 +9606,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             None,
         )
@@ -9774,6 +9777,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         };
         for group in assigned {
             let n_members = group.members.len();
@@ -9796,6 +9800,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         };
         assert_eq!(
             drain_cell_vector_config(&cfg, COMMIT_CELL_ROWS).1,

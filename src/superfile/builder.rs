@@ -2440,6 +2440,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
+            residual_codes: false,
         }];
         let s = vec_columns_json(&cols);
         assert!(s.contains(r#""column":"emb""#));
@@ -2907,6 +2908,7 @@ mod tests {
                 metric: Metric::L2Sq,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             None,
         );
@@ -4280,6 +4282,7 @@ mod tests {
             },
             rerank_codec,
             provided_centroids: None,
+            residual_codes: false,
         };
         let mut ids: Vec<i128> = Vec::new();
         let mut packed = Vec::with_capacity(cells.len());

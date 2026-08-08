@@ -219,6 +219,7 @@ pub fn default_vector_config(column: &str, rot_seed: u64) -> VectorConfig {
         metric: Metric::Cosine,
         rerank_codec: RerankCodec::Fp32,
         provided_centroids: None,
+        residual_codes: false,
     }
 }
 

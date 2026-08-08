@@ -917,6 +917,7 @@ mod tests {
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8FixedResidual,
             provided_centroids: Some(Arc::from(centroids)),
+            residual_codes: false,
         };
         build_merged_subsection_from_fp32(cfg, N_CENT, Arc::new(vectors), &ids).expect("cell build")
     }
@@ -973,6 +974,7 @@ mod tests {
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq16,
             provided_centroids: Some(Arc::from(centroids)),
+            residual_codes: false,
         };
         build_merged_subsection_from_fp32(cfg, N_CENT, Arc::new(vectors), &ids)
             .expect("Sq16 cell build")

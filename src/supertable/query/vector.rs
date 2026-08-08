@@ -4498,6 +4498,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(tok()),
         )
@@ -4565,6 +4566,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(tok()),
         );
@@ -6465,6 +6467,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(tok()),
         )
@@ -6532,6 +6535,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(tok()),
         )
@@ -6639,6 +6643,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(tok()),
         )
@@ -6754,6 +6759,7 @@ mod tests {
                 metric: Metric::Cosine,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             }],
             Some(tok()),
         )

@@ -1240,6 +1240,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         };
         let mut b = CellPostingBuilder::new();
         b.register_column(cfg).expect("register");

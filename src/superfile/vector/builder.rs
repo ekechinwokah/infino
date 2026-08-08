@@ -204,6 +204,13 @@ pub struct VectorConfig {
     /// cluster `c` → cell `c` without re-clustering. The centroid count is
     /// taken from the supplied centroids (`len / dim`).
     pub provided_centroids: Option<std::sync::Arc<[f32]>>,
+    /// Encode the per-cluster 1-bit codes as signs of `rot(v − c_cell)`
+    /// (cell-centroid residual, subsection version 3) and emit the per-doc
+    /// residual-norm region, instead of raw-vector sign codes. Only
+    /// meaningful with [`Self::provided_centroids`] — the residual is taken
+    /// against the row's assigned cluster centroid, so it sharpens the
+    /// 1-bit estimator exactly on the hidden cell grid. Default `false`.
+    pub residual_codes: bool,
 }
 
 /// Pick the default rerank codec for a new index built with `metric`.
@@ -235,6 +242,7 @@ impl VectorConfig {
             metric,
             rerank_codec: default_rerank_codec_for(metric),
             provided_centroids: None,
+            residual_codes: false,
         }
     }
 
@@ -3381,6 +3389,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
+            residual_codes: false,
         }
     }
 
@@ -3519,6 +3528,7 @@ mod tests {
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         };
 
         // Streaming build: distinct vectors at local_doc_ids 0..n.
@@ -3598,6 +3608,7 @@ mod tests {
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         };
 
         // Build one materialized cell blob of `n` rows whose stable `_id`s are
@@ -3679,6 +3690,7 @@ mod tests {
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register sq8 column");
         b.add(0, &[1.0; 16]).expect("add single row");
@@ -3892,6 +3904,7 @@ mod tests {
                 metric: Metric::L2Sq,
                 rerank_codec: RerankCodec::Sq8Residual,
                 provided_centroids: None,
+                residual_codes: false,
             };
             materialized_centroids(&cfg, requested, n_docs, &sample).0
         };
@@ -3926,6 +3939,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         };
         let (n_cent, centroids) = materialized_centroids(
             &cfg,
@@ -3989,6 +4003,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         };
         let ids: Vec<i128> = (0..n as i128).map(|i| 9_000 + i).collect();
         let sub = build_merged_subsection_from_fp32(cfg.clone(), 64, Arc::new(corpus), &ids)
@@ -4058,6 +4073,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
         // Generate a small but distinguishable corpus where each
@@ -4116,6 +4132,7 @@ mod tests {
                 metric: Metric::L2Sq,
                 rerank_codec: RerankCodec::Fp32,
                 provided_centroids: None,
+                residual_codes: false,
             })
             .expect("register column");
             for d in 0..n_docs {
@@ -4260,6 +4277,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
+            residual_codes: false,
         })
         .expect("register column");
         for d in 0..n_docs {
@@ -4401,6 +4419,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         };
         let sub0 = build_merged_subsection_from_materialized(cfg(), 2, make_rows(0, 4))
             .expect("cell 0 subsection");
@@ -4518,6 +4537,7 @@ mod tests {
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq16,
             provided_centroids: None,
+            residual_codes: false,
         };
         let sub = build_merged_subsection_from_materialized(cfg, 2, rows).expect("Sq16 merge");
         let cells = vec![(0u32, sub)];
@@ -4599,6 +4619,7 @@ mod tests {
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8FixedResidual,
             provided_centroids: None,
+            residual_codes: false,
         };
         let source_rows: Vec<MaterializedIvfRow> = [make_rows(0), make_rows(1)].concat();
         let sub0 = build_merged_subsection_from_materialized(config.clone(), 2, make_rows(0))
@@ -4658,6 +4679,7 @@ mod tests {
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Sq8FixedResidual,
             provided_centroids: None,
+            residual_codes: false,
         };
         let expected = build_merged_subsection_from_materialized(config.clone(), 4, rows.clone())
             .expect("in-memory materialized build");
@@ -4745,6 +4767,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         };
         let sub0 =
             build_merged_subsection_from_materialized(cfg(), 2, make_rows(0, 4)).expect("cell 0");
@@ -4817,6 +4840,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         };
         // cell0 → file-local 0..3; cell1 → file-local 4..6.
         let sub0 =
@@ -4906,6 +4930,7 @@ mod tests {
             metric: Metric::L2Sq,
             rerank_codec: RerankCodec::Sq8Residual,
             provided_centroids: None,
+            residual_codes: false,
         };
         let sub0 =
             build_merged_subsection_from_materialized(cfg(), 2, make_rows(7, 3)).expect("cell 7");

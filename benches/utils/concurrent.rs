@@ -252,6 +252,7 @@ fn build_supertable_options(storage: Arc<dyn StorageProvider>) -> SupertableOpti
             metric: Metric::Cosine,
             rerank_codec: RerankCodec::Fp32,
             provided_centroids: None,
+            residual_codes: false,
         }],
         Some(default_tokenizer()),
     )

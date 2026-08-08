@@ -138,6 +138,7 @@ pub fn sql_options() -> SupertableOptions {
         ],
         vec![VectorConfig {
             provided_centroids: None,
+            residual_codes: false,
             column: VECTOR_COLUMN.into(),
             dim: SQL_DIM,
             rot_seed: ROT_SEED,

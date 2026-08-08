@@ -56,6 +56,7 @@ fn build_superfile(
         vec![],
         vec![VectorConfig {
             provided_centroids: None,
+            residual_codes: false,
             column: column.into(),
             dim,
             rot_seed: ROT_SEED,
