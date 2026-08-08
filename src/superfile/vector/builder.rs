@@ -2204,6 +2204,7 @@ pub(crate) fn build_cell_subsection_from_source(
         cluster_stride,
         codec_meta_size,
         stable_ids_region_bytes,
+        false,
     );
     let cluster_order = centroid_storage_order(&centroids, n_cent, dim);
     let planned = plan_ivf_cluster_blocks(
@@ -2221,6 +2222,7 @@ pub(crate) fn build_cell_subsection_from_source(
         &mut open_region,
         &layout,
         codec_meta_size,
+        0.0,
         &summary_centroid,
         &centroids,
     );
@@ -2675,11 +2677,12 @@ fn build_subsection_streaming(
         cluster_stride,
         codec_meta_size,
         stable_ids_region_bytes,
+        false,
     );
     let total_size_before_crc = layout.total_size_before_crc;
 
     let mut bytes =
-        alloc_ivf_subsection_with_header(&layout, codec_meta_size, &summary_centroid, &centroids);
+        alloc_ivf_subsection_with_header(&layout, codec_meta_size, 0.0, &summary_centroid, &centroids);
 
     let sq8_scale_block_off = layout.codec_meta_off;
     let sq8_offset_block_off = sq8_scale_block_off + n_cent * dim * 4;
@@ -2965,6 +2968,13 @@ pub(crate) struct IvfSubsectionLayout {
     /// per-cluster Sq8 `scale` block offset.
     pub codec_meta_off: usize,
     pub per_cluster_blocks_off: usize,
+    /// Offset of the per-doc residual-norm region (`n_docs` `f32`, indexed by
+    /// `local_doc_id`), present only when the column stores cell-centroid
+    /// residual codes (subsection version 3). `None` for raw-code columns.
+    /// The region sits between `codec_meta` and the stable-id region; the
+    /// residual header flag tells the reader the first `n_docs*4` bytes of
+    /// the post-`codec_meta` gap are these norms.
+    pub residual_norms_off: Option<usize>,
     /// Offset of the inline stable-`_id` region (one i128 per doc, indexed by
     /// `local_doc_id`), present only for the materialized (hidden-cell) build.
     /// `None` when no region was requested. The region sits *between* the
@@ -2989,16 +2999,23 @@ impl IvfSubsectionLayout {
         per_cluster_stride: usize,
         codec_meta_size: usize,
         stable_ids_region_bytes: usize,
+        residual: bool,
     ) -> Self {
         let summary_off = SUB_HEADER_SIZE;
         let centroids_off = summary_off + dim * 4;
         let cluster_idx_off = centroids_off + n_cent * dim * 4;
         let codec_meta_off = cluster_idx_off + n_cent * CLUSTER_IDX_ENTRY_BYTES;
-        // The stable-`_id` region (if any) goes between codec_meta and the
-        // per-cluster blocks, so the blocks remain the trailing data region.
         let codec_meta_end = codec_meta_off + codec_meta_size;
-        let stable_ids_off = (stable_ids_region_bytes > 0).then_some(codec_meta_end);
-        let per_cluster_blocks_off = codec_meta_end + stable_ids_region_bytes;
+        // The residual-norm region (if any) precedes the stable-`_id` region
+        // in the post-codec_meta gap; both keep the per-cluster blocks as the
+        // trailing data region. The reader splits the gap using the residual
+        // header flag (first `n_docs*4` bytes are norms) then the same
+        // stable-id gap validation as before.
+        let residual_norms_bytes = if residual { n_docs * 4 } else { 0 };
+        let residual_norms_off = (residual_norms_bytes > 0).then_some(codec_meta_end);
+        let stable_ids_start = codec_meta_end + residual_norms_bytes;
+        let stable_ids_off = (stable_ids_region_bytes > 0).then_some(stable_ids_start);
+        let per_cluster_blocks_off = stable_ids_start + stable_ids_region_bytes;
         let total_size_before_crc = per_cluster_blocks_off + n_docs * per_cluster_stride;
         Self {
             summary_off,
@@ -3006,6 +3023,7 @@ impl IvfSubsectionLayout {
             cluster_idx_off,
             codec_meta_off,
             per_cluster_blocks_off,
+            residual_norms_off,
             stable_ids_off,
             total_size_before_crc,
         }
@@ -3019,6 +3037,7 @@ impl IvfSubsectionLayout {
 pub(crate) fn alloc_ivf_subsection_with_header(
     layout: &IvfSubsectionLayout,
     codec_meta_size: usize,
+    residual_kappa: f32,
     summary_centroid: &[f32],
     centroids: &[f32],
 ) -> Vec<u8> {
@@ -3027,6 +3046,7 @@ pub(crate) fn alloc_ivf_subsection_with_header(
         &mut bytes,
         layout,
         codec_meta_size,
+        residual_kappa,
         summary_centroid,
         centroids,
     );
@@ -3039,13 +3059,25 @@ fn write_ivf_subsection_header(
     bytes: &mut [u8],
     layout: &IvfSubsectionLayout,
     codec_meta_size: usize,
+    residual_kappa: f32,
     summary_centroid: &[f32],
     centroids: &[f32],
 ) {
     debug_assert!(bytes.len() >= layout.codec_meta_off);
     bytes[0..MAGIC_BYTES].copy_from_slice(format::vec::SUB_MAGIC);
+    // Residual columns stamp version 3 and the flag + κ in the reclaimed
+    // reserved slot; raw columns stamp version 2 and leave the slot zero,
+    // byte-identical to pre-residual builds.
+    let (version, residual_flag, kappa) = match layout.residual_norms_off {
+        Some(_) => (format::vec::SUBSECTION_VERSION_RESIDUAL, 1u32, residual_kappa),
+        None => (format::vec::SUBSECTION_VERSION, 0u32, 0.0f32),
+    };
     bytes[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]
-        .copy_from_slice(&format::vec::SUBSECTION_VERSION.to_le_bytes());
+        .copy_from_slice(&version.to_le_bytes());
+    bytes[sub_hdr::RESIDUAL_FLAG_OFF..sub_hdr::RESIDUAL_FLAG_OFF + U32_BYTES]
+        .copy_from_slice(&residual_flag.to_le_bytes());
+    bytes[sub_hdr::RESIDUAL_KAPPA_OFF..sub_hdr::RESIDUAL_KAPPA_OFF + U32_BYTES]
+        .copy_from_slice(&kappa.to_le_bytes());
     bytes[sub_hdr::CODEC_META_SIZE_OFF..sub_hdr::CODEC_META_SIZE_OFF + U32_BYTES]
         .copy_from_slice(&(codec_meta_size as u32).to_le_bytes());
     bytes[sub_hdr::SUMMARY_OFF_OFF..sub_hdr::SUMMARY_OFF_OFF + U64_BYTES]
@@ -3275,9 +3307,78 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::superfile::vector::{
-        cell_posting::EncodedCellRow, reader::VectorReader, spill::MaterializedRowSpillWriter,
+    use crate::superfile::{
+        format::vec::sub_hdr,
+        vector::{
+            cell_posting::EncodedCellRow, reader::VectorReader, spill::MaterializedRowSpillWriter,
+        },
     };
+
+    /// The residual layout inserts an `n_docs × f32` region between
+    /// `codec_meta` and the stable-id region, bumps the subsection version to
+    /// 3, and stamps the flag + κ into the reclaimed reserved slot — while the
+    /// non-residual layout stays byte-for-byte a version-2 subsection with a
+    /// zero reserved slot (every existing superfile unchanged). The header
+    /// writer round-trips both.
+    #[test]
+    fn residual_layout_offsets_and_header_roundtrip() {
+        const DIM: usize = 8;
+        const N_CENT: usize = 3;
+        const N_DOCS: usize = 40;
+        const STRIDE: usize = 4 + 4 + 0; // code_bytes(ceil 8/8=1)... use explicit below
+        let code_bytes = DIM.div_ceil(8);
+        let per_cluster_stride = code_bytes + format::vec::DOC_ID_BYTES;
+        let codec_meta_size = 0;
+        let stable_ids_bytes = N_DOCS * format::vec::STABLE_ID_BYTES;
+        let _ = STRIDE;
+
+        let raw = IvfSubsectionLayout::compute(
+            DIM, N_CENT, N_DOCS, per_cluster_stride, codec_meta_size, stable_ids_bytes, false,
+        );
+        let res = IvfSubsectionLayout::compute(
+            DIM, N_CENT, N_DOCS, per_cluster_stride, codec_meta_size, stable_ids_bytes, true,
+        );
+
+        // Residual region present only in the residual layout, sized n_docs·4,
+        // and it pushes the stable-id region + blocks down by exactly that.
+        assert_eq!(raw.residual_norms_off, None);
+        assert_eq!(res.residual_norms_off, Some(raw.stable_ids_off.unwrap()));
+        assert_eq!(
+            res.stable_ids_off.unwrap() - raw.stable_ids_off.unwrap(),
+            N_DOCS * 4
+        );
+        assert_eq!(
+            res.total_size_before_crc - raw.total_size_before_crc,
+            N_DOCS * 4
+        );
+
+        // Header writer: residual stamps version 3, flag 1, the passed κ;
+        // raw stamps version 2, flag 0, κ 0 — a zero reserved slot.
+        const KAPPA: f32 = 0.047_36;
+        let centroids = vec![0.0f32; N_CENT * DIM];
+        let summary = vec![0.0f32; DIM];
+        let res_bytes =
+            alloc_ivf_subsection_with_header(&res, codec_meta_size, KAPPA, &summary, &centroids);
+        let raw_bytes =
+            alloc_ivf_subsection_with_header(&raw, codec_meta_size, KAPPA, &summary, &centroids);
+
+        let u32_at = |b: &[u8], off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+        let ver = |b: &[u8]| u32_at(b, sub_hdr::VERSION_OFF);
+        let flag = |b: &[u8]| u32_at(b, sub_hdr::RESIDUAL_FLAG_OFF);
+        let kappa = |b: &[u8]| {
+            f32::from_le_bytes(
+                b[sub_hdr::RESIDUAL_KAPPA_OFF..sub_hdr::RESIDUAL_KAPPA_OFF + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(ver(&res_bytes), format::vec::SUBSECTION_VERSION_RESIDUAL);
+        assert_eq!(flag(&res_bytes), 1);
+        assert_eq!(kappa(&res_bytes), KAPPA);
+        assert_eq!(ver(&raw_bytes), format::vec::SUBSECTION_VERSION);
+        assert_eq!(flag(&raw_bytes), 0, "raw layout leaves the reserved flag zero");
+        assert_eq!(kappa(&raw_bytes), 0.0, "raw layout ignores κ (reserved zero)");
+    }
 
     /// Drive an async reader call to completion. The materialized read-back is
     /// async (the drain fetches-on-miss); these tests use in-memory readers, so

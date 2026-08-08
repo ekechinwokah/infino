@@ -176,6 +176,13 @@ pub struct ColumnReader {
     /// [`VectorReader::inline_stable_ids_for_locals`] so an id+score query (and
     /// the drain) skips resolving the stable `_id` through a scalar `_id` column.
     stable_ids_off: Option<usize>,
+    /// Relative offset of the per-doc residual-norm region (`n_docs` `f32`),
+    /// present iff the column stores cell-centroid residual codes. `None` for
+    /// raw-code columns. When set, the scan estimator forms
+    /// `est = q·c_cell + residual_kappa·‖r‖·signdot`.
+    residual_norms_off: Option<usize>,
+    /// Residual scale κ from the sub-header; `0.0` for raw-code columns.
+    residual_kappa: f32,
     quant: BitQuantizer,
     /// Cached random rotation built once at open from `(dim, rot_seed)`.
     /// Construction is `O(dim³)` for Gram-Schmidt — at dim=384 that's
@@ -1007,12 +1014,31 @@ impl VectorReader {
             //   [48..56] per_cluster_blocks_off (u64 LE)
             let subsection_version =
                 read_u32_le(&sub_header[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]);
-            if subsection_version != format::vec::SUBSECTION_VERSION {
+            if !format::vec::subsection_version_supported(subsection_version) {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' has unsupported subsection layout version \
-                     {subsection_version}; this build supports only {}",
+                     {subsection_version}; this build supports {} and {}",
                     cfg.column,
-                    format::vec::SUBSECTION_VERSION
+                    format::vec::SUBSECTION_VERSION,
+                    format::vec::SUBSECTION_VERSION_RESIDUAL,
+                ))));
+            }
+            // Residual columns (version 3) carry the flag + κ in the reclaimed
+            // reserved slot; version 2 leaves it zero. Reading it on version 2
+            // is a guaranteed zero, so no version branch is needed here.
+            let residual_codes = read_u32_le(
+                &sub_header[sub_hdr::RESIDUAL_FLAG_OFF..sub_hdr::RESIDUAL_FLAG_OFF + U32_BYTES],
+            ) == 1;
+            let residual_kappa = f32::from_le_bytes(
+                sub_header[sub_hdr::RESIDUAL_KAPPA_OFF..sub_hdr::RESIDUAL_KAPPA_OFF + U32_BYTES]
+                    .try_into()
+                    .expect("4-byte κ slot"),
+            );
+            if residual_codes != (subsection_version == format::vec::SUBSECTION_VERSION_RESIDUAL) {
+                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    "column '{}' residual flag {residual_codes} disagrees with subsection \
+                     version {subsection_version}",
+                    cfg.column
                 ))));
             }
 
@@ -1073,11 +1099,11 @@ impl VectorReader {
             } else {
                 codec_meta_off + codec_meta_size
             };
-            // Anything between `preceding_end` and `per_cluster_blocks_off` is
-            // the inline stable-`_id` region (materialized/hidden-cell builds);
-            // `0` means none. Validated against n_docs below. Self-describing
-            // from the offsets — no header flag.
-            let stable_ids_region_bytes =
+            // Everything between `preceding_end` and `per_cluster_blocks_off`
+            // is the optional residual-norm region (residual columns) followed
+            // by the optional inline stable-`_id` region — self-describing from
+            // the offsets plus the residual header flag.
+            let region_gap =
                 per_cluster_blocks_off.checked_sub(preceding_end).ok_or_else(|| {
                     VectorError::Read(ReadError::MalformedVersion(format!(
                         "column '{}' regions before per_cluster_blocks_off={per_cluster_blocks_off} \
@@ -1090,8 +1116,8 @@ impl VectorReader {
             // the trailing data region. Each doc contributes
             // `code_bytes + 4 (doc_id) + per_vec_bytes (full)` — codes, doc-id,
             // and rerank vector interleaved per cluster. Solve for n_docs from
-            // the region size (the stable-`_id` region, if any, is *before*
-            // per_cluster_blocks_off and so does not perturb this).
+            // the region size (the residual/stable-`_id` regions are *before*
+            // per_cluster_blocks_off and so do not perturb this).
             let blocks_region_size = sub_crc_pos - per_cluster_blocks_off;
             let per_doc_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
             if per_doc_stride == 0 || !blocks_region_size.is_multiple_of(per_doc_stride) {
@@ -1102,18 +1128,38 @@ impl VectorReader {
                 ))));
             }
             let col_n_docs = (blocks_region_size / per_doc_stride) as u32;
+            // Split the gap: the residual-norm region (present iff the flag is
+            // set) is exactly one f32 per doc at `preceding_end`; the stable-id
+            // region, if any, is exactly one i128 per doc after it.
+            let residual_norms_bytes = if residual_codes {
+                (col_n_docs as usize) * 4
+            } else {
+                0
+            };
+            let stable_ids_region_bytes = region_gap.checked_sub(residual_norms_bytes).ok_or_else(
+                || {
+                    VectorError::Read(ReadError::MalformedVersion(format!(
+                        "column '{}' region gap {region_gap} smaller than the residual-norm \
+                         region {residual_norms_bytes}",
+                        cfg.column
+                    )))
+                },
+            )?;
+            let residual_norms_off = residual_codes.then_some(preceding_end);
+            let stable_ids_start = preceding_end + residual_norms_bytes;
             // The stable-`_id` region, when present, is exactly one i128 per doc.
             let expected_stable_ids_bytes = (col_n_docs as usize) * format::vec::STABLE_ID_BYTES;
             if stable_ids_region_bytes != 0 && stable_ids_region_bytes != expected_stable_ids_bytes
             {
                 return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                     "column '{}' gap before per_cluster_blocks_off is {stable_ids_region_bytes} \
-                     bytes; expected 0 or n_docs×16 = {expected_stable_ids_bytes}",
+                     bytes after the residual region; expected 0 or n_docs×16 = \
+                     {expected_stable_ids_bytes}",
                     cfg.column
                 ))));
             }
             // Relative offset of the stable-`_id` region (start of the i128s).
-            let stable_ids_off = (stable_ids_region_bytes != 0).then_some(preceding_end);
+            let stable_ids_off = (stable_ids_region_bytes != 0).then_some(stable_ids_start);
             let actual_codec_meta_size = codec_meta_size;
 
             // Sq8 + L2Sq adds the per-doc norms tail to codec_meta
@@ -1238,6 +1284,8 @@ impl VectorReader {
                 codec_meta_off,
                 per_cluster_blocks_off,
                 stable_ids_off,
+                residual_norms_off,
+                residual_kappa,
                 quant,
                 rot: RandomRotation::new(dim, rot_seed),
             });
@@ -1651,10 +1699,23 @@ impl VectorReader {
         }
         let subsection_version =
             read_u32_le(&sub_header[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]);
-        if subsection_version != format::vec::SUBSECTION_VERSION {
+        if !format::vec::subsection_version_supported(subsection_version) {
             return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                 "cell subsection unsupported layout version {subsection_version}"
             ))));
+        }
+        let residual_codes = read_u32_le(
+            &sub_header[sub_hdr::RESIDUAL_FLAG_OFF..sub_hdr::RESIDUAL_FLAG_OFF + U32_BYTES],
+        ) == 1;
+        let residual_kappa = f32::from_le_bytes(
+            sub_header[sub_hdr::RESIDUAL_KAPPA_OFF..sub_hdr::RESIDUAL_KAPPA_OFF + U32_BYTES]
+                .try_into()
+                .expect("4-byte κ slot"),
+        );
+        if residual_codes != (subsection_version == format::vec::SUBSECTION_VERSION_RESIDUAL) {
+            return Err(VectorError::Read(ReadError::MalformedVersion(
+                "cell subsection residual flag disagrees with layout version".into(),
+            )));
         }
         if verify_crc {
             let body = fetch_sync(source, subsection_off..sub_end, "cell subsection crc")?;
@@ -1717,7 +1778,7 @@ impl VectorReader {
             codec_meta_off + codec_meta_size
         };
         let sub_crc_pos = subsection_len - format::CRC_BYTES;
-        let stable_ids_region_bytes = per_cluster_blocks_off
+        let region_gap = per_cluster_blocks_off
             .checked_sub(preceding_end)
             .ok_or_else(|| {
                 VectorError::Read(ReadError::MalformedVersion(
@@ -1741,13 +1802,28 @@ impl VectorReader {
             ))));
         }
         let col_n_docs = (blocks_region_size / per_doc_stride) as u32;
+        // Gap split (same rule as the single-column path): residual-norm
+        // region (iff the flag is set) then the stable-`_id` region.
+        let residual_norms_bytes = if residual_codes {
+            (col_n_docs as usize) * 4
+        } else {
+            0
+        };
+        let stable_ids_region_bytes =
+            region_gap.checked_sub(residual_norms_bytes).ok_or_else(|| {
+                VectorError::Read(ReadError::MalformedVersion(
+                    "cell subsection region gap smaller than the residual-norm region".into(),
+                ))
+            })?;
+        let residual_norms_off = residual_codes.then_some(preceding_end);
+        let stable_ids_start = preceding_end + residual_norms_bytes;
         let expected_stable_ids_bytes = (col_n_docs as usize) * format::vec::STABLE_ID_BYTES;
         if stable_ids_region_bytes != 0 && stable_ids_region_bytes != expected_stable_ids_bytes {
             return Err(VectorError::Read(ReadError::MalformedVersion(format!(
                 "cell subsection stable-id gap {stable_ids_region_bytes}, expected 0 or {expected_stable_ids_bytes}"
             ))));
         }
-        let stable_ids_off = (stable_ids_region_bytes != 0).then_some(preceding_end);
+        let stable_ids_off = (stable_ids_region_bytes != 0).then_some(stable_ids_start);
         let expected_codec_meta_size =
             rerank_codec.codec_meta_bytes(dim, col_n_docs as usize, n_cent, metric);
         if codec_meta_size != expected_codec_meta_size {
@@ -1829,6 +1905,8 @@ impl VectorReader {
             codec_meta_off,
             per_cluster_blocks_off,
             stable_ids_off,
+            residual_norms_off,
+            residual_kappa,
             quant,
             rot: RandomRotation::new(dim, rot_seed),
         })

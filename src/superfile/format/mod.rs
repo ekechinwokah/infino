@@ -258,10 +258,25 @@ pub mod vec {
     ///   `per_cluster_blocks_off + doc_off[c] * (code_bytes + 4)`,
     ///   block size `count[c] * (code_bytes + 4)`.
     ///
-    /// Only this version is accepted on read; a superfile stamped
-    /// with any other value at this slot is rejected as malformed
-    /// rather than carrying an alternate parse path.
+    /// Baseline subsection version: raw-vector sign codes, reserved
+    /// `[24..32]` written zero. Written for every non-residual column and
+    /// still accepted on read unchanged.
     pub const SUBSECTION_VERSION: u32 = 2;
+
+    /// Residual subsection version: the per-cluster 1-bit codes are signs
+    /// of `rot(v − c_cell)` and a per-doc residual-norm region (`n_docs`
+    /// `f32`) sits between `codec_meta` and the stable-id region, with the
+    /// flag + κ in the reclaimed reserved slot (see [`sub_hdr`]). A reader
+    /// accepts `{SUBSECTION_VERSION, SUBSECTION_VERSION_RESIDUAL}`; an
+    /// older binary hard-fails on this value rather than mis-parsing the
+    /// extra region. Flag-off files stay [`SUBSECTION_VERSION`], so every
+    /// existing superfile and its parse are byte-identical.
+    pub const SUBSECTION_VERSION_RESIDUAL: u32 = 3;
+
+    /// True for any subsection layout version this build can decode.
+    pub const fn subsection_version_supported(v: u32) -> bool {
+        v == SUBSECTION_VERSION || v == SUBSECTION_VERSION_RESIDUAL
+    }
 
     /// Width of a little-endian `u32` field in the vector blob.
     pub const U32_BYTES: usize = 4;
@@ -357,7 +372,17 @@ pub mod vec {
         pub const CODEC_META_SIZE_OFF: usize = 12;
         /// `[16..24]` summary-centroid offset (`u64` LE).
         pub const SUMMARY_OFF_OFF: usize = 16;
-        // `[24..32]` reserved (`u64`).
+        // `[24..32]` was reserved (written zero). Reclaimed by the
+        // residual-code layer (subsection version 3): the two halves below.
+        /// `[24..28]` residual-code flag (`u32` LE): `1` when the per-cluster
+        /// 1-bit codes are signs of `rot(v − c_cell)` (cell-centroid residual)
+        /// and a per-doc residual-norm region is present; `0` (the pre-v3
+        /// value) means raw-vector sign codes and no residual region.
+        pub const RESIDUAL_FLAG_OFF: usize = 24;
+        /// `[28..32]` residual scale κ (`f32` LE): the drain-fitted multiplier
+        /// in `est = q·c_cell + κ·‖r‖·signdot`. Meaningful only when
+        /// [`RESIDUAL_FLAG_OFF`] is `1`.
+        pub const RESIDUAL_KAPPA_OFF: usize = 28;
         /// `[32..40]` centroids offset (`u64` LE).
         pub const CENTROIDS_OFF_OFF: usize = 32;
         /// `[40..48]` cluster-index offset (`u64` LE).
