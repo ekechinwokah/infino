@@ -412,6 +412,14 @@ pub struct CellRoutingParams {
     /// the query path is deliberately deferred until calibration shows
     /// the analytic value costing budget.
     pub residual_kappa: f32,
+    /// Adaptive-stopping margin for the deferred rerank: the calibrated
+    /// stage-coverage quantile of `exact_similarity − estimate` over
+    /// pooled calibration pairs (cosine tables only). Serving's
+    /// estimate-banded phase C may stop once no remaining estimate plus
+    /// this margin can reach the current kth exact score; the stamped
+    /// rerank budget stays the hard cap. `0.0` (the default, and every
+    /// pre-margin manifest) disables early stopping.
+    pub rerank_margin: f32,
 }
 
 impl Default for CellRoutingParams {
@@ -426,6 +434,7 @@ impl Default for CellRoutingParams {
             rerank_for_k: [0; WIDTH_LAW_KS.len()],
             rerank_pool_cells: [RERANK_LAW_POOL_CELLS as u32; WIDTH_LAW_KS.len()],
             residual_kappa: 0.0,
+            rerank_margin: 0.0,
         }
     }
 }
@@ -1338,6 +1347,10 @@ struct CellRoutingParamsDto {
     /// to `0.0` = no residual calibration).
     #[serde(default)]
     residual_kappa: f32,
+    /// Adaptive-stopping margin; absent on pre-margin manifests
+    /// (defaults to `0.0` = never stop early).
+    #[serde(default)]
+    rerank_margin: f32,
 }
 
 /// Serde default for [`CellRoutingParamsDto::rerank_pool_cells`]: every
@@ -1358,6 +1371,7 @@ impl From<CellRoutingParams> for CellRoutingParamsDto {
             rerank_for_k: r.rerank_for_k,
             rerank_pool_cells: r.rerank_pool_cells,
             residual_kappa: r.residual_kappa,
+            rerank_margin: r.rerank_margin,
         }
     }
 }
@@ -1382,6 +1396,7 @@ impl From<CellRoutingParamsDto> for CellRoutingParams {
         r.rerank_for_k = d.rerank_for_k;
         r.rerank_pool_cells = d.rerank_pool_cells.map(|p| p.max(1));
         r.residual_kappa = d.residual_kappa;
+        r.rerank_margin = d.rerank_margin;
         r.nprobe_max = r.nprobe_max.max(r.nprobe_min);
         r
     }
@@ -2948,6 +2963,13 @@ mod tests {
     fn partition_strategy_vector_cell_roundtrip() {
         use super::super::ClusterCentroids;
         let mut list = empty_list();
+        // Non-default stamped laws so the roundtrip covers every routing
+        // field, not just defaults surviving a default-deserialize.
+        let routing = CellRoutingParams {
+            rerank_margin: 0.25,
+            residual_kappa: 0.05,
+            ..CellRoutingParams::default()
+        };
         list.partition_strategy = PartitionStrategy::VectorCell {
             column: "emb".into(),
             clusters: ClusterCentroids::from_fp32(
@@ -2956,7 +2978,7 @@ mod tests {
                 &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
                 vec![1, 1],
             ),
-            routing: CellRoutingParams::default(),
+            routing,
         };
         let bytes = encode(&list).expect("encode");
         let decoded = decode(&bytes).expect("decode");

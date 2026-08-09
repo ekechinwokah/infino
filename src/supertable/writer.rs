@@ -4198,6 +4198,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 &mut routing.rerank_for_k,
                 &routing.rerank_pool_cells,
             );
+            // Stop margin follows the same shrink discipline as the drain's
+            // rerank merge: keep the LARGER (more conservative) margin — a
+            // wider margin only stops later. The recalibration pass replaces
+            // it under current evidence, like the rerank law.
+            if laws.rerank_margin > routing.rerank_margin {
+                routing.rerank_margin = laws.rerank_margin;
+            }
             info!(
                 "supertable drain: probe laws at k={WIDTH_LAW_KS:?}: width measured {:?} stamped {:?}; fine depth measured {:?} stamped {:?}; rerank measured {:?} stamped {:?}",
                 laws.width_for_k,
@@ -7453,6 +7460,15 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                     *pool = laws.pool_cells;
                 }
             }
+            // The stop margin rides the same evidence gate: measured over
+            // the full current superfile set with the serving-exact
+            // estimator, it replaces (a fresh sharper-estimator margin is
+            // SMALLER, and max-merge would pin the blunter one forever).
+            // `0.0` (no cosine evidence) keeps the previous value, like an
+            // unsupported rerank knot.
+            if laws.rerank_margin > 0.0 {
+                routing.rerank_margin = laws.rerank_margin;
+            }
         } else {
             opann::merge_rerank_with_pools(
                 &mut routing.rerank_for_k,
@@ -7460,6 +7476,9 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                 &laws.rerank_for_k,
                 laws.pool_cells,
             );
+            if laws.rerank_margin > routing.rerank_margin {
+                routing.rerank_margin = laws.rerank_margin;
+            }
         }
         opann::clear_rerank_beyond_pool(
             &routing.width_for_k,

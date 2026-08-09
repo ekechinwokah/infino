@@ -88,6 +88,35 @@ pub mod served_shortlist_probe {
     }
 }
 
+/// Test-only override of the adaptive-stopping band floor
+/// (`STOP_BAND_MIN_ROWS`): the banded rerank only engages naturally at
+/// 10M-scale shortlists, so unit-scale tests lower the floor to walk the
+/// band loop on a small fixture. Process-global — tests that set it must
+/// not assume exclusivity (assert on their own table's results, never on
+/// the counter of another test's query).
+pub mod stop_band_floor_override {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `0` = no override (the compiled constant serves).
+    static ROWS: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn set(rows: usize) {
+        ROWS.store(rows, Ordering::Relaxed);
+    }
+
+    pub fn clear() {
+        ROWS.store(0, Ordering::Relaxed);
+    }
+
+    /// Read by the query path (test-helpers builds only).
+    pub fn get() -> Option<usize> {
+        match ROWS.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+}
+
 use std::{collections::HashSet, path::Path, sync::Arc};
 
 use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};

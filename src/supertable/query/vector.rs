@@ -94,6 +94,8 @@ use super::{
 pub use crate::superfile::reader::VectorSearchOptions;
 #[cfg(feature = "test-helpers")]
 use crate::test_helpers::{admit_trace, served_shortlist_probe};
+#[cfg(any(test, feature = "test-helpers"))]
+use crate::test_helpers::stop_band_floor_override;
 use crate::{
     config,
     runtime_metrics::op_stats::{self, OpStatsCollector},
@@ -103,7 +105,7 @@ use crate::{
         error::ReadError,
         fts::reader::BoolMode,
         vector::{
-            distance::{Metric, distance, normalize, relative_score_window},
+            distance::{COSINE_DISTANCE_BASE, Metric, distance, normalize, relative_score_window},
             layout::VectorLayout,
             reader::ScanCandidate,
         },
@@ -127,6 +129,23 @@ use crate::{
 /// is exactly the fine-first default's sweep, so the law only engages
 /// when it demands a WIDER read than the default already performs.
 const LAW_WIDTH_WITHIN_DEFAULT: usize = 1;
+
+/// Smallest estimate band the adaptive-stopping rerank will fan out
+/// (rows). Bands halve the remaining shortlist down to this floor; a
+/// shortlist smaller than two floors reranks in one pass — per-band
+/// fanout has fixed dispatch cost, and sub-floor bands would spend more
+/// on dispatch than the rows they might skip.
+const STOP_BAND_MIN_ROWS: usize = 1024;
+
+/// The band floor serving actually uses: the compiled constant, unless a
+/// test lowered it to walk the band loop on a unit-scale fixture.
+fn stop_band_min_rows() -> usize {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if let Some(rows) = stop_band_floor_override::get() {
+        return rows;
+    }
+    STOP_BAND_MIN_ROWS
+}
 
 /// Oversample factor on the per-sweep rerank budget. Dividing
 /// `k x rerank_mult` evenly across the sweep under-serves the nearest
@@ -2463,26 +2482,6 @@ impl SupertableReader {
                 #[cfg(feature = "test-helpers")]
                 served_shortlist_probe::record(shortlist_limit, cell_floor);
                 flat = select_global_shortlist(flat, shortlist_limit, cell_floor);
-                let mut winners_by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
-                for (si, cand) in flat {
-                    winners_by_seg.entry(si).or_default().push(cand);
-                }
-                let rerank_units: Vec<(Arc<SuperfileEntry>, Vec<ScanCandidate>)> = superfiles
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(si, entry)| {
-                        winners_by_seg
-                            .remove(&si)
-                            .map(|sel| (Arc::clone(entry), sel))
-                    })
-                    .collect();
-                if let Some(stats) = &self.op_stats {
-                    // Actual winner rows; their planned ranges were priced
-                    // canonically above, from the budget these winners were
-                    // selected under.
-                    let rows: u64 = rerank_units.iter().map(|(_, sel)| sel.len() as u64).sum();
-                    stats.add_vector_rows_reranked(rows);
-                }
                 let column = Arc::clone(&column_arc2);
                 let query = Arc::clone(&query_arc2);
                 let reader_pool = Arc::clone(&manifest.options.reader_pool);
@@ -2534,8 +2533,112 @@ impl SupertableReader {
                         Ok::<Vec<SuperfileHit>, QueryError>(tagged)
                     }
                 };
-                per_superfile
-                    .extend(dispatch::fanout_with(self, rerank_units, false, false, body_c).await?);
+                // Adaptive stopping: on the law-served default (never under
+                // caller overrides), walk the shortlist in estimate bands —
+                // half the remainder per band, floored — and stop once no
+                // unprocessed candidate can reach the running kth exact
+                // score even granted its estimate plus the calibrated
+                // margin. A stamped margin (> 0) is cosine-only evidence
+                // by construction (the calibration measures gaps on cosine
+                // tables alone), so `BASE − distance` is the exact
+                // similarity scale here. The stamped rerank budget already
+                // capped the shortlist above — stopping only SKIPS work,
+                // never adds candidates.
+                let stop_margin = hidden_routing
+                    .as_ref()
+                    .map(|r| r.rerank_margin)
+                    .filter(|&m| m > 0.0)
+                    .filter(|_| law_rerank_served && options.nprobe.is_none());
+                let band_floor = stop_band_min_rows();
+                let banded = match stop_margin {
+                    Some(margin) if flat.len() > 2 * band_floor => Some(margin),
+                    _ => None,
+                };
+                if let Some(margin) = banded {
+                    // The selection's own total order — deterministic bands.
+                    flat.sort_unstable_by(shortlist_total_order);
+                    // The stop rule's kth is over raw reranked hits;
+                    // replica duplicates (dedup happens downstream) can
+                    // only WEAKEN the kth, firing the stop later — safe.
+                    let k_stop = k.saturating_add(replica_overhead);
+                    let mut exact_dists: Vec<f32> = Vec::new();
+                    let mut cursor = 0usize;
+                    while cursor < flat.len() {
+                        let remaining = flat.len() - cursor;
+                        let band_len = (remaining / 2).max(band_floor).min(remaining);
+                        let band_end = cursor + band_len;
+                        let mut winners_by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
+                        for (si, cand) in &flat[cursor..band_end] {
+                            winners_by_seg.entry(*si).or_default().push(*cand);
+                        }
+                        cursor = band_end;
+                        let rerank_units: Vec<(Arc<SuperfileEntry>, Vec<ScanCandidate>)> =
+                            superfiles
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(si, entry)| {
+                                    winners_by_seg
+                                        .remove(&si)
+                                        .map(|sel| (Arc::clone(entry), sel))
+                                })
+                                .collect();
+                        if let Some(stats) = &self.op_stats {
+                            // Actual rows this band reranks — skipped bands
+                            // never reach the counter, so the diagnostic
+                            // reflects the adaptive work, not the cap.
+                            let rows: u64 =
+                                rerank_units.iter().map(|(_, sel)| sel.len() as u64).sum();
+                            stats.add_vector_rows_reranked(rows);
+                        }
+                        let band_hits =
+                            dispatch::fanout_with(self, rerank_units, false, false, body_c.clone())
+                                .await?;
+                        let done = cursor >= flat.len();
+                        if !done {
+                            exact_dists.extend(band_hits.iter().flatten().map(|h| h.score));
+                            exact_dists.sort_unstable_by(f32::total_cmp);
+                            exact_dists.truncate(k_stop);
+                        }
+                        per_superfile.extend(band_hits);
+                        if done {
+                            break;
+                        }
+                        if exact_dists.len() >= k_stop
+                            && let Some(&kth_dist) = exact_dists.last()
+                        {
+                            let kth_sim = COSINE_DISTANCE_BASE - kth_dist;
+                            let next_best_est = flat[cursor].1.estimate;
+                            if next_best_est + margin < kth_sim {
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    let mut winners_by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
+                    for (si, cand) in flat {
+                        winners_by_seg.entry(si).or_default().push(cand);
+                    }
+                    let rerank_units: Vec<(Arc<SuperfileEntry>, Vec<ScanCandidate>)> = superfiles
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(si, entry)| {
+                            winners_by_seg
+                                .remove(&si)
+                                .map(|sel| (Arc::clone(entry), sel))
+                        })
+                        .collect();
+                    if let Some(stats) = &self.op_stats {
+                        // Actual winner rows; their planned ranges were
+                        // priced canonically above, from the budget these
+                        // winners were selected under.
+                        let rows: u64 =
+                            rerank_units.iter().map(|(_, sel)| sel.len() as u64).sum();
+                        stats.add_vector_rows_reranked(rows);
+                    }
+                    per_superfile.extend(
+                        dispatch::fanout_with(self, rerank_units, false, false, body_c).await?,
+                    );
+                }
             }
         }
         if let Some(t0) = fanout_t0 {
@@ -3734,6 +3837,16 @@ fn deferred_shortlist_limit(
     }
 }
 
+/// The shortlist's total order: best estimate first, ties on
+/// `(unit, cell, pos, did)` — shared by [`select_global_shortlist`]'s cut
+/// and the adaptive-stopping band sort so both walk one deterministic
+/// sequence.
+fn shortlist_total_order(a: &(usize, ScanCandidate), b: &(usize, ScanCandidate)) -> Ordering {
+    b.1.estimate.total_cmp(&a.1.estimate).then_with(|| {
+        (a.0, a.1.cell_idx, a.1.pos, a.1.did).cmp(&(b.0, b.1.cell_idx, b.1.pos, b.1.did))
+    })
+}
+
 /// Deterministic global shortlist selection for deferred-rerank width
 /// sweeps: keep the `limit` best 1-bit estimates pooled across every
 /// scanned unit, plus each scanned (unit, cell)'s `cell_floor` best.
@@ -3746,11 +3859,7 @@ fn select_global_shortlist(
     limit: usize,
     cell_floor: usize,
 ) -> Vec<(usize, ScanCandidate)> {
-    let cmp = |a: &(usize, ScanCandidate), b: &(usize, ScanCandidate)| {
-        b.1.estimate.total_cmp(&a.1.estimate).then_with(|| {
-            (a.0, a.1.cell_idx, a.1.pos, a.1.did).cmp(&(b.0, b.1.cell_idx, b.1.pos, b.1.did))
-        })
-    };
+    let cmp = shortlist_total_order;
     if pooled.len() <= limit {
         return pooled;
     }
@@ -4003,8 +4112,8 @@ mod tests {
         calibrated_query_for, cells_ranked_by_fine_score, gate_fine_candidates_by_fragment,
         hidden_hits_user_ids, is_hidden_vector_manifest, law_floor_serve_selection,
         postings_by_cell_from_summaries, projection_is_id_score_only, rerank_mult_from_law,
-        score_fine_candidates, select_global_shortlist, union_cell_selection,
-        vector_read_query_error,
+        score_fine_candidates, select_global_shortlist, stop_band_floor_override,
+        union_cell_selection, vector_read_query_error,
     };
     use crate::{
         BoolMode, InfinoError,
@@ -5452,6 +5561,40 @@ mod tests {
     /// Planted neighbors among `hits` (orthogonal docs score exactly 1.0).
     fn near_count(hits: &[SuperfileHit]) -> usize {
         hits.iter().filter(|h| h.score < ORTHOGONAL_SCORE).count()
+    }
+
+    /// The estimate-banded adaptive rerank returns exactly the planted
+    /// top-k with the band floor lowered to unit scale — bands partition
+    /// the same selected shortlist, so every planted neighbor either
+    /// reranks in an early band or the stop rule provably cannot fire
+    /// before its band (its estimate is within margin of the kth). Also
+    /// pins determinism: two identical banded searches return identical
+    /// hits. The floor override is process-global; this test asserts only
+    /// its own table's results.
+    #[test]
+    fn banded_adaptive_rerank_keeps_planted_neighbors_and_determinism() {
+        let (_dir, st, q, k) = drained_three_direction_fixture();
+        stop_band_floor_override::set(4);
+        let search = || {
+            st.reader()
+                .expect("reader")
+                .vector_hits("emb", &q, k, VectorSearchOptions::new(), None)
+                .expect("banded default search")
+        };
+        let first = search();
+        let second = search();
+        stop_band_floor_override::clear();
+        assert_eq!(
+            near_count(&first),
+            k,
+            "banded default search must keep every planted neighbor"
+        );
+        let key = |hits: &[SuperfileHit]| -> Vec<(u32, u32)> {
+            hits.iter()
+                .map(|h| (h.local_doc_id, h.score.to_bits()))
+                .collect()
+        };
+        assert_eq!(key(&first), key(&second), "banded search is deterministic");
     }
 
     /// Explicit caller `nprobe` widens the post-drain UNFILTERED cell sweep.

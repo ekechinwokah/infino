@@ -40,7 +40,8 @@ use crate::{
     superfile::vector::{
         cell_posting::{EncodedCellRow, MaterializedIvfRow, manifest_centroid_components_from_row},
         distance::{
-            Metric, distance, nearest_k_centroids_bytes, nearest_k_centroids_transposed, normalize,
+            COSINE_DISTANCE_BASE, Metric, distance, nearest_k_centroids_bytes,
+            nearest_k_centroids_transposed, normalize,
             relative_score_window,
         },
         kmeans::{kmeans, kmeans_pp},
@@ -808,6 +809,12 @@ const RERANK_LAW_EST_BINS: usize = 4096;
 const WIDTH_LAW_SAMPLE_SEED: u64 = 0x51ED_CA1B;
 /// Rows decoded per chunk while scoring a spilled cell.
 const WIDTH_LAW_SCORE_CHUNK: usize = 1024;
+/// Half-range of the stop-margin gap histogram. Cosine exact similarities
+/// live in `[-1, 1]` and 1-bit estimates concentrate within a few units of
+/// zero, so ±4 covers every realistic `exact − estimate` gap; anything
+/// beyond clamps into the edge bin, which can only WIDEN the measured
+/// margin (disabling early stops — the safe failure).
+const STOP_MARGIN_GAP_RANGE: f32 = 4.0;
 /// Frozen query sample: dequantized fp32 vectors + their stable ids
 /// (self-hit exclusion while scoring).
 struct WidthLawQueries {
@@ -935,6 +942,17 @@ struct RerankLawObservation {
     /// on a large table must never wrap a bin and silently NARROW the
     /// measured survivor budget.
     hist: Mutex<Vec<Vec<u64>>>,
+    /// Global histogram of `exact_similarity − estimate` gaps over every
+    /// pooled (query, row) pair — cosine tables only (the one metric whose
+    /// exact score and 1-bit estimate share a scale). Bins span
+    /// `±STOP_MARGIN_GAP_RANGE`; [`WidthLawCalibration::finish`] reads the
+    /// [`LAW_STAGE_TARGET_COVERAGE`] quantile's UPPER bin edge as the stop
+    /// margin: the serving rerank may stop once no remaining estimate plus
+    /// this margin can reach the current kth exact score. Tail clamping is
+    /// conservative — an over-range gap lands in the top bin and drags the
+    /// margin to the range edge, disabling early stops rather than firing
+    /// them wrongly.
+    gap_hist: Mutex<Vec<u64>>,
 }
 
 impl RerankLawObservation {
@@ -948,6 +966,41 @@ impl RerankLawObservation {
         let frac = ((range - est) / (2.0 * range)).clamp(0.0, 1.0);
         ((frac * RERANK_LAW_EST_BINS as f32) as usize).min(RERANK_LAW_EST_BINS - 1)
     }
+
+    /// Histogram bin for one `exact − estimate` gap under the fixed
+    /// `±STOP_MARGIN_GAP_RANGE`; bin 0 = most negative gap. The inverse
+    /// (a bin's UPPER gap edge) is [`stop_margin_bin_upper_edge`].
+    fn gap_bin(gap: f32) -> usize {
+        let frac = ((gap + STOP_MARGIN_GAP_RANGE) / (2.0 * STOP_MARGIN_GAP_RANGE)).clamp(0.0, 1.0);
+        ((frac * RERANK_LAW_EST_BINS as f32) as usize).min(RERANK_LAW_EST_BINS - 1)
+    }
+}
+
+/// The UPPER gap edge of one stop-margin histogram bin — the conservative
+/// read-out direction: a margin taken at the bin's upper edge can only be
+/// larger than the true quantile, and a larger margin only stops later.
+fn stop_margin_bin_upper_edge(bin: usize) -> f32 {
+    let frac = (bin + 1) as f32 / RERANK_LAW_EST_BINS as f32;
+    frac * 2.0 * STOP_MARGIN_GAP_RANGE - STOP_MARGIN_GAP_RANGE
+}
+
+/// The stop margin from a gap histogram: the
+/// [`LAW_STAGE_TARGET_COVERAGE`] quantile's upper bin edge; `0.0` on an
+/// empty histogram (no cosine evidence — serving never stops early).
+fn stop_margin_from_hist(gaps: &[u64]) -> f32 {
+    let total: u64 = gaps.iter().sum();
+    if total == 0 {
+        return 0.0;
+    }
+    let needed = (LAW_STAGE_TARGET_COVERAGE * total as f64).ceil() as u64;
+    let mut seen = 0u64;
+    for (bin, &n) in gaps.iter().enumerate() {
+        seen += n;
+        if seen >= needed {
+            return stop_margin_bin_upper_edge(bin);
+        }
+    }
+    STOP_MARGIN_GAP_RANGE
 }
 
 /// Both laws the drain calibration measures — cells for the width sweep,
@@ -963,6 +1016,13 @@ pub(crate) struct CalibratedLaws {
     /// against — the stamp records it so a later, wider law knows
     /// whether the budget's evidence still covers it.
     pub(crate) pool_cells: u32,
+    /// Adaptive-stopping margin: the [`LAW_STAGE_TARGET_COVERAGE`] quantile
+    /// of `exact_similarity − estimate` over the pooled calibration pairs
+    /// (cosine only). Serving's estimate-banded rerank may stop once no
+    /// remaining estimate plus this margin can reach the current kth exact
+    /// score. `0.0` = no evidence (non-cosine, or no pooled pairs) —
+    /// serving never stops early.
+    pub(crate) rerank_margin: f32,
 }
 
 #[cfg(test)]
@@ -1120,6 +1180,7 @@ impl WidthLawCalibration {
                 q_l1,
                 pools,
                 hist: Mutex::new(vec![Vec::new(); n_queries]),
+                gap_hist: Mutex::new(Vec::new()),
             });
         }
         self.frozen = Some(WidthLawQueries { queries, ids });
@@ -1149,6 +1210,7 @@ impl WidthLawCalibration {
         let mut reader = spill.reader()?;
         let mut remaining = spill.n_rows();
         let mut scratch = vec![0f32; self.dim];
+        let mut gap_local: Vec<u64> = Vec::new();
         while remaining > 0 {
             let chunk = reader.next_chunk(WIDTH_LAW_SCORE_CHUNK.min(remaining))?;
             remaining -= chunk.len();
@@ -1161,9 +1223,10 @@ impl WidthLawCalibration {
                 &mut scratch,
                 &mut partial,
                 &mut hist_local,
+                &mut gap_local,
             );
         }
-        self.merge_partial(partial, hist_local);
+        self.merge_partial(partial, hist_local, gap_local);
         Ok(())
     }
 
@@ -1189,6 +1252,7 @@ impl WidthLawCalibration {
         let members = self.pool_members(cell);
         let mut hist_local: HashMap<usize, Vec<u64>> = HashMap::new();
         let mut scratch = vec![0f32; self.dim];
+        let mut gap_local: Vec<u64> = Vec::new();
         for chunk in rows.chunks(WIDTH_LAW_SCORE_CHUNK) {
             self.score_slice(
                 frozen,
@@ -1199,9 +1263,10 @@ impl WidthLawCalibration {
                 &mut scratch,
                 &mut partial,
                 &mut hist_local,
+                &mut gap_local,
             );
         }
-        self.merge_partial(partial, hist_local);
+        self.merge_partial(partial, hist_local, gap_local);
         Ok(())
     }
 
@@ -1213,6 +1278,7 @@ impl WidthLawCalibration {
         &self,
         partial: Vec<Vec<(f32, u32, i128, f32)>>,
         hist_local: HashMap<usize, Vec<u64>>,
+        gap_local: Vec<u64>,
     ) {
         let k_max = WIDTH_LAW_MAX_K;
         let mut tops = self.tops.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1232,6 +1298,18 @@ impl WidthLawCalibration {
                     for (a, b) in slot.iter_mut().zip(delta) {
                         *a = a.saturating_add(b);
                     }
+                }
+            }
+        }
+        if let Some(rl) = self.rerank.as_ref()
+            && !gap_local.is_empty()
+        {
+            let mut gaps = rl.gap_hist.lock().unwrap_or_else(PoisonError::into_inner);
+            if gaps.is_empty() {
+                *gaps = gap_local;
+            } else {
+                for (a, b) in gaps.iter_mut().zip(gap_local) {
+                    *a = a.saturating_add(b);
                 }
             }
         }
@@ -1266,6 +1344,7 @@ impl WidthLawCalibration {
         scratch: &mut [f32],
         partial: &mut [Vec<(f32, u32, i128, f32)>],
         hist_local: &mut HashMap<usize, Vec<u64>>,
+        gap_local: &mut Vec<u64>,
     ) {
         let k_max = WIDTH_LAW_MAX_K;
         let rl = self.rerank.as_ref();
@@ -1350,12 +1429,22 @@ impl WidthLawCalibration {
                 if row.stable_id == frozen.ids[qi] {
                     continue;
                 }
-                partial[qi].push((
-                    distance(self.metric, q, scratch),
-                    cell,
-                    row.stable_id,
-                    est_of[qi],
-                ));
+                let exact = distance(self.metric, q, scratch);
+                // Stop-margin evidence: this (query, row) pair's
+                // exact-similarity minus its serving estimate — pooled
+                // pairs only (a finite `est_of` IS pool membership), and
+                // cosine only, the one metric where the two share a scale.
+                // Measured here because it is the one place the exact
+                // score and the serving estimate exist side by side.
+                if self.metric == Metric::Cosine && est_of[qi].is_finite() {
+                    let gap = (COSINE_DISTANCE_BASE - exact) - est_of[qi];
+                    if gap_local.is_empty() {
+                        gap_local.resize(RERANK_LAW_EST_BINS, 0);
+                    }
+                    let bin = RerankLawObservation::gap_bin(gap);
+                    gap_local[bin] = gap_local[bin].saturating_add(1);
+                }
+                partial[qi].push((exact, cell, row.stable_id, est_of[qi]));
             }
             if rl.is_some() {
                 for &qi in members {
@@ -1648,11 +1737,25 @@ impl WidthLawCalibration {
         floor_monotone(&mut law);
         floor_monotone(&mut fine_law);
         floor_monotone(&mut rerank_law);
+        // Stop margin: the LAW_STAGE_TARGET_COVERAGE quantile of the pooled
+        // `exact − estimate` gaps, read at the bin's UPPER edge (the
+        // conservative direction — a larger margin only stops later).
+        // `0.0` = no cosine gap evidence; serving treats it as "never stop
+        // early".
+        let rerank_margin = self
+            .rerank
+            .as_ref()
+            .map(|rl| {
+                let gaps = rl.gap_hist.lock().unwrap_or_else(PoisonError::into_inner);
+                stop_margin_from_hist(&gaps)
+            })
+            .unwrap_or(0.0);
         (law.iter().any(|&w| w > 0)).then_some(CalibratedLaws {
             width_for_k: law,
             fine_for_k: fine_law,
             rerank_for_k: rerank_law,
             pool_cells: self.pool_cells as u32,
+            rerank_margin,
         })
     }
 }
@@ -2020,6 +2123,7 @@ mod tests {
             q_l1: vec![1.0],
             pools: vec![vec![0]],
             hist: Mutex::new(vec![Vec::new()]),
+            gap_hist: Mutex::new(Vec::new()),
         };
         let mut hist = vec![0u64; RERANK_LAW_EST_BINS];
         hist[rl.bin(0, 0.9)] = 3;
@@ -2176,6 +2280,52 @@ mod tests {
     /// every knot on Cohere-10M, via the monotone floor). Knots with
     /// enough evidence (k = 10 here) keep the bound: one fully-uncovered
     /// query still forces their crossing out to full coverage.
+    #[test]
+    fn stop_margin_quantile_reads_the_upper_bin_edge() {
+        // Empty histogram: no evidence, margin 0 (serving never stops).
+        assert_eq!(stop_margin_from_hist(&[]), 0.0);
+        assert_eq!(stop_margin_from_hist(&vec![0u64; RERANK_LAW_EST_BINS]), 0.0);
+
+        // All mass in one bin: the margin is that bin's UPPER edge —
+        // strictly above any gap the bin holds (conservative direction).
+        let mid = RERANK_LAW_EST_BINS / 2;
+        let mut gaps = vec![0u64; RERANK_LAW_EST_BINS];
+        gaps[mid] = 1_000;
+        let margin = stop_margin_from_hist(&gaps);
+        assert!(
+            margin > 0.0 && margin <= 2.0 * STOP_MARGIN_GAP_RANGE / RERANK_LAW_EST_BINS as f32,
+            "gaps at ~0 read a one-bin-wide positive margin, got {margin}"
+        );
+        // The bin math round-trips: a gap bins into the bin whose upper
+        // edge exceeds it.
+        for gap in [-3.9f32, -1.0, 0.0, 0.5, 3.9] {
+            let bin = RerankLawObservation::gap_bin(gap);
+            assert!(
+                stop_margin_bin_upper_edge(bin) >= gap,
+                "upper edge covers the binned gap {gap}"
+            );
+        }
+
+        // A 0.3% tail of large gaps sits ABOVE the 0.997 quantile: the
+        // margin tracks the bulk, not the outliers…
+        let mut gaps = vec![0u64; RERANK_LAW_EST_BINS];
+        gaps[mid] = 997;
+        gaps[RERANK_LAW_EST_BINS - 1] = 3;
+        let bulk = stop_margin_from_hist(&gaps);
+        assert!(
+            bulk < 0.1,
+            "0.3% outlier tail must not widen the margin, got {bulk}"
+        );
+        // …but a 1% tail crosses the coverage target and drags the margin
+        // to the tail's bin (wider = later stops = safe).
+        gaps[RERANK_LAW_EST_BINS - 1] = 11;
+        let tail = stop_margin_from_hist(&gaps);
+        assert!(
+            (tail - STOP_MARGIN_GAP_RANGE).abs() < 1e-3,
+            "a supra-target tail widens the margin to its bin, got {tail}"
+        );
+    }
+
     #[test]
     fn width_law_thin_knot_uses_raw_mean_not_the_worst_query() {
         const DIM: usize = 8;
