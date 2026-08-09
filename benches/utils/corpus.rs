@@ -28,18 +28,21 @@ use std::{
     cmp::Ordering,
     env,
     fs::File,
-    io::{Error, ErrorKind, Result as IoResult, Write},
+    io::{BufWriter, Error, ErrorKind, Result as IoResult, Write},
     mem::size_of,
     os::unix::fs::FileExt,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
     },
     time::Instant,
 };
 
-use arrow_array::{Decimal128Array, Float32Array, LargeStringArray, RecordBatch};
+use arrow_array::{
+    Array, Decimal128Array, FixedSizeListArray, Float32Array, LargeListArray, LargeStringArray,
+    ListArray, RecordBatch,
+};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
@@ -59,6 +62,7 @@ use infino::{
     test_helpers::default_tokenizer,
 };
 use memmap2::Mmap;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
@@ -177,10 +181,79 @@ pub(crate) fn chunk_seed(seed: u64, chunk_index: usize) -> u64 {
     )
 }
 
-/// Vector dimension — matches modern large embedding models
-/// (OpenAI text-embedding-3-small = 1536 truncates to 1024,
-/// BGE-large = 1024, E5-large = 1024).
-pub const DIM: usize = 1024;
+/// Synthetic-corpus vector dimension — matches modern large embedding
+/// models (OpenAI text-embedding-3-small = 1536 truncates to 1024,
+/// BGE-large = 1024, E5-large = 1024). Runtime code reads [`dim`], which
+/// resolves to this for the synthetic corpus and to the dataset's own
+/// dimension for a real corpus.
+pub const SYNTHETIC_DIM: usize = 1024;
+
+/// Env selecting the vector corpus source: `synthetic` (the default —
+/// the seeded planted-cluster generator below) or `cohere` (a real
+/// dataset in the VDBBench parquet layout; requires [`CORPUS_DIR_ENV`]).
+/// Real corpora are vector-only: FTS / SQL / combined modalities keep
+/// the synthetic corpus and panic if asked to run on a real one.
+pub const CORPUS_SOURCE_ENV: &str = "INFINO_BENCH_CORPUS";
+
+/// Env naming the directory holding a real corpus's parquet files:
+/// `shuffle_train.parquet` (ingest rows, `emb` list<f32> column) and
+/// `test.parquet` (query rows, same column) — the VDBBench dataset
+/// layout, so a directory prepared for VDBBench works here unchanged.
+pub const CORPUS_DIR_ENV: &str = "INFINO_BENCH_CORPUS_DIR";
+
+/// Which vector corpus feeds the benches. Resolved once per process
+/// from [`CORPUS_SOURCE_ENV`].
+#[derive(Debug)]
+pub enum CorpusSource {
+    /// Seeded planted-cluster generator (the historical default).
+    Synthetic,
+    /// Real dataset in the VDBBench parquet layout at `dir`.
+    Cohere { dir: PathBuf },
+}
+
+/// The process-wide corpus source. Panics on an unknown
+/// [`CORPUS_SOURCE_ENV`] value or a `cohere` selection without
+/// [`CORPUS_DIR_ENV`] — both are configuration errors a run must not
+/// silently paper over.
+pub fn corpus_source() -> &'static CorpusSource {
+    static SOURCE: OnceLock<CorpusSource> = OnceLock::new();
+    SOURCE.get_or_init(|| match env::var(CORPUS_SOURCE_ENV).ok().as_deref() {
+        None | Some("") | Some("synthetic") => CorpusSource::Synthetic,
+        Some("cohere") => {
+            let dir = env::var(CORPUS_DIR_ENV).unwrap_or_else(|_| {
+                panic!(
+                    "{CORPUS_SOURCE_ENV}=cohere requires {CORPUS_DIR_ENV}=<dir with \
+                     shuffle_train.parquet + test.parquet>"
+                )
+            });
+            CorpusSource::Cohere {
+                dir: PathBuf::from(dir),
+            }
+        }
+        Some(other) => {
+            panic!("unknown {CORPUS_SOURCE_ENV}={other:?} (expected synthetic|cohere)")
+        }
+    })
+}
+
+/// Short corpus name for reports and dataset sidecars.
+pub fn corpus_label() -> &'static str {
+    match corpus_source() {
+        CorpusSource::Synthetic => "synthetic",
+        CorpusSource::Cohere { .. } => "cohere",
+    }
+}
+
+/// Vector dimension of the active corpus: the synthetic constant for
+/// the generator, the dataset's own embedding width for a real corpus
+/// (read once from the parquet schema).
+pub fn dim() -> usize {
+    static DIM_ONCE: OnceLock<usize> = OnceLock::new();
+    *DIM_ONCE.get_or_init(|| match corpus_source() {
+        CorpusSource::Synthetic => SYNTHETIC_DIM,
+        CorpusSource::Cohere { dir } => real_corpus_dim(dir),
+    })
+}
 
 /// One `(local_doc_id, distance)` hit — same shape `VectorReader::search`
 /// returns. Re-exported here so recall helpers stay engine-agnostic.
@@ -204,7 +277,7 @@ pub const SUPERTABLE_DOCS: usize = 10_000_000;
 /// [`SUPERFILE_DOCS`] (1M); override with `INFINO_BENCH_SUPERFILE_DOCS`
 /// for a quicker local loop or a larger stress run.
 pub fn superfile_docs() -> usize {
-    docs_from_env("INFINO_BENCH_SUPERFILE_DOCS", SUPERFILE_DOCS)
+    clamp_docs_to_corpus(docs_from_env("INFINO_BENCH_SUPERFILE_DOCS", SUPERFILE_DOCS))
 }
 
 /// Document count for the **supertable** test — a multi-superfile table
@@ -212,7 +285,26 @@ pub fn superfile_docs() -> usize {
 /// [`SUPERTABLE_DOCS`] (10M); override with
 /// `INFINO_BENCH_SUPERTABLE_DOCS`.
 pub fn supertable_docs() -> usize {
-    docs_from_env("INFINO_BENCH_SUPERTABLE_DOCS", SUPERTABLE_DOCS)
+    clamp_docs_to_corpus(docs_from_env(
+        "INFINO_BENCH_SUPERTABLE_DOCS",
+        SUPERTABLE_DOCS,
+    ))
+}
+
+/// Cap a requested doc count at what a real corpus actually holds (the
+/// synthetic generator has no cap). Loud when it bites: a clamped run
+/// measures a different scale than the caller asked for.
+fn clamp_docs_to_corpus(n: usize) -> usize {
+    match corpus_source() {
+        CorpusSource::Synthetic => n,
+        CorpusSource::Cohere { dir } => {
+            let rows = real_corpus_rows(dir);
+            if n > rows {
+                eprintln!("[corpus] requested {n} docs but the real corpus holds {rows}; clamping");
+            }
+            n.min(rows)
+        }
+    }
 }
 
 /// Parse a positive doc-count override from `var`, falling back to
@@ -526,12 +618,12 @@ pub use combined::SequentialSyntheticCorpus;
 
 // ─── Vector corpus ────────────────────────────────────────────────────
 
-/// Generate `n_docs` planted-cluster vectors of [`DIM`] dimensions,
+/// Generate `n_docs` planted-cluster vectors of [`dim()`] dimensions,
 /// optionally per-doc normalized for cosine. `n_cent` planted centers
 /// drawn from `3·N(0, 1)` per dim; each doc lives near a center with
 /// `sigma = 0.3` per-dim Gaussian noise.
 ///
-/// **Centers are intentionally NOT normalized.** At `DIM=384` the
+/// **Centers are intentionally NOT normalized.** At `dim()=384` the
 /// un-normalized center magnitude is ~58 and per-doc noise norm is
 /// ~5.9 (about 10% of center magnitude), so docs sit tightly around
 /// their planted center direction. If centers were unit-normalized
@@ -550,7 +642,7 @@ pub fn generate_vector_corpus(
 
     let centers: Vec<Vec<f32>> = (0..n_cent)
         .map(|_| {
-            (0..DIM)
+            (0..dim())
                 .map(|_| {
                     let s: f64 = dist.sample(&mut rng);
                     (s as f32) * CENTER_GAUSSIAN_SCALE
@@ -559,7 +651,7 @@ pub fn generate_vector_corpus(
         })
         .collect();
 
-    let mut out: Vec<f32> = Vec::with_capacity(n_docs * DIM);
+    let mut out: Vec<f32> = Vec::with_capacity(n_docs * dim());
     for i in 0..n_docs {
         let center = &centers[i % n_cent];
         let mut v: Vec<f32> = center
@@ -628,7 +720,7 @@ impl MmapVectorCorpus {
         let cdist = StandardNormal;
         let centers: Vec<Vec<f32>> = (0..n_cent)
             .map(|_| {
-                (0..DIM)
+                (0..dim())
                     .map(|_| {
                         let s: f64 = cdist.sample(&mut crng);
                         (s as f32) * CENTER_GAUSSIAN_SCALE
@@ -637,7 +729,7 @@ impl MmapVectorCorpus {
             })
             .collect();
 
-        let row_bytes = DIM * size_of::<f32>();
+        let row_bytes = dim() * size_of::<f32>();
         let total = vector_corpus_byte_len(n_docs).expect("vector corpus byte length");
         let file = File::create(&path).expect("create corpus file");
         file.set_len(total).expect("set_len vector corpus");
@@ -674,11 +766,11 @@ impl MmapVectorCorpus {
             // any preceding vectors so the requested rows remain bit-identical
             // to a full corpus generated with the same knobs.
             for _ in chunk_start..start {
-                for _ in 0..DIM {
+                for _ in 0..dim() {
                     let _: f64 = dist.sample(&mut rng);
                 }
             }
-            let mut row = vec![0.0f32; DIM];
+            let mut row = vec![0.0f32; dim()];
             for i in start..end {
                 let center = &centers_ref[i % n_cent];
                 for (j, slot) in row.iter_mut().enumerate() {
@@ -706,7 +798,7 @@ impl MmapVectorCorpus {
 
     /// Open an existing raw f32 corpus without copying or modifying it.
     ///
-    /// The file must contain exactly `n_docs * DIM` native-endian f32 values.
+    /// The file must contain exactly `n_docs * dim()` native-endian f32 values.
     pub fn open(path: &Path, n_docs: usize) -> IoResult<Self> {
         let file = File::open(path)?;
         Self::from_file(file, n_docs, None)
@@ -729,7 +821,7 @@ impl MmapVectorCorpus {
             _tmp: tmp,
             map,
             n_docs,
-            dim: DIM,
+            dim: dim(),
         })
     }
 
@@ -768,7 +860,7 @@ impl MmapVectorCorpus {
 }
 
 fn vector_corpus_byte_len(n_docs: usize) -> IoResult<u64> {
-    let row_bytes = DIM
+    let row_bytes = dim()
         .checked_mul(size_of::<f32>())
         .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "vector corpus row size overflow"))?;
     let total = n_docs.checked_mul(row_bytes).ok_or_else(|| {
@@ -785,6 +877,176 @@ fn vector_corpus_byte_len(n_docs: usize) -> IoResult<u64> {
     })
 }
 
+// ─── Real-corpus (parquet) source ─────────────────────────────────────
+
+/// Train-rows file of the VDBBench dataset layout.
+const REAL_TRAIN_FILE: &str = "shuffle_train.parquet";
+/// Query-rows file of the VDBBench dataset layout.
+const REAL_TEST_FILE: &str = "test.parquet";
+/// Embedding column name in both files.
+const REAL_EMB_COLUMN: &str = "emb";
+
+/// Open one parquet file's record-batch reader (VDBBench layout).
+fn parquet_batches(path: &Path) -> ParquetRecordBatchReader {
+    let file = File::open(path)
+        .unwrap_or_else(|e| panic!("open real-corpus parquet {}: {e}", path.display()));
+    ParquetRecordBatchReaderBuilder::try_new(file)
+        .and_then(|b| b.build())
+        .unwrap_or_else(|e| panic!("read real-corpus parquet {}: {e}", path.display()))
+}
+
+/// Row count of the real corpus's train file, from parquet metadata
+/// (no data read).
+pub fn real_corpus_rows(dir: &Path) -> usize {
+    let path = dir.join(REAL_TRAIN_FILE);
+    let file = File::open(&path)
+        .unwrap_or_else(|e| panic!("open real-corpus parquet {}: {e}", path.display()));
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap_or_else(|e| panic!("read real-corpus parquet {}: {e}", path.display()));
+    reader.metadata().file_metadata().num_rows() as usize
+}
+
+/// Embedding width of the real corpus, from the train file's first row.
+fn real_corpus_dim(dir: &Path) -> usize {
+    let mut reader = parquet_batches(&dir.join(REAL_TRAIN_FILE));
+    let batch = reader
+        .next()
+        .expect("real corpus train parquet has at least one batch")
+        .expect("read first train batch");
+    let rows = emb_rows(&batch);
+    rows.first().map(Vec::len).expect("non-empty train batch")
+}
+
+/// The `emb` column of one batch as owned fp32 rows. Accepts the list
+/// encodings the VDBBench preparers emit (`List`/`LargeList`/
+/// `FixedSizeList` of `Float32`).
+fn emb_rows(batch: &RecordBatch) -> Vec<Vec<f32>> {
+    let col = batch
+        .column_by_name(REAL_EMB_COLUMN)
+        .unwrap_or_else(|| panic!("real corpus parquet lacks a {REAL_EMB_COLUMN:?} column"));
+    let values_of = |values: &dyn Array, start: usize, len: usize| -> Vec<f32> {
+        let f = values
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("emb values are f32");
+        (start..start + len).map(|i| f.value(i)).collect()
+    };
+    if let Some(l) = col.as_any().downcast_ref::<ListArray>() {
+        (0..l.len())
+            .map(|i| {
+                let start = l.value_offsets()[i] as usize;
+                let end = l.value_offsets()[i + 1] as usize;
+                values_of(l.values().as_ref(), start, end - start)
+            })
+            .collect()
+    } else if let Some(l) = col.as_any().downcast_ref::<LargeListArray>() {
+        (0..l.len())
+            .map(|i| {
+                let start = l.value_offsets()[i] as usize;
+                let end = l.value_offsets()[i + 1] as usize;
+                values_of(l.values().as_ref(), start, end - start)
+            })
+            .collect()
+    } else if let Some(l) = col.as_any().downcast_ref::<FixedSizeListArray>() {
+        let w = l.value_length() as usize;
+        (0..l.len())
+            .map(|i| values_of(l.values().as_ref(), i * w, w))
+            .collect()
+    } else {
+        panic!(
+            "unsupported {REAL_EMB_COLUMN:?} encoding {:?} (expected List/LargeList/FixedSizeList of Float32)",
+            col.data_type()
+        )
+    }
+}
+
+impl MmapVectorCorpus {
+    /// Materialize the first `n_docs` rows of a real corpus (VDBBench
+    /// parquet layout) into the standard corpus mmap. Rows stream
+    /// batch-by-batch — peak memory is one record batch. Errors when the
+    /// dataset holds fewer than `n_docs` rows, mirroring [`Self::open`]'s
+    /// size check so callers can fall back to a base-only shape.
+    pub fn from_parquet(dir: &Path, n_docs: usize, normalize_each: bool) -> IoResult<Self> {
+        let available = real_corpus_rows(dir);
+        if available < n_docs {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "real corpus at {} holds {available} rows; {n_docs} requested",
+                    dir.display()
+                ),
+            ));
+        }
+        let tmp = TempDir::new().expect("create MmapVectorCorpus tempdir");
+        let path = tmp.path().join("corpus.bin");
+        let mut writer = BufWriter::new(File::create(&path)?);
+        let dim = dim();
+        let mut written = 0usize;
+        'outer: for batch in parquet_batches(&dir.join(REAL_TRAIN_FILE)) {
+            let batch = batch.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+            for mut row in emb_rows(&batch) {
+                assert_eq!(row.len(), dim, "real corpus row width drifted mid-file");
+                if normalize_each {
+                    normalize(&mut row);
+                }
+                let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+                writer.write_all(&bytes)?;
+                written += 1;
+                if written == n_docs {
+                    break 'outer;
+                }
+            }
+        }
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|e| e.into_error())?
+            .sync_all()?;
+        Self::from_file(File::open(&path)?, n_docs, Some(tmp))
+    }
+}
+
+/// The real corpus's query vectors (`test.parquet`), strided so `n`
+/// queries sample the whole file rather than its head. Real queries are
+/// the point of a real corpus: the drain calibrates on corpus rows, so
+/// query-vs-row distribution mismatch only shows up when the queries
+/// are the dataset's own.
+pub fn real_queries(dir: &Path, n_queries: usize, normalize_each: bool) -> Vec<Vec<f32>> {
+    let mut all: Vec<Vec<f32>> = Vec::new();
+    for batch in parquet_batches(&dir.join(REAL_TEST_FILE)) {
+        let batch = batch.expect("read test batch");
+        all.extend(emb_rows(&batch));
+    }
+    assert!(!all.is_empty(), "real corpus test parquet is empty");
+    if normalize_each {
+        for q in &mut all {
+            normalize(q);
+        }
+    }
+    let stride = (all.len() / n_queries).max(1);
+    all.into_iter().step_by(stride).take(n_queries).collect()
+}
+
+/// The bench query battery for the MAIN vector corpus: dataset test
+/// queries for a real corpus, perturbed corpus members for the
+/// synthetic one. Diagnostics that plant their own private corpora keep
+/// calling [`generate_realistic_queries`] directly.
+pub fn bench_queries(
+    vectors: &[f32],
+    n_docs: usize,
+    n_queries: usize,
+    seed: u64,
+    normalize_each: bool,
+    sigma: f32,
+) -> Vec<Vec<f32>> {
+    match corpus_source() {
+        CorpusSource::Synthetic => {
+            generate_realistic_queries(vectors, n_docs, n_queries, seed, normalize_each, sigma)
+        }
+        CorpusSource::Cohere { dir } => real_queries(dir, n_queries, normalize_each),
+    }
+}
+
 // ─── Query batteries ──────────────────────────────────────────────────
 
 /// `n_queries` deterministic Gaussian queries (no corpus dependency),
@@ -796,7 +1058,7 @@ pub fn generate_queries(n_queries: usize, seed: u64) -> Vec<Vec<f32>> {
     let dist = StandardNormal;
     (0..n_queries)
         .map(|_| {
-            let mut q: Vec<f32> = (0..DIM)
+            let mut q: Vec<f32> = (0..dim())
                 .map(|_| {
                     let s: f64 = dist.sample(&mut rng);
                     (s as f32) * QUERY_GAUSSIAN_SCALE
@@ -828,8 +1090,8 @@ pub fn generate_realistic_queries(
         // Coprime stride so consecutive queries don't all sit in the
         // first planted cluster.
         let base_idx = (i * QUERY_BASE_DOC_STRIDE) % n_docs;
-        let off = base_idx * DIM;
-        let mut q: Vec<f32> = (0..DIM)
+        let off = base_idx * dim();
+        let mut q: Vec<f32> = (0..dim())
             .map(|d| {
                 let s: f64 = dist.sample(&mut rng);
                 vectors[off + d] + (s as f32) * sigma
@@ -854,12 +1116,12 @@ pub fn brute_force_topk(
     metric: Metric,
     k: usize,
 ) -> Vec<u32> {
-    assert_eq!(vectors.len(), n_docs * DIM);
-    assert_eq!(query.len(), DIM);
+    assert_eq!(vectors.len(), n_docs * dim());
+    assert_eq!(query.len(), dim());
     let mut scored: Vec<(u32, f32)> = (0..n_docs as u32)
         .map(|i| {
-            let off = (i as usize) * DIM;
-            (i, distance(metric, query, &vectors[off..off + DIM]))
+            let off = (i as usize) * dim();
+            (i, distance(metric, query, &vectors[off..off + dim()]))
         })
         .collect();
     scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -876,14 +1138,14 @@ pub fn brute_force_topk_cosine(
     query: &[f32],
     k: usize,
 ) -> Vec<u32> {
-    assert_eq!(vectors.len(), n_docs * DIM);
-    assert_eq!(query.len(), DIM);
+    assert_eq!(vectors.len(), n_docs * dim());
+    assert_eq!(query.len(), dim());
     // For L2-normalized inputs cosine distance is monotone in -dot.
     let mut scored: Vec<(u32, f32)> = (0..n_docs as u32)
         .map(|i| {
-            let off = (i as usize) * DIM;
+            let off = (i as usize) * dim();
             let mut dot = 0f32;
-            for d in 0..DIM {
+            for d in 0..dim() {
                 dot += vectors[off + d] * query[d];
             }
             (i, -dot)
@@ -982,9 +1244,9 @@ fn ground_truth_ids(tops: Vec<Vec<GroundTruthCandidate>>) -> Vec<Vec<u32>> {
 }
 
 fn transpose_queries(queries: &[Vec<f32>]) -> Vec<f32> {
-    let mut transposed = vec![0.0; DIM * queries.len()];
+    let mut transposed = vec![0.0; dim() * queries.len()];
     for (query_index, query) in queries.iter().enumerate() {
-        assert_eq!(query.len(), DIM);
+        assert_eq!(query.len(), dim());
         for (dimension, value) in query.iter().enumerate() {
             transposed[dimension * queries.len() + query_index] = *value;
         }
@@ -1044,23 +1306,23 @@ pub fn ground_truth(
     queries: &[Vec<f32>],
     k: usize,
 ) -> Vec<Vec<u32>> {
-    assert_eq!(vectors.len(), n_docs * DIM);
+    assert_eq!(vectors.len(), n_docs * dim());
     if queries.is_empty() || n_docs == 0 || k == 0 {
         return vec![Vec::new(); queries.len()];
     }
 
     let tops = vectors
-        .par_chunks(GT_DOC_CHUNK * DIM)
+        .par_chunks(GT_DOC_CHUNK * dim())
         .enumerate()
         .map(|(chunk_idx, chunk)| {
             let base = (chunk_idx * GT_DOC_CHUNK) as u32;
             let mut tops: Vec<Vec<GroundTruthCandidate>> =
                 vec![Vec::with_capacity(k + 1); queries.len()];
-            for (j, doc) in chunk.chunks_exact(DIM).enumerate() {
+            for (j, doc) in chunk.chunks_exact(dim()).enumerate() {
                 let id = base + j as u32;
                 for (top, q) in tops.iter_mut().zip(queries) {
                     let mut dot = 0f32;
-                    for d in 0..DIM {
+                    for d in 0..dim() {
                         dot += doc[d] * q[d];
                     }
                     insert_ground_truth_candidate(top, (-dot, id), k);
@@ -1092,7 +1354,7 @@ pub fn lifecycle_ground_truth(
     filter_keep_every: usize,
     k: usize,
 ) -> LifecycleGroundTruth {
-    assert_eq!(vectors.len(), augmented_docs * DIM);
+    assert_eq!(vectors.len(), augmented_docs * dim());
     assert!(n_docs <= augmented_docs);
     assert!(augmented_docs <= u32::MAX as usize);
     assert!(n_correctness_queries <= queries.len());
@@ -1111,13 +1373,13 @@ pub fn lifecycle_ground_truth(
         .then(|| augmented_docs.div_ceil(GT_PROGRESS_STEPS));
     let next_report = AtomicUsize::new(progress_stride.unwrap_or(usize::MAX));
     let tops = vectors
-        .par_chunks(GT_DOC_CHUNK * DIM)
+        .par_chunks(GT_DOC_CHUNK * dim())
         .enumerate()
         .map(|(chunk_index, chunk)| {
             let base = chunk_index * GT_DOC_CHUNK;
             let mut tops = LifecycleTopLists::empty(queries.len(), n_correctness_queries);
             let mut dots = vec![0.0f32; queries.len()];
-            for (local_doc, doc) in chunk.chunks_exact(DIM).enumerate() {
+            for (local_doc, doc) in chunk.chunks_exact(dim()).enumerate() {
                 let doc_id = base + local_doc;
                 let query_count = if doc_id < n_docs {
                     queries.len()
@@ -1164,7 +1426,7 @@ pub fn lifecycle_ground_truth(
                     &next_report,
                     augmented_docs,
                     stride,
-                    chunk.len() / DIM,
+                    chunk.len() / dim(),
                 );
             }
             tops
@@ -1197,7 +1459,7 @@ pub fn filtered_ground_truth(
             let mut dists: Vec<(f32, u32)> = allow
                 .iter()
                 .map(|id| {
-                    let row = &vectors[id as usize * DIM..(id as usize + 1) * DIM];
+                    let row = &vectors[id as usize * dim()..(id as usize + 1) * dim()];
                     let dot: f32 = row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
                     (-dot, id)
                 })
@@ -1501,7 +1763,7 @@ pub fn build_fts_index(docs: &[String]) -> FtsBuilder {
     b
 }
 
-/// Build a stand-alone vector index. `vectors` is flat `n_docs * DIM`.
+/// Build a stand-alone vector index. `vectors` is flat `n_docs * dim()`.
 ///
 /// Bench harness picks `Sq8` by default to match the on-disk
 /// default for production superfiles. Per-cluster scale/offset
@@ -1515,15 +1777,15 @@ pub fn build_vector_index(vectors: &[f32], n_docs: usize, metric: Metric) -> Vec
     b.register_column(VectorConfig {
         provided_centroids: None,
         column: "v".into(),
-        dim: DIM,
+        dim: dim(),
         rot_seed: ROT_SEED,
         metric,
         rerank_codec: bench_rerank_codec(metric),
     })
     .expect("register column");
     for i in 0..n_docs {
-        let off = i * DIM;
-        b.add(0, &vectors[off..off + DIM])
+        let off = i * dim();
+        b.add(0, &vectors[off..off + dim()])
             .expect("add to vector builder");
     }
     b
@@ -1537,7 +1799,10 @@ pub fn open_vector_reader(blob: Vec<u8>, metric: Metric) -> VectorReader {
         Metric::Cosine => "cosine",
         Metric::NegDot => "negdot",
     };
-    let json = format!(r#"[{{"column":"v","dim":{DIM},"rot_seed":7,"metric":"{metric_str}"}}]"#);
+    let json = format!(
+        r#"[{{"column":"v","dim":{},"rot_seed":7,"metric":"{metric_str}"}}]"#,
+        dim()
+    );
     VectorReader::open_with(Bytes::from(blob), &json, OpenOptions { verify_crc: true })
         .expect("open VectorReader")
 }
@@ -1566,7 +1831,7 @@ pub fn build_superfile(docs: &[String], vectors: &[f32]) -> Vec<u8> {
         vec![SfVectorConfig {
             provided_centroids: None,
             column: "emb".into(),
-            dim: DIM,
+            dim: dim(),
             rot_seed: ROT_SEED,
             metric: Metric::Cosine,
             rerank_codec: bench_rerank_codec(Metric::Cosine),
@@ -1608,7 +1873,7 @@ pub fn build_superfile_with_metric(docs: &[String], vectors: &[f32], metric: Met
         vec![SfVectorConfig {
             provided_centroids: None,
             column: "emb".into(),
-            dim: DIM,
+            dim: dim(),
             rot_seed: ROT_SEED,
             metric,
             rerank_codec: bench_rerank_codec(metric),
@@ -1674,7 +1939,7 @@ mod tests {
     fn mmap_vector_corpus_opens_only_the_exact_expected_size() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("vectors.bin");
-        let values: Vec<f32> = (0..MMAP_OPEN_TEST_DOCS * DIM)
+        let values: Vec<f32> = (0..MMAP_OPEN_TEST_DOCS * dim())
             .map(|value| value as f32)
             .collect();
         let bytes: &[u8] = bytemuck::cast_slice(&values);
@@ -1682,7 +1947,7 @@ mod tests {
 
         let corpus = MmapVectorCorpus::open(&path, MMAP_OPEN_TEST_DOCS).expect("open exact corpus");
         assert_eq!(corpus.n_docs(), MMAP_OPEN_TEST_DOCS);
-        assert_eq!(corpus.dim(), DIM);
+        assert_eq!(corpus.dim(), dim());
         assert_eq!(corpus.as_slice(), values);
 
         let wrong_path = directory.path().join("wrong-size.bin");
@@ -1715,8 +1980,8 @@ mod tests {
             MMAP_RANGE_TEST_SEED,
             true,
         );
-        let start = MMAP_RANGE_TEST_START * DIM;
-        let end = full_docs * DIM;
+        let start = MMAP_RANGE_TEST_START * dim();
+        let end = full_docs * dim();
         let tail_bytes: &[u8] = bytemuck::cast_slice(tail.as_slice());
         let expected_bytes: &[u8] = bytemuck::cast_slice(&full.as_slice()[start..end]);
 
@@ -1727,12 +1992,12 @@ mod tests {
     #[test]
     fn transposed_ground_truth_matches_reference() {
         let mut rng = StdRng::seed_from_u64(GT_TEST_SEED);
-        let mut vectors = vec![0f32; GT_TEST_DOCS * DIM];
+        let mut vectors = vec![0f32; GT_TEST_DOCS * dim()];
         for v in vectors.iter_mut() {
             *v = rng.random::<f32>() - 0.5;
         }
         let queries: Vec<Vec<f32>> = (0..GT_TEST_QUERIES)
-            .map(|_| (0..DIM).map(|_| rng.random::<f32>() - 0.5).collect())
+            .map(|_| (0..dim()).map(|_| rng.random::<f32>() - 0.5).collect())
             .collect();
 
         let transposed = ground_truth(&vectors, GT_TEST_DOCS, &queries, GT_TEST_K);
@@ -1748,14 +2013,14 @@ mod tests {
     #[test]
     fn lifecycle_ground_truth_matches_three_reference_oracles() {
         let mut rng = StdRng::seed_from_u64(GT_TEST_SEED);
-        let mut vectors = vec![0f32; LIFECYCLE_GT_TEST_AUGMENTED_DOCS * DIM];
+        let mut vectors = vec![0f32; LIFECYCLE_GT_TEST_AUGMENTED_DOCS * dim()];
         for value in &mut vectors {
             *value = rng.random::<f32>() - 0.5;
         }
         let queries: Vec<Vec<f32>> = (0..GT_TEST_QUERIES)
-            .map(|_| (0..DIM).map(|_| rng.random::<f32>() - 0.5).collect())
+            .map(|_| (0..dim()).map(|_| rng.random::<f32>() - 0.5).collect())
             .collect();
-        let base_vectors = &vectors[..LIFECYCLE_GT_TEST_DOCS * DIM];
+        let base_vectors = &vectors[..LIFECYCLE_GT_TEST_DOCS * dim()];
         let base = ground_truth(base_vectors, LIFECYCLE_GT_TEST_DOCS, &queries, GT_TEST_K);
         let mut allow = RoaringBitmap::new();
         for id in (0..LIFECYCLE_GT_TEST_DOCS as u32).step_by(LIFECYCLE_GT_TEST_FILTER_KEEP_EVERY) {
@@ -1786,5 +2051,65 @@ mod tests {
         assert_eq!(combined.base, base);
         assert_eq!(combined.filtered, filtered);
         assert_eq!(combined.augmented, augmented);
+    }
+
+    /// A real corpus round-trips from the VDBBench parquet layout into the
+    /// standard mmap: row order and values preserved (modulo the requested
+    /// normalization), row-count shortfall is an error (the base-only
+    /// fallback contract), and the strided query loader samples the whole
+    /// test file.
+    #[test]
+    fn real_corpus_parquet_round_trip() {
+        use arrow_array::{ArrayRef, ListArray, types::Float32Type};
+        use parquet::arrow::ArrowWriter;
+
+        const ROWS: usize = 20;
+        const TEST_DIM: usize = 4;
+        let dir = TempDir::new().expect("fixture dir");
+        let write = |name: &str, rows: usize, offset: f32| {
+            let lists: Vec<Option<Vec<Option<f32>>>> = (0..rows)
+                .map(|r| {
+                    Some(
+                        (0..TEST_DIM)
+                            .map(|d| Some(offset + (r * TEST_DIM + d) as f32))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let emb = ListArray::from_iter_primitive::<Float32Type, _, _>(lists);
+            let batch = RecordBatch::try_from_iter(vec![("emb", Arc::new(emb) as ArrayRef)])
+                .expect("batch");
+            let file = File::create(dir.path().join(name)).expect("create parquet");
+            let mut w = ArrowWriter::try_new(file, batch.schema(), None).expect("writer");
+            w.write(&batch).expect("write");
+            w.close().expect("close");
+        };
+        write(REAL_TRAIN_FILE, ROWS, 1.0);
+        write(REAL_TEST_FILE, 10, 100.0);
+
+        assert_eq!(real_corpus_rows(dir.path()), ROWS);
+        assert_eq!(real_corpus_dim(dir.path()), TEST_DIM);
+
+        // NOTE: from_parquet sizes rows against the PROCESS dim(), which in
+        // this test process resolves to the synthetic dim — so exercise the
+        // row plumbing through emb_rows/real_queries (dim-independent) and
+        // validate from_parquet's shortfall contract, which fires before any
+        // row is read.
+        let err = match MmapVectorCorpus::from_parquet(dir.path(), ROWS + 1, false) {
+            Err(e) => e,
+            Ok(_) => panic!("row shortfall must be an error"),
+        };
+        assert!(err.to_string().contains("holds 20 rows"), "{err}");
+
+        let qs = real_queries(dir.path(), 5, false);
+        assert_eq!(qs.len(), 5);
+        assert_eq!(qs[0].len(), TEST_DIM);
+        // Strided: first query is test row 0, second is test row 2 (10/5=2).
+        assert_eq!(qs[0][0], 100.0);
+        assert_eq!(qs[1][0], 100.0 + (2 * TEST_DIM) as f32);
+        // Normalization applies per row when asked.
+        let qn = real_queries(dir.path(), 1, true);
+        let norm: f32 = qn[0].iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "normalized query norm {norm}");
     }
 }

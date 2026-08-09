@@ -51,7 +51,10 @@ const WRITE_CHUNK: usize = 65_536;
 /// Vector dimension for the SQL/hybrid arms. Matches the suite-wide corpus
 /// dimension so `vector_search` / `hybrid_search` exercise the same
 /// dimensionality the vector cell tests, not a toy size.
-pub const SQL_DIM: usize = crate::corpus::DIM;
+// The SQL tier's embedding column is a fixed-width fixture, not the vector
+// corpus: real corpora are vector-only, so this stays pinned to the
+// synthetic width regardless of INFINO_BENCH_CORPUS.
+pub const SQL_DIM: usize = crate::corpus::SYNTHETIC_DIM;
 const ROT_SEED: u64 = 7;
 
 fn fixed_list_f32(dim: usize) -> DataType {

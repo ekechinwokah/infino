@@ -1007,7 +1007,7 @@ pub mod vector {
     };
 
     use crate::{
-        corpus::{self, DIM},
+        corpus::{self, dim},
         cost,
         executors::{vector as exec_vec, vector::VectorRead},
         harness::{
@@ -1071,21 +1071,25 @@ pub mod vector {
                 // normal vector builder/reader paths; the mmap avoids pinning the
                 // synthetic source corpus as heap RAM.
                 let n = n_docs();
-                corpus::MmapVectorCorpus::generate(n, corpus::n_cent(n), CORPUS_ROT_SEED, true)
+                match corpus::corpus_source() {
+                    corpus::CorpusSource::Cohere { dir } => {
+                        corpus::MmapVectorCorpus::from_parquet(dir, n, true)
+                            .expect("load real corpus for the superfile tier")
+                    }
+                    corpus::CorpusSource::Synthetic => corpus::MmapVectorCorpus::generate(
+                        n,
+                        corpus::n_cent(n),
+                        CORPUS_ROT_SEED,
+                        true,
+                    ),
+                }
             })
             .as_slice()
     }
 
     pub fn queries_correctness() -> &'static [Vec<f32>] {
         QUERIES_CORRECTNESS.get_or_init(|| {
-            corpus::generate_realistic_queries(
-                vectors(),
-                n_docs(),
-                N_CORRECTNESS_QUERIES,
-                17,
-                true,
-                0.05,
-            )
+            corpus::bench_queries(vectors(), n_docs(), N_CORRECTNESS_QUERIES, 17, true, 0.05)
         })
     }
 
@@ -1094,14 +1098,7 @@ pub mod vector {
     // protocol against the same queries and ground truth.
     pub fn queries_calibration() -> &'static [Vec<f32>] {
         QUERIES_CALIBRATION.get_or_init(|| {
-            corpus::generate_realistic_queries(
-                vectors(),
-                n_docs(),
-                N_CALIBRATION_QUERIES,
-                99,
-                true,
-                0.05,
-            )
+            corpus::bench_queries(vectors(), n_docs(), N_CALIBRATION_QUERIES, 99, true, 0.05)
         })
     }
 
@@ -1355,8 +1352,9 @@ pub mod vector {
         report.emit(&Section {
             anchor: "bench/vector/superfile/sweep".into(),
             title: format!(
-                "Superfile vector — (p, r) sweep from ({start_p}, {start_r}) ({} docs × dim={DIM})",
+                "Superfile vector — (p, r) sweep from ({start_p}, {start_r}) ({} docs × dim={})",
                 fmt_count(n_docs),
+                dim(),
             ),
             note: format!("One build; {sweep_label}. Floor recall@{TOP_K} ≥ {floor:.2}."),
             blocks: vec![Block {
@@ -1424,7 +1422,8 @@ pub mod vector {
         let q0 = &queries_calibration()[0];
 
         eprintln!(
-            "[superfile_vec] latency compare ({}×{DIM}, q=calibration[0], {} iters/query):",
+            "[superfile_vec] latency compare ({}×{}, q=calibration[0], {} iters/query):",
+            dim(),
             fmt_count(n_docs),
             CALIBRATION_P50_ITERS,
         );
@@ -1448,7 +1447,8 @@ pub mod vector {
     pub fn run(phases: Phases) {
         let n_docs = n_docs();
         eprintln!(
-            "[superfile_vec] starting {}×{DIM} (build={}, warm={}, cold={})",
+            "[superfile_vec] starting {}×{} (build={}, warm={}, cold={})",
+            dim(),
             fmt_count(n_docs),
             phases.build,
             phases.warm,
@@ -1518,8 +1518,9 @@ pub mod vector {
                 "superfile_vec",
                 "bench/vector/superfile/search",
                 format!(
-                    "Superfile vector — search, single-superfile / in-memory ({} docs × dim={DIM})",
-                    fmt_count(n_docs)
+                    "Superfile vector — search, single-superfile / in-memory ({} docs × dim={})",
+                    fmt_count(n_docs),
+                    dim()
                 ),
                 "Warm search and cold upload reuse the measured 1-writer artifact. The `default` row is the user-facing option baseline, recall-gated; recall-target rows appear only when the calibration grid is explicitly enabled. Δ is vs the previous run.",
             );
@@ -1528,13 +1529,14 @@ pub mod vector {
                     .builds
                     .last()
                     .expect("harness records at least one build row");
-                let corpus_bytes = (n_docs * DIM) as u64 * std::mem::size_of::<f32>() as u64;
+                let corpus_bytes = (n_docs * dim()) as u64 * std::mem::size_of::<f32>() as u64;
                 super::emit_cost_warm(
                     &mut report,
                     "bench/vector/superfile/cost",
                     format!(
-                        "Superfile vector — cost model ({} docs × dim={DIM})",
-                        fmt_count(n_docs)
+                        "Superfile vector — cost model ({} docs × dim={})",
+                        fmt_count(n_docs),
+                        dim()
                     ),
                     b.wall.as_secs_f64(),
                     b.writers as u32,
@@ -1683,8 +1685,9 @@ pub mod vector {
                 report.emit(&Section {
                     anchor: "bench/vector/superfile/filtered".into(),
                     title: format!(
-                        "Superfile vector — filtered search, single-superfile / in-memory ({} docs × dim={DIM})",
-                        fmt_count(n_docs)
+                        "Superfile vector — filtered search, single-superfile / in-memory ({} docs × dim={})",
+                        fmt_count(n_docs),
+                        dim()
                     ),
                     note: "Filtered kNN ranks distance only among an allow-set of matching `local_doc_id`s (predicate pushdown). `filtered (~10%)` keeps every 10th row; recall and p50 over the correctness query battery at the requested `default` config. `effective (p, r)` is the reader's own post-selectivity-boost math (shared helper, caps included). Δ is vs the previous run.".into(),
                     blocks: vec![Block {
@@ -1757,8 +1760,10 @@ pub mod vector {
     /// correctness, warm search, and cold upload.
     fn build_warm_artifact(n_docs: usize) -> (EngineVectorResult, InfinoVectorIndex) {
         eprintln!(
-            "[superfile_vec] generating {}×{DIM} planted-cluster vector corpus...",
-            fmt_count(n_docs)
+            "[superfile_vec] preparing {}×{} {} vector corpus...",
+            fmt_count(n_docs),
+            dim(),
+            corpus::corpus_label()
         );
         let vectors = vectors();
 
@@ -1770,7 +1775,7 @@ pub mod vector {
         let (build_result, index) = run_vector_with_index::<InfinoVectorEngine>(
             VectorRunConfig {
                 column: VEC_COLUMN,
-                dim: DIM,
+                dim: dim(),
                 metric: VectorMetric::Cosine,
                 k: TOP_K,
                 iters: CALIBRATION_P50_ITERS,
@@ -1799,7 +1804,7 @@ pub mod vector {
     ) -> Vec<Vec<Cell>> {
         // Logical input payload: the raw f32 embeddings, identical across
         // every writer count (the parallel build shards the same corpus).
-        let corpus_bytes = (n_docs * DIM * size_of::<f32>()) as u64;
+        let corpus_bytes = (n_docs * dim() * size_of::<f32>()) as u64;
         let mut rows = Vec::new();
         for b in &build_result.builds {
             rows.push(build_row(
@@ -1818,8 +1823,9 @@ pub mod vector {
         report.emit(&Section {
             anchor: "bench/vector/superfile/ingest".into(),
             title: format!(
-                "Superfile vector — ingest, single-superfile / in-memory ({} docs × dim={DIM})",
-                fmt_count(n_docs)
+                "Superfile vector — ingest, single-superfile / in-memory ({} docs × dim={})",
+                fmt_count(n_docs),
+                dim()
             ),
             note: "Build path: `SuperfileBuilder` → unified `.parquet`, through `VectorEngine`. Rows are by writer count; `1 writer` is the canonical artifact used by correctness/search/cold upload. Δ is vs the previous run.".into(),
             blocks: vec![Block {

@@ -61,7 +61,7 @@ use tempfile::TempDir;
 
 use crate::{
     cold_store::{self, ColdStoreMeasurement, STEADY_COLD_SAMPLES},
-    corpus::DIM,
+    corpus::dim,
     cost, cpu,
     executors::p50,
     ingest::supertable::{self, Modality, modality_label},
@@ -882,7 +882,7 @@ pub fn run() {
         title: format!(
             "Supertable — ingest, multi-superfile / object-store ({} docs × dim={}, {} commits, {} writers)",
             fmt_count(n_docs),
-            crate::corpus::DIM,
+            crate::corpus::dim(),
             supertable::n_commits(),
             supertable::n_writers()
         ),
@@ -2689,7 +2689,7 @@ pub mod vector {
         let grid = global.grid;
         let metric = consumer.options().vector_columns[0].metric;
         let n_cells = grid.n_cent as usize;
-        let n_rows = vectors.len() / DIM;
+        let n_rows = vectors.len() / dim();
 
         let stored_total: usize = cells.iter().map(|(_, ids)| ids.len()).sum();
         let mut stored_by_dense: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -2742,8 +2742,8 @@ pub mod vector {
                         continue;
                     };
                     local_audited += 1;
-                    let start = dense * DIM;
-                    if stored.contains(&nearest_cell(&vectors[start..start + DIM])) {
+                    let start = dense * dim();
+                    if stored.contains(&nearest_cell(&vectors[start..start + dim()])) {
                         local_agree += 1;
                     }
                 }
@@ -2807,12 +2807,12 @@ pub mod vector {
                 n_cells,
             );
             for id in truth {
-                let start = *id as usize * DIM;
-                if start + DIM > vectors.len() {
+                let start = *id as usize * dim();
+                if start + dim() > vectors.len() {
                     continue;
                 }
                 total += 1;
-                let geom_rank = rank_by_cell[nearest_cell(&vectors[start..start + DIM]) as usize];
+                let geom_rank = rank_by_cell[nearest_cell(&vectors[start..start + dim()]) as usize];
                 let (stored_rank, routed_rank) = stored_by_dense
                     .get(id)
                     .map(|stored| {
@@ -2869,8 +2869,8 @@ pub mod vector {
         for (query, truth) in queries.iter().zip(ground_truth) {
             let probed = nearest_cell(query);
             for id in truth {
-                let start = *id as usize * DIM;
-                if start + DIM > vectors.len() {
+                let start = *id as usize * dim();
+                if start + dim() > vectors.len() {
                     continue;
                 }
                 if stored_by_dense
@@ -2879,7 +2879,7 @@ pub mod vector {
                 {
                     continue;
                 }
-                let neighbor = &vectors[start..start + DIM];
+                let neighbor = &vectors[start..start + dim()];
                 let own = nearest_cell(neighbor);
                 let own_score = grid.score_one(metric, own as usize, neighbor);
                 let rescue_score = grid.score_one(metric, probed as usize, neighbor);
@@ -2905,7 +2905,7 @@ pub mod vector {
         let copies: Vec<[usize; CLOSURE_RATIO_CANDIDATES.len()]> = sampled
             .par_iter()
             .map(|&row_idx| {
-                let row = &vectors[row_idx * DIM..(row_idx + 1) * DIM];
+                let row = &vectors[row_idx * dim()..(row_idx + 1) * dim()];
                 // Already ascending — `rank_cells` sorts.
                 let scores: Vec<f32> = grid
                     .rank_cells(metric, row)
@@ -3006,8 +3006,8 @@ pub mod vector {
             }
             let rank_of = rank_map(query_scores, flat_base);
             for id in truth {
-                let start = *id as usize * DIM;
-                if start + DIM > vectors.len() {
+                let start = *id as usize * dim();
+                if start + dim() > vectors.len() {
                     continue;
                 }
                 if !stored_by_dense
@@ -3017,7 +3017,7 @@ pub mod vector {
                     continue;
                 }
                 fine_total += 1;
-                let neighbor = &vectors[start..start + DIM];
+                let neighbor = &vectors[start..start + dim()];
                 let mut best_run = usize::MAX;
                 let mut best_score = f32::INFINITY;
                 let mut flat = 0usize;
@@ -3062,8 +3062,8 @@ pub mod vector {
         let mut self_top10 = 0usize;
         let mut sampled = 0usize;
         for dense in &dense_ids {
-            let start = *dense as usize * DIM;
-            if start + DIM > vectors.len() {
+            let start = *dense as usize * dim();
+            if start + dim() > vectors.len() {
                 continue;
             }
             let Some(&stable) = dense_to_id.get(dense) else {
@@ -3075,7 +3075,7 @@ pub mod vector {
                 .expect("reader")
                 .vector_search(
                     supertable::VEC_COLUMN,
-                    &vectors[start..start + DIM],
+                    &vectors[start..start + dim()],
                     TOP_K,
                     exec_vec::default_search_opts(),
                     None,
@@ -3576,7 +3576,7 @@ pub mod vector {
             format!(
                 "Supertable vector — routing state transitions ({} docs × dim={})",
                 fmt_count(n_docs),
-                DIM
+                dim()
             ),
             format!(
                 "One search configuration across the full lifecycle. Data-path assertions use cold GET classes. Recall is the same {N_CORRECTNESS_QUERIES}-query brute-force metric in every state; the follow-up commit adds {} normal rows from the corpus distribution.",
@@ -3594,7 +3594,7 @@ pub mod vector {
             format!(
                 "Supertable vector — lifecycle transitions ({} base docs × dim={})",
                 fmt_count(n_docs),
-                DIM
+                dim()
             ),
             transitions,
         );
@@ -3687,7 +3687,7 @@ pub mod vector {
                 title: format!(
                     "Supertable vector — ingest, multi-superfile / object-store ({} docs × dim={}, {} commits, {} writers)",
                     fmt_count(n_docs),
-                    DIM,
+                    dim(),
                     supertable::n_commits(),
                     supertable::n_writers()
                 ),
@@ -3746,8 +3746,8 @@ pub mod vector {
                         .vectors()
                         .expect("vector modality prepared a vector corpus")
                         .as_slice();
-                    let base_vectors = &vslice[..n_docs * DIM];
-                    let q_correct = corpus::generate_realistic_queries(
+                    let base_vectors = &vslice[..n_docs * dim()];
+                    let q_correct = corpus::bench_queries(
                         base_vectors,
                         n_docs,
                         N_CORRECTNESS_QUERIES,
@@ -3755,7 +3755,7 @@ pub mod vector {
                         true,
                         QUERY_SIGMA,
                     );
-                    let q_cal = corpus::generate_realistic_queries(
+                    let q_cal = corpus::bench_queries(
                         base_vectors,
                         n_docs,
                         N_CALIBRATION_QUERIES,
@@ -3830,7 +3830,7 @@ pub mod vector {
                 format!(
                     "Supertable vector — search {phase}, multi-superfile / object-store ({} docs × dim={})",
                     fmt_count(n_docs),
-                    DIM
+                    dim()
                 )
             };
 
@@ -4057,7 +4057,7 @@ pub mod vector {
                 {
                     report_post_drain_assignment_audit(
                         &consumer,
-                        &vectors.as_slice()[..n_docs * DIM],
+                        &vectors.as_slice()[..n_docs * dim()],
                         &q_correct,
                         &gt_correct,
                         &id_to_dense,
@@ -4257,7 +4257,7 @@ pub mod vector {
                         title: format!(
                             "Supertable vector — filtered search ({} docs × dim={})",
                             fmt_count(n_docs),
-                            DIM
+                            dim()
                         ),
                         note: format!(
                             "Filtered kNN (~10% selectivity, every {}th row). recall@{TOP_K} = {mean_recall:.3}. Δ is vs the previous run.",
@@ -4346,7 +4346,7 @@ pub mod vector {
                     .expect("vector benches always prepare a corpus")
                     .vectors()
                     .expect("vector corpus carries vectors");
-                let vslice = &primary_vectors.as_slice()[..n_docs * DIM];
+                let vslice = &primary_vectors.as_slice()[..n_docs * dim()];
                 let gt = corpus::filtered_ground_truth(vslice, &allow, &q_correct, TOP_K);
 
                 let filter = || VectorFilter {
@@ -4428,7 +4428,7 @@ pub mod vector {
                         title: format!(
                             "Supertable vector — predicate-filtered search ({} docs × dim={})",
                             fmt_count(n_docs),
-                            DIM
+                            dim()
                         ),
                         note: format!(
                             "The PUBLIC filtered path: `vector_search` with a real \
@@ -4864,7 +4864,7 @@ pub mod vector {
                     format!(
                         "Supertable vector — cost model ({} docs × dim={})",
                         fmt_count(cost_n_docs),
-                        DIM
+                        dim()
                     ),
                     &built,
                     ingest_metrics.as_ref(),
