@@ -420,6 +420,17 @@ pub struct CellRoutingParams {
     /// rerank budget stays the hard cap. `0.0` (the default, and every
     /// pre-margin manifest) disables early stopping.
     pub rerank_margin: f32,
+    /// Adaptive-width first-wave law: cells (in routing order) covering the
+    /// calibration's bulk share of exact top-k pairs. Serving probes these
+    /// first and escalates to the full `width_for_k` cap only when the
+    /// width margin cannot rule the remaining cells out. All-zero (the
+    /// default, and every pre-adaptive manifest) disables staging.
+    pub width_bulk_for_k: [u32; WIDTH_LAW_KS.len()],
+    /// Adaptive-width stop margin: the calibrated stage-coverage quantile
+    /// of `member_similarity − cell_routing_similarity` (cosine only).
+    /// `0.0` disables the escalation skip — every query probes the full
+    /// stamped width, byte-identical to pre-adaptive serving.
+    pub width_margin: f32,
 }
 
 impl Default for CellRoutingParams {
@@ -435,6 +446,8 @@ impl Default for CellRoutingParams {
             rerank_pool_cells: [RERANK_LAW_POOL_CELLS as u32; WIDTH_LAW_KS.len()],
             residual_kappa: 0.0,
             rerank_margin: 0.0,
+            width_bulk_for_k: [0; WIDTH_LAW_KS.len()],
+            width_margin: 0.0,
         }
     }
 }
@@ -1351,6 +1364,14 @@ struct CellRoutingParamsDto {
     /// (defaults to `0.0` = never stop early).
     #[serde(default)]
     rerank_margin: f32,
+    /// Adaptive-width first-wave law; absent on pre-adaptive manifests
+    /// (defaults to all-zero = staging disabled).
+    #[serde(default)]
+    width_bulk_for_k: [u32; WIDTH_LAW_KS.len()],
+    /// Adaptive-width stop margin; absent on pre-adaptive manifests
+    /// (defaults to `0.0` = never skip the escalation).
+    #[serde(default)]
+    width_margin: f32,
 }
 
 /// Serde default for [`CellRoutingParamsDto::rerank_pool_cells`]: every
@@ -1372,6 +1393,8 @@ impl From<CellRoutingParams> for CellRoutingParamsDto {
             rerank_pool_cells: r.rerank_pool_cells,
             residual_kappa: r.residual_kappa,
             rerank_margin: r.rerank_margin,
+            width_bulk_for_k: r.width_bulk_for_k,
+            width_margin: r.width_margin,
         }
     }
 }
@@ -1397,6 +1420,8 @@ impl From<CellRoutingParamsDto> for CellRoutingParams {
         r.rerank_pool_cells = d.rerank_pool_cells.map(|p| p.max(1));
         r.residual_kappa = d.residual_kappa;
         r.rerank_margin = d.rerank_margin;
+        r.width_bulk_for_k = d.width_bulk_for_k;
+        r.width_margin = d.width_margin;
         r.nprobe_max = r.nprobe_max.max(r.nprobe_min);
         r
     }
@@ -2968,6 +2993,8 @@ mod tests {
         let routing = CellRoutingParams {
             rerank_margin: 0.25,
             residual_kappa: 0.05,
+            width_bulk_for_k: [3, 7, 9, 12],
+            width_margin: 0.125,
             ..CellRoutingParams::default()
         };
         list.partition_strategy = PartitionStrategy::VectorCell {

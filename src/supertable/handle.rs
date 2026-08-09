@@ -3406,10 +3406,9 @@ mod tests {
                 .clone();
             let reader = hidden.reader().expect("hidden reader");
             let manifest = reader.manifest();
-            let routing = manifest
+            manifest
                 .vector_cell_routing()
-                .unwrap_or_else(|| panic!("{stage}: hidden manifest has routing"));
-            routing
+                .unwrap_or_else(|| panic!("{stage}: hidden manifest has routing"))
         };
         let first = hidden_routing("post-first-optimize");
         assert!(
@@ -3417,6 +3416,24 @@ mod tests {
             "post-first-optimize: cosine gap evidence must stamp a stop \
              margin, got {}",
             first.rerank_margin
+        );
+        assert!(
+            first.width_margin > 0.0,
+            "post-first-optimize: cosine gap evidence must stamp a WIDTH \
+             margin, got {}",
+            first.width_margin
+        );
+        assert!(
+            first.width_bulk_for_k.iter().any(|&w| w > 0)
+                && first
+                    .width_bulk_for_k
+                    .iter()
+                    .zip(first.width_for_k.iter())
+                    .all(|(b, w)| b <= w),
+            "post-first-optimize: the bulk width law must stamp and sit at \
+             or under the full width cap (bulk {:?}, width {:?})",
+            first.width_bulk_for_k,
+            first.width_for_k
         );
         // Force the second optimize to actually RESHAPE (append a fresh
         // hidden delta shard) so its recalibration runs — an idle second
@@ -3491,7 +3508,8 @@ mod tests {
                 .vector_cell_routing()
                 .unwrap_or_else(|| panic!("{stage}: hidden manifest has routing"))
         };
-        st.optimize(&OptimizeOptions::default()).expect("optimize 2");
+        st.optimize(&OptimizeOptions::default())
+            .expect("optimize 2");
         let second = hidden_routing("post-second-optimize");
         assert!(
             second.rerank_margin > 0.0,
@@ -3501,7 +3519,10 @@ mod tests {
             first.rerank_margin
         );
         assert!(
-            second.rerank_pool_cells.iter().all(|&p| p >= first.rerank_pool_cells[0]),
+            second
+                .rerank_pool_cells
+                .iter()
+                .all(|&p| p >= first.rerank_pool_cells[0]),
             "post-second-optimize: pool provenance must not collapse to \
              the legacy floor (first {:?}, second {:?})",
             first.rerank_pool_cells,

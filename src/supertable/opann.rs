@@ -808,6 +808,14 @@ const RERANK_LAW_EST_BINS: usize = 4096;
 const WIDTH_LAW_SAMPLE_SEED: u64 = 0x51ED_CA1B;
 /// Rows decoded per chunk while scoring a spilled cell.
 const WIDTH_LAW_SCORE_CHUNK: usize = 1024;
+/// First-wave ("bulk") width coverage: the adaptive-width serving stage
+/// probes the cells covering this share of calibration (query, member)
+/// pairs first, and escalates to the full stamped width only when the
+/// calibrated width margin cannot rule the remaining cells out. Recall is
+/// unaffected by construction — the margin gates the stop, the full width
+/// stays the cap; this quantile only positions the p50/p95 latency split.
+const WIDTH_LAW_BULK_COVERAGE: f64 = 0.9;
+
 /// Half-range of the stop-margin gap histogram. Cosine exact similarities
 /// live in `[-1, 1]` and 1-bit estimates concentrate within a few units of
 /// zero, so ±4 covers every realistic `exact − estimate` gap; anything
@@ -883,6 +891,15 @@ pub(crate) struct WidthLawCalibration {
     /// Rerank-law observation state, armed by [`Self::freeze`]; `None`
     /// (e.g. planted test fixtures) measures no rerank law.
     rerank: Option<RerankLawObservation>,
+    /// Adaptive-width gap evidence (cosine only): per observed
+    /// (query, top-k member), `member_similarity − cell_routing_similarity`
+    /// where the routing similarity is the member cell's BEST fine-centroid
+    /// similarity for that query — the exact score serving's escalation
+    /// check consults. The stage-coverage quantile of these gaps is the
+    /// width margin: serving may stop probing once no remaining cell's
+    /// routing similarity plus this margin can reach the running kth exact
+    /// score. Same bins and conservative edge read as the rerank margin.
+    width_gap_hist: Mutex<Vec<u64>>,
 }
 
 /// Streaming state for the rerank law: per query, the 1-bit-encoded query
@@ -1022,6 +1039,16 @@ pub(crate) struct CalibratedLaws {
     /// score. `0.0` = no evidence (non-cosine, or no pooled pairs) —
     /// serving never stops early.
     pub(crate) rerank_margin: f32,
+    /// Adaptive-width first-wave law: cells (routing order) covering
+    /// [`WIDTH_LAW_BULK_COVERAGE`] of exact top-k pairs — the p50-economy
+    /// stage width; `width_for_k` stays the escalation cap.
+    pub(crate) width_bulk_for_k: [u32; WIDTH_LAW_KS.len()],
+    /// Adaptive-width stop margin: the stage-coverage quantile of
+    /// `member_similarity − cell_routing_similarity` over observed pairs
+    /// (cosine only). Serving may skip the escalation once no remaining
+    /// cell's routing similarity plus this margin reaches the running kth
+    /// exact score. `0.0` = never skip.
+    pub(crate) width_margin: f32,
 }
 
 #[cfg(test)]
@@ -1118,6 +1145,7 @@ impl WidthLawCalibration {
             max_fine: AtomicU32::new(0),
             pool_cells: RERANK_LAW_POOL_CELLS,
             rerank: None,
+            width_gap_hist: Mutex::new(Vec::new()),
         }
     }
 
@@ -1472,16 +1500,17 @@ impl WidthLawCalibration {
         }
         // Candidates per cell, gathered once — observation touches only
         // rows that currently matter to some query's top-k.
-        let per_cell: HashMap<u32, Vec<(u32, i128)>> = {
+        let per_cell: HashMap<u32, Vec<(u32, i128, f32)>> = {
             let tops = self.tops.lock().unwrap_or_else(PoisonError::into_inner);
-            let mut map: HashMap<u32, Vec<(u32, i128)>> = HashMap::new();
+            let mut map: HashMap<u32, Vec<(u32, i128, f32)>> = HashMap::new();
             for (qi, cands) in tops.iter().enumerate() {
-                for &(_, cell, id, _) in cands {
-                    map.entry(cell).or_default().push((qi as u32, id));
+                for &(dist, cell, id, _) in cands {
+                    map.entry(cell).or_default().push((qi as u32, id, dist));
                 }
             }
             map
         };
+        let mut width_gaps_local: Vec<u64> = Vec::new();
         for view in views {
             let Some(cell_id) = view.cell_id else {
                 continue;
@@ -1495,17 +1524,20 @@ impl WidthLawCalibration {
             self.max_fine
                 .fetch_max(view.n_fine as u32, AtomicOrdering::Relaxed);
             // Per-query fine ranking, computed once per query that has
-            // candidates in this cell.
-            let mut rank_cache: HashMap<u32, Vec<u32>> = HashMap::new();
+            // candidates in this cell. The best fine distance rides along:
+            // it is the cell's routing similarity for this query — the
+            // score the adaptive-width escalation check consults — so the
+            // width-margin gaps are measured on serving's own scale.
+            let mut rank_cache: HashMap<u32, (Vec<u32>, f32)> = HashMap::new();
             let mut ranks = self
                 .fine_ranks
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            for &(qi, id) in cands {
+            for &(qi, id, member_dist) in cands {
                 let Some(&cluster) = view.cluster_of_stable.get(&id) else {
                     continue;
                 };
-                let rank_of = rank_cache.entry(qi).or_insert_with(|| {
+                let (rank_of, best_fine_dist) = rank_cache.entry(qi).or_insert_with(|| {
                     let q = &frozen.queries[qi as usize * self.dim..(qi as usize + 1) * self.dim];
                     // Full ranking (`k = n_fine`) through the shared
                     // row-major centroid-scan owner — identical distance
@@ -1518,14 +1550,42 @@ impl WidthLawCalibration {
                         view.dim,
                         view.n_fine,
                     );
+                    let best = ranked.first().map(|&(_, d)| d).unwrap_or(f32::MAX);
                     let mut rank_of = vec![0u32; view.n_fine];
                     for (rank, (c, _)) in ranked.iter().enumerate() {
                         rank_of[*c as usize] = rank as u32;
                     }
-                    rank_of
+                    (rank_of, best)
                 });
                 if let Some(&r) = rank_of.get(cluster as usize) {
                     ranks.insert((qi, id, cell_id), r);
+                }
+                // Width-margin gap (cosine only — the metric whose exact
+                // score and routing score share the similarity scale):
+                // member_sim − routing_sim = best_fine_dist − member_dist.
+                if self.metric == Metric::Cosine
+                    && member_dist.is_finite()
+                    && best_fine_dist.is_finite()
+                {
+                    let gap = *best_fine_dist - member_dist;
+                    if width_gaps_local.is_empty() {
+                        width_gaps_local.resize(RERANK_LAW_EST_BINS, 0);
+                    }
+                    let bin = RerankLawObservation::gap_bin(gap);
+                    width_gaps_local[bin] = width_gaps_local[bin].saturating_add(1);
+                }
+            }
+        }
+        if !width_gaps_local.is_empty() {
+            let mut gaps = self
+                .width_gap_hist
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if gaps.is_empty() {
+                *gaps = width_gaps_local;
+            } else {
+                for (a, b) in gaps.iter_mut().zip(width_gaps_local) {
+                    *a = a.saturating_add(b);
                 }
             }
         }
@@ -1545,6 +1605,13 @@ impl WidthLawCalibration {
             return None;
         }
         let n_cells = grid.n_cent as usize;
+        let width_margin = {
+            let gaps = self
+                .width_gap_hist
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            stop_margin_from_hist(&gaps)
+        };
         let tops = self
             .tops
             .into_inner()
@@ -1553,6 +1620,7 @@ impl WidthLawCalibration {
         // them, this count does not) — an over-probe, never an under-probe;
         // fresh drains, the normal calibration moment, have neither.
         let mut law = [0u32; WIDTH_LAW_KS.len()];
+        let mut bulk = [0u32; WIDTH_LAW_KS.len()];
         let mut coverage_sums: Vec<Vec<f64>> = vec![vec![0f64; n_cells]; WIDTH_LAW_KS.len()];
         // Per-query squared coverages alongside the sums: the crossing
         // rule needs the sample's own variance to know when its mean is
@@ -1703,6 +1771,14 @@ impl WidthLawCalibration {
             }) {
                 law[ki] = (rank + 1) as u32;
             }
+            // Bulk crossing: the raw-mean width covering the first-wave
+            // share of pairs. No confidence ceremony — a bulk miss
+            // escalates to the full law width instead of losing recall,
+            // so this knot prices latency, not correctness.
+            let bulk_target = WIDTH_LAW_BULK_COVERAGE * n;
+            if let Some(rank) = sums.iter().enumerate().position(|(_, &s)| s >= bulk_target) {
+                bulk[ki] = (rank + 1) as u32;
+            }
             let stage_target = LAW_STAGE_TARGET_COVERAGE * support[ki] as f64;
             if let Some(rank) = fine_sums[ki].iter().position(|&s| s >= stage_target) {
                 fine_law[ki] = (rank + 1) as u32;
@@ -1734,6 +1810,7 @@ impl WidthLawCalibration {
         // recall inversion at query time). Unmeasured points (0) stay 0; the
         // interpolator skips them.
         floor_monotone(&mut law);
+        floor_monotone(&mut bulk);
         floor_monotone(&mut fine_law);
         floor_monotone(&mut rerank_law);
         // Stop margin: the LAW_STAGE_TARGET_COVERAGE quantile of the pooled
@@ -1751,10 +1828,12 @@ impl WidthLawCalibration {
             .unwrap_or(0.0);
         (law.iter().any(|&w| w > 0)).then_some(CalibratedLaws {
             width_for_k: law,
+            width_bulk_for_k: bulk,
             fine_for_k: fine_law,
             rerank_for_k: rerank_law,
             pool_cells: self.pool_cells as u32,
             rerank_margin,
+            width_margin,
         })
     }
 }

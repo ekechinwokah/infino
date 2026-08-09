@@ -4180,6 +4180,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             for (slot, measured) in routing.width_for_k.iter_mut().zip(laws.width_for_k) {
                 *slot = (*slot).max(measured);
             }
+            for (slot, measured) in routing
+                .width_bulk_for_k
+                .iter_mut()
+                .zip(laws.width_bulk_for_k)
+            {
+                *slot = (*slot).max(measured);
+            }
             for (slot, measured) in routing.fine_for_k.iter_mut().zip(laws.fine_for_k) {
                 *slot = (*slot).max(measured);
             }
@@ -4198,12 +4205,15 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 &mut routing.rerank_for_k,
                 &routing.rerank_pool_cells,
             );
-            // Stop margin follows the same shrink discipline as the drain's
+            // Stop margins follow the same shrink discipline as the drain's
             // rerank merge: keep the LARGER (more conservative) margin — a
             // wider margin only stops later. The recalibration pass replaces
-            // it under current evidence, like the rerank law.
+            // them under current evidence, like the rerank law.
             if laws.rerank_margin > routing.rerank_margin {
                 routing.rerank_margin = laws.rerank_margin;
+            }
+            if laws.width_margin > routing.width_margin {
+                routing.width_margin = laws.width_margin;
             }
             info!(
                 "supertable drain: probe laws at k={WIDTH_LAW_KS:?}: width measured {:?} stamped {:?}; fine depth measured {:?} stamped {:?}; rerank measured {:?} stamped {:?}",
@@ -7427,6 +7437,21 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                 *slot = (*slot).max(measured);
             }
         }
+        // The bulk width follows the width law's own merge discipline —
+        // replace under current evidence, max-merge otherwise.
+        for (slot, measured) in routing
+            .width_bulk_for_k
+            .iter_mut()
+            .zip(laws.width_bulk_for_k)
+        {
+            if evidence_current {
+                if measured > 0 {
+                    *slot = measured;
+                }
+            } else {
+                *slot = (*slot).max(measured);
+            }
+        }
         // Fine depth MAX-MERGES against the live stamp, exactly as the
         // drain does: a sample that under-measures a per-stage walk must
         // never shallow a stamp the previous full measurement certified —
@@ -7469,6 +7494,9 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             if laws.rerank_margin > 0.0 {
                 routing.rerank_margin = laws.rerank_margin;
             }
+            if laws.width_margin > 0.0 {
+                routing.width_margin = laws.width_margin;
+            }
         } else {
             opann::merge_rerank_with_pools(
                 &mut routing.rerank_for_k,
@@ -7478,6 +7506,9 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             );
             if laws.rerank_margin > routing.rerank_margin {
                 routing.rerank_margin = laws.rerank_margin;
+            }
+            if laws.width_margin > routing.width_margin {
+                routing.width_margin = laws.width_margin;
             }
         }
         opann::clear_rerank_beyond_pool(
