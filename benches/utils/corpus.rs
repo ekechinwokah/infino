@@ -68,6 +68,8 @@ use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 use tempfile::TempDir;
 
+use crate::rss;
+
 // ─── Async bridge for in-memory bench helpers ─────────────────────────
 
 /// Drive an in-memory (no object-store I/O) async search to
@@ -886,6 +888,73 @@ const REAL_TEST_FILE: &str = "test.parquet";
 /// Embedding column name in both files.
 const REAL_EMB_COLUMN: &str = "emb";
 
+/// Env overriding the download base for real-corpus files. Defaults to
+/// the public bucket VDBBench itself downloads from, so the fetched
+/// bytes are identical to a VDBBench-prepared directory.
+pub const CORPUS_URL_ENV: &str = "INFINO_BENCH_CORPUS_URL";
+
+/// Public dataset bucket (VDBBench's own source of truth).
+const DEFAULT_CORPUS_URL_BASE: &str = "https://assets.zilliz.com/benchmark/";
+
+/// Resolve one real-corpus file, downloading it into `dir` when absent.
+/// The dataset slug is `dir`'s basename (the VDBBench layout:
+/// `.../cohere/cohere_medium_1m/shuffle_train.parquet`), so any dataset
+/// in that layout fetches without extra configuration. Present files
+/// are never re-downloaded or verified — a directory the caller
+/// prepared by hand is trusted as-is.
+fn real_corpus_path(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    if path.exists() {
+        return path;
+    }
+    let slug = dir.file_name().and_then(|s| s.to_str()).unwrap_or_else(|| {
+        panic!(
+            "{CORPUS_DIR_ENV}={} has no basename to use as a dataset slug",
+            dir.display()
+        )
+    });
+    let base = env::var(CORPUS_URL_ENV).unwrap_or_else(|_| DEFAULT_CORPUS_URL_BASE.to_string());
+    let url = format!("{}/{slug}/{name}", base.trim_end_matches('/'));
+    eprintln!(
+        "[corpus] {name} missing from {}; downloading {url}...",
+        dir.display()
+    );
+    std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(None)
+        .build()
+        .expect("build http client");
+    let mut resp = client
+        .get(&url)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .unwrap_or_else(|e| {
+            panic!(
+                "download {url} failed: {e}\nplace {name} in {} manually (VDBBench layout) or set {CORPUS_URL_ENV}",
+                dir.display()
+            )
+        });
+    if let Some(len) = resp.content_length() {
+        eprintln!("[corpus]   size: {}", rss::fmt_bytes(len));
+    }
+    let tmp = dir.join(format!("{name}.part"));
+    let mut out = BufWriter::new(
+        File::create(&tmp).unwrap_or_else(|e| panic!("create {}: {e}", tmp.display())),
+    );
+    std::io::copy(&mut resp, &mut out)
+        .and_then(|_| out.into_inner().map_err(|e| e.into_error())?.sync_all())
+        .unwrap_or_else(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            panic!("stream {url} to {}: {e}", tmp.display())
+        });
+    std::fs::rename(&tmp, &path).unwrap_or_else(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        panic!("finalize {}: {e}", path.display())
+    });
+    eprintln!("[corpus]   downloaded {}", path.display());
+    path
+}
+
 /// Open one parquet file's record-batch reader (VDBBench layout).
 fn parquet_batches(path: &Path) -> ParquetRecordBatchReader {
     let file = File::open(path)
@@ -898,7 +967,7 @@ fn parquet_batches(path: &Path) -> ParquetRecordBatchReader {
 /// Row count of the real corpus's train file, from parquet metadata
 /// (no data read).
 pub fn real_corpus_rows(dir: &Path) -> usize {
-    let path = dir.join(REAL_TRAIN_FILE);
+    let path = real_corpus_path(dir, REAL_TRAIN_FILE);
     let file = File::open(&path)
         .unwrap_or_else(|e| panic!("open real-corpus parquet {}: {e}", path.display()));
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -908,7 +977,7 @@ pub fn real_corpus_rows(dir: &Path) -> usize {
 
 /// Embedding width of the real corpus, from the train file's first row.
 fn real_corpus_dim(dir: &Path) -> usize {
-    let mut reader = parquet_batches(&dir.join(REAL_TRAIN_FILE));
+    let mut reader = parquet_batches(&real_corpus_path(dir, REAL_TRAIN_FILE));
     let batch = reader
         .next()
         .expect("real corpus train parquet has at least one batch")
@@ -982,7 +1051,7 @@ impl MmapVectorCorpus {
         let mut writer = BufWriter::new(File::create(&path)?);
         let dim = dim();
         let mut written = 0usize;
-        'outer: for batch in parquet_batches(&dir.join(REAL_TRAIN_FILE)) {
+        'outer: for batch in parquet_batches(&real_corpus_path(dir, REAL_TRAIN_FILE)) {
             let batch = batch.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
             for mut row in emb_rows(&batch) {
                 assert_eq!(row.len(), dim, "real corpus row width drifted mid-file");
@@ -1013,7 +1082,7 @@ impl MmapVectorCorpus {
 /// are the dataset's own.
 pub fn real_queries(dir: &Path, n_queries: usize, normalize_each: bool) -> Vec<Vec<f32>> {
     let mut all: Vec<Vec<f32>> = Vec::new();
-    for batch in parquet_batches(&dir.join(REAL_TEST_FILE)) {
+    for batch in parquet_batches(&real_corpus_path(dir, REAL_TEST_FILE)) {
         let batch = batch.expect("read test batch");
         all.extend(emb_rows(&batch));
     }
@@ -2111,5 +2180,23 @@ mod tests {
         let qn = real_queries(dir.path(), 1, true);
         let norm: f32 = qn[0].iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-5, "normalized query norm {norm}");
+    }
+
+    /// Live-network smoke for the on-demand download (ignored: needs
+    /// outbound HTTPS). Pulls only the ~3 MB test.parquet of the public
+    /// Cohere-1M dataset into an empty dir and parses it.
+    #[test]
+    #[ignore = "network: downloads test.parquet from the public dataset bucket"]
+    fn real_corpus_download_smoke() {
+        let tmp = TempDir::new().expect("tmp");
+        let dir = tmp.path().join("cohere_medium_1m");
+        let qs = real_queries(&dir, 3, true);
+        assert_eq!(qs.len(), 3);
+        assert_eq!(qs[0].len(), 768);
+        assert!(dir.join(REAL_TEST_FILE).exists());
+        assert!(
+            !dir.join(REAL_TRAIN_FILE).exists(),
+            "train must not download for queries"
+        );
     }
 }
