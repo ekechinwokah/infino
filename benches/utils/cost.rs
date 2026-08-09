@@ -27,7 +27,7 @@
 //!
 //! Local NVMe (file-backed disk-cache mmap) is treated as free.
 
-use std::{collections::HashMap, sync::OnceLock};
+use std::{collections::HashMap, env, sync::OnceLock};
 
 use crate::{
     executors::{ColdTiming, fts::FtsQueryStat, sql::QuerySets, vector::RecallRow},
@@ -59,6 +59,29 @@ const DEFAULT_STORAGE_MONTHS: f64 = 1.0;
 const BYTES_PER_GIB: f64 = (1u64 << 30) as f64;
 /// Bytes per GB (object storage is priced per decimal GB).
 const BYTES_PER_GB: f64 = 1.0e9;
+
+/// Re-price the measured ingest request cost at an assumed commit size:
+/// request work scales with commit count (uploads + manifest turns per
+/// commit), so the per-commit cost is the measured total over the measured
+/// commits, multiplied by how many commits the same corpus needs at the
+/// assumed size. Compute is deliberately NOT repriced — the fixed/variable
+/// CPU split per commit is unmeasured, and guessing it would fabricate a
+/// number.
+fn reprice_ingest_requests_at_batch(
+    ingest_req_usd: f64,
+    n_commits: u64,
+    n_docs: usize,
+    batch_docs: u64,
+) -> f64 {
+    let per_commit_req = ingest_req_usd / n_commits as f64;
+    per_commit_req * (n_docs as f64 / batch_docs as f64).ceil()
+}
+
+/// Env naming an assumed commit size (docs per commit) for the write-path
+/// sensitivity row: the ingest request leg is re-priced at that commit
+/// count while compute stays as measured. Unset (the default) renders no
+/// extra row.
+const WRITE_BATCH_DOCS_ENV: &str = "INFINO_BENCH_COST_WRITE_BATCH_DOCS";
 /// Seconds per hour.
 const SECS_PER_HOUR: f64 = 3600.0;
 /// Queries per "per-million" pricing unit.
@@ -861,6 +884,39 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
     } else {
         0.0
     };
+    // Same total, expressed per logical GB submitted — the write-volume
+    // unit that is independent of batch shape and on-disk representation.
+    let write_per_logical_gb =
+        (c.corpus_bytes > 0).then(|| write_total / (c.corpus_bytes as f64 / BYTES_PER_GB));
+    // The measured request cost amortizes over the bench's commit size;
+    // stating it keeps the batch-shape assumption out in the open.
+    let measured_commit_shape = if c.n_commits > 0 && c.n_docs > 0 {
+        format!(
+            "; measured at {} commit(s) (~{} docs/commit)",
+            c.n_commits,
+            fmt_count(c.n_docs / c.n_commits as usize)
+        )
+    } else {
+        String::new()
+    };
+    // Optional sensitivity: re-price the ingest request leg at an assumed
+    // commit size. Request work scales with commit count (uploads +
+    // manifest turns per commit); compute is held at the measured value
+    // rather than guessing a fixed/variable split. Rendered only when the
+    // env names a batch size, so default reports are unchanged.
+    let write_at_assumed_batch = env::var(WRITE_BATCH_DOCS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&b| b > 0 && c.n_commits > 0 && c.n_docs > 0)
+        .map(|batch_docs| {
+            let requests =
+                reprice_ingest_requests_at_batch(ingest_req_usd, c.n_commits, c.n_docs, batch_docs)
+                    + drain_req_usd
+                    + delta_req_usd
+                    + compaction_req_usd;
+            let total = write_compute + requests;
+            (batch_docs, total / (c.n_docs as f64 / PER_MILLION))
+        });
     // The write-compute figure is COMPLETE only if every write phase that ran
     // had its CPU sampled. An unsampled phase must read NOT METERED — the model
     // never back-fills it with a wall-clock guess (see the comment above) — so
@@ -1038,11 +1094,15 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             text(write_label),
             text(if write_compute_metered {
                 format!(
-                    "{} compute + {} requests → {} total ({}/1M docs)",
+                    "{} compute + {} requests → {} total ({}/1M docs{}{})",
                     usd(write_compute),
                     usd(write_requests),
                     usd(write_total),
                     usd(write_per_million_docs),
+                    write_per_logical_gb
+                        .map(|v| format!(", {}/logical GB written", usd(v)))
+                        .unwrap_or_default(),
+                    measured_commit_shape,
                 )
             } else {
                 // A write phase ran but its CPU wasn't sampled: show requests
@@ -1056,6 +1116,15 @@ pub fn emit(report: &mut Report, anchor: &str, title: String, c: &CellCost) {
             }),
         ],
     ];
+    if let Some((batch_docs, per_million)) = write_at_assumed_batch {
+        rate_rows.push(vec![
+            text(format!(
+                "Write path at {} docs/commit (assumed; requests re-priced, compute as measured)",
+                fmt_count(batch_docs as usize)
+            )),
+            text(format!("{}/1M docs", usd(per_million))),
+        ]);
+    }
     if query_states.is_empty() {
         rate_rows.push(vec![
             text("Warm query (marginal, binding resource)"),
@@ -3125,5 +3194,26 @@ mod tests {
         assert_eq!(fmt_share(0.593), "59.3%");
         assert_eq!(fmt_share(0.0006), "0.060%");
         assert_eq!(fmt_share(0.0), "0%");
+    }
+
+    /// The assumed-batch repricing scales the request leg with commit
+    /// count and nothing else: the measured shape re-prices to itself,
+    /// and a 10x smaller commit costs 10x the requests (ceil'd).
+    #[test]
+    fn ingest_request_repricing_scales_with_commit_count() {
+        // measured: $0.16 across 16 commits of 625K docs (10M corpus)
+        let measured = reprice_ingest_requests_at_batch(0.16, 16, 10_000_000, 625_000);
+        assert!(
+            (measured - 0.16).abs() < 1e-12,
+            "self-reprice must be identity: {measured}"
+        );
+        let tenx = reprice_ingest_requests_at_batch(0.16, 16, 10_000_000, 62_500);
+        assert!(
+            (tenx - 1.6).abs() < 1e-9,
+            "10x commits => 10x requests: {tenx}"
+        );
+        // ceil: 10M docs at 999_999/commit needs 11 commits, not 10.001
+        let ceil = reprice_ingest_requests_at_batch(0.16, 16, 10_000_000, 999_999);
+        assert!((ceil - 0.16 / 16.0 * 11.0).abs() < 1e-12, "{ceil}");
     }
 }
