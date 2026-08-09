@@ -1292,8 +1292,8 @@ mod tests {
         let a_norms = a_inp.residual_norms.clone().expect("a norms");
         let b_norms = b_inp.residual_norms.clone().expect("b norms");
 
-        let merged = merge_sq8_ivf_subsections_from_parsed(&[a_inp, b_inp])
-            .expect("residual parsed merge");
+        let merged =
+            merge_sq8_ivf_subsections_from_parsed(&[a_inp, b_inp]).expect("residual parsed merge");
         let (m_inp, m_clusters) = parsed_norms_and_clusters(&merged);
         let m_norms = m_inp
             .residual_norms

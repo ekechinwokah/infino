@@ -41,8 +41,7 @@ use crate::{
         cell_posting::{EncodedCellRow, MaterializedIvfRow, manifest_centroid_components_from_row},
         distance::{
             COSINE_DISTANCE_BASE, Metric, distance, nearest_k_centroids_bytes,
-            nearest_k_centroids_transposed, normalize,
-            relative_score_window,
+            nearest_k_centroids_transposed, normalize, relative_score_window,
         },
         kmeans::{kmeans, kmeans_pp},
         quant::BitQuantizer,
@@ -2339,12 +2338,8 @@ mod tests {
         for c in 0..N_CELLS {
             cents[c * DIM + c] = 1.0;
         }
-        let grid = ClusterCentroids::from_fp32(
-            N_CELLS as u32,
-            DIM as u32,
-            &cents,
-            vec![1; N_CELLS],
-        );
+        let grid =
+            ClusterCentroids::from_fp32(N_CELLS as u32, DIM as u32, &cents, vec![1; N_CELLS]);
         let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
         let mut queries = vec![0.0f32; N_QUERIES * DIM];
         for qi in 0..N_QUERIES {

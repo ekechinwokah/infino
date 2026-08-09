@@ -2403,8 +2403,8 @@ pub(crate) fn build_cell_subsection_from_source(
         let (scale, offset) = &quantizers[planned_block.centroid_id];
         let residual_ctx = match (&residual_rotation, &residual_quant) {
             (Some(rotation), Some(quant)) => {
-                let c = &centroids[planned_block.centroid_id * dim
-                    ..(planned_block.centroid_id + 1) * dim];
+                let c = &centroids
+                    [planned_block.centroid_id * dim..(planned_block.centroid_id + 1) * dim];
                 rotation.apply(c, &mut rot_centroid);
                 Some(ResidualPackCtx {
                     rotation,
@@ -3220,7 +3220,13 @@ pub(crate) fn alloc_ivf_subsection_with_header(
     centroids: &[f32],
 ) -> Vec<u8> {
     let mut bytes = vec![0u8; layout.total_size_before_crc];
-    write_ivf_subsection_header(&mut bytes, layout, codec_meta_size, summary_centroid, centroids);
+    write_ivf_subsection_header(
+        &mut bytes,
+        layout,
+        codec_meta_size,
+        summary_centroid,
+        centroids,
+    );
     bytes
 }
 
@@ -3500,17 +3506,31 @@ mod tests {
         let stable_ids_bytes = N_DOCS * format::vec::STABLE_ID_BYTES;
 
         let raw = IvfSubsectionLayout::compute(
-            DIM, N_CENT, N_DOCS, per_cluster_stride, codec_meta_size, stable_ids_bytes, false,
+            DIM,
+            N_CENT,
+            N_DOCS,
+            per_cluster_stride,
+            codec_meta_size,
+            stable_ids_bytes,
+            false,
         );
         let res = IvfSubsectionLayout::compute(
-            DIM, N_CENT, N_DOCS, per_cluster_stride, codec_meta_size, stable_ids_bytes, true,
+            DIM,
+            N_CENT,
+            N_DOCS,
+            per_cluster_stride,
+            codec_meta_size,
+            stable_ids_bytes,
+            true,
         );
 
         // Residual region present only in the residual layout, sized n_docs·4,
         // and it pushes the stable-id region + blocks down by exactly that.
         assert_eq!(raw.residual_norms_off, None);
         let raw_ids_off = raw.stable_ids_off.expect("raw layout has an id region");
-        let res_ids_off = res.stable_ids_off.expect("residual layout has an id region");
+        let res_ids_off = res
+            .stable_ids_off
+            .expect("residual layout has an id region");
         assert_eq!(res.residual_norms_off, Some(raw_ids_off));
         assert_eq!(res_ids_off - raw_ids_off, N_DOCS * 4);
         assert_eq!(
@@ -3534,7 +3554,11 @@ mod tests {
         assert_eq!(ver(&res_bytes), format::vec::SUBSECTION_VERSION_RESIDUAL);
         assert_eq!(flag(&res_bytes), 1);
         assert_eq!(ver(&raw_bytes), format::vec::SUBSECTION_VERSION);
-        assert_eq!(flag(&raw_bytes), 0, "raw layout leaves the reserved flag zero");
+        assert_eq!(
+            flag(&raw_bytes),
+            0,
+            "raw layout leaves the reserved flag zero"
+        );
         // The κ slot [28..32] stays reserved-zero in both.
         assert_eq!(u32_at(&res_bytes, 28), 0);
         assert_eq!(u32_at(&raw_bytes, 28), 0);
@@ -4311,7 +4335,8 @@ mod tests {
                     &mut expected_code,
                 );
                 assert_eq!(
-                    stored_code, &expected_code[..],
+                    stored_code,
+                    &expected_code[..],
                     "cluster {c} row {i}: stored code must be the residual signs"
                 );
                 let norm_off = residual_norms_off + (doc_off + i) * 4;

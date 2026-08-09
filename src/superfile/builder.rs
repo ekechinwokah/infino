@@ -913,9 +913,9 @@ impl SuperfileBuilder {
         // residual config; the pack core re-derives every code from the
         // payload, so raw inputs re-encode correctly under it.
         let any_residual = readers.iter().any(|(reader, _)| {
-            reader.vec().is_some_and(|v| {
-                v.vector_columns_config().any(|cell| cell.residual_codes())
-            })
+            reader
+                .vec()
+                .is_some_and(|v| v.vector_columns_config().any(|cell| cell.residual_codes()))
         });
         let vec_cfg = builder_opts
             .vector_columns
@@ -1040,8 +1040,7 @@ impl SuperfileBuilder {
                 // which re-encodes every row under `any_residual`.
                 let same_shape = sources.windows(2).all(|pair| {
                     pair[0].2.n_cent == pair[1].2.n_cent
-                        && pair[0].2.residual_norms.is_some()
-                            == pair[1].2.residual_norms.is_some()
+                        && pair[0].2.residual_norms.is_some() == pair[1].2.residual_norms.is_some()
                 });
                 if same_shape {
                     let mut inputs: Vec<Sq8IvfMergeInput> =

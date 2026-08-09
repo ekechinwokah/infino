@@ -1140,15 +1140,16 @@ impl VectorReader {
             } else {
                 0
             };
-            let stable_ids_region_bytes = region_gap.checked_sub(residual_norms_bytes).ok_or_else(
-                || {
-                    VectorError::Read(ReadError::MalformedVersion(format!(
-                        "column '{}' region gap {region_gap} smaller than the residual-norm \
+            let stable_ids_region_bytes =
+                region_gap
+                    .checked_sub(residual_norms_bytes)
+                    .ok_or_else(|| {
+                        VectorError::Read(ReadError::MalformedVersion(format!(
+                            "column '{}' region gap {region_gap} smaller than the residual-norm \
                          region {residual_norms_bytes}",
-                        cfg.column
-                    )))
-                },
-            )?;
+                            cfg.column
+                        )))
+                    })?;
             let residual_norms_off = residual_codes.then_some(preceding_end);
             let stable_ids_start = preceding_end + residual_norms_bytes;
             // The stable-`_id` region, when present, is exactly one i128 per doc.
@@ -1811,11 +1812,13 @@ impl VectorReader {
             0
         };
         let stable_ids_region_bytes =
-            region_gap.checked_sub(residual_norms_bytes).ok_or_else(|| {
-                VectorError::Read(ReadError::MalformedVersion(
-                    "cell subsection region gap smaller than the residual-norm region".into(),
-                ))
-            })?;
+            region_gap
+                .checked_sub(residual_norms_bytes)
+                .ok_or_else(|| {
+                    VectorError::Read(ReadError::MalformedVersion(
+                        "cell subsection region gap smaller than the residual-norm region".into(),
+                    ))
+                })?;
         let residual_norms_off = residual_codes.then_some(preceding_end);
         let stable_ids_start = preceding_end + residual_norms_bytes;
         let expected_stable_ids_bytes = (col_n_docs as usize) * format::vec::STABLE_ID_BYTES;
@@ -3957,8 +3960,8 @@ impl VectorReader {
         };
         let sub = col.subsection_range.start;
         let norms_range = sub + norms_off..sub + norms_off + col.n_docs as usize * 4;
-        let cent_range = sub + col.centroids_off
-            ..sub + col.centroids_off + col.n_cent as usize * col.dim * 4;
+        let cent_range =
+            sub + col.centroids_off..sub + col.centroids_off + col.n_cent as usize * col.dim * 4;
         let norms = match self.source.try_get_range_sync(norms_range.clone()) {
             Some(b) => b,
             None => self
@@ -4574,8 +4577,7 @@ impl ClusterResidual {
         let start = pos_base as usize * 4;
         let bytes = &self.norms[start..start + live * 4];
         for (score, norm_bytes) in scores[..live].iter_mut().zip(bytes.chunks_exact(4)) {
-            let norm =
-                f32::from_le_bytes(norm_bytes.try_into().expect("4-byte residual norm"));
+            let norm = f32::from_le_bytes(norm_bytes.try_into().expect("4-byte residual norm"));
             *score = self.q_dot + self.kappa * norm * *score;
         }
     }
@@ -4750,9 +4752,8 @@ async fn scan_shortlist(
                     for (j, (&(c, off, cnt), block)) in
                         meta_chunk.iter().zip(block_chunk.iter()).enumerate()
                     {
-                        let cluster_residual = residuals_owned
-                            .as_ref()
-                            .map(|v| &v[chunk_idx * chunk + j]);
+                        let cluster_residual =
+                            residuals_owned.as_ref().map(|v| &v[chunk_idx * chunk + j]);
                         let codes_len = (cnt as usize) * cb;
                         let doc_ids = block.slice(codes_len..codes_len + (cnt as usize) * 4);
                         let codes = block.slice(0..codes_len);

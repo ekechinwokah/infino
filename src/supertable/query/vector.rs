@@ -92,10 +92,10 @@ use super::{
     prune::{PruneLeaf, select_superfiles},
 };
 pub use crate::superfile::reader::VectorSearchOptions;
-#[cfg(feature = "test-helpers")]
-use crate::test_helpers::{admit_trace, served_shortlist_probe};
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::test_helpers::stop_band_floor_override;
+#[cfg(feature = "test-helpers")]
+use crate::test_helpers::{admit_trace, served_shortlist_probe};
 use crate::{
     config,
     runtime_bridge::run_on_pool,
@@ -2716,8 +2716,7 @@ impl SupertableReader {
                         // Actual winner rows; their planned ranges were
                         // priced canonically above, from the budget these
                         // winners were selected under.
-                        let rows: u64 =
-                            rerank_units.iter().map(|(_, sel)| sel.len() as u64).sum();
+                        let rows: u64 = rerank_units.iter().map(|(_, sel)| sel.len() as u64).sum();
                         stats.add_vector_rows_reranked(rows);
                     }
                     per_superfile.extend(
