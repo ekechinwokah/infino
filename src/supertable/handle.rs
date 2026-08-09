@@ -3306,7 +3306,7 @@ mod tests {
             None,
         );
         let batch = arrow_array::RecordBatch::try_new(
-            schema,
+            schema.clone(),
             vec![
                 Arc::new(titles) as Arc<dyn Array>,
                 Arc::new(fsl) as Arc<dyn Array>,
@@ -3391,6 +3391,122 @@ mod tests {
         // the splice/merge norm carry-through).
         st.optimize(&OptimizeOptions::default()).expect("optimize");
         assert_all_hidden_cells_residual("post-optimize");
+
+        // The stop margin and the rerank pool provenance must SURVIVE
+        // repeated optimizes: the 10M reproduction showed a re-optimize
+        // stamping margin 0.0 and the pool collapsed to the legacy floor
+        // — silently disabling adaptive stopping and invalidating the
+        // budget's provenance on every maintenance cycle.
+        let hidden_routing = |stage: &str| {
+            let hidden = st
+                .reader()
+                .expect("reader")
+                .vector_index_table()
+                .expect("hidden index")
+                .clone();
+            let reader = hidden.reader().expect("hidden reader");
+            let manifest = reader.manifest();
+            let routing = manifest
+                .vector_cell_routing()
+                .unwrap_or_else(|| panic!("{stage}: hidden manifest has routing"));
+            routing
+        };
+        let first = hidden_routing("post-first-optimize");
+        assert!(
+            first.rerank_margin > 0.0,
+            "post-first-optimize: cosine gap evidence must stamp a stop \
+             margin, got {}",
+            first.rerank_margin
+        );
+        // Force the second optimize to actually RESHAPE (append a fresh
+        // hidden delta shard) so its recalibration runs — an idle second
+        // optimize skips the restamp and the margin survives trivially.
+        let titles3 = LargeStringArray::from(vec!["i", "j", "k", "l"]);
+        let mut flat3 = vec![0.0f32; ROWS * dim];
+        for row in 0..ROWS {
+            flat3[row * dim + row] = 0.7;
+            flat3[row * dim + (row + 8) % dim] = 0.7;
+        }
+        let fsl3 = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+            Arc::new(Float32Array::from(flat3)),
+            None,
+        );
+        let batch3 = arrow_array::RecordBatch::try_new(
+            st.options().schema.clone(),
+            vec![
+                Arc::new(titles3) as Arc<dyn Array>,
+                Arc::new(fsl3) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch3");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch3).expect("append 3");
+        w.commit().expect("commit 3");
+        drop(w);
+        // The 10M reproduction lost the margin on a REOPENED handle (a
+        // fresh process re-running optimize), not the create-era handle —
+        // the split-visibility bug's exact divergence class. Reopen before
+        // the second optimize.
+        drop(st);
+        let st = Supertable::open(
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig {
+                    column: "title".into(),
+                    positions: false,
+                }],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim,
+                    rot_seed: 7,
+                    metric: Metric::Cosine,
+                    rerank_codec: RerankCodec::Sq8Residual,
+                    provided_centroids: None,
+                    residual_codes: false,
+                }],
+                Some(crate::test_helpers::default_tokenizer()),
+            )
+            .expect("valid options")
+            .with_storage(Arc::clone(&storage))
+            .with_writer_pool(Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .expect("pool"),
+            )),
+        )
+        .expect("reopen before second optimize");
+        let hidden_routing = |stage: &str| {
+            let hidden = st
+                .reader()
+                .expect("reader")
+                .vector_index_table()
+                .expect("hidden index")
+                .clone();
+            let reader = hidden.reader().expect("hidden reader");
+            let manifest = reader.manifest();
+            manifest
+                .vector_cell_routing()
+                .unwrap_or_else(|| panic!("{stage}: hidden manifest has routing"))
+        };
+        st.optimize(&OptimizeOptions::default()).expect("optimize 2");
+        let second = hidden_routing("post-second-optimize");
+        assert!(
+            second.rerank_margin > 0.0,
+            "post-second-optimize: the stop margin must survive a \
+             re-optimize (got {}; first stamped {})",
+            second.rerank_margin,
+            first.rerank_margin
+        );
+        assert!(
+            second.rerank_pool_cells.iter().all(|&p| p >= first.rerank_pool_cells[0]),
+            "post-second-optimize: pool provenance must not collapse to \
+             the legacy floor (first {:?}, second {:?})",
+            first.rerank_pool_cells,
+            second.rerank_pool_cells
+        );
     }
 
     /// After a splice drain into the hidden vector index, the reader's derived-
