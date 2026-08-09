@@ -3157,7 +3157,7 @@ impl VectorReader {
             budget: None,
         };
         // Superfile-tier direct API: no collector at this layer, ns dropped.
-        let residual_ctx = self.residual_scan_ctx(col).await?;
+        let residual_ctx = self.residual_scan_ctx(col, query).await?;
         let (outcome, _scan_kernel_ns) = build_shortlist(
             col,
             cb,
@@ -3693,7 +3693,7 @@ impl VectorReader {
                         budget,
                     };
                     let coarse_limit = k.saturating_mul(rerank_mult);
-                    let residual_ctx = self.residual_scan_ctx(col).await?;
+                    let residual_ctx = self.residual_scan_ctx(col, query).await?;
                     let (shortlist, scan_kernel_ns) = scan_shortlist(
                         col,
                         cb,
@@ -3950,6 +3950,7 @@ impl VectorReader {
     async fn residual_scan_ctx(
         &self,
         col: &ColumnReader,
+        query: &[f32],
     ) -> Result<Option<ResidualScanCtx>, VectorError> {
         let Some(norms_off) = col.residual_norms_off else {
             return Ok(None);
@@ -3978,6 +3979,7 @@ impl VectorReader {
             centroids,
             norms,
             kappa: BitQuantizer::residual_kappa_analytic(col.dim),
+            q: query.to_vec(),
         }))
     }
 
@@ -4102,7 +4104,7 @@ impl VectorReader {
         // RaBitQ heap; survivor_fetch = warm/cold full-row gather; rerank =
         // Sq8/fp32 refine. Concurrent fan-out units each emit their own spans.
         let shortlist_t0 = io_counters::phase_start();
-        let residual_ctx = self.residual_scan_ctx(col).await?;
+        let residual_ctx = self.residual_scan_ctx(col, query).await?;
         let (outcome, scan_kernel_ns) = build_shortlist(
             col,
             cb,
@@ -4508,11 +4510,16 @@ struct ResidualScanCtx {
     centroids: Bytes,
     norms: Bytes,
     kappa: f32,
+    /// The pre-rotation query (the vector whose rotation the scan ranks
+    /// with): `q·c` resolves as a raw dot against each probed centroid.
+    q: Vec<f32>,
 }
 
 /// One probed cluster's resolved residual context: the exact
-/// `q·c_cluster` (computed as `q_rot·rot(c)` — the rotation is
-/// orthonormal), κ, and the norm region indexed by the row's absolute
+/// `q·c_cluster` (a raw dot — the rotation is orthonormal, so
+/// `q_rot·rot(c) ≡ q·c`, and rotating every probed fine centroid per
+/// query cost ~7K structured rotations per 10M-scale probe), κ, and the
+/// norm region indexed by the row's absolute
 /// cluster-order position. The scan estimate becomes
 /// `q_dot + κ·‖r‖·sign_dot` — the estimator the residual codes were
 /// built for; raw sign-dot on residual codes would rank garbage.
@@ -4525,16 +4532,15 @@ struct ClusterResidual {
 impl ClusterResidual {
     /// Resolve one cluster's context: slice its raw centroid, rotate,
     /// and dot with the rotated query.
-    fn resolve(ctx: &ResidualScanCtx, col: &ColumnReader, cluster: usize, q_rot: &[f32]) -> Self {
+    fn resolve(ctx: &ResidualScanCtx, col: &ColumnReader, cluster: usize) -> Self {
         let dim = col.dim;
         let raw = &ctx.centroids[cluster * dim * 4..(cluster + 1) * dim * 4];
-        let mut c = vec![0.0f32; dim];
-        for (slot, b) in c.iter_mut().zip(raw.chunks_exact(4)) {
-            *slot = f32::from_le_bytes(b.try_into().expect("4-byte centroid component"));
-        }
-        let mut c_rot = vec![0.0f32; dim];
-        col.rot.apply(&c, &mut c_rot);
-        let q_dot = q_rot.iter().zip(&c_rot).map(|(a, b)| a * b).sum();
+        let q_dot = ctx
+            .q
+            .iter()
+            .zip(raw.chunks_exact(4))
+            .map(|(q, b)| q * f32::from_le_bytes(b.try_into().expect("4-byte centroid component")))
+            .sum();
         Self {
             q_dot,
             kappa: ctx.kappa,
@@ -4554,6 +4560,25 @@ impl ClusterResidual {
         );
         self.q_dot + self.kappa * norm * sign_dot
     }
+
+    /// Block form of [`Self::estimate`] for the LUT scan: one block's rows
+    /// sit at consecutive cluster-order positions, so their norms are one
+    /// contiguous f32-le run — stream it and fold the affine over the
+    /// whole score vector in a single auto-vectorizable pass. The per-lane
+    /// scalar lookup this replaces sat inside the scan's push loop and
+    /// cost ~10 ns/row — a flat ~+12 ms/query across every budget on
+    /// Cohere-10M-scale scans (~1.1M rows/query), erasing the residual
+    /// feature's budget win at serve time.
+    #[inline]
+    fn estimate_block(&self, pos_base: u32, live: usize, scores: &mut [f32; LUT_BLOCK_ROWS]) {
+        let start = pos_base as usize * 4;
+        let bytes = &self.norms[start..start + live * 4];
+        for (score, norm_bytes) in scores[..live].iter_mut().zip(bytes.chunks_exact(4)) {
+            let norm =
+                f32::from_le_bytes(norm_bytes.try_into().expect("4-byte residual norm"));
+            *score = self.q_dot + self.kappa * norm * *score;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4570,6 +4595,19 @@ fn scan_cluster_transposed(
 ) {
     for_each_code_block_scores(transposed, cb, lut, |base_r, scores| {
         let live = cnt.saturating_sub(base_r).min(LUT_BLOCK_ROWS);
+        // Residual affine over the WHOLE block before the push loop — the
+        // per-lane scalar `estimate` here was the hidden serve-time tax
+        // (see `estimate_block`). One 128-byte copy per block buys a
+        // streamed, vectorizable pass.
+        let mut adjusted: [f32; LUT_BLOCK_ROWS];
+        let scores: &[f32; LUT_BLOCK_ROWS] = match residual {
+            Some(res) => {
+                adjusted = *scores;
+                res.estimate_block(off + base_r as u32, live, &mut adjusted);
+                &adjusted
+            }
+            None => scores,
+        };
         for (lane, &est) in scores.iter().enumerate().take(live) {
             let rr = base_r + lane;
             let did = u32::from_le_bytes(
@@ -4578,10 +4616,6 @@ fn scan_cluster_transposed(
                     .expect("4-byte doc id"),
             );
             let pos = off + rr as u32;
-            let est = match residual {
-                Some(res) => res.estimate(pos, est),
-                None => est,
-            };
             acc.push((did, est, pos, cluster_id));
         }
     });
@@ -4626,7 +4660,7 @@ async fn scan_shortlist(
         Arc::new(
             cluster_meta
                 .iter()
-                .map(|&(c, _, _)| ClusterResidual::resolve(r, col, c, ctx.q_rot))
+                .map(|&(c, _, _)| ClusterResidual::resolve(r, col, c))
                 .collect(),
         )
     });
