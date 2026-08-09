@@ -253,6 +253,16 @@ impl VectorConfig {
         self
     }
 
+    /// Store 1-bit codes as subsection-centroid residuals (subsection v3).
+    /// Requires a payload-carrying (`writes_full`) rerank codec; the cell
+    /// pack re-derives every code from the payload, so rebuilds from any
+    /// input generation land on this setting.
+    #[must_use]
+    pub fn with_residual_codes(mut self, residual: bool) -> Self {
+        self.residual_codes = residual;
+        self
+    }
+
     /// Partition against caller-supplied global centroids instead of
     /// local k-means. See [`Self::provided_centroids`].
     #[must_use]
@@ -3416,12 +3426,10 @@ mod tests {
         const DIM: usize = 8;
         const N_CENT: usize = 3;
         const N_DOCS: usize = 40;
-        const STRIDE: usize = 4 + 4 + 0; // code_bytes(ceil 8/8=1)... use explicit below
         let code_bytes = DIM.div_ceil(8);
         let per_cluster_stride = code_bytes + format::vec::DOC_ID_BYTES;
         let codec_meta_size = 0;
         let stable_ids_bytes = N_DOCS * format::vec::STABLE_ID_BYTES;
-        let _ = STRIDE;
 
         let raw = IvfSubsectionLayout::compute(
             DIM, N_CENT, N_DOCS, per_cluster_stride, codec_meta_size, stable_ids_bytes, false,
@@ -3433,11 +3441,10 @@ mod tests {
         // Residual region present only in the residual layout, sized n_docs·4,
         // and it pushes the stable-id region + blocks down by exactly that.
         assert_eq!(raw.residual_norms_off, None);
-        assert_eq!(res.residual_norms_off, Some(raw.stable_ids_off.unwrap()));
-        assert_eq!(
-            res.stable_ids_off.unwrap() - raw.stable_ids_off.unwrap(),
-            N_DOCS * 4
-        );
+        let raw_ids_off = raw.stable_ids_off.expect("raw layout has an id region");
+        let res_ids_off = res.stable_ids_off.expect("residual layout has an id region");
+        assert_eq!(res.residual_norms_off, Some(raw_ids_off));
+        assert_eq!(res_ids_off - raw_ids_off, N_DOCS * 4);
         assert_eq!(
             res.total_size_before_crc - raw.total_size_before_crc,
             N_DOCS * 4
@@ -3452,7 +3459,8 @@ mod tests {
         let raw_bytes =
             alloc_ivf_subsection_with_header(&raw, codec_meta_size, &summary, &centroids);
 
-        let u32_at = |b: &[u8], off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+        let u32_at =
+            |b: &[u8], off: usize| u32::from_le_bytes(b[off..off + 4].try_into().expect("4 bytes"));
         let ver = |b: &[u8]| u32_at(b, sub_hdr::VERSION_OFF);
         let flag = |b: &[u8]| u32_at(b, sub_hdr::RESIDUAL_FLAG_OFF);
         assert_eq!(ver(&res_bytes), format::vec::SUBSECTION_VERSION_RESIDUAL);
@@ -4157,8 +4165,10 @@ mod tests {
         let bytes = &sub.bytes;
 
         // Header: version 3 + flag set.
-        let u32_at = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-        let u64_at = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+        let u32_at =
+            |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().expect("4 bytes"));
+        let u64_at =
+            |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().expect("8 bytes"));
         assert_eq!(
             u32_at(sub_hdr::VERSION_OFF),
             format::vec::SUBSECTION_VERSION_RESIDUAL
@@ -4198,7 +4208,7 @@ mod tests {
             let centroid: Vec<f32> = bytes
                 [centroids_off + c * dim * 4..centroids_off + (c + 1) * dim * 4]
                 .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .map(|b| f32::from_le_bytes(b.try_into().expect("4 bytes")))
                 .collect();
             rotation.apply(&centroid, &mut rot_centroid);
             let block_base = blocks_off + doc_off * stride;
@@ -4221,7 +4231,7 @@ mod tests {
                 );
                 let norm_off = residual_norms_off + (doc_off + i) * 4;
                 let stored_norm =
-                    f32::from_le_bytes(bytes[norm_off..norm_off + 4].try_into().unwrap());
+                    f32::from_le_bytes(bytes[norm_off..norm_off + 4].try_into().expect("4 bytes"));
                 assert!(
                     (stored_norm - expected_norm).abs() <= 1e-5 * expected_norm.max(1.0),
                     "cluster {c} row {i}: stored ‖r‖ {stored_norm} vs {expected_norm}"

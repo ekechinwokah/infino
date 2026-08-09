@@ -399,15 +399,18 @@ pub struct CellRoutingParams {
     /// surviving next to fresh wide-pool ones). Pre-provenance
     /// manifests decode to the legacy floor.
     pub rerank_pool_cells: [u32; WIDTH_LAW_KS.len()],
-    /// Residual-code scale κ: the drain-calibrated multiplier in the
-    /// 1-bit estimator `est = q·c_cell + κ·‖r‖·sign_dot`, applied when a
-    /// column's codes are cell-centroid residuals (subsection version 3).
-    /// Table-global and calibrated *after* the immutable superfile bytes
-    /// are written, so it lives here — not in the subsection header — and
-    /// is refreshed by the same recalibration that restamps the probe
-    /// laws. `0.0` means "no residual calibration" (raw-code tables, or a
-    /// residual table not yet calibrated); the estimator falls back to the
-    /// raw sign-dot when κ is `0.0`.
+    /// Residual-code scale κ: reserved slot for a drain-calibrated
+    /// multiplier in the 1-bit estimator `est = q·c_cell + κ·‖r‖·sign_dot`
+    /// (codes that are subsection-centroid residuals, subsection
+    /// version 3). Table-global and refreshable after the immutable
+    /// superfile bytes are written, which is why it lives here — not in
+    /// the subsection header. NOT yet consumed: serving and calibration
+    /// both use the analytic κ (`BitQuantizer::residual_kappa_analytic`,
+    /// within ~5% of the measured fit on real embeddings), keyed off each
+    /// column's own residual flag — so `0.0` (the default, and every
+    /// stamp so far) changes nothing. Wiring a measured override through
+    /// the query path is deliberately deferred until calibration shows
+    /// the analytic value costing budget.
     pub residual_kappa: f32,
 }
 

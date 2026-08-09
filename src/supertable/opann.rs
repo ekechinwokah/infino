@@ -808,15 +808,6 @@ const RERANK_LAW_EST_BINS: usize = 4096;
 const WIDTH_LAW_SAMPLE_SEED: u64 = 0x51ED_CA1B;
 /// Rows decoded per chunk while scoring a spilled cell.
 const WIDTH_LAW_SCORE_CHUNK: usize = 1024;
-/// Bounds for the residual estimate's histogram range: rows are unit
-/// (cosine tables), centers are means of unit rows, so `|q·c| ≤ ‖q‖` and
-/// `‖v − c‖ ≤ 2` — the residual estimate is inside
-/// `±(‖q‖·CENTER + κ·NORM·q_l1)`. Loose bounds only widen bins (rank
-/// error stays one bin's occupancy, always over-counting toward a wider
-/// law), never clip.
-const RESIDUAL_EST_CENTER_BOUND: f32 = 1.0;
-const RESIDUAL_EST_NORM_BOUND: f32 = 2.0;
-
 /// Frozen query sample: dequantized fp32 vectors + their stable ids
 /// (self-hit exclusion while scoring).
 struct WidthLawQueries {
@@ -886,11 +877,6 @@ pub(crate) struct WidthLawCalibration {
     /// Rerank-law observation state, armed by [`Self::freeze`]; `None`
     /// (e.g. planted test fixtures) measures no rerank law.
     rerank: Option<RerankLawObservation>,
-    /// The table's codes are cell/fine-centroid residuals: the rerank-law
-    /// estimate must be the serving `q·c_ref + κ·‖r‖·sign_dot`, and the
-    /// histogram range widens accordingly. Callers then pass the per-call
-    /// [`ResidualRef`] into the score paths.
-    residual: bool,
 }
 
 /// Streaming state for the rerank law: per query, the 1-bit-encoded query
@@ -901,16 +887,13 @@ pub(crate) struct WidthLawCalibration {
 /// [`finish`]: WidthLawCalibration::finish
 /// Reference centers for residual-coded rows during calibration: the
 /// estimate the scan serves is `q·c_ref + κ·‖r‖·sign_dot`, so calibration
-/// must histogram THAT quantity, not the raw sign-dot. Which center a
-/// row's stored code was taken against depends on provenance:
-/// drain-spill rows come from incoming shards whose clusters ARE grid
-/// cells (one centroid per call); packed-cell rows carry fine-cluster
-/// residuals (`row.cluster` is the fine ordinal into that cell's
-/// centroid table). `None` at the call sites = raw codes, the exact
-/// pre-residual arithmetic.
+/// must histogram THAT quantity, not the raw sign-dot. Only packed cells
+/// carry residual codes (`row.cluster` is the fine ordinal into that
+/// cell's own centroid table); drain spills are user-table rows — raw
+/// codes always — and score with `None`, the exact pre-residual
+/// arithmetic (a spill-time reference is impossible in principle: the
+/// serving centers are the fine centroids the pack has not trained yet).
 pub(crate) enum ResidualRef<'a> {
-    /// One grid-cell centroid for every row of the call (drain spills).
-    Cell(&'a [f32]),
     /// Fine centroids (`n_fine × dim`), indexed by `row.cluster`
     /// (packed-cell rows).
     Fine(&'a [f32]),
@@ -920,7 +903,6 @@ impl ResidualRef<'_> {
     /// The reference center for one row.
     fn center(&self, row: &MaterializedIvfRow, dim: usize) -> &[f32] {
         match self {
-            Self::Cell(c) => c,
             Self::Fine(table) => {
                 let c = row.cluster as usize;
                 &table[c * dim..(c + 1) * dim]
@@ -935,13 +917,16 @@ struct RerankLawObservation {
     q_rot: Vec<f32>,
     /// Per query `Σ q_rot[d]` — the estimator's per-query identity term.
     q_total: Vec<f32>,
-    /// Per query `Σ |q_rot[d]|` — the raw sign-dot's exact range.
+    /// Per query `Σ |q_rot[d]|` — the histogram half-range, uniform across
+    /// raw and residual codes so mixed-generation estimates bin on one
+    /// scale. Raw sign-dots span `[-l1, +l1]` exactly. Residual estimates
+    /// (`q·c_ref + κ·‖r‖·sign_dot`) are bounded by `‖q‖₂ + 2κ·l1`
+    /// (unit-ish centers, `‖r‖ ≤ 2`, `|sign_dot| ≤ l1`), so with
+    /// `‖q‖₂ ≤ l1` they overshoot ±l1 by at most `2κ·l1 ≈ 0.09·l1`
+    /// (κ ≈ 0.045 at dim 768) — that sliver clamps into the edge bins,
+    /// and edge clamping only over-counts a candidate's rank toward a
+    /// WIDER (safer) law.
     q_l1: Vec<f32>,
-    /// Per query histogram half-range. Raw codes: `q_l1` (the sign-dot's
-    /// exact range). Residual codes: `|q·c| + κ·‖r‖·|sd|` is bounded by
-    /// `q_norm·CENTER_NORM_MAX + κ·RESIDUAL_NORM_MAX·q_l1`, so the full
-    /// estimate bins linearly over that.
-    bin_range: Vec<f32>,
     /// Per query: ascending cell ids of its `RERANK_LAW_POOL_CELLS`
     /// grid-nearest cells.
     pools: Vec<Vec<u32>>,
@@ -956,7 +941,7 @@ impl RerankLawObservation {
     /// Histogram bin for `est` under this query's `[-l1, +l1]` range;
     /// bin 0 holds the best (largest) estimates.
     fn bin(&self, qi: usize, est: f32) -> usize {
-        let range = self.bin_range[qi];
+        let range = self.q_l1[qi];
         if range <= 0.0 {
             return RERANK_LAW_EST_BINS - 1;
         }
@@ -1061,8 +1046,7 @@ fn floor_monotone(law: &mut [u32; WIDTH_LAW_KS.len()]) {
 }
 
 impl WidthLawCalibration {
-    pub(crate) fn new(dim: usize, metric: Metric, residual: bool) -> Self {
-        let _ = &residual;
+    pub(crate) fn new(dim: usize, metric: Metric) -> Self {
         Self {
             dim,
             metric,
@@ -1075,7 +1059,6 @@ impl WidthLawCalibration {
             max_fine: AtomicU32::new(0),
             pool_cells: RERANK_LAW_POOL_CELLS,
             rerank: None,
-            residual,
         }
     }
 
@@ -1114,21 +1097,13 @@ impl WidthLawCalibration {
             let mut q_rot = vec![0f32; n_queries * self.dim];
             let mut q_total = Vec::with_capacity(n_queries);
             let mut q_l1 = Vec::with_capacity(n_queries);
-            let mut bin_range = Vec::with_capacity(n_queries);
             let mut pools = Vec::with_capacity(n_queries);
-            let kappa = BitQuantizer::residual_kappa_analytic(self.dim);
             for (qi, q) in queries.chunks_exact(self.dim).enumerate() {
                 let out = &mut q_rot[qi * self.dim..(qi + 1) * self.dim];
                 rotation.apply(q, out);
                 let l1: f32 = out.iter().map(|v| v.abs()).sum();
                 q_total.push(out.iter().sum());
                 q_l1.push(l1);
-                bin_range.push(if self.residual {
-                    let q_norm = q.iter().map(|v| v * v).sum::<f32>().sqrt();
-                    q_norm * RESIDUAL_EST_CENTER_BOUND + kappa * RESIDUAL_EST_NORM_BOUND * l1
-                } else {
-                    l1
-                });
                 let mut pool: Vec<u32> = grid
                     .rank_cells(self.metric, q)
                     .into_iter()
@@ -1143,7 +1118,6 @@ impl WidthLawCalibration {
                 q_rot,
                 q_total,
                 q_l1,
-                bin_range,
                 pools,
                 hist: Mutex::new(vec![Vec::new(); n_queries]),
             });
@@ -1296,9 +1270,8 @@ impl WidthLawCalibration {
         let k_max = WIDTH_LAW_MAX_K;
         let rl = self.rerank.as_ref();
         let kappa = BitQuantizer::residual_kappa_analytic(self.dim);
-        // Exact `q·c_ref` per (query, reference center), cached across rows —
-        // the residual estimate's center term (`u32::MAX` keys the single
-        // Cell center).
+        // Exact `q·c_ref` per (query, fine cluster), cached across rows —
+        // the residual estimate's center term.
         let mut cref_dots: HashMap<(usize, u32), f32> = HashMap::new();
         let mut est_of = vec![f32::NEG_INFINITY; frozen.ids.len()];
         for row in rows {
@@ -1314,11 +1287,7 @@ impl WidthLawCalibration {
                     .map(|(v, c)| (v - c) * (v - c))
                     .sum::<f32>()
                     .sqrt();
-                let key = match rref {
-                    ResidualRef::Cell(_) => u32::MAX,
-                    ResidualRef::Fine(_) => row.cluster,
-                };
-                (r_norm, key)
+                (r_norm, row.cluster)
             });
             if let Some(rl) = rl
                 && row.rabitq_code.len() == rl.quant.code_bytes()
@@ -1905,7 +1874,7 @@ mod tests {
             ],
             vec![1; 4],
         );
-        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, false);
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
         let mut query = vec![0.0f32; DIM];
         query[0] = 1.0;
         cal.frozen = Some(WidthLawQueries {
@@ -1955,7 +1924,7 @@ mod tests {
     fn depth_law_walks_fine_ranks() {
         const DIM: usize = 4;
         let grid = ClusterCentroids::from_fp32(1, DIM as u32, &[1.0, 0.0, 0.0, 0.0], vec![1; 1]);
-        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, false);
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
         let mut query = vec![0.0f32; DIM];
         query[0] = 1.0;
         cal.frozen = Some(WidthLawQueries {
@@ -2035,7 +2004,7 @@ mod tests {
     fn rerank_law_reads_survivor_budget_from_histograms() {
         const DIM: usize = 4;
         let grid = ClusterCentroids::from_fp32(1, DIM as u32, &[1.0, 0.0, 0.0, 0.0], vec![1; 1]);
-        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, false);
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
         let mut query = vec![0.0f32; DIM];
         query[0] = 1.0;
         cal.frozen = Some(WidthLawQueries {
@@ -2049,7 +2018,6 @@ mod tests {
             q_rot: vec![0.0; DIM],
             q_total: vec![0.0],
             q_l1: vec![1.0],
-            bin_range: vec![1.0],
             pools: vec![vec![0]],
             hist: Mutex::new(vec![Vec::new()]),
         };
@@ -2092,7 +2060,7 @@ mod tests {
     fn depth_law_missing_rank_is_conservative() {
         const DIM: usize = 4;
         let grid = ClusterCentroids::from_fp32(1, DIM as u32, &[1.0, 0.0, 0.0, 0.0], vec![1; 1]);
-        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, false);
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
         let mut query = vec![0.0f32; DIM];
         query[0] = 1.0;
         cal.frozen = Some(WidthLawQueries {
@@ -2152,7 +2120,7 @@ mod tests {
             ],
             vec![1; 4],
         );
-        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, false);
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
         let mut queries = vec![0.0f32; 2 * DIM];
         queries[0] = 1.0;
         queries[DIM] = 1.0;
@@ -2227,7 +2195,7 @@ mod tests {
             &cents,
             vec![1; N_CELLS],
         );
-        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, false);
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
         let mut queries = vec![0.0f32; N_QUERIES * DIM];
         for qi in 0..N_QUERIES {
             queries[qi * DIM] = 1.0;
@@ -2288,7 +2256,7 @@ mod tests {
             ],
             vec![1; 2],
         );
-        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, false);
+        let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
         let mut query = vec![0.0f32; DIM];
         query[0] = 1.0;
         cal.frozen = Some(WidthLawQueries {
@@ -2399,7 +2367,7 @@ mod tests {
         let c_ref: Vec<f32> = (0..DIM).map(|d| 0.2 + d as f32 * 0.05).collect();
 
         let run = |residual: bool| -> Vec<(f32, u32, i128, f32)> {
-            let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine, residual);
+            let mut cal = WidthLawCalibration::new(DIM, Metric::Cosine);
             let query_row = &synth_fixed_rows(DIM, 1, 200)[0];
             cal.offer(&MaterializedIvfRow {
                 local_doc_id: 0,
@@ -2420,7 +2388,9 @@ mod tests {
                     encoded,
                 })
                 .collect();
-            let rref = ResidualRef::Cell(&c_ref);
+            // A one-cluster fine table whose rows all carry `cluster: 0`,
+            // so every row's reference center is `c_ref`.
+            let rref = ResidualRef::Fine(&c_ref);
             cal.score_rows(0, &rows, residual.then_some(&rref))
                 .expect("score rows");
             let tops = cal.tops.lock().unwrap_or_else(PoisonError::into_inner);

@@ -3429,7 +3429,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         && completed_shards.is_empty()
         && local_checkpoint.spills.is_empty();
     let mut width_law = clean_uncheckpointed_drain
-        .then(|| opann::WidthLawCalibration::new(running_clusters.dim as usize, metric, false));
+        .then(|| opann::WidthLawCalibration::new(running_clusters.dim as usize, metric));
     // #512 invariant tripwire: no re-encode in this drain may saturate its
     // destination quantizer — cosine rows are unit (ingest-normalized) so
     // the fixed grid covers them, and data-derived grids are built to cover
@@ -3949,6 +3949,23 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         DrainCellSource::Rows(spill) => {
                             // Calibration reads the spill the pack pass is
                             // about to read anyway (before remove_files).
+                            // Scored RAW (`None`) even on residual tables:
+                            // spill rows are materialized USER-table rows,
+                            // and user superfiles carry whole-vector sign
+                            // codes always (residual is hidden-only) — a
+                            // residual reference here would histogram
+                            // `q·c + κ·‖r‖·sd_raw`, a chimera whose center
+                            // term double-counts what the raw sign-dot
+                            // already contains. The serving-consistent
+                            // residual reference (each packed cell's own
+                            // fine centroids + re-encoded codes) only
+                            // exists after the pack below; the raw sign-dot
+                            // is the blunter estimator, so the budget it
+                            // measures over-covers residual serving (recall-
+                            // safe, cost-conservative), and the optimize
+                            // recalibration — which rescores PACKED cells
+                            // with `ResidualRef::Fine` — is the
+                            // serving-exact stamp.
                             if let Some(cal) = width_law_ref {
                                 cal.score_cell(*cell_id, spill, None)?;
                             }
@@ -4936,10 +4953,17 @@ fn drain_cell_vector_config(cfg: &VectorConfig, n_rows: usize) -> (VectorConfig,
         rabitq_bytes + DOC_ID_BYTES + rerank_bytes + STABLE_ID_BYTES + mem::size_of::<f32>();
     let rows_per_run = (DRAIN_FINE_RUN_TARGET_BYTES / row_stride.max(1)).max(1);
     let n_cent = n_rows.div_ceil(rows_per_run).clamp(1, n_rows);
+    // `residual_codes` inherits from the caller's config (`..cfg.clone()`):
+    // this function shapes EVERY hidden cell pack — commit-time incoming
+    // shards, drain spill packs, and split children — so pinning it here
+    // silently turns the whole residual feature off on disk while the
+    // drain calibration still scores with the residual estimator (the
+    // enable-was-a-no-op failure this comment exists to prevent). Both
+    // codec arms above are `writes_full`, which residual re-encoding
+    // requires.
     let cell_cfg = VectorConfig {
         rerank_codec,
         provided_centroids: None,
-        residual_codes: false,
         ..cfg.clone()
     };
     (cell_cfg, n_cent)
@@ -7140,7 +7164,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     // this scan measures. A drain that commits between the scan and the
     // stamp adds rows this evidence never saw.
     let scan_ids: HashSet<Uuid> = manifest.superfiles.iter().map(|e| e.superfile_id).collect();
-    let mut cal = opann::WidthLawCalibration::new(clusters.dim as usize, metric, false);
+    let mut cal = opann::WidthLawCalibration::new(clusters.dim as usize, metric);
     // Query-sample pass: exactly `min(total_docs, WIDTH_LAW_QUERY_SAMPLE)`
     // evenly spaced ordinals over the cell-ordered live-row enumeration —
     // the law's noise floor is set by evidence size, and any fixed stride
@@ -7243,6 +7267,41 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     // memory stays bounded at one chunk of materialized cells.
     let chunk_cells = pool.current_num_threads().max(1);
     for (entry, cells) in &work {
+        // Bytes for this entry resolve SYNCHRONOUSLY here (both the
+        // scoring tables below and the fine observation after go through
+        // `try_get_range_sync`), and the lazy query opener only exposes
+        // sync bytes after a BACKGROUND mmap promotion — a fresh
+        // post-compaction output racing that promotion would silently
+        // degrade, keeping the previous law: the staleness this pass
+        // exists to fix. Open the way compaction opens its own inputs:
+        // resident bytes guaranteed.
+        let reader = open_compaction_input(
+            &inner.options.store,
+            inner.options.disk_cache.as_ref(),
+            inner.options.storage.as_ref(),
+            entry,
+        )
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+        // Per residual cell: its fine-centroid table, the reference
+        // centers `score_rows` re-centers estimates against
+        // (`ResidualRef::Fine` indexes it by each row's fine ordinal).
+        // Raw cells are absent and score as plain sign-dots. Multi-cell
+        // entries must resolve tables — a residual cell scored with the
+        // raw formula silently corrupts the law, so a degraded read is
+        // an error, not a skip. Legacy single-cell (v1) layouts predate
+        // residual codes: raw formula is correct, no tables.
+        let fine_tables: Arc<HashMap<u32, Vec<f32>>> = Arc::new(match reader.vec() {
+            Some(v) if v.is_multi_cell() => {
+                v.cell_fine_scoring_tables(&column).ok_or_else(|| {
+                    BuildError::Store(format!(
+                        "recalibration scoring tables unavailable for superfile {}",
+                        entry.superfile_id
+                    ))
+                })?
+            }
+            _ => HashMap::new(),
+        });
         for chunk in cells.chunks(chunk_cells) {
             let mut loaded: Vec<(u32, Vec<MaterializedIvfRow>)> = Vec::with_capacity(chunk.len());
             for &(cell, _) in chunk {
@@ -7257,10 +7316,14 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                 loaded.push((cell, rows));
             }
             let chunk_cal = Arc::clone(&cal);
+            let chunk_tables = Arc::clone(&fine_tables);
             run_on_pool(Some(pool), "recalibration score", move || {
-                let result = loaded
-                    .par_iter()
-                    .try_for_each(|(cell, rows)| chunk_cal.score_rows(*cell, rows, None));
+                let result = loaded.par_iter().try_for_each(|(cell, rows)| {
+                    let fine_ref = chunk_tables
+                        .get(cell)
+                        .map(|table| opann::ResidualRef::Fine(table));
+                    chunk_cal.score_rows(*cell, rows, fine_ref.as_ref())
+                });
                 // Release the shared handle BEFORE returning — the oneshot
                 // send follows the return, and the awaiting side unwraps
                 // the Arc after the final recv (a send-then-drop order
@@ -7272,25 +7335,12 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             .await
             .map_err(|e| BuildError::Store(format!("recalibration score: {e}")))??;
         }
-        // The fine observation reads subsection/stable-id bytes
-        // SYNCHRONOUSLY (`cell_fine_calibration_views` resolves through
-        // `try_get_range_sync`), and the lazy query opener only exposes
-        // sync bytes after a BACKGROUND mmap promotion — a fresh
-        // post-compaction output racing that promotion would silently
-        // skip its depth observation and keep the previous law, the
-        // staleness this pass exists to fix. Open the way compaction
-        // opens its own inputs: resident bytes guaranteed.
-        let reader = open_compaction_input(
-            &inner.options.store,
-            inner.options.disk_cache.as_ref(),
-            inner.options.storage.as_ref(),
-            entry,
-        )
-        .await
-        .map_err(|e| BuildError::Store(e.to_string()))?;
-        // `None` here is a legacy single-cell layout — skip its depth
-        // observation; the finish fallback keeps the previous depth law
-        // rather than shallowing it on partial evidence.
+        // The fine observation walks stable ids per row — deliberately
+        // extracted AFTER the scoring chunks so its per-row maps never
+        // coexist with a loaded chunk (the one-chunk transient-memory
+        // bound). `None` here is a legacy single-cell layout — skip its
+        // depth observation; the finish fallback keeps the previous depth
+        // law rather than shallowing it on partial evidence.
         if let Some(views) = reader
             .vec()
             .and_then(|v| v.cell_fine_calibration_views(&column))
@@ -7370,23 +7420,47 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                 *slot = (*slot).max(measured);
             }
         }
-        // Fine depth and rerank MAX-MERGE against the live stamp, exactly as
-        // the drain does: a sample that under-measures a per-stage walk must
+        // Fine depth MAX-MERGES against the live stamp, exactly as the
+        // drain does: a sample that under-measures a per-stage walk must
         // never shallow a stamp the previous full measurement certified —
-        // that is the query-time under-probe this PR exists to fix. Their
+        // that is the query-time under-probe this PR exists to fix. Its
         // shrink direction buys only intra-fetch compute, so keeping the
         // deeper value is recall-safe at bounded cost. A measured `0`
-        // (unsupported point) keeps the previous value under both rules.
+        // (unsupported point) keeps the previous value.
         for (slot, measured) in routing.fine_for_k.iter_mut().zip(laws.fine_for_k) {
             *slot = (*slot).max(measured);
         }
-        // Same per-knot merge + provenance as the drain stamp.
-        opann::merge_rerank_with_pools(
-            &mut routing.rerank_for_k,
-            &mut routing.rerank_pool_cells,
-            &laws.rerank_for_k,
-            laws.pool_cells,
-        );
+        // Rerank: REPLACE under current evidence (same gate as width),
+        // max-merge otherwise. The replace arm is load-bearing for
+        // residual tables: the drain stamps a budget measured with the
+        // BLUNTER raw sign-dot estimator (its spill rows are user rows —
+        // raw codes always), which over-covers residual serving; this
+        // pass rescores every packed cell with the serving-exact
+        // estimator (`ResidualRef::Fine` per provenance), and a max-merge
+        // would keep the drain's inflated budget forever — the sharper
+        // estimator's smaller measured budget could never land. A
+        // measured `0` (unsupported point) keeps the previous value
+        // under both rules, exactly like width.
+        if evidence_current {
+            for ((slot, pool), measured) in routing
+                .rerank_for_k
+                .iter_mut()
+                .zip(routing.rerank_pool_cells.iter_mut())
+                .zip(laws.rerank_for_k.iter())
+            {
+                if *measured > 0 {
+                    *slot = *measured;
+                    *pool = laws.pool_cells;
+                }
+            }
+        } else {
+            opann::merge_rerank_with_pools(
+                &mut routing.rerank_for_k,
+                &mut routing.rerank_pool_cells,
+                &laws.rerank_for_k,
+                laws.pool_cells,
+            );
+        }
         opann::clear_rerank_beyond_pool(
             &routing.width_for_k,
             &mut routing.rerank_for_k,
@@ -9812,6 +9886,35 @@ mod tests {
             2,
             "a fully drained cell needs two ~2 MiB fine runs"
         );
+    }
+
+    /// The per-cell drain config must inherit `residual_codes` — this
+    /// function shapes every hidden cell pack, so a pinned `false` here
+    /// silently turns the residual feature off on disk while calibration
+    /// keeps scoring with the residual estimator (the regression that
+    /// invalidated a full 1M bench arm). Both codec arms must preserve it.
+    #[test]
+    fn drain_cell_vector_config_preserves_residual_codes() {
+        for rerank_codec in [RerankCodec::Sq16, RerankCodec::Fp32] {
+            let cfg = VectorConfig {
+                column: "emb".into(),
+                dim: 16,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec,
+                provided_centroids: None,
+                residual_codes: true,
+            };
+            let (cell_cfg, _) = drain_cell_vector_config(&cfg, 100);
+            assert!(
+                cell_cfg.residual_codes,
+                "{rerank_codec:?}: drain cell config must inherit residual_codes"
+            );
+            assert!(
+                cell_cfg.rerank_codec.writes_full(),
+                "{rerank_codec:?}: residual codes require a writes_full cell codec"
+            );
+        }
     }
 
     // ---- rayon-shard parallelism -------------------------------------

@@ -1533,6 +1533,14 @@ fn build_vector_index_options(
             } else {
                 RerankCodec::Sq8Residual
             },
+            // Hidden cells store 1-bit codes re-centered on each row's own
+            // subsection centroid (grid cell on incoming shards, fine
+            // centroid once packed) — sharper scan estimates than
+            // whole-space sign codes, so the calibrated rerank budget
+            // shrinks. Requires a writes_full rerank codec, which both
+            // arms above guarantee. Hidden-only: user-table superfiles
+            // keep raw codes.
+            residual_codes: true,
             ..vc.clone()
         })
         .collect();
@@ -3220,6 +3228,169 @@ mod tests {
             max_per_cell > 0 && max_per_cell <= total,
             "max-per-cell {max_per_cell} in 1..={total}",
         );
+    }
+
+    /// The hidden vector index stores residual (subsection v3) codes — on
+    /// EVERY superfile generation: the commit-time delta shards, the drained
+    /// packed cells, and the compacted outputs an optimize produces from
+    /// them. This is the end-to-end tripwire for the enable-was-a-no-op
+    /// class: `hidden_vector_columns` sets `residual_codes: true`, but a
+    /// pack- or merge-path config that pins or drops the flag (as
+    /// `drain_cell_vector_config` once did) silently writes raw codes while
+    /// every recall test keeps passing.
+    #[test]
+    fn hidden_index_superfiles_are_residual_coded_across_maintenance() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, LargeStringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use crate::superfile::{
+            builder::{FtsConfig, VectorConfig},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
+        };
+
+        /// Rows in the fixture batch (axis-aligned unit vectors).
+        const ROWS: usize = 4;
+
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let options = SupertableOptions::new(
+            schema.clone(),
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric: Metric::Cosine,
+                rerank_codec: RerankCodec::Sq8Residual,
+                provided_centroids: None,
+                residual_codes: false,
+            }],
+            Some(crate::test_helpers::default_tokenizer()),
+        )
+        .expect("valid options")
+        .with_storage(Arc::clone(&storage))
+        .with_writer_pool(pool);
+
+        let st = Supertable::create(options).expect("create");
+        let titles = LargeStringArray::from(vec!["a", "b", "c", "d"]);
+        let mut flat = vec![0.0f32; ROWS * dim];
+        for row in 0..ROWS {
+            flat[row * dim + row] = 1.0;
+        }
+        let fsl = FixedSizeListArray::new(
+            item_field,
+            dim as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(titles) as Arc<dyn Array>,
+                Arc::new(fsl) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        let assert_all_hidden_cells_residual = |stage: &str| {
+            // (The hidden index materializes at the first drain; callers
+            // only probe stages where it exists.)
+            let hidden = st
+                .reader()
+                .expect("reader")
+                .vector_index_table()
+                .expect("hidden index")
+                .clone();
+            let table_reader = hidden.reader().expect("hidden reader");
+            let manifest = table_reader.manifest();
+            let entries = bridge_sync_to_async(manifest.get_all_superfiles_loaded())
+                .expect("load hidden entries");
+            assert!(!entries.is_empty(), "{stage}: hidden index has superfiles");
+            let mut cells_seen = 0usize;
+            for entry in entries {
+                let reader = bridge_sync_to_async(open_reader(
+                    &manifest.options.store,
+                    manifest.options.disk_cache.as_ref(),
+                    manifest.options.storage.as_ref(),
+                    &entry,
+                    true,
+                ))
+                .expect("open hidden superfile");
+                let vector = reader.vec().expect("vector reader");
+                for col in vector.vector_columns_config() {
+                    if col.n_docs == 0 {
+                        continue;
+                    }
+                    cells_seen += 1;
+                    assert!(
+                        col.residual_codes(),
+                        "{stage}: hidden cell subsection must carry residual \
+                         (v3) codes, found raw"
+                    );
+                }
+            }
+            assert!(cells_seen > 0, "{stage}: hidden index has populated cells");
+        };
+
+        // Drained packed cells (the drain establishes the hidden index).
+        st.drain_vectors_to_cells_sync().expect("drain");
+        assert_all_hidden_cells_residual("post-drain");
+        // Commit-time delta shards: with the index live, a second commit
+        // dual-writes incoming cells through the same per-cell config.
+        let titles2 = LargeStringArray::from(vec!["e", "f", "g", "h"]);
+        let mut flat2 = vec![0.0f32; ROWS * dim];
+        for row in 0..ROWS {
+            flat2[row * dim + ROWS + row] = 1.0;
+        }
+        let fsl2 = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+            Arc::new(Float32Array::from(flat2)),
+            None,
+        );
+        let batch2 = arrow_array::RecordBatch::try_new(
+            st.options().schema.clone(),
+            vec![
+                Arc::new(titles2) as Arc<dyn Array>,
+                Arc::new(fsl2) as Arc<dyn Array>,
+            ],
+        )
+        .expect("batch2");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch2).expect("append 2");
+        w.commit().expect("commit 2");
+        drop(w);
+        assert_all_hidden_cells_residual("post-second-commit");
+        // Compaction/merge generation (`new_from_reader`-derived configs and
+        // the splice/merge norm carry-through).
+        st.optimize(&OptimizeOptions::default()).expect("optimize");
+        assert_all_hidden_cells_residual("post-optimize");
     }
 
     /// After a splice drain into the hidden vector index, the reader's derived-

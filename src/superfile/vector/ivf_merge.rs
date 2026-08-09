@@ -18,8 +18,9 @@ use crate::superfile::{
         CRC_BYTES,
         checksum::crc32c,
         vec::{
-            CLUSTER_IDX_ENTRY_BYTES, DOC_ID_BYTES, STABLE_ID_BYTES, SUB_HEADER_SIZE, U32_BYTES,
-            U64_BYTES, sub_hdr,
+            CLUSTER_IDX_ENTRY_BYTES, DOC_ID_BYTES, STABLE_ID_BYTES, SUB_HEADER_SIZE,
+            SUBSECTION_VERSION_RESIDUAL, U32_BYTES, U64_BYTES, sub_hdr,
+            subsection_version_supported,
         },
     },
     vector::{
@@ -74,6 +75,14 @@ pub(crate) struct Sq8IvfMergeInput {
     /// `None` for region-less sources (streaming/incoming). The merge produces a
     /// merged region only when every input has one.
     pub stable_ids: Option<Vec<i128>>,
+    /// Per-doc residual norms (`‖v − c_cluster‖`, subsection v3), indexed by
+    /// this input's local doc position — present iff the source subsection
+    /// carries residual 1-bit codes. Codes and norms are anchored to the
+    /// row's OWN cluster centroid, which every splice/merge below copies
+    /// verbatim, so both stay valid across the byte-splice; the merge output
+    /// is v3 iff every input is (mixed provenance is a schema mismatch, like
+    /// a codec mismatch — the caller rebuilds through the pack core instead).
+    pub residual_norms: Option<Vec<f32>>,
 }
 
 /// Output of a byte-splice merge, ready for [`super::builder::VectorBuilder::set_prebuilt_subsection`].
@@ -127,6 +136,11 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
     let n_cent = parsed[0].n_cent;
     let metric = parsed[0].metric;
     let codec = parsed[0].rerank_codec;
+    // Residual provenance is all-or-none for the same reason the codec is:
+    // one output header flag covers every merged row (see the splice's
+    // matching check). Mixed inputs only arise across a config-generation
+    // boundary; the caller rebuilds through the pack core instead.
+    let residual = parsed[0].residual_norms.is_some();
     for inp in &parsed[1..] {
         if inp.dim != dim
             || inp.n_cent != n_cent
@@ -135,6 +149,11 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
         {
             return Err(BuildError::VectorSchemaMismatch(
                 "Sq8 IVF merge inputs must share dim, n_cent, metric, and codec".into(),
+            ));
+        }
+        if inp.residual_norms.is_some() != residual {
+            return Err(BuildError::VectorSchemaMismatch(
+                "Sq8 IVF merge inputs must share residual-code provenance".into(),
             ));
         }
     }
@@ -230,7 +249,7 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
         cluster_stride,
         codec_meta_size,
         stable_ids_region_bytes,
-        false,
+        residual,
     );
 
     let mut bytes = alloc_ivf_subsection_with_header(
@@ -380,6 +399,20 @@ pub(crate) fn merge_sq8_ivf_subsections_from_parsed(
                         let n_off = norms_off + (blk.first_row + out_i) * 4;
                         bytes[n_off..n_off + 4].copy_from_slice(&n_sq.to_le_bytes());
                     }
+                    // v3: residual ‖r‖ rides along, indexed by cluster-order
+                    // position on both sides (the serving scan's `cand.pos`
+                    // index space); the code above copied verbatim stays
+                    // anchored to this cluster's shared centroid.
+                    if let Some(nr_off) = layout.residual_norms_off {
+                        let norms = inp.residual_norms.as_deref().unwrap_or_default();
+                        let r_norm = *norms.get(doc_off + i).ok_or_else(|| {
+                            BuildError::VectorSchemaMismatch(
+                                "Sq8 IVF merge input residual-norm region too short".into(),
+                            )
+                        })?;
+                        let p = nr_off + (blk.first_row + out_i) * U32_BYTES;
+                        bytes[p..p + U32_BYTES].copy_from_slice(&r_norm.to_le_bytes());
+                    }
                     out_i += 1;
                 }
             }
@@ -452,10 +485,21 @@ pub(crate) fn splice_fragments_into_cell(
     let dim = fragments[0].0.dim;
     let metric = fragments[0].0.metric;
     let codec = fragments[0].0.rerank_codec;
+    // Residual provenance is all-or-none, like the codec: a mixed splice
+    // would emit rows whose 1-bit codes disagree with the output header's
+    // single residual flag — silently garbage at serve time. Callers hit
+    // this only across a config-generation boundary (e.g. a drain resumed
+    // over the residual upgrade) and rebuild through the pack core instead.
+    let residual = fragments[0].0.residual_norms.is_some();
     for (inp, _, _) in &fragments[1..] {
         if inp.dim != dim || inp.metric != metric || inp.rerank_codec != codec {
             return Err(BuildError::VectorSchemaMismatch(
                 "fragment splice inputs must share dim, metric, and codec".into(),
+            ));
+        }
+        if inp.residual_norms.is_some() != residual {
+            return Err(BuildError::VectorSchemaMismatch(
+                "fragment splice inputs must share residual-code provenance".into(),
             ));
         }
     }
@@ -516,7 +560,7 @@ pub(crate) fn splice_fragments_into_cell(
         cluster_stride,
         codec_meta_size,
         stable_ids_region_bytes,
-        false,
+        residual,
     );
 
     let mut bytes = alloc_ivf_subsection_with_header(
@@ -595,6 +639,20 @@ pub(crate) fn splice_fragments_into_cell(
                         .decoded_norm_sq(&inp.sub[rowb..rowb + dim * 2], dim, scale_c, offset_c);
                     let n_off = norms_off + out_row * 4;
                     bytes[n_off..n_off + 4].copy_from_slice(&n_sq.to_le_bytes());
+                }
+                // v3: residual ‖r‖ rides along, indexed by cluster-order
+                // position on both sides (the same index space the serving
+                // scan's `cand.pos` reads) — the code stays anchored to this
+                // cluster's own centroid, copied verbatim above.
+                if let Some(nr_off) = layout.residual_norms_off {
+                    let norms = inp.residual_norms.as_deref().unwrap_or_default();
+                    let r_norm = *norms.get(doc_off + i).ok_or_else(|| {
+                        BuildError::VectorSchemaMismatch(
+                            "fragment splice input residual-norm region too short".into(),
+                        )
+                    })?;
+                    let p = nr_off + out_row * U32_BYTES;
+                    bytes[p..p + U32_BYTES].copy_from_slice(&r_norm.to_le_bytes());
                 }
             }
             debug_assert_eq!(count, blk.count);
@@ -756,6 +814,30 @@ pub(crate) fn sq8_ivf_merge_input_from_subsection(
             "subsection too short for fragment merge".into(),
         ));
     }
+    // Same version/flag discipline as the reader's open path: the flag must
+    // agree with the version, so a half-written or foreign header fails loud
+    // instead of merging residual codes as raw (or vice versa).
+    let version = u32::from_le_bytes(
+        sub[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]
+            .try_into()
+            .expect("4-byte version"),
+    );
+    if !subsection_version_supported(version) {
+        return Err(BuildError::VectorSchemaMismatch(format!(
+            "fragment merge input has unsupported subsection version {version}"
+        )));
+    }
+    let residual = u32::from_le_bytes(
+        sub[sub_hdr::RESIDUAL_FLAG_OFF..sub_hdr::RESIDUAL_FLAG_OFF + U32_BYTES]
+            .try_into()
+            .expect("4-byte residual flag"),
+    ) == 1;
+    if residual != (version == SUBSECTION_VERSION_RESIDUAL) {
+        return Err(BuildError::VectorSchemaMismatch(format!(
+            "fragment merge input residual flag {residual} disagrees with \
+             subsection version {version}"
+        )));
+    }
     let centroids_off = u64::from_le_bytes(
         sub[sub_hdr::CENTROIDS_OFF_OFF..sub_hdr::CENTROIDS_OFF_OFF + U64_BYTES]
             .try_into()
@@ -801,6 +883,22 @@ pub(crate) fn sq8_ivf_merge_input_from_subsection(
     } else {
         (Vec::new(), Vec::new())
     };
+    // v3: the per-doc residual-norm region sits directly after codec_meta
+    // (the builder's layout places it between codec_meta and stable-ids;
+    // the reader's open path splits the same gap).
+    let residual_norms = residual
+        .then(|| {
+            let norms_off = codec_meta_off + codec_meta_size;
+            let norms_bytes = n_docs as usize * U32_BYTES;
+            sub.get(norms_off..norms_off + norms_bytes)
+                .map(decode_f32_le_vec)
+                .ok_or_else(|| {
+                    BuildError::VectorSchemaMismatch(
+                        "subsection truncated before residual-norm region".into(),
+                    )
+                })
+        })
+        .transpose()?;
     let quant = BitQuantizer::new(dim);
     let code_bytes = quant.code_bytes();
     let per_vec_bytes = rerank_codec.per_vector_bytes(dim);
@@ -821,6 +919,7 @@ pub(crate) fn sq8_ivf_merge_input_from_subsection(
         scale,
         offset,
         stable_ids,
+        residual_norms,
     })
 }
 
@@ -1021,6 +1120,183 @@ mod tests {
             "spliced cell holds every doc from both batches"
         );
         assert_eq!(ids.len(), 2 * ROWS, "one stable id per spliced doc");
+    }
+
+    /// Residual (subsection v3) sibling of
+    /// [`sq16_subsection_with_empty_clusters`]: 1-bit codes re-centered on
+    /// the provided grid, per-doc `‖r‖` region present. Row perturbations
+    /// make every row's residual norm distinct, so index slips show up as
+    /// value mismatches.
+    fn residual_subsection_with_empty_clusters(id_base: i128) -> MergedIvfSubsection {
+        let mut centroids = vec![0.0f32; N_CENT * DIM];
+        for c in 0..N_CENT {
+            centroids[c * DIM + c] = 1.0;
+        }
+        let mut vectors = Vec::with_capacity(ROWS * DIM);
+        for r in 0..ROWS {
+            let mut row = [0.0f32; DIM];
+            row[0] = 1.0;
+            row[4 + r % 4] = 0.05 + r as f32 * 0.01;
+            let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+            vectors.extend(row.iter().map(|v| v / norm));
+        }
+        let ids: Vec<i128> = (0..ROWS as i128).map(|i| id_base + i).collect();
+        let cfg = VectorConfig {
+            column: "emb".into(),
+            dim: DIM,
+            rot_seed: 7,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq16,
+            provided_centroids: Some(Arc::from(centroids)),
+            residual_codes: true,
+        };
+        build_merged_subsection_from_fp32(cfg, N_CENT, Arc::new(vectors), &ids)
+            .expect("residual cell build")
+    }
+
+    /// Parse a merged subsection back and return its per-doc residual norms
+    /// plus per-cluster `(doc_off, count)` entries — the serving index space
+    /// the tests below compare in.
+    fn parsed_norms_and_clusters(
+        sub: &MergedIvfSubsection,
+    ) -> (Sq8IvfMergeInput, Vec<(usize, usize)>) {
+        let inp = sq8_ivf_merge_input_from_subsection(
+            &sub.bytes,
+            DIM,
+            sub.n_cent,
+            sub.n_docs,
+            Metric::Cosine,
+            sub.rerank_codec,
+            None,
+        )
+        .expect("read-back parses");
+        let clusters = (0..sub.n_cent)
+            .map(|c| cluster_entry(&inp.sub, inp.cluster_idx_off, c))
+            .collect();
+        (inp, clusters)
+    }
+
+    /// A splice of residual fragments must (a) stamp the merged subsection
+    /// v3 (the read-back's version/flag coherence check enforces the
+    /// header), and (b) carry every row's `‖r‖` to its new cluster-order
+    /// position — the index space the serving scan reads norms in. Output
+    /// cluster `k` is fragment `k` verbatim (left's clusters then right's),
+    /// so each output cluster's norm slice must equal its source cluster's.
+    #[test]
+    fn fragment_splice_carries_residual_norms_and_v3_header() {
+        let left = residual_subsection_with_empty_clusters(1_000);
+        let right = residual_subsection_with_empty_clusters(2_000);
+        let left_ids: Vec<i128> = (0..ROWS as i128).map(|i| 1_000 + i).collect();
+        let right_ids: Vec<i128> = (0..ROWS as i128).map(|i| 2_000 + i).collect();
+
+        let (merged, _) =
+            merge_fragment_subsections(&left, &left_ids, &right, &right_ids, DIM, Metric::Cosine)
+                .expect("residual fragment splice");
+
+        let (m_inp, m_clusters) = parsed_norms_and_clusters(&merged);
+        let m_norms = m_inp
+            .residual_norms
+            .as_deref()
+            .expect("spliced output carries the residual-norm region");
+        assert_eq!(m_norms.len(), 2 * ROWS, "one norm per spliced row");
+
+        let (l_inp, l_clusters) = parsed_norms_and_clusters(&left);
+        let (r_inp, r_clusters) = parsed_norms_and_clusters(&right);
+        let l_norms = l_inp.residual_norms.as_deref().expect("left norms");
+        let r_norms = r_inp.residual_norms.as_deref().expect("right norms");
+        for k in 0..merged.n_cent {
+            let (m_off, m_cnt) = m_clusters[k];
+            let (src_norms, (s_off, s_cnt)) = if k < left.n_cent {
+                (l_norms, l_clusters[k])
+            } else {
+                (r_norms, r_clusters[k - left.n_cent])
+            };
+            assert_eq!(m_cnt, s_cnt, "cluster {k}: row count survives splice");
+            assert_eq!(
+                &m_norms[m_off..m_off + m_cnt],
+                &src_norms[s_off..s_off + s_cnt],
+                "cluster {k}: residual norms must ride to the new cluster-order \
+                 positions"
+            );
+        }
+    }
+
+    /// Mixed residual provenance must fail the splice loudly (one output
+    /// header flag cannot describe both generations); the parsed-merge path
+    /// enforces the same rule.
+    #[test]
+    fn merges_reject_mixed_residual_provenance() {
+        let residual = residual_subsection_with_empty_clusters(1_000);
+        let raw = sq16_subsection_with_empty_clusters(2_000);
+        let residual_ids: Vec<i128> = (0..ROWS as i128).map(|i| 1_000 + i).collect();
+        let raw_ids: Vec<i128> = (0..ROWS as i128).map(|i| 2_000 + i).collect();
+
+        let err = match merge_fragment_subsections(
+            &residual,
+            &residual_ids,
+            &raw,
+            &raw_ids,
+            DIM,
+            Metric::Cosine,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("mixed-provenance splice must fail"),
+        };
+        assert!(
+            err.to_string().contains("residual-code provenance"),
+            "unexpected splice error: {err}"
+        );
+
+        let (res_inp, _) = parsed_norms_and_clusters(&residual);
+        let (raw_inp, _) = parsed_norms_and_clusters(&raw);
+        let err = match merge_sq8_ivf_subsections_from_parsed(&[res_inp, raw_inp]) {
+            Err(e) => e,
+            Ok(_) => panic!("mixed-provenance parsed merge must fail"),
+        };
+        assert!(
+            err.to_string().contains("residual-code provenance"),
+            "unexpected parsed-merge error: {err}"
+        );
+    }
+
+    /// The parsed merge (same fine shape, e.g. compaction of same-cell
+    /// fragments) concatenates each cluster's rows across inputs in input
+    /// order; residual norms must land at the same concatenated cluster-order
+    /// positions, and the output must round-trip as v3.
+    #[test]
+    fn parsed_merge_carries_residual_norms() {
+        let a = residual_subsection_with_empty_clusters(1_000);
+        let b = residual_subsection_with_empty_clusters(2_000);
+        let (a_inp, a_clusters) = parsed_norms_and_clusters(&a);
+        let (mut b_inp, b_clusters) = parsed_norms_and_clusters(&b);
+        b_inp.doc_id_offset = a.n_docs;
+        let a_norms = a_inp.residual_norms.clone().expect("a norms");
+        let b_norms = b_inp.residual_norms.clone().expect("b norms");
+
+        let merged = merge_sq8_ivf_subsections_from_parsed(&[a_inp, b_inp])
+            .expect("residual parsed merge");
+        let (m_inp, m_clusters) = parsed_norms_and_clusters(&merged);
+        let m_norms = m_inp
+            .residual_norms
+            .as_deref()
+            .expect("merged output carries the residual-norm region");
+        assert_eq!(m_norms.len(), 2 * ROWS, "one norm per merged row");
+
+        for c in 0..merged.n_cent {
+            let (m_off, m_cnt) = m_clusters[c];
+            let (a_off, a_cnt) = a_clusters[c];
+            let (b_off, b_cnt) = b_clusters[c];
+            assert_eq!(m_cnt, a_cnt + b_cnt, "cluster {c}: merged row count");
+            let mut expected = Vec::with_capacity(m_cnt);
+            expected.extend_from_slice(&a_norms[a_off..a_off + a_cnt]);
+            expected.extend_from_slice(&b_norms[b_off..b_off + b_cnt]);
+            assert_eq!(
+                &m_norms[m_off..m_off + m_cnt],
+                &expected[..],
+                "cluster {c}: norms concatenate in input order at cluster-order \
+                 positions"
+            );
+        }
     }
 
     /// Splice-merging inputs that share an all-empty cluster must leave the

@@ -276,6 +276,14 @@ impl ColumnReader {
 
     /// Per-doc byte stride inside a cluster block:
     /// `code_bytes + 4 (doc_id) + per_vec_bytes (full rerank)`.
+    /// `true` when this subsection's 1-bit codes are subsection-centroid
+    /// residuals (v3) — the on-disk truth a rebuild config must reproduce
+    /// (the KV column JSON deliberately doesn't carry it; the subsection
+    /// header is authoritative, like the codec id).
+    pub(crate) fn residual_codes(&self) -> bool {
+        self.residual_norms_off.is_some()
+    }
+
     /// A cluster's block packs `cnt` docs at this stride as
     /// `[codes_chunk][doc_ids_chunk][full_chunk]`.
     pub(super) fn per_cluster_doc_stride(&self) -> usize {
@@ -2246,6 +2254,42 @@ impl VectorReader {
         Some(out)
     }
 
+    /// Fine-centroid tables for this blob's RESIDUAL cells, keyed by global
+    /// cell id — the reference centers recalibration re-centers estimates
+    /// against ([`ResidualRef::Fine`] indexes a table by each row's fine
+    /// ordinal). Raw cells are absent. A lightweight sibling of
+    /// [`Self::cell_fine_calibration_views`] for the scoring sweep: no
+    /// stable-id walk, so holding every cell's table across the sweep costs
+    /// `n_fine × dim` floats per cell, not per-row maps. Same multi-cell
+    /// gate and degrade-to-`None` hardening; the caller decides whether
+    /// `None` is legacy-v1-benign or an error (a residual cell scored with
+    /// the raw formula corrupts the law, so multi-cell callers must not
+    /// silently continue).
+    pub(crate) fn cell_fine_scoring_tables(&self, column: &str) -> Option<HashMap<u32, Vec<f32>>> {
+        if !self.is_multi_cell() || !self.column_id_by_name.contains_key(column) {
+            return None;
+        }
+        let mut out = HashMap::new();
+        for (index, col) in self.columns.iter().enumerate() {
+            if col.n_docs == 0 || col.n_cent == 0 || col.residual_norms_off.is_none() {
+                continue;
+            }
+            let sub = self
+                .source
+                .try_get_range_sync(col.subsection_range.clone())?;
+            // Same corrupt-offset hardening as the views walk above.
+            let n_fine = col.n_cent as usize;
+            let centroids_len = n_fine.checked_mul(col.dim)?.checked_mul(F32_BYTES)?;
+            let centroids_end = col.centroids_off.checked_add(centroids_len)?;
+            if centroids_end > sub.len() {
+                return None;
+            }
+            let centroids = parse_f32_le_vec(&sub[col.centroids_off..centroids_end]);
+            out.insert(self.cell_ids.get(index).copied()?, centroids);
+        }
+        Some(out)
+    }
+
     /// Remap a file-local allow/deny bitmap onto one packed cell's local
     /// id space (`0..n_docs`). IVF cluster blocks store cell-local ids;
     /// callers pass file-local bitmaps (parquet / packed-shard space).
@@ -2556,6 +2600,18 @@ impl VectorReader {
                     .collect::<Result<Vec<_>, BuildError>>()
             })
             .transpose()?;
+        // v3: per-doc residual norms ride the merge input so splices carry
+        // them into the merged norm region (checked read, same rationale as
+        // the stable-id reads above).
+        let residual_norms = col
+            .residual_norms_off
+            .map(|off| {
+                sub.as_ref()
+                    .get(off..off + col.n_docs as usize * U32_BYTES)
+                    .map(parse_f32_le_vec)
+                    .ok_or(BuildError::VectorReadError)
+            })
+            .transpose()?;
         Ok(Sq8IvfMergeInput {
             sub: sub.as_ref().to_vec(),
             dim,
@@ -2573,6 +2629,7 @@ impl VectorReader {
             scale,
             offset,
             stable_ids,
+            residual_norms,
         })
     }
 
@@ -5133,7 +5190,6 @@ where
 /// candidate sink ([`scan_shortlist`] appends to a plain vec and keeps
 /// the top `coarse_limit` with one O(n) partition afterwards).
 #[inline]
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn score_cluster_codes_with(
     cluster_codes: &[u8],

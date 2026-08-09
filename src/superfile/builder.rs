@@ -338,6 +338,14 @@ impl BuilderOptions {
         let (vector_columns, vector_layout) = if let Some(vec) = &reader.vec() {
             if vec.is_multi_cell() {
                 // One logical column; cell IVFs live in the v2 cell directory.
+                // Residual provenance is per-subsection on disk (the KV JSON
+                // deliberately doesn't carry it): a rebuild must re-encode
+                // residual whenever ANY packed cell is v3, or a compaction
+                // through this config would silently downgrade the table's
+                // codes back to raw.
+                let residual = vec
+                    .vector_columns_config()
+                    .any(|cell| cell.residual_codes());
                 let v = vec
                     .vector_columns_config()
                     .next()
@@ -345,7 +353,8 @@ impl BuilderOptions {
                 (
                     vec![
                         VectorConfig::new(v.name.clone(), v.dim, v.rot_seed, v.metric)
-                            .with_rerank_codec(v.rerank_codec),
+                            .with_rerank_codec(v.rerank_codec)
+                            .with_residual_codes(residual),
                     ],
                     VectorLayout::MultiCellIvf,
                 )
@@ -355,6 +364,7 @@ impl BuilderOptions {
                         .map(|v| {
                             VectorConfig::new(v.name.clone(), v.dim, v.rot_seed, v.metric)
                                 .with_rerank_codec(v.rerank_codec)
+                                .with_residual_codes(v.residual_codes())
                         })
                         .collect::<Vec<_>>(),
                     VectorLayout::Ivf,
@@ -895,11 +905,24 @@ impl SuperfileBuilder {
         }
         let scalar_schema = builder_opts.schema.clone();
         let id_column = builder_opts.id_column.clone();
+        // Residual provenance across ALL inputs, not just the first:
+        // `new_from_reader` above only saw `first`, and a v2-first /
+        // v3-later mix would rebuild v3 rows under a raw config — the
+        // raw pack copies their residual sign codes verbatim into a v2
+        // cell, which serves as garbage. Any residual input forces the
+        // residual config; the pack core re-derives every code from the
+        // payload, so raw inputs re-encode correctly under it.
+        let any_residual = readers.iter().any(|(reader, _)| {
+            reader.vec().is_some_and(|v| {
+                v.vector_columns_config().any(|cell| cell.residual_codes())
+            })
+        });
         let vec_cfg = builder_opts
             .vector_columns
             .first()
             .cloned()
-            .ok_or(BuildError::VectorReadError)?;
+            .ok_or(BuildError::VectorReadError)?
+            .with_residual_codes(any_residual);
         let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
 
         let any_tombstones = readers
@@ -1009,9 +1032,17 @@ impl SuperfileBuilder {
             cell_ids.sort_unstable();
             for cell_id in cell_ids {
                 let sources = by_cell.remove(&cell_id).expect("cell present");
-                let same_shape = sources
-                    .windows(2)
-                    .all(|pair| pair[0].2.n_cent == pair[1].2.n_cent);
+                // Byte-splice needs uniform fine shape AND uniform residual
+                // provenance (the splice hard-errors on a mix — one output
+                // header flag can't describe both generations, and erroring
+                // here would wedge compaction permanently). Mixed v2+v3
+                // fragments of one cell take the materialize arm below,
+                // which re-encodes every row under `any_residual`.
+                let same_shape = sources.windows(2).all(|pair| {
+                    pair[0].2.n_cent == pair[1].2.n_cent
+                        && pair[0].2.residual_norms.is_some()
+                            == pair[1].2.residual_norms.is_some()
+                });
                 if same_shape {
                     let mut inputs: Vec<Sq8IvfMergeInput> =
                         sources.into_iter().map(|(_, _, inp)| inp).collect();
