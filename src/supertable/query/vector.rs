@@ -1277,18 +1277,33 @@ async fn hidden_hits_user_ids(
 const ID_SCORE_ID_COLUMN: usize = 0;
 const ID_SCORE_SCORE_COLUMN: usize = 1;
 
-/// Positions into the synthesized `_id` + `score` batch for
-/// `projection`, or `None` when a requested name needs a user data
-/// page (which forces placement + a Parquet read).
+/// Position of `name` in the batch [`hits_id_score_batch`] synthesizes,
+/// or `None` when it is a user column that needs a data page.
 ///
-/// `_id` and `score` both come free with the search wave — the ids are
-/// stamped on the hits and the scores are the kernel's output — so ANY
-/// subset or ordering of the two serves without resolving placements.
-/// Matching only the exact pair left `["_id"]` alone paying a full
-/// placement resolve for data already in hand. Name-based counterpart
-/// of the index derivation the SQL TVF path uses
-/// (`exec::vector_exec`), so both entry points admit the same
-/// projections to the same fast path.
+/// THE rule for which columns come free with the search wave: the ids
+/// are stamped on the hits and the scores are the kernel's output, so
+/// any subset or ordering of the two serves without resolving
+/// placements. Both entry points classify through this one function —
+/// the public API by name directly, the SQL TVF by mapping its
+/// DataFusion column indices back to names — so a third free column
+/// cannot be added to one path and forgotten on the other.
+pub(crate) fn free_column_slot(name: &str, id_column: &str) -> Option<usize> {
+    match name {
+        n if n == id_column => Some(ID_SCORE_ID_COLUMN),
+        n if n == SCORE_COLUMN => Some(ID_SCORE_SCORE_COLUMN),
+        _ => None,
+    }
+}
+
+/// Public-API projection policy: positions into the synthesized batch,
+/// or `None` when the projection needs the general path.
+///
+/// `None` (engine-native) is the `_id` + `score` pair. An EMPTY
+/// projection takes the general path: a zero-column batch carries its
+/// row count differently, and reproducing that here would be a second
+/// contract to maintain for a degenerate input. (The SQL TVF keeps its
+/// own policy for empty — DataFusion emits one for `COUNT(*)`-shaped
+/// plans, where a zero-column batch is exactly what it wants.)
 pub(crate) fn id_score_projection_indices(
     projection: Option<&[&str]>,
     id_column: &str,
@@ -1296,19 +1311,12 @@ pub(crate) fn id_score_projection_indices(
     let Some(names) = projection else {
         return Some(vec![ID_SCORE_ID_COLUMN, ID_SCORE_SCORE_COLUMN]);
     };
-    // An empty projection keeps the general path: a zero-column batch
-    // carries its row count differently, and reproducing that here
-    // would be a second contract to maintain for a degenerate input.
     if names.is_empty() {
         return None;
     }
     names
         .iter()
-        .map(|name| match *name {
-            n if n == id_column => Some(ID_SCORE_ID_COLUMN),
-            n if n == SCORE_COLUMN => Some(ID_SCORE_SCORE_COLUMN),
-            _ => None,
-        })
+        .map(|name| free_column_slot(name, id_column))
         .collect()
 }
 
@@ -4179,10 +4187,10 @@ mod tests {
     use super::{
         RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate, VectorFilter,
         VectorSearchOptions, admit_extension_round, admit_shortlist_window, apply_width_pin,
-        calibrated_query_for, cells_ranked_by_fine_score, gate_fine_candidates_by_fragment,
-        hidden_hits_user_ids, id_score_projection_indices, is_hidden_vector_manifest,
-        law_floor_serve_selection, postings_by_cell_from_summaries, rerank_mult_from_law,
-        score_fine_candidates, select_global_shortlist, union_cell_selection,
+        calibrated_query_for, cells_ranked_by_fine_score, free_column_slot,
+        gate_fine_candidates_by_fragment, hidden_hits_user_ids, id_score_projection_indices,
+        is_hidden_vector_manifest, law_floor_serve_selection, postings_by_cell_from_summaries,
+        rerank_mult_from_law, score_fine_candidates, select_global_shortlist, union_cell_selection,
         vector_read_query_error,
     };
     use crate::{
@@ -4221,6 +4229,42 @@ mod tests {
     /// Fine ranking takes each cell's best (minimum) candidate score,
     /// sorts ascending with lower-id tie-break, and ignores untagged
     /// (legacy, `None`-cell) candidates.
+    /// The SQL TVF classifies by DataFusion column INDEX and the public
+    /// API by NAME, so they cannot share a signature — but they must
+    /// share the RULE. Both resolve through [`free_column_slot`]; this
+    /// pins that the index path (index -> field name -> slot) lands on
+    /// exactly what the name path returns, for every projection shape.
+    /// A third free column added to `free_column_slot` is then picked
+    /// up by both without touching either call site.
+    #[test]
+    fn tvf_index_classification_matches_the_name_path() {
+        let id = "doc_id";
+        // The TVF's output schema: scalar columns, `score` appended.
+        let names = [id, "title", "body", SCORE_COLUMN];
+        // Index path: what exec::vector_exec derives per requested index.
+        let by_index = |requested: &[usize]| -> Option<Vec<usize>> {
+            requested
+                .iter()
+                .map(|&i| names.get(i).and_then(|n| free_column_slot(n, id)))
+                .collect()
+        };
+        for requested in [
+            vec![0, 3],    // _id + score
+            vec![3, 0],    // reversed
+            vec![0],       // _id alone
+            vec![3],       // score alone
+            vec![0, 1, 3], // includes a user column
+            vec![1],       // user column alone
+        ] {
+            let as_names: Vec<&str> = requested.iter().map(|&i| names[i]).collect();
+            assert_eq!(
+                by_index(&requested),
+                id_score_projection_indices(Some(&as_names), id),
+                "index and name classification disagree for {requested:?}"
+            );
+        }
+    }
+
     /// ANY subset/order of `_id` + `score` takes the fast path, and the
     /// returned indices reproduce the requested order — `_id` alone is
     /// the regression: it used to miss the exact-pair match and pay a
