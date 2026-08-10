@@ -17,7 +17,7 @@ use std::{
     ops::Range,
     sync::{
         Arc, Mutex, OnceLock, PoisonError,
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering},
     },
     thread,
 };
@@ -58,7 +58,7 @@ use crate::{
             },
             ivf_merge::Sq8IvfMergeInput,
             quant::{
-                BitQuantizer, LUT_BLOCK_ROWS, LutQuery, build_transposed_code_cache,
+                BitQuantizer, LUT_BLOCK_ROWS, LutQuery, PruneBar, build_transposed_code_cache,
                 for_each_code_block_scores, lut_scan_supported,
             },
             rerank_codec::{EncodedRowParts, RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
@@ -66,6 +66,34 @@ use crate::{
         },
     },
 };
+#[cfg(any(test, feature = "test-helpers"))]
+use crate::{superfile::vector::quant::shadow_block_dead_planes, test_helpers::plane_trunc_probe};
+
+/// z-multipliers for the probabilistic (z-sigma suffix) bound family the
+/// plane-truncation shadow measures alongside the exact suffix-max bound
+/// — one probe run maps the whole pruning frontier. Must stay one
+/// shorter than `plane_trunc_probe::VARIANTS` (variant 0 is the exact
+/// bound).
+#[cfg(any(test, feature = "test-helpers"))]
+const PLANE_TRUNC_Z: [f32; 4] = [2.0, 2.25, 2.5, 3.0];
+#[cfg(any(test, feature = "test-helpers"))]
+const _: () = assert!(PLANE_TRUNC_Z.len() + 1 == plane_trunc_probe::VARIANTS);
+
+/// Whether the plane-truncation shadow is live in this build+process —
+/// `false` in shipped builds, the probe's env switch under the
+/// `test-helpers` feature. Forces the cell scan onto its serial arm.
+#[cfg(any(test, feature = "test-helpers"))]
+fn plane_trunc_active() -> bool {
+    plane_trunc_probe::enabled()
+}
+#[cfg(not(any(test, feature = "test-helpers")))]
+fn plane_trunc_active() -> bool {
+    false
+}
+
+/// The f32 sign bit, used to build order-preserving integer keys for the
+/// shared scan bar.
+const SIGN_BIT: u32 = 0x8000_0000;
 
 /// Bytes per fp32 lane in the on-disk centroid region.
 const F32_BYTES: usize = 4;
@@ -3633,6 +3661,12 @@ impl VectorReader {
         let mut q_rot_shared = vec![0f32; first_col.dim];
         first_col.rot.apply(query, &mut q_rot_shared);
         let q_rot_shared = &q_rot_shared;
+        // One pruning bar for the whole query's scan. Cells complete in
+        // arbitrary order, so whichever reaches shortlist depth first
+        // publishes for every cell still scanning — the k-th best of a
+        // subset is a lower bound on the k-th best of the union, so this
+        // is safe in any order and only ever skips work.
+        let scan_bar: ScanBar = Arc::new(AtomicU32::new(SCAN_BAR_NONE));
         let cell_scans = per_cell.into_iter().filter_map(|(cell_idx, base, locals)| {
             let col = &self.columns[cell_idx];
             if col.n_docs == 0 {
@@ -3645,6 +3679,7 @@ impl VectorReader {
             }
             let pool = pool.clone();
             let budget = budget.clone();
+            let scan_bar = Arc::clone(&scan_bar);
             Some(async move {
                 let sub_start = col.subsection_range.start;
                 let idx_start = sub_start + col.cluster_idx_off;
@@ -3706,6 +3741,7 @@ impl VectorReader {
                         coarse_limit,
                         &ctx,
                         residual_ctx.as_ref(),
+                        Some(Arc::clone(&scan_bar)),
                     )
                     .await?;
                     tally.kernel_cpu_ns += scan_kernel_ns;
@@ -3754,11 +3790,27 @@ impl VectorReader {
             })
         });
         let max_in_flight = pool_wave_cap(pool.as_deref());
-        let per_cell_results: Vec<(Vec<(u32, f32)>, Vec<ScanCandidate>, ProbeTally)> =
+        // Arm the shared pruning bar before the wide fan-out: run ONE cell
+        // alone, so its shortlist depth publishes a bar the remaining cells
+        // can prune against from their first block. Launching every cell at
+        // once instead leaves all accumulators crossing shortlist depth
+        // simultaneously — at the end — and the bar arrives with no work
+        // left to skip (measured: a bar for 0 of 406k clusters). One cell of
+        // a width-W sweep is ~1/W of the scan, and the bound is valid in any
+        // order because the k-th best of a subset can only be below the
+        // k-th best of the union.
+        let mut cell_scans: Vec<_> = cell_scans.collect();
+        let mut per_cell_results: Vec<(Vec<(u32, f32)>, Vec<ScanCandidate>, ProbeTally)> =
+            Vec::with_capacity(cell_scans.len());
+        if !cell_scans.is_empty() {
+            per_cell_results.push(cell_scans.remove(0).await?);
+        }
+        let fanned: Vec<(Vec<(u32, f32)>, Vec<ScanCandidate>, ProbeTally)> =
             stream::iter(cell_scans)
                 .buffer_unordered(max_in_flight)
                 .try_collect()
                 .await?;
+        per_cell_results.extend(fanned);
         for (hits, cands, tally) in per_cell_results {
             outcome.hits.extend(hits);
             outcome.candidates.extend(cands);
@@ -4530,6 +4582,12 @@ struct ClusterResidual {
     q_dot: f32,
     kappa: f32,
     norms: Bytes,
+    /// Largest stored residual norm among this cluster's rows. The
+    /// estimate is `q_dot + kappa * norm * lut_score`, so the row with
+    /// the largest norm converts a given estimate bar into the LOWEST
+    /// accumulator threshold — using that row's gain for the whole
+    /// cluster keeps one threshold safe for every row in it.
+    norm_max: f32,
 }
 
 impl ClusterResidual {
@@ -4548,20 +4606,53 @@ impl ClusterResidual {
             q_dot,
             kappa: ctx.kappa,
             norms: ctx.norms.clone(),
+            norm_max: 0.0,
         }
+    }
+
+    /// Record the largest residual norm over the rows this cluster owns
+    /// (`off..off + rows` in cluster-order position space) — one
+    /// streaming pass over 4 bytes per row, against the 96+ bytes per row
+    /// the scan itself reads.
+    fn with_norm_max(mut self, off: u32, rows: usize) -> Self {
+        let start = off as usize * 4;
+        let end = start + rows * 4;
+        self.norm_max = self.norms[start..end]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().expect("4-byte residual norm")))
+            .fold(0.0f32, f32::max);
+        self
+    }
+
+    /// Convert a shortlist floor on estimate scale into this cluster's
+    /// LUT-accumulator bar: `q_dot + kappa * norm * (acc * inv_scale)`
+    /// stays under `floor` while `acc < (floor - q_dot) / gain`, and the
+    /// largest-norm row has the largest gain, hence the safest bar.
+    fn prune_bar(&self, lut: &LutQuery, floor: f32, rows: usize) -> Option<PruneBar> {
+        let gain = self.kappa * self.norm_max;
+        if gain <= 0.0 {
+            return None;
+        }
+        lut.prune_bar((floor - self.q_dot) / gain, rows)
+    }
+
+    /// The stored residual norm of the row at absolute cluster-order
+    /// position `pos`.
+    #[inline]
+    fn norm_at(&self, pos: u32) -> f32 {
+        let p = pos as usize * 4;
+        f32::from_le_bytes(
+            self.norms[p..p + 4]
+                .try_into()
+                .expect("4-byte residual norm"),
+        )
     }
 
     /// The residual estimate for the row at absolute cluster-order
     /// position `pos`, given its raw sign-dot.
     #[inline]
     fn estimate(&self, pos: u32, sign_dot: f32) -> f32 {
-        let p = pos as usize * 4;
-        let norm = f32::from_le_bytes(
-            self.norms[p..p + 4]
-                .try_into()
-                .expect("4-byte residual norm"),
-        );
-        self.q_dot + self.kappa * norm * sign_dot
+        self.q_dot + self.kappa * self.norm_at(pos) * sign_dot
     }
 
     /// Block form of [`Self::estimate`] for the LUT scan: one block's rows
@@ -4593,34 +4684,58 @@ fn scan_cluster_transposed(
     cb: usize,
     lut: &LutQuery,
     residual: Option<&ClusterResidual>,
+    prune: Option<&PruneBar>,
+    #[cfg(any(test, feature = "test-helpers"))] killed_blocks: Option<&[bool]>,
     acc: &mut Vec<(u32, f32, u32, u32)>,
 ) {
-    for_each_code_block_scores(transposed, cb, lut, |base_r, scores| {
-        let live = cnt.saturating_sub(base_r).min(LUT_BLOCK_ROWS);
-        // Residual affine over the WHOLE block before the push loop — the
-        // per-lane scalar `estimate` here was the hidden serve-time tax
-        // (see `estimate_block`). One 128-byte copy per block buys a
-        // streamed, vectorizable pass.
-        let mut adjusted: [f32; LUT_BLOCK_ROWS];
-        let scores: &[f32; LUT_BLOCK_ROWS] = match residual {
-            Some(res) => {
-                adjusted = *scores;
-                res.estimate_block(off + base_r as u32, live, &mut adjusted);
-                &adjusted
+    let mut planes_scanned = 0usize;
+    for_each_code_block_scores(
+        transposed,
+        cb,
+        lut,
+        prune,
+        &mut planes_scanned,
+        |base_r, scores| {
+            let live = cnt.saturating_sub(base_r).min(LUT_BLOCK_ROWS);
+            // Plane-truncation enforcement (probe builds only): a block the
+            // shadow proved dead contributes nothing, exactly as a
+            // checkpointed early-exit kernel would leave it unscored.
+            #[cfg(any(test, feature = "test-helpers"))]
+            if killed_blocks.is_some_and(|mask| mask[base_r / LUT_BLOCK_ROWS]) {
+                return;
             }
-            None => scores,
-        };
-        for (lane, &est) in scores.iter().enumerate().take(live) {
-            let rr = base_r + lane;
-            let did = u32::from_le_bytes(
-                doc_ids[rr * 4..rr * 4 + 4]
-                    .try_into()
-                    .expect("4-byte doc id"),
-            );
-            let pos = off + rr as u32;
-            acc.push((did, est, pos, cluster_id));
-        }
-    });
+            // Residual affine over the WHOLE block before the push loop — the
+            // per-lane scalar `estimate` here was the hidden serve-time tax
+            // (see `estimate_block`). One 128-byte copy per block buys a
+            // streamed, vectorizable pass.
+            let mut adjusted: [f32; LUT_BLOCK_ROWS];
+            let scores: &[f32; LUT_BLOCK_ROWS] = match residual {
+                Some(res) => {
+                    adjusted = *scores;
+                    res.estimate_block(off + base_r as u32, live, &mut adjusted);
+                    &adjusted
+                }
+                None => scores,
+            };
+            for (lane, &est) in scores.iter().enumerate().take(live) {
+                let rr = base_r + lane;
+                let did = u32::from_le_bytes(
+                    doc_ids[rr * 4..rr * 4 + 4]
+                        .try_into()
+                        .expect("4-byte doc id"),
+                );
+                let pos = off + rr as u32;
+                acc.push((did, est, pos, cluster_id));
+            }
+        },
+    );
+    #[cfg(any(test, feature = "test-helpers"))]
+    if plane_trunc_probe::prod_enabled() {
+        plane_trunc_probe::add_prod_planes(
+            planes_scanned as u64,
+            (cnt.div_ceil(LUT_BLOCK_ROWS) * cb) as u64,
+        );
+    }
 }
 
 /// The pure-CPU half of [`build_shortlist`]: score every probed cluster's
@@ -4639,6 +4754,7 @@ async fn scan_shortlist(
     coarse_limit: usize,
     ctx: &ProbeCtx<'_>,
     residual: Option<&ResidualScanCtx>,
+    scan_bar: Option<ScanBar>,
 ) -> Result<(Vec<(u32, f32, u32, u32)>, u64), VectorError> {
     let full_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
     let total_candidates: usize = cluster_meta.iter().map(|&(_, _, cnt)| cnt as usize).sum();
@@ -4662,12 +4778,15 @@ async fn scan_shortlist(
         Arc::new(
             cluster_meta
                 .iter()
-                .map(|&(c, _, _)| ClusterResidual::resolve(r, col, c))
+                .map(|&(c, off, cnt)| {
+                    ClusterResidual::resolve(r, col, c).with_norm_max(off, cnt as usize)
+                })
                 .collect(),
         )
     });
     let scan_vec = |acc: &mut Vec<(u32, f32, u32, u32)>,
                     cluster_residual: Option<&ClusterResidual>,
+                    bar: Option<f32>,
                     (&(c, off, cnt), block): (&(usize, u32, u32), &Bytes)| {
         let codes_len = (cnt as usize) * cb;
         let doc_ids_len = (cnt as usize) * 4;
@@ -4690,6 +4809,41 @@ async fn scan_shortlist(
                 ctx.budget.as_ref(),
             )
         {
+            #[cfg(any(test, feature = "test-helpers"))]
+            let mut killed_blocks: Option<Vec<bool>> = None;
+            #[cfg(any(test, feature = "test-helpers"))]
+            if plane_trunc_probe::enabled() {
+                match shortlist_floor(acc, coarse_limit) {
+                    Some(floor) => {
+                        killed_blocks = shadow_plane_trunc(
+                            &transposed,
+                            cnt as usize,
+                            off,
+                            cb,
+                            lut,
+                            cluster_residual,
+                            floor,
+                        );
+                    }
+                    None => plane_trunc_probe::add_unfloored(
+                        ((cnt as usize).div_ceil(LUT_BLOCK_ROWS) * cb) as u64,
+                    ),
+                }
+            }
+            let prune = bar
+                .zip(cluster_residual)
+                .and_then(|(floor, residual)| residual.prune_bar(lut, floor, cnt as usize));
+            #[cfg(any(test, feature = "test-helpers"))]
+            let (prod_before, prod_bar) = (acc.len() as u64, prune.is_some());
+            #[cfg(any(test, feature = "test-helpers"))]
+            if plane_trunc_probe::prod_enabled() {
+                let gain_zero = cluster_residual.is_some_and(|r| r.kappa * r.norm_max <= 0.0);
+                plane_trunc_probe::add_prod_bar_reason(
+                    bar.is_some(),
+                    gain_zero,
+                    bar.is_some() && !gain_zero && prune.is_none(),
+                );
+            }
             scan_cluster_transposed(
                 &transposed,
                 &doc_ids,
@@ -4699,8 +4853,19 @@ async fn scan_shortlist(
                 cb,
                 lut,
                 cluster_residual,
+                prune.as_ref(),
+                #[cfg(any(test, feature = "test-helpers"))]
+                killed_blocks.as_deref(),
                 acc,
             );
+            #[cfg(any(test, feature = "test-helpers"))]
+            if plane_trunc_probe::prod_enabled() {
+                plane_trunc_probe::add_prod_cluster(
+                    u64::from(cnt),
+                    acc.len() as u64 - prod_before,
+                    prod_bar,
+                );
+            }
             return;
         }
         score_cluster_codes_with(
@@ -4717,7 +4882,13 @@ async fn scan_shortlist(
             &mut |cand| acc.push((cand.did, cand.estimate, cand.pos, cand.cluster_id)),
         );
     };
-    let acc = if total_candidates >= PARALLEL_SCAN_MIN && cluster_meta.len() > 1 {
+    // The plane-truncation probe forces the serial arm: its shadow reads
+    // the evolving shortlist floor between clusters, which the parallel
+    // arm's chunk-private accumulators would dilute.
+    let acc = if total_candidates >= PARALLEL_SCAN_MIN
+        && cluster_meta.len() > 1
+        && !plane_trunc_active()
+    {
         // Parallelize the coarse 1-bit scan across the configured rayon
         // pool, bridged back via a oneshot so no tokio worker blocks under
         // the compute. Cluster scoring is order-independent — the partition
@@ -4736,6 +4907,7 @@ async fn scan_shortlist(
         // task; each chunk borrows them as `Option<&RoaringBitmap>`.
         let allow_owned = ctx.allow.clone();
         let deny_owned = ctx.deny.clone();
+        let bar_owned = scan_bar.clone();
         let residuals_owned = cluster_residuals.clone();
         let (tx, rx) = oneshot::channel();
         spawn_on(ctx.pool.as_deref(), move || {
@@ -4752,6 +4924,7 @@ async fn scan_shortlist(
                     for (j, (&(c, off, cnt), block)) in
                         meta_chunk.iter().zip(block_chunk.iter()).enumerate()
                     {
+                        let bar = load_scan_bar(bar_owned.as_ref());
                         let cluster_residual =
                             residuals_owned.as_ref().map(|v| &v[chunk_idx * chunk + j]);
                         let codes_len = (cnt as usize) * cb;
@@ -4766,6 +4939,21 @@ async fn scan_shortlist(
                                 budget_owned.as_ref(),
                             )
                         {
+                            let prune = bar.zip(cluster_residual).and_then(|(floor, residual)| {
+                                residual.prune_bar(lut, floor, cnt as usize)
+                            });
+                            #[cfg(any(test, feature = "test-helpers"))]
+                            let (prod_before, prod_bar) = (acc.len() as u64, prune.is_some());
+                            #[cfg(any(test, feature = "test-helpers"))]
+                            if plane_trunc_probe::prod_enabled() {
+                                let gain_zero =
+                                    cluster_residual.is_some_and(|r| r.kappa * r.norm_max <= 0.0);
+                                plane_trunc_probe::add_prod_bar_reason(
+                                    bar.is_some(),
+                                    gain_zero,
+                                    bar.is_some() && !gain_zero && prune.is_none(),
+                                );
+                            }
                             scan_cluster_transposed(
                                 &transposed,
                                 &doc_ids,
@@ -4775,8 +4963,28 @@ async fn scan_shortlist(
                                 cb,
                                 lut,
                                 cluster_residual,
+                                prune.as_ref(),
+                                // The rayon arm never runs under the
+                                // plane-truncation probe (which forces
+                                // the serial arm for a coherent floor).
+                                #[cfg(any(test, feature = "test-helpers"))]
+                                None,
                                 &mut acc,
                             );
+                            #[cfg(any(test, feature = "test-helpers"))]
+                            if plane_trunc_probe::prod_enabled() {
+                                plane_trunc_probe::add_prod_cluster(
+                                    u64::from(cnt),
+                                    acc.len() as u64 - prod_before,
+                                    prod_bar,
+                                );
+                            }
+                            // Publish BEFORE the `continue` — this branch
+                            // skips the rest of the loop body, so a bar
+                            // raised after it would never be raised at all
+                            // (the LUT path is the only one taken on the
+                            // warm hidden-index scan).
+                            publish_scan_bar(bar_owned.as_ref(), &mut acc, coarse_limit);
                             continue;
                         }
                         score_cluster_codes_with(
@@ -4794,10 +5002,16 @@ async fn scan_shortlist(
                                 acc.push((cand.did, cand.estimate, cand.pos, cand.cluster_id))
                             },
                         );
+                        if load_scan_bar(bar_owned.as_ref()).is_none() {
+                            publish_scan_bar(bar_owned.as_ref(), &mut acc, coarse_limit);
+                        }
                         if acc.len() >= cap {
                             truncate_to_top_estimates(&mut acc, coarse_limit);
                         }
                     }
+                    // One publish per chunk: a single selection, and it
+                    // raises the bar for whichever cells are still scanning.
+                    publish_scan_bar(bar_owned.as_ref(), &mut acc, coarse_limit);
                     (acc, thread_cpu_delta_ns(kernel_start))
                 })
                 .reduce(
@@ -4819,7 +5033,9 @@ async fn scan_shortlist(
             let mut acc = Vec::with_capacity(total_candidates.min(cap));
             for (idx, item) in cluster_meta.iter().zip(cluster_blocks.iter()).enumerate() {
                 let cluster_residual = cluster_residuals.as_ref().map(|v| &v[idx]);
-                scan_vec(&mut acc, cluster_residual, item);
+                let bar = load_scan_bar(scan_bar.as_ref());
+                scan_vec(&mut acc, cluster_residual, bar, item);
+                publish_scan_bar(scan_bar.as_ref(), &mut acc, coarse_limit);
                 if acc.len() >= cap {
                     truncate_to_top_estimates(&mut acc, coarse_limit);
                 }
@@ -4828,8 +5044,188 @@ async fn scan_shortlist(
         })
     };
     let (mut acc, kernel_ns) = acc;
+    #[cfg(any(test, feature = "test-helpers"))]
+    if plane_trunc_probe::prod_enabled() {
+        plane_trunc_probe::add_prod_scan(scan_bar.is_some(), coarse_limit as u64, acc.len() as u64);
+    }
     truncate_to_top_estimates(&mut acc, coarse_limit);
+    #[cfg(any(test, feature = "test-helpers"))]
+    if plane_trunc_probe::enabled() {
+        plane_trunc_probe::cell_done();
+    }
+    #[cfg(any(test, feature = "test-helpers"))]
+    if plane_trunc_probe::prod_enabled() {
+        plane_trunc_probe::emit_prod();
+    }
     Ok((acc, kernel_ns))
+}
+
+/// The current pruning floor of a partially-scanned cell shortlist: the
+/// `limit`-th best estimate accumulated so far, or `None` while the
+/// shortlist is still filling. Any row whose estimate provably stays
+/// below this floor is dropped by the final
+/// [`truncate_to_top_estimates`] regardless of what later clusters add,
+/// so a scan-time prune against it is survivor-set-exact.
+#[cfg(any(test, feature = "test-helpers"))]
+fn shortlist_floor(acc: &[(u32, f32, u32, u32)], limit: usize) -> Option<f32> {
+    if limit == 0 || acc.len() < limit {
+        return None;
+    }
+    let mut ests: Vec<f32> = acc.iter().map(|&(_, est, _, _)| est).collect();
+    let (_, kth, _) = ests.select_nth_unstable_by(limit - 1, |a, b| b.total_cmp(a));
+    Some(*kth)
+}
+
+/// Counterfactual plane-truncation shadow for one cluster's LUT scan
+/// (probe-gated; see `plane_trunc_probe`). Replays the cluster's
+/// transposed blocks through [`shadow_block_dead_planes`] against the
+/// cell's current shortlist floor and records how many plane units each
+/// bound variant would have skipped. The real scan is untouched — the
+/// measurement is exact and risk-free. Bars convert the estimate-scale
+/// floor into integer accumulator units per lane: with residual codes
+/// the estimate is `q_dot + kappa * norm * (acc * inv_scale)`, so a
+/// lane is provably dead once
+/// `acc + allowance < (floor - q_dot) / (kappa * norm * inv_scale)`;
+/// a zero-gain lane (norm 0) is dead iff `q_dot` alone misses the
+/// floor.
+#[cfg(any(test, feature = "test-helpers"))]
+fn shadow_plane_trunc(
+    transposed: &[u8],
+    cnt: usize,
+    off: u32,
+    cb: usize,
+    lut: &LutQuery,
+    residual: Option<&ClusterResidual>,
+    floor: f32,
+) -> Option<Vec<bool>> {
+    let (suffix_max, suffix_sigma) = lut.plane_suffix_tables();
+    let mut allowances: Vec<Vec<i32>> = Vec::with_capacity(plane_trunc_probe::VARIANTS);
+    allowances.push(suffix_max);
+    for &z in &PLANE_TRUNC_Z {
+        allowances.push(suffix_sigma.iter().map(|s| (z * s).ceil() as i32).collect());
+    }
+    let allowance_refs: Vec<&[i32]> = allowances.iter().map(Vec::as_slice).collect();
+    let inv_scale = lut.inv_scale();
+    let n_blocks = cnt.div_ceil(LUT_BLOCK_ROWS);
+    let mut skipped = [0u64; plane_trunc_probe::VARIANTS];
+    let mut fully_skipped = [true; plane_trunc_probe::VARIANTS];
+    let mut fired = [0u16; plane_trunc_probe::VARIANTS];
+    let mut unsafe_lanes = [0u32; plane_trunc_probe::VARIANTS];
+    let mut unsafe_total = [0u64; plane_trunc_probe::VARIANTS];
+    let enforce = plane_trunc_probe::enforce_variant();
+    let mut killed_blocks = enforce.map(|_| vec![false; n_blocks]);
+    let mut enforced_rows = 0u64;
+    for block_i in 0..n_blocks {
+        let base = block_i * LUT_BLOCK_ROWS;
+        let live = (cnt - base).min(LUT_BLOCK_ROWS);
+        // Padded tail lanes can never survive, so they must not hold a
+        // block open: +inf bars are unconditionally dead.
+        let mut bars = [f32::INFINITY; LUT_BLOCK_ROWS];
+        for (lane, bar) in bars.iter_mut().enumerate().take(live) {
+            *bar = match residual {
+                Some(res) => {
+                    let gain = res.kappa * res.norm_at(off + (base + lane) as u32) * inv_scale;
+                    if gain > 0.0 {
+                        (floor - res.q_dot) / gain
+                    } else if res.q_dot < floor {
+                        f32::INFINITY
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                }
+                None => floor / inv_scale,
+            };
+        }
+        shadow_block_dead_planes(
+            &transposed[block_i * cb * LUT_BLOCK_ROWS..(block_i + 1) * cb * LUT_BLOCK_ROWS],
+            cb,
+            lut,
+            &bars,
+            &allowance_refs,
+            &mut fired,
+            &mut unsafe_lanes,
+        );
+        for (v, &f) in fired.iter().enumerate() {
+            skipped[v] += (cb - f as usize) as u64;
+            if f > 0 {
+                fully_skipped[v] = false;
+            }
+            unsafe_total[v] += u64::from(unsafe_lanes[v]);
+        }
+        if let (Some(v), Some(mask)) = (enforce, killed_blocks.as_mut())
+            && (fired[v] as usize) < cb
+        {
+            mask[block_i] = true;
+            enforced_rows += live as u64;
+        }
+    }
+    plane_trunc_probe::add_cluster(
+        (n_blocks * cb) as u64,
+        &skipped,
+        &fully_skipped,
+        &unsafe_total,
+    );
+    if enforced_rows > 0 {
+        plane_trunc_probe::add_enforced_rows(enforced_rows);
+    }
+    killed_blocks
+}
+
+/// "No bar published yet" in a [`ScanBar`]: no real key collides, since
+/// the most negative finite estimate still maps to a nonzero key.
+const SCAN_BAR_NONE: u32 = 0;
+
+/// A pruning bar shared by every cluster, rayon chunk and cell of one
+/// query's scan. The k-th best estimate of ANY subset of the scanned rows
+/// is a lower bound on the k-th best of the union (more rows can only
+/// raise it), so whichever part of the scan reaches that depth first can
+/// publish for all the others, and a bar that lags reality costs pruning
+/// power but never a survivor. Raised with one `fetch_max` over an
+/// order-preserving key, so the scan's hot path takes no lock.
+type ScanBar = Arc<AtomicU32>;
+
+/// Map an f32 onto a u32 whose unsigned order matches float order, so
+/// `fetch_max` raises the bar correctly for negative estimates too.
+#[inline]
+fn scan_bar_key(est: f32) -> u32 {
+    let bits = est.to_bits();
+    if bits & SIGN_BIT != 0 {
+        !bits
+    } else {
+        bits | SIGN_BIT
+    }
+}
+
+/// Inverse of [`scan_bar_key`].
+#[inline]
+fn scan_bar_value(key: u32) -> f32 {
+    f32::from_bits(if key & SIGN_BIT != 0 {
+        key & !SIGN_BIT
+    } else {
+        !key
+    })
+}
+
+/// The bar published so far for this query, if any.
+#[inline]
+fn load_scan_bar(bar: Option<&ScanBar>) -> Option<f32> {
+    let key = bar?.load(AtomicOrdering::Relaxed);
+    (key != SCAN_BAR_NONE).then(|| scan_bar_value(key))
+}
+
+/// Raise the shared bar to the `limit`-th best estimate in `acc` once it
+/// holds that many rows. This partitions `acc` in place (its order is
+/// unspecified by contract) instead of truncating, so it can run after
+/// every cluster rather than only when an accumulator overflows: the
+/// rayon arm's per-chunk accumulators are each far smaller than the
+/// truncation cap and would otherwise never produce a bar at all.
+fn publish_scan_bar(bar: Option<&ScanBar>, acc: &mut [(u32, f32, u32, u32)], limit: usize) {
+    let Some(bar) = bar else { return };
+    if limit == 0 || acc.len() < limit {
+        return;
+    }
+    let (_, kth, _) = acc.select_nth_unstable_by(limit - 1, |a, b| b.1.total_cmp(&a.1));
+    bar.fetch_max(scan_bar_key(kth.1), AtomicOrdering::Relaxed);
 }
 
 /// Keep the `limit` highest-estimate survivors of one cell scan via a
@@ -4980,6 +5376,7 @@ async fn build_shortlist(
         coarse_limit,
         ctx,
         residual,
+        None,
     )
     .await?;
 

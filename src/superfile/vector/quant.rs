@@ -65,6 +65,44 @@ const LUT_ENTRIES_PER_GROUP: usize = 16;
 /// The i8 quantization ceiling for LUT entries.
 const LUT_I8_MAX: f32 = 127.0;
 
+/// Planes a block kernel scores between prune checks. Each plane is one
+/// contiguous 64-byte run in the transposed layout, so aborting a block
+/// at a checkpoint skips a contiguous suffix of its bytes — the saving is
+/// bandwidth, not just arithmetic. 16 keeps the check's cost (a handful
+/// of SIMD compares) far below the ~12-20 instructions each plane costs.
+const PLANE_PRUNE_CHECKPOINT: usize = 16;
+
+/// Sigma multiplier for the remaining-planes allowance used by the block
+/// prune. The exact worst-case allowance (the suffix sum of per-group max
+/// entries) runs ~20x the per-row score spread on high-dimensional unit
+/// queries, so it only crosses a pruning bar in the last few planes —
+/// measured at 2.4% of scan work on 10M Cohere, i.e. useless. This
+/// allowance is `z` standard deviations of the remaining contribution
+/// under a uniform-nibble model instead: NOT a hard bound, so a row
+/// within `z` sigma of the bar can be dropped. It is a fixed constant,
+/// not a calibrated per-table law — nothing is stamped, there is no
+/// manifest field and no drain-time measurement, and the effect is
+/// one-sided (it can only skip work). Set to 0 to disable pruning.
+///
+/// CURRENTLY 0 (disabled), because the uniform-nibble model this
+/// allowance rests on is only valid for RESIDUAL codes. Measured on 10M
+/// Cohere: with residual codes (signs of `v - c`, which are near-isotropic
+/// once the centroid term is split out) z=3 skipped a third of the scan at
+/// recall identical to baseline; on RAW codes, whose sign pattern is
+/// strongly aligned with any query whose cell got probed, the same z=3
+/// dropped recall@10 from 0.998 to 0.676 — the rows in a probed cell sit
+/// many "random-row" sigma above the mean, so an allowance built from
+/// random-row statistics prunes true neighbours at the first checkpoint.
+/// A bound that extrapolates the observed prefix (remaining ~
+/// prefix * remaining_planes / scored_planes, plus a conditional sigma)
+/// is the fix; until it is built and measured, this stays 0 and the
+/// kernels below are a no-op.
+const PLANE_PRUNE_Z: f32 = 0.0;
+
+/// Upper bound on checkpoints per block: dim 1536 is 192 planes, i.e. 11
+/// checkpoints at [`PLANE_PRUNE_CHECKPOINT`] = 16.
+const MAX_PLANE_CHECKPOINTS: usize = 16;
+
 /// Number of distinct byte values a code byte can take (`2^8`). The
 /// sign table holds one [`BITS_PER_CODE_BYTE`]-wide `±1` expansion
 /// per pattern, so it is `SIGN_TABLE_BYTE_PATTERNS * BITS_PER_CODE_BYTE`
@@ -284,6 +322,36 @@ pub(crate) struct LutQuery {
     /// groups of each group's max |entry|. The i16 kernels are safe
     /// iff this fits i16 — see [`LutQuery::fits_i16`].
     worst_abs: u32,
+    /// Allowance for what the unread planes can still contribute, in
+    /// accumulator units, one entry per checkpoint: entry `c` covers the
+    /// planes after `(c + 1) * PLANE_PRUNE_CHECKPOINT`. See
+    /// [`PLANE_PRUNE_Z`] for what "allowance" means here — a sigma
+    /// multiple, not a hard bound.
+    prune_allowance: [i32; MAX_PLANE_CHECKPOINTS],
+    /// Live entries in [`Self::prune_allowance`]; `0` disables pruning
+    /// for this query (short codes, or `PLANE_PRUNE_Z` set to 0).
+    prune_checkpoints: usize,
+}
+
+/// One cluster scan's pruning bar, resolved from the cell's running
+/// shortlist floor: per-checkpoint thresholds in accumulator units. A
+/// block whose every lane sits below the threshold at some checkpoint is
+/// abandoned and its remaining planes are never read.
+pub(crate) struct PruneBar {
+    thresholds: [i16; MAX_PLANE_CHECKPOINTS],
+    checkpoints: usize,
+    /// Blocks eligible for pruning: the full 64-row ones. The tail block
+    /// carries zero-padded lanes whose scores are meaningless, and
+    /// letting them decide a block's fate would cost a lane mask in
+    /// every kernel to save one block per cluster.
+    full_blocks: usize,
+}
+
+impl PruneBar {
+    #[inline]
+    fn thresholds(&self) -> &[i16] {
+        &self.thresholds[..self.checkpoints]
+    }
 }
 
 impl LutQuery {
@@ -303,6 +371,10 @@ impl LutQuery {
         let scale = LUT_I8_MAX / max_abs;
         let mut luts = vec![0i8; groups * LUT_ENTRIES_PER_GROUP];
         let mut worst_abs = 0u32;
+        // Mean square of each group's 16 entries — the variance of that
+        // group's contribution to a row when its nibble is uniform. The
+        // prune allowance is built from suffix sums of these.
+        let mut group_mean_square = vec![0f32; groups];
         for g in 0..groups {
             let d0 = g * LUT_GROUP_DIMS;
             let mut group_max = 0u32;
@@ -315,15 +387,83 @@ impl LutQuery {
                 let entry = (s * scale).round().clamp(-LUT_I8_MAX, LUT_I8_MAX) as i8;
                 luts[g * LUT_ENTRIES_PER_GROUP + nib as usize] = entry;
                 group_max = group_max.max(entry.unsigned_abs() as u32);
+                group_mean_square[g] +=
+                    f32::from(entry) * f32::from(entry) / LUT_ENTRIES_PER_GROUP as f32;
             }
             worst_abs += group_max;
         }
+        let (prune_allowance, prune_checkpoints) =
+            Self::build_prune_allowance(groups, &group_mean_square);
         LutQuery {
             luts,
             inv_scale: 1.0 / scale,
             groups,
             worst_abs,
+            prune_allowance,
+            prune_checkpoints,
         }
+    }
+
+    /// Per-checkpoint allowance for the block prune: [`PLANE_PRUNE_Z`]
+    /// standard deviations of everything the unread planes can still
+    /// contribute, rounded up so a stored value never understates it.
+    fn build_prune_allowance(
+        groups: usize,
+        group_mean_square: &[f32],
+    ) -> ([i32; MAX_PLANE_CHECKPOINTS], usize) {
+        let mut allowance = [0i32; MAX_PLANE_CHECKPOINTS];
+        if PLANE_PRUNE_Z <= 0.0 {
+            return (allowance, 0);
+        }
+        // `sigma_after[p]` = sd of the contribution planes `p..` make.
+        let planes = groups.div_ceil(2);
+        let mut sigma_after = vec![0f32; planes + 1];
+        let mut suffix = 0f32;
+        for p in (0..planes).rev() {
+            let g_lo = 2 * p;
+            suffix += group_mean_square[g_lo];
+            if g_lo + 1 < groups {
+                suffix += group_mean_square[g_lo + 1];
+            }
+            sigma_after[p] = suffix.sqrt();
+        }
+        let mut checkpoints = 0;
+        let mut scored = PLANE_PRUNE_CHECKPOINT;
+        while scored < planes && checkpoints < MAX_PLANE_CHECKPOINTS {
+            allowance[checkpoints] = (PLANE_PRUNE_Z * sigma_after[scored]).ceil() as i32;
+            checkpoints += 1;
+            scored += PLANE_PRUNE_CHECKPOINT;
+        }
+        (allowance, checkpoints)
+    }
+
+    /// Resolve this query's pruning bar against a cell scan's running
+    /// shortlist floor (`bar_estimate`, on estimate scale) for a cluster
+    /// of `rows` rows. `None` when nothing can be pruned.
+    pub(crate) fn prune_bar(&self, bar_estimate: f32, rows: usize) -> Option<PruneBar> {
+        if self.prune_checkpoints == 0 || !bar_estimate.is_finite() {
+            return None;
+        }
+        let full_blocks = rows / LUT_BLOCK_ROWS;
+        if full_blocks == 0 {
+            return None;
+        }
+        // Estimate scale back to accumulator units; the floor keeps a
+        // threshold from creeping above the true bar.
+        let bar_units = (bar_estimate / self.inv_scale).floor();
+        let bar = bar_units.clamp(i16::MIN as f32, i16::MAX as f32) as i32;
+        let mut thresholds = [i16::MIN; MAX_PLANE_CHECKPOINTS];
+        for (slot, allowance) in thresholds
+            .iter_mut()
+            .zip(&self.prune_allowance[..self.prune_checkpoints])
+        {
+            *slot = (bar - allowance).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        }
+        Some(PruneBar {
+            thresholds,
+            checkpoints: self.prune_checkpoints,
+            full_blocks,
+        })
     }
 
     /// Whether the i16 block accumulators can represent every possible
@@ -346,6 +486,59 @@ impl LutQuery {
     #[cfg(test)]
     pub(crate) fn quantization_bound(&self) -> f32 {
         self.groups as f32 * 0.5 * self.inv_scale
+    }
+
+    /// Multiplier that undoes the i8 LUT quantization (see [`Self::new`]).
+    /// Exposed for the plane-truncation shadow, which converts an
+    /// estimate-scale pruning floor into integer accumulator units.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[inline]
+    pub(crate) fn inv_scale(&self) -> f32 {
+        self.inv_scale
+    }
+
+    /// Per-plane suffix tables for the plane-truncation shadow
+    /// ([`shadow_block_dead_planes`]). Entry `p` of the first table is
+    /// the EXACT maximum accumulator contribution planes `p..` can still
+    /// add: the suffix sum of each remaining group's max entry (the 16
+    /// entries of a group are sign-symmetric, so the max entry is also
+    /// the max magnitude). Entry `p` of the second table is the standard
+    /// deviation of that remaining contribution under a uniform-nibble
+    /// model: `sqrt(suffix sum of mean(entry^2))`. Both tables have
+    /// `planes + 1` entries with the last equal to zero, in the same
+    /// quantized integer units as the kernel accumulators.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) fn plane_suffix_tables(&self) -> (Vec<i32>, Vec<f32>) {
+        let planes = self.groups.div_ceil(2);
+        let group_stats = |g: usize| {
+            let entries = &self.luts[g * LUT_ENTRIES_PER_GROUP..(g + 1) * LUT_ENTRIES_PER_GROUP];
+            let max = entries
+                .iter()
+                .map(|&e| i32::from(e))
+                .max()
+                .unwrap_or(0)
+                .max(0);
+            let var = entries
+                .iter()
+                .map(|&e| f32::from(e) * f32::from(e))
+                .sum::<f32>()
+                / LUT_ENTRIES_PER_GROUP as f32;
+            (max, var)
+        };
+        let mut suffix_max = vec![0i32; planes + 1];
+        let mut suffix_var = vec![0f32; planes + 1];
+        for p in (0..planes).rev() {
+            let g_lo = 2 * p;
+            let (mut max, mut var) = group_stats(g_lo);
+            if g_lo + 1 < self.groups {
+                let (hi_max, hi_var) = group_stats(g_lo + 1);
+                max += hi_max;
+                var += hi_var;
+            }
+            suffix_max[p] = suffix_max[p + 1] + max;
+            suffix_var[p] = suffix_var[p + 1] + var;
+        }
+        (suffix_max, suffix_var.into_iter().map(f32::sqrt).collect())
     }
 }
 
@@ -472,12 +665,22 @@ pub(crate) fn for_each_code_block_scores(
     cache: &[u8],
     cb: usize,
     lut: &LutQuery,
+    prune: Option<&PruneBar>,
+    planes_scanned: &mut usize,
     mut reduce: impl FnMut(usize, &[f32; LUT_BLOCK_ROWS]),
 ) {
     debug_assert_eq!(cache.len() % (cb * LUT_BLOCK_ROWS), 0);
     debug_assert!(lut.worst_abs <= i16::MAX as u32);
     let n_blocks = cache.len() / (cb * LUT_BLOCK_ROWS);
     let mut scores = [0f32; LUT_BLOCK_ROWS];
+    // Thresholds for this block, or an empty slice when it must be
+    // scored in full (no bar, or the zero-padded tail block).
+    let bars_for = |block: usize| -> &[i16] {
+        match prune {
+            Some(bar) if block < bar.full_blocks => bar.thresholds(),
+            _ => &[],
+        }
+    };
     #[cfg(target_arch = "x86_64")]
     {
         if has_vbmi() {
@@ -485,8 +688,19 @@ pub(crate) fn for_each_code_block_scores(
                 let span = &cache[block * cb * LUT_BLOCK_ROWS..(block + 1) * cb * LUT_BLOCK_ROWS];
                 // SAFETY: gated on `has_vbmi()` which implies `avx512f` +
                 // `avx512bw` and checks `avx512vbmi`.
-                unsafe { score_code_block64_transposed_avx512(span, cb, lut, &mut scores) };
-                reduce(block * LUT_BLOCK_ROWS, &scores);
+                let consumed = unsafe {
+                    score_code_block64_transposed_avx512(
+                        span,
+                        cb,
+                        lut,
+                        bars_for(block),
+                        &mut scores,
+                    )
+                };
+                *planes_scanned += consumed;
+                if consumed == cb {
+                    reduce(block * LUT_BLOCK_ROWS, &scores);
+                }
             }
             return;
         }
@@ -494,16 +708,25 @@ pub(crate) fn for_each_code_block_scores(
             for block in 0..n_blocks {
                 let span = &cache[block * cb * LUT_BLOCK_ROWS..(block + 1) * cb * LUT_BLOCK_ROWS];
                 // SAFETY: gated on `avx2_enabled()` which requires `avx2`.
-                unsafe { score_code_block64_transposed_avx2(span, cb, lut, &mut scores) };
-                reduce(block * LUT_BLOCK_ROWS, &scores);
+                let consumed = unsafe {
+                    score_code_block64_transposed_avx2(span, cb, lut, bars_for(block), &mut scores)
+                };
+                *planes_scanned += consumed;
+                if consumed == cb {
+                    reduce(block * LUT_BLOCK_ROWS, &scores);
+                }
             }
             return;
         }
     }
     for block in 0..n_blocks {
         let span = &cache[block * cb * LUT_BLOCK_ROWS..(block + 1) * cb * LUT_BLOCK_ROWS];
-        score_code_block64_transposed_scalar(span, cb, lut, &mut scores);
-        reduce(block * LUT_BLOCK_ROWS, &scores);
+        let consumed =
+            score_code_block64_transposed_scalar(span, cb, lut, bars_for(block), &mut scores);
+        *planes_scanned += consumed;
+        if consumed == cb {
+            reduce(block * LUT_BLOCK_ROWS, &scores);
+        }
     }
 }
 
@@ -515,9 +738,11 @@ fn score_code_block64_transposed_scalar(
     block: &[u8],
     cb: usize,
     lut: &LutQuery,
+    bars: &[i16],
     est_out: &mut [f32; LUT_BLOCK_ROWS],
-) {
+) -> usize {
     let mut acc = [0i16; LUT_BLOCK_ROWS];
+    let mut checkpoint = 0usize;
     for p in 0..cb {
         let g_lo = 2 * p;
         let g_hi = 2 * p + 1;
@@ -530,9 +755,92 @@ fn score_code_block64_transposed_scalar(
                 acc[lane] += i16::from(lut.luts[g_hi * LUT_ENTRIES_PER_GROUP + hi]);
             }
         }
+        if (p + 1) % PLANE_PRUNE_CHECKPOINT == 0 {
+            if let Some(&bar) = bars.get(checkpoint)
+                && acc.iter().all(|&a| a < bar)
+            {
+                return p + 1;
+            }
+            checkpoint += 1;
+        }
     }
     for (lane, &a) in acc.iter().enumerate() {
         est_out[lane] = f32::from(a) * lut.inv_scale;
+    }
+    cb
+}
+
+/// Counterfactual shadow of the block kernels for plane-truncation
+/// analysis: replays one 64-row block plane-by-plane in the scalar
+/// kernel's exact accumulation order and reports, for each candidate
+/// bound, the first plane count after which EVERY lane is provably below
+/// its bar — `acc + allowance < bar` for all 64 lanes — or `cb` when the
+/// block never dies. `allowances[v]` holds `planes + 1` entries of
+/// remaining-contribution allowance (entry `p` = allowance once `p`
+/// planes are complete); `bars` is in integer accumulator units, with
+/// `f32::INFINITY` marking a lane that is unconditionally dead (e.g.
+/// tail-block padding) and `f32::NEG_INFINITY` a lane that must never be
+/// pruned. Diagnostics only — the production kernels are untouched.
+#[cfg(any(test, feature = "test-helpers"))]
+pub(crate) fn shadow_block_dead_planes(
+    block: &[u8],
+    cb: usize,
+    lut: &LutQuery,
+    bars: &[f32; LUT_BLOCK_ROWS],
+    allowances: &[&[i32]],
+    fired: &mut [u16],
+    unsafe_lanes: &mut [u32],
+) {
+    debug_assert_eq!(block.len(), cb * LUT_BLOCK_ROWS);
+    debug_assert_eq!(fired.len(), allowances.len());
+    debug_assert_eq!(unsafe_lanes.len(), allowances.len());
+    let all_dead = |acc: &[i32; LUT_BLOCK_ROWS], allow: i32| {
+        acc.iter()
+            .zip(bars)
+            .all(|(&a, &bar)| ((a + allow) as f32) < bar)
+    };
+    let mut acc = [0i32; LUT_BLOCK_ROWS];
+    for (v, allowance) in allowances.iter().enumerate() {
+        fired[v] = if all_dead(&acc, allowance[0]) {
+            0
+        } else {
+            cb as u16
+        };
+    }
+    // Full replay even after every variant fires: the final accumulators
+    // feed the false-kill audit below.
+    for p in 0..cb {
+        let g_lo = 2 * p;
+        let g_hi = g_lo + 1;
+        let bytes = &block[p * LUT_BLOCK_ROWS..(p + 1) * LUT_BLOCK_ROWS];
+        for (lane, &b) in bytes.iter().enumerate() {
+            let lo = (b & 0x0F) as usize;
+            acc[lane] += i32::from(lut.luts[g_lo * LUT_ENTRIES_PER_GROUP + lo]);
+            if g_hi < lut.groups {
+                let hi = (b >> 4) as usize;
+                acc[lane] += i32::from(lut.luts[g_hi * LUT_ENTRIES_PER_GROUP + hi]);
+            }
+        }
+        for (v, allowance) in allowances.iter().enumerate() {
+            if fired[v] == cb as u16 && all_dead(&acc, allowance[p + 1]) {
+                fired[v] = (p + 1) as u16;
+            }
+        }
+    }
+    // False-kill audit: a variant that stopped this block killed every
+    // lane's remaining planes — any lane whose FINAL accumulator still
+    // reaches its bar was a survivor the truncated scan would have lost
+    // (an upper bound on harm: the bar is the cluster-entry floor, and
+    // the cell's final floor is never lower).
+    for (v, count) in unsafe_lanes.iter_mut().enumerate() {
+        *count = 0;
+        if (fired[v] as usize) < cb {
+            *count = acc
+                .iter()
+                .zip(bars)
+                .filter(|&(&a, &bar)| (a as f32) >= bar)
+                .count() as u32;
+        }
     }
 }
 
@@ -546,8 +854,9 @@ unsafe fn score_code_block64_transposed_avx512(
     block: &[u8],
     cb: usize,
     lut: &LutQuery,
+    bars: &[i16],
     est_out: &mut [f32; LUT_BLOCK_ROWS],
-) {
+) -> usize {
     use std::arch::x86_64::*;
     // SAFETY: `block.len() == cb * 64` (the driver slices exactly that
     // span), so every 64-byte load at `p * 64` for `p < cb` is in
@@ -557,10 +866,13 @@ unsafe fn score_code_block64_transposed_avx512(
     // `avx512vbmi`, guaranteed by the caller per the `# Safety`
     // contract. i16 accumulators cannot overflow: the driver
     // debug-asserts `lut.worst_abs <= i16::MAX` (exact per-query bound).
+    // Returning early at a prune checkpoint only shrinks the range of
+    // planes touched, so every load stays within the same bounds.
     unsafe {
         let mut acc_lo = _mm512_setzero_si512();
         let mut acc_hi = _mm512_setzero_si512();
         let nib_mask = _mm512_set1_epi8(0x0F);
+        let mut checkpoint = 0usize;
         for p in 0..cb {
             let bytes = _mm512_loadu_si512(block.as_ptr().add(p * LUT_BLOCK_ROWS) as *const _);
             let g_lo = 2 * p;
@@ -588,6 +900,19 @@ unsafe fn score_code_block64_transposed_avx512(
                     _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(val_hi, 1)),
                 );
             }
+            if (p + 1) % PLANE_PRUNE_CHECKPOINT == 0 {
+                if let Some(&bar) = bars.get(checkpoint) {
+                    // Every lane strictly below the bar: all 32 mask bits
+                    // set in both halves.
+                    let bar_v = _mm512_set1_epi16(bar);
+                    let below_lo = _mm512_cmplt_epi16_mask(acc_lo, bar_v);
+                    let below_hi = _mm512_cmplt_epi16_mask(acc_hi, bar_v);
+                    if below_lo == u32::MAX && below_hi == u32::MAX {
+                        return p + 1;
+                    }
+                }
+                checkpoint += 1;
+            }
         }
         let mut tmp = [0i16; LUT_BLOCK_ROWS];
         _mm512_storeu_si512(tmp.as_mut_ptr() as *mut _, acc_lo);
@@ -596,6 +921,7 @@ unsafe fn score_code_block64_transposed_avx512(
             est_out[r] = f32::from(tmp[r]) * lut.inv_scale;
         }
     }
+    cb
 }
 
 /// # Safety
@@ -608,8 +934,9 @@ unsafe fn score_code_block64_transposed_avx2(
     block: &[u8],
     cb: usize,
     lut: &LutQuery,
+    bars: &[i16],
     est_out: &mut [f32; LUT_BLOCK_ROWS],
-) {
+) -> usize {
     use std::arch::x86_64::*;
     // SAFETY: `block.len() == cb * 64` (the driver slices exactly that
     // span), so the two 32-byte loads at `p * 64` and `p * 64 + 32` are
@@ -624,6 +951,7 @@ unsafe fn score_code_block64_transposed_avx2(
         // 64 i16 lanes = four 256-bit accumulators: [0..16), [16..32)
         // for the low 32 rows, [32..48), [48..64) for the high 32.
         let mut acc = [_mm256_setzero_si256(); 4];
+        let mut checkpoint = 0usize;
         let nib_mask = _mm256_set1_epi8(0x0F);
         for p in 0..cb {
             let lo32 = _mm256_loadu_si256(block.as_ptr().add(p * LUT_BLOCK_ROWS) as *const _);
@@ -666,6 +994,21 @@ unsafe fn score_code_block64_transposed_avx2(
                     _mm256_cvtepi8_epi16(_mm256_extracti128_si256(val_b, 1)),
                 );
             }
+            if (p + 1) % PLANE_PRUNE_CHECKPOINT == 0 {
+                if let Some(&bar) = bars.get(checkpoint) {
+                    // `cmpgt(bar, acc)` is `acc < bar` per lane; a byte
+                    // mask of all ones means all 16 lanes of that
+                    // accumulator sit below the bar.
+                    let bar_v = _mm256_set1_epi16(bar);
+                    let below = acc
+                        .iter()
+                        .all(|a| _mm256_movemask_epi8(_mm256_cmpgt_epi16(bar_v, *a)) == -1);
+                    if below {
+                        return p + 1;
+                    }
+                }
+                checkpoint += 1;
+            }
         }
         let mut tmp = [0i16; LUT_BLOCK_ROWS];
         for (i, a) in acc.iter().enumerate() {
@@ -675,6 +1018,7 @@ unsafe fn score_code_block64_transposed_avx2(
             est_out[r] = f32::from(tmp[r]) * lut.inv_scale;
         }
     }
+    cb
 }
 // -------------- END FastScan LUT transposed code scan --------------
 
@@ -1083,6 +1427,7 @@ mod tests {
                     &cache[block * cb * LUT_BLOCK_ROWS..(block + 1) * cb * LUT_BLOCK_ROWS],
                     cb,
                     &lut,
+                    &[],
                     out,
                 );
             }
@@ -1095,7 +1440,15 @@ mod tests {
                     match tier {
                         "avx2" if std::arch::is_x86_feature_detected!("avx2") => {
                             // SAFETY: gated on the raw avx2 probe above.
-                            unsafe { score_code_block64_transposed_avx2(span, cb, &lut, &mut got) }
+                            unsafe {
+                                let _ = score_code_block64_transposed_avx2(
+                                    span,
+                                    cb,
+                                    &lut,
+                                    &[],
+                                    &mut got,
+                                );
+                            }
                         }
                         "avx512"
                             if std::arch::is_x86_feature_detected!("avx512f")
@@ -1104,7 +1457,13 @@ mod tests {
                         {
                             // SAFETY: gated on the raw avx512f/bw/vbmi probes above.
                             unsafe {
-                                score_code_block64_transposed_avx512(span, cb, &lut, &mut got)
+                                let _ = score_code_block64_transposed_avx512(
+                                    span,
+                                    cb,
+                                    &lut,
+                                    &[],
+                                    &mut got,
+                                );
                             }
                         }
                         _ => continue,
@@ -1122,6 +1481,111 @@ mod tests {
     /// The i8-quantized LUT estimate must sit within its analytic
     /// rounding bound of the exact estimator on every row: half a
     /// quantization step per nibble group.
+    /// The plane-truncation shadow is conservative: (1) its suffix-max
+    /// table starts at exactly the per-query worst case and drains to
+    /// zero; (2) whenever the EXACT variant declares a block dead after
+    /// `p` planes, every lane's FINAL score sits below the floor — an
+    /// early exit there never drops a row the full scan keeps; (3) a
+    /// smaller allowance never fires later than a larger one; (4) the
+    /// unconditional bar sentinels behave (`+inf` = dead at entry,
+    /// `-inf` = never fires).
+    #[test]
+    fn shadow_dead_planes_exact_bound_never_kills_a_survivor() {
+        for &dim in &[12usize, 60, 768] {
+            let quant = BitQuantizer::new(dim);
+            let cb = quant.code_bytes();
+            let cnt = 130;
+            let mut codes = Vec::with_capacity(cnt * cb);
+            for row in 0..cnt {
+                codes.extend_from_slice(&fake_code(&quant, 0x5150 + row as u32));
+            }
+            let cache = build_transposed_code_cache(&codes, cnt, cb);
+            let lut = LutQuery::new(&fake_vec(dim, 0xF00D));
+            let (suffix_max, suffix_sigma) = lut.plane_suffix_tables();
+            assert_eq!(
+                suffix_max[0], lut.worst_abs as i32,
+                "suffix-max must start at the exact per-query worst case"
+            );
+            assert_eq!(suffix_max[cb], 0);
+            let z_allowances: Vec<Vec<i32>> = [2.0f32, 6.0]
+                .iter()
+                .map(|z| suffix_sigma.iter().map(|s| (z * s).ceil() as i32).collect())
+                .collect();
+            let n_blocks = cache.len() / (cb * LUT_BLOCK_ROWS);
+            for block in 0..n_blocks {
+                let span = &cache[block * cb * LUT_BLOCK_ROWS..(block + 1) * cb * LUT_BLOCK_ROWS];
+                let mut finals = [0f32; LUT_BLOCK_ROWS];
+                score_code_block64_transposed_scalar(span, cb, &lut, &[], &mut finals);
+                let lo = finals.iter().copied().fold(f32::INFINITY, f32::min);
+                let hi = finals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                // Sweep floors across (and past) the block's own score
+                // range so some prune mid-block, some at entry, some never.
+                for &quantile in &[0.0f32, 0.25, 0.5, 0.9, 1.1] {
+                    let floor = lo + (hi - lo) * quantile;
+                    let bars = [floor / lut.inv_scale; LUT_BLOCK_ROWS];
+                    let mut allowances: Vec<&[i32]> = vec![&suffix_max];
+                    for a in &z_allowances {
+                        allowances.push(a);
+                    }
+                    let mut fired = vec![0u16; allowances.len()];
+                    let mut unsafe_lanes = vec![0u32; allowances.len()];
+                    shadow_block_dead_planes(
+                        span,
+                        cb,
+                        &lut,
+                        &bars,
+                        &allowances,
+                        &mut fired,
+                        &mut unsafe_lanes,
+                    );
+                    assert_eq!(
+                        unsafe_lanes[0], 0,
+                        "the exact bound must never report a false kill (dim {dim})"
+                    );
+                    if (fired[0] as usize) < cb {
+                        for &est in &finals {
+                            assert!(
+                                est < floor,
+                                "exact variant fired at plane {} but final score \
+                                 {est} >= floor {floor} (dim {dim})",
+                                fired[0]
+                            );
+                        }
+                    }
+                    assert!(
+                        fired[1] <= fired[2],
+                        "z=2 allowance must not fire later than z=6"
+                    );
+                }
+                let mut fired = vec![0u16; 1];
+                let mut unsafe_lanes = vec![0u32; 1];
+                let dead = [f32::INFINITY; LUT_BLOCK_ROWS];
+                shadow_block_dead_planes(
+                    span,
+                    cb,
+                    &lut,
+                    &dead,
+                    &[&suffix_max],
+                    &mut fired,
+                    &mut unsafe_lanes,
+                );
+                assert_eq!(fired[0], 0, "+inf bars must fire at entry");
+                assert_eq!(unsafe_lanes[0], 0);
+                let never = [f32::NEG_INFINITY; LUT_BLOCK_ROWS];
+                shadow_block_dead_planes(
+                    span,
+                    cb,
+                    &lut,
+                    &never,
+                    &[&suffix_max],
+                    &mut fired,
+                    &mut unsafe_lanes,
+                );
+                assert_eq!(fired[0] as usize, cb, "-inf bars must never fire");
+            }
+        }
+    }
+
     #[test]
     fn lut_estimate_within_quantization_bound() {
         for &dim in &[60usize, 768, 1024] {
@@ -1137,7 +1601,7 @@ mod tests {
             }
             let cache = build_transposed_code_cache(&codes, cnt, cb);
             let mut checked = 0usize;
-            for_each_code_block_scores(&cache, cb, &lut, |base_r, scores| {
+            for_each_code_block_scores(&cache, cb, &lut, None, &mut 0, |base_r, scores| {
                 for (lane, &est) in scores.iter().enumerate() {
                     let r = base_r + lane;
                     if r >= cnt {

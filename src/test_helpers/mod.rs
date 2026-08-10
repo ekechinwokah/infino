@@ -88,6 +88,235 @@ pub mod served_shortlist_probe {
     }
 }
 
+/// Counterfactual plane-truncation probe for the 1-bit LUT cell scan.
+/// Enabled by `INFINO_DIAG_PLANE_TRUNC=1` in the environment (read
+/// once) — a diagnostics switch in the `INFINO_DIAG_*` family, not an
+/// engine-behavior knob: search results are identical either way, the
+/// probe only measures what a checkpointed early-exit kernel WOULD
+/// have skipped against the cell's evolving shortlist floor. Counters
+/// are cumulative and process-global; a JSON snapshot line prefixed
+/// `PLANE_TRUNC` goes to stderr every [`EMIT_EVERY_CELLS`] recorded
+/// cell scans, so the last line of a run carries the totals.
+pub mod plane_trunc_probe {
+    use std::{
+        env,
+        sync::{
+            OnceLock,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
+
+    /// Bound variants measured side by side: index 0 is the exact
+    /// suffix-max bound; indexes 1.. are the probabilistic z-sigma
+    /// family (the scan side defines the z ladder).
+    pub const VARIANTS: usize = 5;
+    /// Emit a cumulative stderr snapshot every this many cell scans.
+    const EMIT_EVERY_CELLS: u64 = 64;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static ENFORCE: OnceLock<Option<usize>> = OnceLock::new();
+    static CELLS: AtomicU64 = AtomicU64::new(0);
+    static CLUSTERS: AtomicU64 = AtomicU64::new(0);
+    static PLANE_UNITS: AtomicU64 = AtomicU64::new(0);
+    static UNFLOORED_UNITS: AtomicU64 = AtomicU64::new(0);
+    static SKIPPED: [AtomicU64; VARIANTS] = new_counters();
+    static CLUSTERS_SKIPPED: [AtomicU64; VARIANTS] = new_counters();
+    static UNSAFE_LANES: [AtomicU64; VARIANTS] = new_counters();
+    static ENFORCED_ROWS: AtomicU64 = AtomicU64::new(0);
+
+    const fn new_counters() -> [AtomicU64; VARIANTS] {
+        [
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+        ]
+    }
+
+    /// Counters-only switch for the PRODUCTION prune path
+    /// (`INFINO_DIAG_PLANE_PROD=1`): unlike [`enabled`] it does not force
+    /// the serial scan arm and runs no shadow, so it observes exactly what
+    /// shipped code does — how often a bar exists, and how many rows the
+    /// kernels actually skipped.
+    pub fn prod_enabled() -> bool {
+        static PROD: OnceLock<bool> = OnceLock::new();
+        *PROD.get_or_init(|| env::var_os("INFINO_DIAG_PLANE_PROD").is_some_and(|v| v == "1"))
+    }
+
+    static PROD_CLUSTERS: AtomicU64 = AtomicU64::new(0);
+    static PROD_WITH_BAR: AtomicU64 = AtomicU64::new(0);
+    static PROD_ROWS: AtomicU64 = AtomicU64::new(0);
+    static PROD_ROWS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+    /// One scanned cluster on the production path: `rows` in it,
+    /// `pushed` rows that survived to the accumulator, and whether a
+    /// pruning bar existed at all.
+    pub fn add_prod_cluster(rows: u64, pushed: u64, had_bar: bool) {
+        PROD_CLUSTERS.fetch_add(1, Ordering::Relaxed);
+        if had_bar {
+            PROD_WITH_BAR.fetch_add(1, Ordering::Relaxed);
+        }
+        PROD_ROWS.fetch_add(rows, Ordering::Relaxed);
+        PROD_ROWS_SKIPPED.fetch_add(rows.saturating_sub(pushed), Ordering::Relaxed);
+    }
+
+    static PROD_SCANS: AtomicU64 = AtomicU64::new(0);
+    static PROD_SCANS_WITH_BAR_OBJ: AtomicU64 = AtomicU64::new(0);
+    static PROD_MAX_ACC: AtomicU64 = AtomicU64::new(0);
+    static PROD_LIMIT: AtomicU64 = AtomicU64::new(0);
+
+    static PROD_FLOOR_SEEN: AtomicU64 = AtomicU64::new(0);
+    static PROD_GAIN_ZERO: AtomicU64 = AtomicU64::new(0);
+    static PROD_BAR_NONE_OTHER: AtomicU64 = AtomicU64::new(0);
+
+    /// Why a cluster ended up without a prune bar: no floor published yet,
+    /// a zero residual gain (kappa * max norm), or the LUT declining.
+    pub fn add_prod_bar_reason(floor_seen: bool, gain_zero: bool, other: bool) {
+        if floor_seen {
+            PROD_FLOOR_SEEN.fetch_add(1, Ordering::Relaxed);
+        }
+        if gain_zero {
+            PROD_GAIN_ZERO.fetch_add(1, Ordering::Relaxed);
+        }
+        if other {
+            PROD_BAR_NONE_OTHER.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// One `scan_shortlist` call: whether it was handed a shared bar at
+    /// all, the shortlist depth it was asked for, and how many rows its
+    /// accumulator actually reached. Distinguishes "the bar never got
+    /// published" from "this code path never had a bar to begin with".
+    pub fn add_prod_scan(had_bar_obj: bool, limit: u64, acc_rows: u64) {
+        PROD_SCANS.fetch_add(1, Ordering::Relaxed);
+        if had_bar_obj {
+            PROD_SCANS_WITH_BAR_OBJ.fetch_add(1, Ordering::Relaxed);
+        }
+        PROD_MAX_ACC.fetch_max(acc_rows, Ordering::Relaxed);
+        PROD_LIMIT.store(limit, Ordering::Relaxed);
+    }
+
+    static PROD_PLANES: AtomicU64 = AtomicU64::new(0);
+    static PROD_PLANES_POSSIBLE: AtomicU64 = AtomicU64::new(0);
+
+    /// Plane-scan units the kernels actually consumed vs what a full scan
+    /// would have cost — the only measure that says whether early exits
+    /// are saving BYTES, not just skipping row pushes.
+    pub fn add_prod_planes(scanned: u64, possible: u64) {
+        PROD_PLANES.fetch_add(scanned, Ordering::Relaxed);
+        PROD_PLANES_POSSIBLE.fetch_add(possible, Ordering::Relaxed);
+    }
+
+    /// Dump the production counters (called per cell scan; cheap).
+    pub fn emit_prod() {
+        let cells = CELLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if !cells.is_multiple_of(EMIT_EVERY_CELLS) {
+            return;
+        }
+        eprintln!(
+            "PLANE_PROD {{\"clusters\":{},\"with_bar\":{},\"rows\":{},\"rows_skipped\":{},\"scans\":{},\"scans_with_bar_obj\":{},\"max_acc\":{},\"limit\":{},\"floor_seen\":{},\"gain_zero\":{},\"bar_none_other\":{},\"planes\":{},\"planes_possible\":{}}}",
+            PROD_CLUSTERS.load(Ordering::Relaxed),
+            PROD_WITH_BAR.load(Ordering::Relaxed),
+            PROD_ROWS.load(Ordering::Relaxed),
+            PROD_ROWS_SKIPPED.load(Ordering::Relaxed),
+            PROD_SCANS.load(Ordering::Relaxed),
+            PROD_SCANS_WITH_BAR_OBJ.load(Ordering::Relaxed),
+            PROD_MAX_ACC.load(Ordering::Relaxed),
+            PROD_LIMIT.load(Ordering::Relaxed),
+            PROD_FLOOR_SEEN.load(Ordering::Relaxed),
+            PROD_GAIN_ZERO.load(Ordering::Relaxed),
+            PROD_BAR_NONE_OTHER.load(Ordering::Relaxed),
+            PROD_PLANES.load(Ordering::Relaxed),
+            PROD_PLANES_POSSIBLE.load(Ordering::Relaxed),
+        );
+    }
+
+    pub fn enabled() -> bool {
+        *ENABLED.get_or_init(|| env::var_os("INFINO_DIAG_PLANE_TRUNC").is_some_and(|v| v == "1"))
+    }
+
+    /// Which bound variant the scan should ACT on, from
+    /// `INFINO_DIAG_PLANE_TRUNC_ENFORCE=<variant index>` — rows in blocks
+    /// that variant declares dead are dropped from the shortlist, exactly
+    /// as a checkpointed early-exit kernel would drop them. This is how
+    /// the recall cost of a probabilistic bound gets measured before any
+    /// kernel is written: the arithmetic is the shadow's, the effect on
+    /// results is the real one. Variant 0 (the exact bound) must leave
+    /// recall untouched by construction — the built-in control.
+    pub fn enforce_variant() -> Option<usize> {
+        *ENFORCE.get_or_init(|| {
+            env::var_os("INFINO_DIAG_PLANE_TRUNC_ENFORCE")
+                .and_then(|v| v.to_str().and_then(|s| s.parse::<usize>().ok()))
+                .filter(|v| *v < VARIANTS)
+        })
+    }
+
+    /// One shadowed cluster: `units` = plane-scan units the real kernel
+    /// spent (blocks x planes), `skipped[v]` = units variant `v` would
+    /// have saved, `fully[v]` = variant `v` killed every block before
+    /// its first plane (the whole cluster was skippable).
+    pub fn add_cluster(
+        units: u64,
+        skipped: &[u64; VARIANTS],
+        fully: &[bool; VARIANTS],
+        unsafe_lanes: &[u64; VARIANTS],
+    ) {
+        CLUSTERS.fetch_add(1, Ordering::Relaxed);
+        PLANE_UNITS.fetch_add(units, Ordering::Relaxed);
+        for v in 0..VARIANTS {
+            SKIPPED[v].fetch_add(skipped[v], Ordering::Relaxed);
+            if fully[v] {
+                CLUSTERS_SKIPPED[v].fetch_add(1, Ordering::Relaxed);
+            }
+            UNSAFE_LANES[v].fetch_add(unsafe_lanes[v], Ordering::Relaxed);
+        }
+    }
+
+    /// Plane units scanned before the shortlist floor existed (no bound
+    /// can prune there); kept separate so skip fractions stay honest.
+    pub fn add_unfloored(units: u64) {
+        UNFLOORED_UNITS.fetch_add(units, Ordering::Relaxed);
+    }
+
+    /// Rows actually withheld from a shortlist under
+    /// [`Self::enforce_variant`] — the enforced counterpart of the
+    /// counterfactual skip counters.
+    pub fn add_enforced_rows(rows: u64) {
+        ENFORCED_ROWS.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    /// Mark one cell scan finished; periodically emit the totals.
+    pub fn cell_done() {
+        let cells = CELLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if cells % EMIT_EVERY_CELLS == 0 {
+            emit();
+        }
+    }
+
+    fn emit() {
+        let fmt_counts = |counters: &[AtomicU64; VARIANTS]| {
+            let each: Vec<String> = counters
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed).to_string())
+                .collect();
+            format!("[{}]", each.join(","))
+        };
+        eprintln!(
+            "PLANE_TRUNC {{\"cells\":{},\"clusters\":{},\"plane_units\":{},\"unfloored_units\":{},\"skipped\":{},\"clusters_skipped\":{},\"unsafe_lanes\":{},\"enforce\":{},\"enforced_rows\":{}}}",
+            CELLS.load(Ordering::Relaxed),
+            CLUSTERS.load(Ordering::Relaxed),
+            PLANE_UNITS.load(Ordering::Relaxed),
+            UNFLOORED_UNITS.load(Ordering::Relaxed),
+            fmt_counts(&SKIPPED),
+            fmt_counts(&CLUSTERS_SKIPPED),
+            fmt_counts(&UNSAFE_LANES),
+            enforce_variant().map_or(-1i64, |v| v as i64),
+            ENFORCED_ROWS.load(Ordering::Relaxed),
+        );
+    }
+}
+
 /// Test-only override of the adaptive-stopping band floor
 /// (`STOP_BAND_MIN_ROWS`): the banded rerank only engages naturally at
 /// 10M-scale shortlists, so unit-scale tests lower the floor to walk the
