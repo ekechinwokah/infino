@@ -913,7 +913,13 @@ async fn lookup_user_placements_by_id(
         // concurrent prune from dropping the cell out from under the build.
         let cells: Vec<(Arc<SuperfileEntry>, GappedPlacementCell)> = {
             let mut cache = slot.lock().await;
-            if version >= cache.pruned_through {
+            // `>` not `>=`: a generation equal to the last prune has already
+            // been pruned, and re-running `retain` for it walks the whole map
+            // under this lock on EVERY projected query of a steady-state table
+            // (the common case — the generation only moves on commit/compact).
+            // The monotonic guarantee is unchanged: an older snapshot still
+            // never evicts a newer one's freshly built maps.
+            if version > cache.pruned_through {
                 cache.entries.retain(|uri, _| live_uris.contains(uri));
                 cache.pruned_through = version;
             }
@@ -1008,11 +1014,17 @@ async fn build_gapped_placement_index(
 ) -> Result<Arc<GappedPlacementIndex>, QueryError> {
     let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
     let ids = read_ids_for_locals(manifest, entry, &locals, id_column, true, op_stats).await?;
-    // Build scratch only: the `(i128, u32)` pair vector the sort runs over,
-    // released the moment the sorted arrays are extracted. Refusal degrades to
-    // an unaccounted build rather than failing the query — the vector scan
+    // Build scratch only, released the moment the sorted arrays are extracted.
+    // The transient peak holds all three vectors at once — the decoded `ids`
+    // and `locals` are still alive while the `(i128, u32)` pairs they zip into
+    // are built — so account for the sum rather than the pair vector alone
+    // (which undercounts the real high-water mark by ~2.6x). Refusal degrades
+    // to an unaccounted build rather than failing the query — the vector scan
     // degrades the same way.
-    let scratch_bytes = ids.len() * std::mem::size_of::<(i128, u32)>();
+    let scratch_bytes = ids.len()
+        * (std::mem::size_of::<i128>()
+            + std::mem::size_of::<u32>()
+            + std::mem::size_of::<(i128, u32)>());
     let scratch = manifest
         .options
         .connection_memory_budget
