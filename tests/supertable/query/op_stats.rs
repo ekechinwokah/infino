@@ -1020,3 +1020,122 @@ fn a_search_tvf_inside_sql_reports_fts_work() {
         "the BM25 leg inside SQL indexes posting bytes; got 0"
     );
 }
+
+/// Projecting only `_id` must cost no more than the engine-native
+/// (`None`) result: both columns are produced by the search wave — ids
+/// stamped on the hits, scores from the kernel — so neither needs a
+/// placement resolve or a Parquet decode. Regression for the fast path
+/// that matched only the exact `[_id, score]` pair and sent a bare
+/// `["_id"]` down the scalar-projection path, which resolves placements
+/// (a whole-`_id`-column read per gapped superfile on first touch) and
+/// then decodes rows. `rows_materialized` is the invariant signal: the
+/// native path decodes nothing, so anything above 0 here means the
+/// query fell off the fast path.
+#[test]
+fn id_only_projection_costs_no_more_than_the_native_result() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_vector_table(&dir);
+    let query = row_vec(3);
+    let search = |projection: Option<&[&str]>| {
+        let (hits, stats) = with_op_stats(|| {
+            st.vector_search(
+                "emb",
+                &query,
+                VECTOR_K,
+                VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+                None,
+                projection,
+            )
+            .expect("vector search")
+        });
+        assert!(!hits.is_empty(), "fixture vector query must match");
+        stats
+    };
+
+    let native = search(None);
+    let id_only = search(Some(&["_id"]));
+    let id_and_score = search(Some(&["_id", "score"]));
+    let score_only = search(Some(&["score"]));
+
+    assert_eq!(
+        native.rows_materialized, 0,
+        "the engine-native result decodes no stored rows"
+    );
+    for (label, stats) in [
+        ("_id", &id_only),
+        ("_id + score", &id_and_score),
+        ("score", &score_only),
+    ] {
+        assert_eq!(
+            stats.rows_materialized, 0,
+            "projection [{label}] must stay on the id/score fast path \
+             (decoded {} rows)",
+            stats.rows_materialized
+        );
+        assert_eq!(
+            stats.planned_read_ranges, native.planned_read_ranges,
+            "projection [{label}] must plan the same reads as the native result"
+        );
+    }
+}
+
+/// The gapped-placement memo must not pin connection-budget bytes. The
+/// budget gates MANDATORY work — ingest and compaction both hard-fail
+/// when refused — so a discretionary, rebuildable read cache that holds
+/// bytes for as long as its superfile stays live can push those over the
+/// ceiling and keep them there: the only thing that evicts an entry is
+/// its superfile being superseded, which is what compaction does, which
+/// would be the operation denied.
+///
+/// Measured as a DELTA against a warmed native query, because the
+/// transposed-code cache legitimately pins bytes for its reader's
+/// lifetime (`TransposedCluster::_reservation`) — this asserts only that
+/// building the placement memo adds nothing permanent on top.
+#[test]
+fn placement_memo_releases_its_budget_bytes() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_vector_table(&dir);
+    let budget = st.options().connection_budget();
+    let query = row_vec(3);
+    let search = |projection: Option<&[&str]>| {
+        let hits = st
+            .vector_search(
+                "emb",
+                &query,
+                VECTOR_K,
+                VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+                None,
+                projection,
+            )
+            .expect("vector search");
+        assert!(!hits.is_empty(), "fixture vector query must match");
+    };
+
+    // Warm every reader-lifetime cache the query path legitimately pins,
+    // so the only new resident state below is the placement memo.
+    search(None);
+    search(None);
+    let warmed = budget.used_bytes();
+    assert!(
+        budget.peak() > 0,
+        "the query must have exercised the budget at all"
+    );
+
+    // A user-column projection forces placement resolution over the
+    // drained (gapped) superfiles — this is what builds the memo.
+    search(Some(&["title"]));
+
+    assert_eq!(
+        budget.used_bytes(),
+        warmed,
+        "building the placement memo must leave no reserved bytes behind; \
+         {} held beyond the warmed baseline",
+        budget.used_bytes().saturating_sub(warmed)
+    );
+
+    // Liveness: mandatory work still reserves after the memo is warm.
+    let schema = st.options().schema.clone();
+    let mut w = st.writer().expect("writer");
+    w.append(&vector_batch(schema)).expect("append after memo");
+    w.commit().expect("commit after memo");
+}
