@@ -1145,10 +1145,28 @@ async fn read_ids_for_locals(
         // requests it identically whether it resolves resident or cold.
         // Hidden cell superfiles inline the stable `_id` in the IVF blob — resolve
         // straight from it (resident; no scalar `_id` column read) when available.
-        if let Some(ids) = reader
-            .vec()
-            .and_then(|v| v.inline_stable_ids_for_locals(local_ids))
-        {
+        // Resident decode is CPU over the whole requested row set — the
+        // placement-index build asks for EVERY row of the superfile — so it
+        // rides the reader pool and this task awaits a oneshot, per the
+        // rayon-for-CPU / tokio-for-I/O contract. Running it inline blocks a
+        // tokio worker for the length of a full-column decode, stalling every
+        // other query's I/O on that worker.
+        let resident = {
+            let reader = Arc::clone(&reader);
+            let locals = local_ids.to_vec();
+            run_on_pool(
+                Some(&manifest.options.reader_pool),
+                "inline stable-id decode: reader pool dropped result",
+                move || {
+                    reader
+                        .vec()
+                        .and_then(|v| v.inline_stable_ids_for_locals(&locals))
+                },
+            )
+            .await
+            .map_err(|e| QueryError::Execute(e.to_string()))?
+        };
+        if let Some(ids) = resident {
             if let Some(stats) = op_stats {
                 stats.add_planned_read_ranges(1);
             }
@@ -1168,11 +1186,26 @@ async fn read_ids_for_locals(
         }
     }
     if reader.parquet_bytes().is_some() {
-        let (batch, decode_ns) = op_stats::timed_section(|| {
-            reader
-                .take_by_local_doc_ids(local_ids, &[id_column])
-                .map_err(|e| QueryError::Execute(e.to_string()))
-        });
+        // Same bridge as the inline path: a Parquet column take over the
+        // requested rows is CPU, not I/O.
+        let (batch, decode_ns) = {
+            let reader = Arc::clone(&reader);
+            let locals = local_ids.to_vec();
+            let id_column = id_column.to_string();
+            run_on_pool(
+                Some(&manifest.options.reader_pool),
+                "scalar id decode: reader pool dropped result",
+                move || {
+                    op_stats::timed_section(|| {
+                        reader
+                            .take_by_local_doc_ids(&locals, &[id_column.as_str()])
+                            .map_err(|e| QueryError::Execute(e.to_string()))
+                    })
+                },
+            )
+            .await
+            .map_err(|e| QueryError::Execute(e.to_string()))?
+        };
         if let Some(stats) = op_stats {
             stats.add_kernel_cpu_ns(decode_ns);
         }
