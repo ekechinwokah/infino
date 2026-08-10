@@ -58,8 +58,8 @@ use crate::{
             },
             ivf_merge::Sq8IvfMergeInput,
             quant::{
-                BitQuantizer, LUT_BLOCK_ROWS, LutQuery, PruneBar, build_transposed_code_cache,
-                for_each_code_block_scores, lut_scan_supported,
+                BitQuantizer, LUT_BLOCK_ROWS, LutQuery, PLANE_PRUNE_ENABLED, PruneBar,
+                build_transposed_code_cache, for_each_code_block_scores, lut_scan_supported,
             },
             rerank_codec::{EncodedRowParts, RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
             rotation::RandomRotation,
@@ -3802,7 +3802,7 @@ impl VectorReader {
         let mut cell_scans: Vec<_> = cell_scans.collect();
         let mut per_cell_results: Vec<(Vec<(u32, f32)>, Vec<ScanCandidate>, ProbeTally)> =
             Vec::with_capacity(cell_scans.len());
-        if !cell_scans.is_empty() {
+        if PLANE_PRUNE_ENABLED && !cell_scans.is_empty() {
             per_cell_results.push(cell_scans.remove(0).await?);
         }
         let fanned: Vec<(Vec<(u32, f32)>, Vec<ScanCandidate>, ProbeTally)> =
@@ -4779,7 +4779,12 @@ async fn scan_shortlist(
             cluster_meta
                 .iter()
                 .map(|&(c, off, cnt)| {
-                    ClusterResidual::resolve(r, col, c).with_norm_max(off, cnt as usize)
+                    let resolved = ClusterResidual::resolve(r, col, c);
+                    if PLANE_PRUNE_ENABLED {
+                        resolved.with_norm_max(off, cnt as usize)
+                    } else {
+                        resolved
+                    }
                 })
                 .collect(),
         )
@@ -5220,6 +5225,9 @@ fn load_scan_bar(bar: Option<&ScanBar>) -> Option<f32> {
 /// rayon arm's per-chunk accumulators are each far smaller than the
 /// truncation cap and would otherwise never produce a bar at all.
 fn publish_scan_bar(bar: Option<&ScanBar>, acc: &mut [(u32, f32, u32, u32)], limit: usize) {
+    if !PLANE_PRUNE_ENABLED {
+        return;
+    }
     let Some(bar) = bar else { return };
     if limit == 0 || acc.len() < limit {
         return;

@@ -103,6 +103,13 @@ const PLANE_PRUNE_Z: f32 = 0.0;
 /// checkpoints at [`PLANE_PRUNE_CHECKPOINT`] = 16.
 const MAX_PLANE_CHECKPOINTS: usize = 16;
 
+/// Whether the plane prune is compiled in at all. When false, every cost
+/// this feature adds must be skipped, not merely unused: the per-cluster
+/// residual norm-max pass and the arming cell's serialization are what
+/// made a `PLANE_PRUNE_Z = 0` build 14 ms/query slower than the branch
+/// without this work.
+pub(crate) const PLANE_PRUNE_ENABLED: bool = PLANE_PRUNE_Z > 0.0;
+
 /// Number of distinct byte values a code byte can take (`2^8`). The
 /// sign table holds one [`BITS_PER_CODE_BYTE`]-wide `±1` expansion
 /// per pattern, so it is `SIGN_TABLE_BYTE_PATTERNS * BITS_PER_CODE_BYTE`
