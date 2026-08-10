@@ -900,7 +900,7 @@ pub(crate) struct WidthLawCalibration {
     /// pairs only (cells ranked beyond the bulk width): the stop rule only
     /// ever bounds tail cells, and bulk-cell gaps — larger and irrelevant
     /// to the proof — would inflate the margin until it never fires.
-    width_gaps: Mutex<Vec<(u32, u32, f32)>>,
+    width_gaps: Mutex<Vec<(u32, i128, u32, f32)>>,
 }
 
 /// Streaming state for the rerank law: per query, the 1-bit-encoded query
@@ -1511,7 +1511,7 @@ impl WidthLawCalibration {
             }
             map
         };
-        let mut width_gaps_local: Vec<(u32, u32, f32)> = Vec::new();
+        let mut width_gaps_local: Vec<(u32, i128, u32, f32)> = Vec::new();
         for view in views {
             let Some(cell_id) = view.cell_id else {
                 continue;
@@ -1568,7 +1568,7 @@ impl WidthLawCalibration {
                     && member_dist.is_finite()
                     && best_fine_dist.is_finite()
                 {
-                    width_gaps_local.push((qi, cell_id, *best_fine_dist - member_dist));
+                    width_gaps_local.push((qi, id, cell_id, *best_fine_dist - member_dist));
                 }
             }
         }
@@ -1598,16 +1598,19 @@ impl WidthLawCalibration {
         // which re-ranks the grid per query anyway — can attach each pair's
         // cell rank; the quantile is taken over TAIL pairs only, after the
         // bulk width is known.
-        let mut width_gap_pairs: HashMap<u32, Vec<(u32, f32)>> = HashMap::new();
-        for (qi, cell, gap) in self
+        let mut gap_of: HashMap<(u32, i128), (u32, f32)> = HashMap::new();
+        for (qi, id, cell, gap) in self
             .width_gaps
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .drain(..)
         {
-            width_gap_pairs.entry(qi).or_default().push((cell, gap));
+            gap_of.insert((qi, id), (cell, gap));
         }
-        let mut ranked_gaps: Vec<(u32, f32)> = Vec::new();
+        // Per (knot, member-rank≤k) gaps of TAIL-cell members: (cell rank,
+        // gap), joined per query inside the main loop where the grid
+        // ranking is fresh.
+        let mut knot_gaps: [Vec<(u32, f32)>; WIDTH_LAW_KS.len()] = Default::default();
         let tops = self
             .tops
             .into_inner()
@@ -1669,13 +1672,6 @@ impl WidthLawCalibration {
                     *slot = rank as u32;
                 }
             }
-            if let Some(pairs) = width_gap_pairs.get(&(qi as u32)) {
-                for &(cell, gap) in pairs {
-                    if let Some(&rank) = rank_of_cell.get(cell as usize) {
-                        ranked_gaps.push((rank + 1, gap));
-                    }
-                }
-            }
             // [`merge_candidates`] keeps one entry per stable id, so the
             // accumulator only needs ranking by score for the prefix walk.
             let mut sorted = cand.clone();
@@ -1687,6 +1683,13 @@ impl WidthLawCalibration {
                     continue;
                 }
                 support[ki] += 1;
+                for (_, _, id, _) in &sorted[..k] {
+                    if let Some(&(cell, gap)) = gap_of.get(&(qi as u32, *id))
+                        && let Some(&rank) = rank_of_cell.get(cell as usize)
+                    {
+                        knot_gaps[ki].push((rank + 1, gap));
+                    }
+                }
                 // Per-rank counts of this query's top-k, then a prefix walk
                 // accumulates the mean coverage curve.
                 let mut per_rank = vec![0u32; n_cells];
@@ -1823,28 +1826,28 @@ impl WidthLawCalibration {
         // gaps inflate the margin until it cannot fire (measured 0.109
         // all-pairs vs the tail population on Cohere-10M). The k=10 knot
         // anchors the conditioning; no tail evidence ⇒ 0.0 ⇒ staging off.
-        let width_margin = {
-            let bulk_anchor = bulk
+        let knot_margin = |ki: usize| -> f32 {
+            let anchor = bulk[ki].max(1);
+            let mut tail: Vec<f32> = knot_gaps[ki]
                 .iter()
-                .find(|&&b| b > 0)
-                .copied()
-                .unwrap_or(0)
-                .max(bulk[1]);
-            let mut tail_gaps: Vec<f32> = ranked_gaps
-                .iter()
-                .filter(|&&(rank, _)| bulk_anchor > 0 && rank > bulk_anchor)
+                .filter(|&&(rank, _)| rank > anchor)
                 .map(|&(_, gap)| gap)
                 .collect();
-            if tail_gaps.is_empty() {
-                0.0
-            } else {
-                tail_gaps.sort_unstable_by(f32::total_cmp);
-                let idx = ((LAW_STAGE_TARGET_COVERAGE * tail_gaps.len() as f64).ceil() as usize)
-                    .clamp(1, tail_gaps.len())
-                    - 1;
-                tail_gaps[idx].max(0.0)
+            if tail.is_empty() {
+                return 0.0;
             }
+            tail.sort_unstable_by(f32::total_cmp);
+            let idx = ((LAW_STAGE_TARGET_COVERAGE * tail.len() as f64).ceil() as usize)
+                .clamp(1, tail.len())
+                - 1;
+            tail[idx].max(0.0)
         };
+        // Stamp the serving anchor knot (k=10): the stop rule protects the
+        // top-k members, so the margin is calibrated over top-k members in
+        // tail cells only — not the full top-1000 calibration walk, whose
+        // deep members are extreme within-cell outliers the k=10 stop
+        // never needs to find.
+        let width_margin = knot_margin(1);
         // Stop margin: the LAW_STAGE_TARGET_COVERAGE quantile of the pooled
         // `exact − estimate` gaps, read at the bin's UPPER edge (the
         // conservative direction — a larger margin only stops later).

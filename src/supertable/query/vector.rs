@@ -1683,20 +1683,6 @@ impl SupertableReader {
 
         let mut gated = Vec::new();
         let mut scored = Vec::new();
-        // Adaptive-width staging plan, captured at cell-selection time and
-        // consumed by the wave loop at the fan-out: each selected cell's
-        // wave index (a geometric schedule over the routing order — bulk,
-        // then bulk more, then the remainder), each fine candidate's owning
-        // cell, and the escalation stop bound BEFORE each wave (the best
-        // fine-centroid DISTANCE over every cell from that wave onward —
-        // `None` when any of those cells is unbounded, which forces the
-        // wave). Armed only on the law-served cosine default with a
-        // stamped bulk law + width margin.
-        let mut width_staging: Option<(
-            HashMap<u32, usize>,
-            HashMap<(usize, u32), u32>,
-            Vec<Option<f32>>,
-        )> = None;
         // Width the sweep was pinned to (caller nprobe or the width law);
         // `None` on the fine-first default and legacy paths.
         let mut sweep_width: Option<usize> = None;
@@ -1996,62 +1982,6 @@ impl SupertableReader {
                     );
                 }
                 let selected_cells: HashSet<u32> = selected_cells_ordered.iter().copied().collect();
-                // Two-stage width: probe the bulk-law cells first; the rest
-                // of the law width escalates only when the calibrated width
-                // margin cannot rule those cells out against the running
-                // kth exact score (see the stage loop at the fan-out).
-                if law_default
-                    && let Some(routing_ref) = hidden_routing.as_ref()
-                    && routing_ref.width_margin > 0.0
-                    && let Some(bulk) = routing_ref.width_bulk_for_k_at(k)
-                    && bulk > 0
-                    && bulk < selected_cells_ordered.len()
-                {
-                    let n = selected_cells_ordered.len();
-                    // Geometric wave schedule over the routing order: the
-                    // bulk width, then bulk more, then the remainder — a
-                    // query needing slightly more than the bulk pays one
-                    // extra wave, not the whole cap.
-                    let wave_starts: Vec<usize> = [0, bulk, (2 * bulk).min(n)]
-                        .into_iter()
-                        .chain(std::iter::once(n))
-                        .collect::<Vec<_>>()
-                        .windows(2)
-                        .filter(|w| w[1] > w[0])
-                        .map(|w| w[0])
-                        .collect();
-                    let mut wave_of_cell: HashMap<u32, usize> = HashMap::new();
-                    for (pos, cell) in selected_cells_ordered.iter().enumerate() {
-                        let wave = wave_starts
-                            .iter()
-                            .rposition(|&start| pos >= start)
-                            .unwrap_or(0);
-                        wave_of_cell.insert(*cell, wave);
-                    }
-                    let cell_of: HashMap<(usize, u32), u32> = candidates
-                        .iter()
-                        .filter_map(|&(si, cluster, _, cell, _)| cell.map(|c| ((si, cluster), c)))
-                        .collect();
-                    // Per-position suffix bound: the best fine-centroid
-                    // distance over every ordered cell from that position
-                    // onward; a cell without a fine score poisons every
-                    // suffix containing it (`None` ⇒ that wave always runs).
-                    let fine_of: HashMap<u32, f32> = fine_ranked.iter().copied().collect();
-                    let mut suffix: Vec<Option<f32>> = vec![None; n + 1];
-                    suffix[n] = Some(f32::INFINITY);
-                    for pos in (0..n).rev() {
-                        suffix[pos] = match (
-                            fine_of.get(&selected_cells_ordered[pos]).copied(),
-                            suffix[pos + 1],
-                        ) {
-                            (Some(d), Some(rest)) => Some(d.min(rest)),
-                            _ => None,
-                        };
-                    }
-                    let wave_bounds: Vec<Option<f32>> =
-                        wave_starts.iter().map(|&start| suffix[start]).collect();
-                    width_staging = Some((wave_of_cell, cell_of, wave_bounds));
-                }
                 // Wave-pooled depth is the p=1 read-volume model: keep runs
                 // per drain wave so reads track wave count, not probed-cell
                 // count — which also means widening the cell sweep alone
@@ -2504,113 +2434,23 @@ impl SupertableReader {
         // carries no bitmaps and fans out all units at once (matching
         // main's concurrency — every superfile GET overlaps on tokio).
         let fanout_t0 = io_counters::phase_start();
-        // Adaptive-width stages: when the plan is armed (law-served cosine
-        // default with a stamped bulk law + margin), partition the fan-out
-        // units by each fine cluster's owning cell — stage 1 = bulk cells
-        // (plus any candidate without a cell tag, conservatively), stage 2
-        // = the escalation remainder, probed only when the width margin
-        // cannot rule its cells out against the running kth exact score.
-        // One stage = today's path, byte-for-byte.
-        let width_margin_val = hidden_routing
-            .as_ref()
-            .map(|r| r.width_margin)
-            .unwrap_or(0.0);
-        let mut stage_bounds: Vec<Option<f32>> = Vec::new();
-        let stage_sets: Vec<
-            Vec<(
-                Arc<SuperfileEntry>,
-                (usize, Vec<u32>, Option<Arc<RoaringBitmap>>),
-            )>,
-        > = match width_staging
-            .as_ref()
-            .filter(|_| allow.is_none() && global_shortlist_width.is_some())
-        {
-            Some((wave_of_cell, cell_of, wave_bounds)) => {
-                let n_waves = wave_bounds.len();
-                let mut waves: Vec<Vec<_>> = vec![Vec::new(); n_waves];
-                for (entry, (si, ids, bitmap)) in &units {
-                    let mut per_wave: Vec<Vec<u32>> = vec![Vec::new(); n_waves];
-                    for &c in ids {
-                        // Cell-less candidates ride wave 0 (probed
-                        // unconditionally — conservative).
-                        let wave = cell_of
-                            .get(&(*si, c))
-                            .and_then(|cell| wave_of_cell.get(cell))
-                            .copied()
-                            .unwrap_or(0);
-                        per_wave[wave].push(c);
-                    }
-                    for (wave, wave_ids) in per_wave.into_iter().enumerate() {
-                        if !wave_ids.is_empty() {
-                            waves[wave].push((Arc::clone(entry), (*si, wave_ids, bitmap.clone())));
-                        }
-                    }
-                }
-                if waves.first().is_some_and(|w| !w.is_empty()) && n_waves > 1 {
-                    stage_bounds = wave_bounds.clone();
-                    waves
-                } else {
-                    vec![units]
-                }
-            }
-            None => vec![units],
-        };
-        let mut per_superfile: Vec<Vec<SuperfileHit>> = Vec::new();
-        // Pooled candidates retained ACROSS stages (the global selection in
-        // a later stage competes old and new candidates together), plus the
-        // identity keys of candidates already exactly reranked, so a row
-        // never reranks twice.
-        let mut flat_retained: Vec<(usize, ScanCandidate)> = Vec::new();
-        let mut reranked_keys: HashSet<(usize, usize, u32, u32)> = HashSet::new();
-        for (stage_idx, stage_units) in stage_sets.into_iter().enumerate() {
-            if stage_idx > 0 {
-                // Escalation stop: no remaining cell's best routing
-                // similarity plus the calibrated margin can reach the
-                // running kth exact score — the tail cells cannot change
-                // the top-k. An unbounded tail (any escalation cell
-                // without a fine score) always escalates.
-                let k_stop = k.saturating_add(
-                    usize::try_from(max_replica_overhead.load(atomic::Ordering::Relaxed))
-                        .unwrap_or(0),
-                );
-                if let Some(bound_dist) = stage_bounds.get(stage_idx).copied().flatten()
-                    && k_stop > 0
-                {
-                    let mut dists: Vec<f32> =
-                        per_superfile.iter().flatten().map(|h| h.score).collect();
-                    if dists.len() >= k_stop {
-                        let (_, kth, _) = dists.select_nth_unstable_by(k_stop - 1, f32::total_cmp);
-                        if width_escalation_stops(*kth, bound_dist, width_margin_val) {
-                            break;
-                        }
-                    }
-                }
-            }
-            let mut stage_units = stage_units;
-            let stage_hits = if allow.is_some() {
-                let fanout_width = manifest.options.reader_pool.current_num_threads().max(1);
-                let mut collected = Vec::new();
-                while !stage_units.is_empty() {
-                    let n = fanout_width.min(stage_units.len());
-                    let wave: Vec<_> = stage_units.drain(..n).collect();
-                    collected.extend(
-                        dispatch::fanout_with(
-                            self,
-                            wave,
-                            !hidden_vector_index,
-                            false,
-                            body.clone(),
-                        )
+        let mut per_superfile = if allow.is_some() {
+            let fanout_width = manifest.options.reader_pool.current_num_threads().max(1);
+            let mut collected = Vec::new();
+            let mut units = units;
+            while !units.is_empty() {
+                let n = fanout_width.min(units.len());
+                let wave: Vec<_> = units.drain(..n).collect();
+                collected.extend(
+                    dispatch::fanout_with(self, wave, !hidden_vector_index, false, body.clone())
                         .await?,
-                    );
-                }
-                collected
-            } else {
-                dispatch::fanout_with(self, stage_units, !hidden_vector_index, false, body.clone())
-                    .await?
-            };
-            per_superfile.extend(stage_hits);
-
+                );
+            }
+            collected
+        } else {
+            dispatch::fanout_with(self, units, !hidden_vector_index, false, body).await?
+        };
+        {
             // Phase C of the deferred-rerank width sweep: select the best
             // `k x rerank_mult` estimates ACROSS every warm-scanned cell and
             // superfile, then rerank only those winners where they live. The
@@ -2656,12 +2496,10 @@ impl SupertableReader {
                     let replica_overhead =
                         usize::try_from(max_replica_overhead.load(atomic::Ordering::Relaxed))
                             .unwrap_or(0);
-                    flat_retained.extend(
-                        pooled
-                            .into_iter()
-                            .flat_map(|(si, _, _, cands)| cands.into_iter().map(move |c| (si, c))),
-                    );
-                    let mut flat: Vec<(usize, ScanCandidate)> = flat_retained.clone();
+                    let mut flat: Vec<(usize, ScanCandidate)> = pooled
+                        .into_iter()
+                        .flat_map(|(si, _, _, cands)| cands.into_iter().map(move |c| (si, c)))
+                        .collect();
                     // Per-cell floor ONLY under an explicit caller nprobe. The
                     // floor exists for the #494 inversion — far cells' 1-bit
                     // noise evicting near cells' true neighbors from the fixed
@@ -2730,11 +2568,6 @@ impl SupertableReader {
                     #[cfg(feature = "test-helpers")]
                     served_shortlist_probe::record(shortlist_limit, cell_floor);
                     flat = select_global_shortlist(flat, shortlist_limit, cell_floor);
-                    // A later stage must not rerank rows an earlier stage
-                    // already scored exactly (their hits are already pooled).
-                    flat.retain(|(si, c)| {
-                        !reranked_keys.contains(&(*si, c.cell_idx, c.pos, c.did))
-                    });
                     let column = Arc::clone(&column_arc2);
                     let query = Arc::clone(&query_arc2);
                     let reader_pool = Arc::clone(&manifest.options.reader_pool);
@@ -2827,7 +2660,6 @@ impl SupertableReader {
                             let mut winners_by_seg: HashMap<usize, Vec<ScanCandidate>> =
                                 HashMap::new();
                             for (si, cand) in &flat[cursor..band_end] {
-                                reranked_keys.insert((*si, cand.cell_idx, cand.pos, cand.did));
                                 winners_by_seg.entry(*si).or_default().push(*cand);
                             }
                             cursor = band_end;
@@ -2880,7 +2712,6 @@ impl SupertableReader {
                     } else {
                         let mut winners_by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
                         for (si, cand) in flat {
-                            reranked_keys.insert((si, cand.cell_idx, cand.pos, cand.did));
                             winners_by_seg.entry(si).or_default().push(cand);
                         }
                         let rerank_units: Vec<(Arc<SuperfileEntry>, Vec<ScanCandidate>)> =
@@ -4104,18 +3935,6 @@ fn deferred_shortlist_limit(
     }
 }
 
-/// The adaptive-width escalation stop: `true` when no remaining cell's
-/// best routing similarity (`COSINE_DISTANCE_BASE − bound_dist`, the best
-/// fine-centroid distance among the escalation cells) plus the calibrated
-/// width margin can reach the running kth exact similarity — the tail
-/// cells provably cannot change the top-k, so stage 2 is skipped. All
-/// quantities are on the cosine similarity scale; the margin is only ever
-/// stamped on cosine tables.
-fn width_escalation_stops(kth_dist: f32, bound_dist: f32, width_margin: f32) -> bool {
-    let kth_sim = COSINE_DISTANCE_BASE - kth_dist;
-    (COSINE_DISTANCE_BASE - bound_dist) + width_margin < kth_sim
-}
-
 /// The shortlist's total order: best estimate first, ties on
 /// `(unit, cell, pos, did)` — shared by [`select_global_shortlist`]'s cut
 /// and the adaptive-stopping band sort so both walk one deterministic
@@ -4392,7 +4211,7 @@ mod tests {
         hidden_hits_user_ids, is_hidden_vector_manifest, law_floor_serve_selection,
         postings_by_cell_from_summaries, projection_is_id_score_only, rerank_mult_from_law,
         score_fine_candidates, select_global_shortlist, stop_band_floor_override,
-        union_cell_selection, vector_read_query_error, width_escalation_stops,
+        union_cell_selection, vector_read_query_error,
     };
     use crate::{
         BoolMode, InfinoError,
@@ -6084,22 +5903,6 @@ mod tests {
     /// Planted neighbors among `hits` (orthogonal docs score exactly 1.0).
     fn near_count(hits: &[SuperfileHit]) -> usize {
         hits.iter().filter(|h| h.score < ORTHOGONAL_SCORE).count()
-    }
-
-    /// The width-escalation stop is conservative in every direction: it
-    /// fires only when the margin-padded best possible similarity of the
-    /// tail cells sits strictly below the kth exact similarity, and any
-    /// tie or unbounded margin keeps probing.
-    #[test]
-    fn width_escalation_stop_rule_is_conservative() {
-        // kth_sim = 0.9; tail's best routing sim = 0.5. Margin 0.3 pads to
-        // 0.8 < 0.9 → stop. Margin 0.5 pads to 1.0 ≥ 0.9 → keep probing.
-        assert!(width_escalation_stops(0.1, 0.5, 0.3));
-        assert!(!width_escalation_stops(0.1, 0.5, 0.5));
-        // Exact tie must NOT stop (strict inequality): 0.5 + 0.4 == 0.9.
-        assert!(!width_escalation_stops(0.1, 0.5, 0.4));
-        // A tail cell ranked better than the kth never stops, margin 0.
-        assert!(!width_escalation_stops(0.5, 0.1, 0.0));
     }
 
     /// The estimate-banded adaptive rerank returns exactly the planted
