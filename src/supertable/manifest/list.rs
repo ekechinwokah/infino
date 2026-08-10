@@ -483,13 +483,6 @@ impl CellRoutingParams {
         Self::law_at(&self.width_for_k, k)
     }
 
-    /// The adaptive-width bulk law at this query's `k` — same log-linear
-    /// interpolation and clamping as [`Self::width_for_k_at`]. `None`
-    /// (all-zero stamp) disables two-stage width serving.
-    pub(crate) fn width_bulk_for_k_at(&self, k: usize) -> Option<usize> {
-        Self::law_at(&self.width_bulk_for_k, k)
-    }
-
     /// The fine-depth law at this query's `k` — same log-linear
     /// interpolation and clamping as [`Self::width_for_k_at`].
     pub(crate) fn fine_for_k_at(&self, k: usize) -> Option<usize> {
