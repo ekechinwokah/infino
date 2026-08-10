@@ -1256,7 +1256,10 @@ const ID_SCORE_SCORE_COLUMN: usize = 1;
 /// of the index derivation the SQL TVF path uses
 /// (`exec::vector_exec`), so both entry points admit the same
 /// projections to the same fast path.
-fn id_score_projection_indices(projection: Option<&[&str]>, id_column: &str) -> Option<Vec<usize>> {
+pub(crate) fn id_score_projection_indices(
+    projection: Option<&[&str]>,
+    id_column: &str,
+) -> Option<Vec<usize>> {
     let Some(names) = projection else {
         return Some(vec![ID_SCORE_ID_COLUMN, ID_SCORE_SCORE_COLUMN]);
     };
