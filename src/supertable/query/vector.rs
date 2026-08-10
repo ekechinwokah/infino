@@ -984,10 +984,22 @@ fn id_values_from_batch(batch: &RecordBatch) -> Result<Vec<i128>, QueryError> {
 }
 
 /// Build one gapped superfile's sorted `stable_id -> local` index (#556): read
-/// its `_id` column once, reserve the resident bytes against the connection
-/// budget (degrading to an unreserved build under pressure rather than failing
-/// the query — the vector scan degrades the same way), then sort + dedup on the
-/// reader pool. Memoized per uri by the caller's single-flight cell.
+/// its `_id` column once, then sort + dedup on the reader pool. Memoized per
+/// uri by the caller's single-flight cell.
+///
+/// The index's RESIDENT bytes are deliberately not charged to the connection
+/// memory budget, only its transient build scratch is. The budget gates
+/// MANDATORY work — ingest reserves through `reserve_build_scratch`
+/// (`writer.rs`) and compaction through `merge_superfiles`
+/// (`compaction/mod.rs`), and both HARD-FAIL when refused. A discretionary,
+/// rebuildable read cache that pins budget bytes for as long as its superfile
+/// stays live can push those two over the ceiling and keep them there: the only
+/// thing that evicts an entry is its superfile being superseded, which is
+/// exactly what compaction does, which is now the operation being denied. That
+/// deadlock does not clear without a process restart, so the cache stays out of
+/// the accounted set. Resident cost is bounded by the live gapped corpus
+/// (~20 B/row) — the same proportional-to-corpus class as the transposed-code
+/// cache — and every entry is reconstructible from immutable bytes.
 async fn build_gapped_placement_index(
     manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
@@ -996,14 +1008,15 @@ async fn build_gapped_placement_index(
 ) -> Result<Arc<GappedPlacementIndex>, QueryError> {
     let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
     let ids = read_ids_for_locals(manifest, entry, &locals, id_column, true, op_stats).await?;
-    // ~20 B resident per row (i128 id + u32 local). Reserve up front; on refusal
-    // build anyway, just unaccounted (correctness is unchanged, only the memo's
-    // budget bookkeeping) — same graceful fallback the transposed-code cache uses.
-    let bytes = ids.len() * (std::mem::size_of::<i128>() + std::mem::size_of::<u32>());
-    let reservation = manifest
+    // Build scratch only: the `(i128, u32)` pair vector the sort runs over,
+    // released the moment the sorted arrays are extracted. Refusal degrades to
+    // an unaccounted build rather than failing the query — the vector scan
+    // degrades the same way.
+    let scratch_bytes = ids.len() * std::mem::size_of::<(i128, u32)>();
+    let scratch = manifest
         .options
         .connection_memory_budget
-        .try_reserve(bytes)
+        .try_reserve(scratch_bytes)
         .ok();
     let pool = Arc::clone(&manifest.options.reader_pool);
     let index = run_on_pool(
@@ -1021,7 +1034,9 @@ async fn build_gapped_placement_index(
                 sorted_ids.push(id);
                 sorted_locals.push(local);
             }
-            GappedPlacementIndex::new(sorted_ids, sorted_locals, reservation)
+            // Scratch is dead here; release before the index outlives it.
+            drop(scratch);
+            GappedPlacementIndex::new(sorted_ids, sorted_locals)
         },
     )
     .await
@@ -1213,11 +1228,40 @@ async fn hidden_hits_user_ids(
     Ok(ids)
 }
 
-fn projection_is_id_score_only(projection: Option<&[&str]>, id_column: &str) -> bool {
-    match projection {
-        None => true,
-        Some(names) => names == [id_column, SCORE_COLUMN] || names == [SCORE_COLUMN, id_column],
+/// Column positions in the batch [`hits_id_score_batch`] synthesizes.
+const ID_SCORE_ID_COLUMN: usize = 0;
+const ID_SCORE_SCORE_COLUMN: usize = 1;
+
+/// Positions into the synthesized `_id` + `score` batch for
+/// `projection`, or `None` when a requested name needs a user data
+/// page (which forces placement + a Parquet read).
+///
+/// `_id` and `score` both come free with the search wave — the ids are
+/// stamped on the hits and the scores are the kernel's output — so ANY
+/// subset or ordering of the two serves without resolving placements.
+/// Matching only the exact pair left `["_id"]` alone paying a full
+/// placement resolve for data already in hand. Name-based counterpart
+/// of the index derivation the SQL TVF path uses
+/// (`exec::vector_exec`), so both entry points admit the same
+/// projections to the same fast path.
+fn id_score_projection_indices(projection: Option<&[&str]>, id_column: &str) -> Option<Vec<usize>> {
+    let Some(names) = projection else {
+        return Some(vec![ID_SCORE_ID_COLUMN, ID_SCORE_SCORE_COLUMN]);
+    };
+    // An empty projection keeps the general path: a zero-column batch
+    // carries its row count differently, and reproducing that here
+    // would be a second contract to maintain for a degenerate input.
+    if names.is_empty() {
+        return None;
     }
+    names
+        .iter()
+        .map(|name| match *name {
+            n if n == id_column => Some(ID_SCORE_ID_COLUMN),
+            n if n == SCORE_COLUMN => Some(ID_SCORE_SCORE_COLUMN),
+            _ => None,
+        })
+        .collect()
 }
 
 fn is_hidden_vector_manifest(manifest: &ManifestSnapshot) -> bool {
@@ -3671,8 +3715,10 @@ impl SupertableReader {
                 }
             };
             let id_column = self.options().id_column.as_str();
-            if projection_is_id_score_only(projection, id_column) {
-                let batch = hits_id_score_batch(self, &hits)?;
+            if let Some(indices) = id_score_projection_indices(projection, id_column) {
+                let batch = hits_id_score_batch(self, &hits)?
+                    .project(&indices)
+                    .map_err(|e| QueryError::Execute(e.to_string()))?;
                 return Ok(vec![batch]);
             }
             let hits = user_placement_for_scalar_resolve(self, &hits).await?;
@@ -4086,8 +4132,8 @@ mod tests {
         RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate, VectorFilter,
         VectorSearchOptions, admit_extension_round, admit_shortlist_window, apply_width_pin,
         calibrated_query_for, cells_ranked_by_fine_score, gate_fine_candidates_by_fragment,
-        hidden_hits_user_ids, is_hidden_vector_manifest, law_floor_serve_selection,
-        postings_by_cell_from_summaries, projection_is_id_score_only, rerank_mult_from_law,
+        hidden_hits_user_ids, id_score_projection_indices, is_hidden_vector_manifest,
+        law_floor_serve_selection, postings_by_cell_from_summaries, rerank_mult_from_law,
         score_fine_candidates, select_global_shortlist, union_cell_selection,
         vector_read_query_error,
     };
@@ -4127,19 +4173,37 @@ mod tests {
     /// Fine ranking takes each cell's best (minimum) candidate score,
     /// sorts ascending with lower-id tie-break, and ignores untagged
     /// (legacy, `None`-cell) candidates.
-    /// Exactly the id + score columns (either order) or a bare `SELECT *`
-    /// (None) takes the id/score fast path; anything else does not.
+    /// ANY subset/order of `_id` + `score` takes the fast path, and the
+    /// returned indices reproduce the requested order — `_id` alone is
+    /// the regression: it used to miss the exact-pair match and pay a
+    /// placement resolve for ids already stamped on the hits. A name
+    /// needing a user data page (or an empty projection) declines.
     #[test]
-    fn projection_is_id_score_only_matches_id_score_combinations() {
+    fn id_score_projection_admits_any_subset_of_id_and_score() {
         let id = "doc_id";
-        assert!(projection_is_id_score_only(None, id));
-        assert!(projection_is_id_score_only(Some(&[id, SCORE_COLUMN]), id));
-        assert!(projection_is_id_score_only(Some(&[SCORE_COLUMN, id]), id));
-        assert!(!projection_is_id_score_only(Some(&[id]), id));
-        assert!(!projection_is_id_score_only(
-            Some(&["other", SCORE_COLUMN]),
-            id
-        ));
+        assert_eq!(id_score_projection_indices(None, id), Some(vec![0, 1]));
+        assert_eq!(
+            id_score_projection_indices(Some(&[id, SCORE_COLUMN]), id),
+            Some(vec![0, 1])
+        );
+        assert_eq!(
+            id_score_projection_indices(Some(&[SCORE_COLUMN, id]), id),
+            Some(vec![1, 0])
+        );
+        assert_eq!(id_score_projection_indices(Some(&[id]), id), Some(vec![0]));
+        assert_eq!(
+            id_score_projection_indices(Some(&[SCORE_COLUMN]), id),
+            Some(vec![1])
+        );
+        assert_eq!(
+            id_score_projection_indices(Some(&[id, SCORE_COLUMN, id]), id),
+            Some(vec![0, 1, 0])
+        );
+        assert_eq!(
+            id_score_projection_indices(Some(&["other", SCORE_COLUMN]), id),
+            None
+        );
+        assert_eq!(id_score_projection_indices(Some(&[]), id), None);
     }
 
     /// The admit window scales with the ranked cell population (the
