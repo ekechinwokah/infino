@@ -1684,14 +1684,19 @@ impl SupertableReader {
         let mut gated = Vec::new();
         let mut scored = Vec::new();
         // Adaptive-width staging plan, captured at cell-selection time and
-        // consumed by the stage loop at the fan-out: the bulk cell set,
-        // each fine candidate's owning cell, and the escalation stop bound
-        // (the best fine-centroid DISTANCE among the escalation cells —
-        // `None` when any escalation cell is unbounded, which forces the
-        // escalation). Armed only on the law-served cosine default with a
+        // consumed by the wave loop at the fan-out: each selected cell's
+        // wave index (a geometric schedule over the routing order — bulk,
+        // then bulk more, then the remainder), each fine candidate's owning
+        // cell, and the escalation stop bound BEFORE each wave (the best
+        // fine-centroid DISTANCE over every cell from that wave onward —
+        // `None` when any of those cells is unbounded, which forces the
+        // wave). Armed only on the law-served cosine default with a
         // stamped bulk law + width margin.
-        let mut width_staging: Option<(HashSet<u32>, HashMap<(usize, u32), u32>, Option<f32>)> =
-            None;
+        let mut width_staging: Option<(
+            HashMap<u32, usize>,
+            HashMap<(usize, u32), u32>,
+            Vec<Option<f32>>,
+        )> = None;
         // Width the sweep was pinned to (caller nprobe or the width law);
         // `None` on the fine-first default and legacy paths.
         let mut sweep_width: Option<usize> = None;
@@ -2002,22 +2007,50 @@ impl SupertableReader {
                     && bulk > 0
                     && bulk < selected_cells_ordered.len()
                 {
-                    let bulk_cells: HashSet<u32> =
-                        selected_cells_ordered[..bulk].iter().copied().collect();
+                    let n = selected_cells_ordered.len();
+                    // Geometric wave schedule over the routing order: the
+                    // bulk width, then bulk more, then the remainder — a
+                    // query needing slightly more than the bulk pays one
+                    // extra wave, not the whole cap.
+                    let wave_starts: Vec<usize> = [0, bulk, (2 * bulk).min(n)]
+                        .into_iter()
+                        .chain(std::iter::once(n))
+                        .collect::<Vec<_>>()
+                        .windows(2)
+                        .filter(|w| w[1] > w[0])
+                        .map(|w| w[0])
+                        .collect();
+                    let mut wave_of_cell: HashMap<u32, usize> = HashMap::new();
+                    for (pos, cell) in selected_cells_ordered.iter().enumerate() {
+                        let wave = wave_starts
+                            .iter()
+                            .rposition(|&start| pos >= start)
+                            .unwrap_or(0);
+                        wave_of_cell.insert(*cell, wave);
+                    }
                     let cell_of: HashMap<(usize, u32), u32> = candidates
                         .iter()
                         .filter_map(|&(si, cluster, _, cell, _)| cell.map(|c| ((si, cluster), c)))
                         .collect();
-                    // The stop check needs EVERY escalation cell bounded by
-                    // its routing similarity; a cell without a fine score
-                    // cannot be bounded and forces the escalation.
+                    // Per-position suffix bound: the best fine-centroid
+                    // distance over every ordered cell from that position
+                    // onward; a cell without a fine score poisons every
+                    // suffix containing it (`None` ⇒ that wave always runs).
                     let fine_of: HashMap<u32, f32> = fine_ranked.iter().copied().collect();
-                    let bound = selected_cells_ordered[bulk..]
-                        .iter()
-                        .map(|c| fine_of.get(c).copied())
-                        .collect::<Option<Vec<f32>>>()
-                        .map(|ds| ds.into_iter().fold(f32::INFINITY, f32::min));
-                    width_staging = Some((bulk_cells, cell_of, bound));
+                    let mut suffix: Vec<Option<f32>> = vec![None; n + 1];
+                    suffix[n] = Some(f32::INFINITY);
+                    for pos in (0..n).rev() {
+                        suffix[pos] = match (
+                            fine_of.get(&selected_cells_ordered[pos]).copied(),
+                            suffix[pos + 1],
+                        ) {
+                            (Some(d), Some(rest)) => Some(d.min(rest)),
+                            _ => None,
+                        };
+                    }
+                    let wave_bounds: Vec<Option<f32>> =
+                        wave_starts.iter().map(|&start| suffix[start]).collect();
+                    width_staging = Some((wave_of_cell, cell_of, wave_bounds));
                 }
                 // Wave-pooled depth is the p=1 read-volume model: keep runs
                 // per drain wave so reads track wave count, not probed-cell
@@ -2482,7 +2515,7 @@ impl SupertableReader {
             .as_ref()
             .map(|r| r.width_margin)
             .unwrap_or(0.0);
-        let mut stage_bound: Option<f32> = None;
+        let mut stage_bounds: Vec<Option<f32>> = Vec::new();
         let stage_sets: Vec<
             Vec<(
                 Arc<SuperfileEntry>,
@@ -2492,28 +2525,32 @@ impl SupertableReader {
             .as_ref()
             .filter(|_| allow.is_none() && global_shortlist_width.is_some())
         {
-            Some((bulk_cells, cell_of, bound)) => {
-                let mut stage1 = Vec::new();
-                let mut stage2 = Vec::new();
+            Some((wave_of_cell, cell_of, wave_bounds)) => {
+                let n_waves = wave_bounds.len();
+                let mut waves: Vec<Vec<_>> = vec![Vec::new(); n_waves];
                 for (entry, (si, ids, bitmap)) in &units {
-                    let (bulk_ids, tail_ids): (Vec<u32>, Vec<u32>) = ids.iter().partition(|&&c| {
-                        cell_of
+                    let mut per_wave: Vec<Vec<u32>> = vec![Vec::new(); n_waves];
+                    for &c in ids {
+                        // Cell-less candidates ride wave 0 (probed
+                        // unconditionally — conservative).
+                        let wave = cell_of
                             .get(&(*si, c))
-                            .map(|cell| bulk_cells.contains(cell))
-                            .unwrap_or(true)
-                    });
-                    if !bulk_ids.is_empty() {
-                        stage1.push((Arc::clone(entry), (*si, bulk_ids, bitmap.clone())));
+                            .and_then(|cell| wave_of_cell.get(cell))
+                            .copied()
+                            .unwrap_or(0);
+                        per_wave[wave].push(c);
                     }
-                    if !tail_ids.is_empty() {
-                        stage2.push((Arc::clone(entry), (*si, tail_ids, bitmap.clone())));
+                    for (wave, wave_ids) in per_wave.into_iter().enumerate() {
+                        if !wave_ids.is_empty() {
+                            waves[wave].push((Arc::clone(entry), (*si, wave_ids, bitmap.clone())));
+                        }
                     }
                 }
-                if stage1.is_empty() || stage2.is_empty() {
-                    vec![units]
+                if waves.first().is_some_and(|w| !w.is_empty()) && n_waves > 1 {
+                    stage_bounds = wave_bounds.clone();
+                    waves
                 } else {
-                    stage_bound = *bound;
-                    vec![stage1, stage2]
+                    vec![units]
                 }
             }
             None => vec![units],
@@ -2536,7 +2573,7 @@ impl SupertableReader {
                     usize::try_from(max_replica_overhead.load(atomic::Ordering::Relaxed))
                         .unwrap_or(0),
                 );
-                if let Some(bound_dist) = stage_bound
+                if let Some(bound_dist) = stage_bounds.get(stage_idx).copied().flatten()
                     && k_stop > 0
                 {
                     let mut dists: Vec<f32> =

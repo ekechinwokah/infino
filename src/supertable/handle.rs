@@ -3417,10 +3417,21 @@ mod tests {
              margin, got {}",
             first.rerank_margin
         );
+        // The width margin is TAIL-conditioned: it stamps positive iff
+        // some knot's bulk width sits under the full width (a tail
+        // exists to bound). On tight fixtures bulk == width at every
+        // knot and 0.0 (staging self-disabled) is the correct stamp.
+        let has_tail = first
+            .width_bulk_for_k
+            .iter()
+            .zip(first.width_for_k.iter())
+            .any(|(b, w)| *b > 0 && b < w);
         assert!(
-            first.width_margin > 0.0,
-            "post-first-optimize: cosine gap evidence must stamp a WIDTH \
-             margin, got {}",
+            !has_tail || first.width_margin > 0.0,
+            "post-first-optimize: a bulk law below the width cap (bulk \
+             {:?}, width {:?}) requires a positive width margin, got {}",
+            first.width_bulk_for_k,
+            first.width_for_k,
             first.width_margin
         );
         assert!(

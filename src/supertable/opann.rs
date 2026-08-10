@@ -892,14 +892,15 @@ pub(crate) struct WidthLawCalibration {
     /// (e.g. planted test fixtures) measures no rerank law.
     rerank: Option<RerankLawObservation>,
     /// Adaptive-width gap evidence (cosine only): per observed
-    /// (query, top-k member), `member_similarity − cell_routing_similarity`
-    /// where the routing similarity is the member cell's BEST fine-centroid
-    /// similarity for that query — the exact score serving's escalation
-    /// check consults. The stage-coverage quantile of these gaps is the
-    /// width margin: serving may stop probing once no remaining cell's
-    /// routing similarity plus this margin can reach the running kth exact
-    /// score. Same bins and conservative edge read as the rerank margin.
-    width_gap_hist: Mutex<Vec<u64>>,
+    /// (query, top-k member) pair, the member's cell and
+    /// `member_similarity − cell_routing_similarity`, where the routing
+    /// similarity is the cell's BEST fine-centroid similarity for that
+    /// query — the exact score serving's escalation check consults.
+    /// [`Self::finish`] takes the stage-coverage quantile over the TAIL
+    /// pairs only (cells ranked beyond the bulk width): the stop rule only
+    /// ever bounds tail cells, and bulk-cell gaps — larger and irrelevant
+    /// to the proof — would inflate the margin until it never fires.
+    width_gaps: Mutex<Vec<(u32, u32, f32)>>,
 }
 
 /// Streaming state for the rerank law: per query, the 1-bit-encoded query
@@ -1145,7 +1146,7 @@ impl WidthLawCalibration {
             max_fine: AtomicU32::new(0),
             pool_cells: RERANK_LAW_POOL_CELLS,
             rerank: None,
-            width_gap_hist: Mutex::new(Vec::new()),
+            width_gaps: Mutex::new(Vec::new()),
         }
     }
 
@@ -1510,7 +1511,7 @@ impl WidthLawCalibration {
             }
             map
         };
-        let mut width_gaps_local: Vec<u64> = Vec::new();
+        let mut width_gaps_local: Vec<(u32, u32, f32)> = Vec::new();
         for view in views {
             let Some(cell_id) = view.cell_id else {
                 continue;
@@ -1567,27 +1568,15 @@ impl WidthLawCalibration {
                     && member_dist.is_finite()
                     && best_fine_dist.is_finite()
                 {
-                    let gap = *best_fine_dist - member_dist;
-                    if width_gaps_local.is_empty() {
-                        width_gaps_local.resize(RERANK_LAW_EST_BINS, 0);
-                    }
-                    let bin = RerankLawObservation::gap_bin(gap);
-                    width_gaps_local[bin] = width_gaps_local[bin].saturating_add(1);
+                    width_gaps_local.push((qi, cell_id, *best_fine_dist - member_dist));
                 }
             }
         }
         if !width_gaps_local.is_empty() {
-            let mut gaps = self
-                .width_gap_hist
+            self.width_gaps
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if gaps.is_empty() {
-                *gaps = width_gaps_local;
-            } else {
-                for (a, b) in gaps.iter_mut().zip(width_gaps_local) {
-                    *a = a.saturating_add(b);
-                }
-            }
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(width_gaps_local);
         }
     }
 
@@ -1605,13 +1594,20 @@ impl WidthLawCalibration {
             return None;
         }
         let n_cells = grid.n_cent as usize;
-        let width_margin = {
-            let gaps = self
-                .width_gap_hist
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            stop_margin_from_hist(&gaps)
-        };
+        // Width-margin evidence, grouped per query so the main loop below —
+        // which re-ranks the grid per query anyway — can attach each pair's
+        // cell rank; the quantile is taken over TAIL pairs only, after the
+        // bulk width is known.
+        let mut width_gap_pairs: HashMap<u32, Vec<(u32, f32)>> = HashMap::new();
+        for (qi, cell, gap) in self
+            .width_gaps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain(..)
+        {
+            width_gap_pairs.entry(qi).or_default().push((cell, gap));
+        }
+        let mut ranked_gaps: Vec<(u32, f32)> = Vec::new();
         let tops = self
             .tops
             .into_inner()
@@ -1671,6 +1667,13 @@ impl WidthLawCalibration {
             for (rank, (cell, _)) in ranked.iter().enumerate() {
                 if let Some(slot) = rank_of_cell.get_mut(*cell as usize) {
                     *slot = rank as u32;
+                }
+            }
+            if let Some(pairs) = width_gap_pairs.get(&(qi as u32)) {
+                for &(cell, gap) in pairs {
+                    if let Some(&rank) = rank_of_cell.get(cell as usize) {
+                        ranked_gaps.push((rank + 1, gap));
+                    }
                 }
             }
             // [`merge_candidates`] keeps one entry per stable id, so the
@@ -1813,6 +1816,35 @@ impl WidthLawCalibration {
         floor_monotone(&mut bulk);
         floor_monotone(&mut fine_law);
         floor_monotone(&mut rerank_law);
+        // Width margin: the stage-coverage quantile of member-vs-routing
+        // gaps over TAIL pairs — members whose cell ranks beyond the bulk
+        // width the serving stage actually probes first. Bulk-cell pairs
+        // are excluded: the stop rule never bounds them, and their larger
+        // gaps inflate the margin until it cannot fire (measured 0.109
+        // all-pairs vs the tail population on Cohere-10M). The k=10 knot
+        // anchors the conditioning; no tail evidence ⇒ 0.0 ⇒ staging off.
+        let width_margin = {
+            let bulk_anchor = bulk
+                .iter()
+                .find(|&&b| b > 0)
+                .copied()
+                .unwrap_or(0)
+                .max(bulk[1]);
+            let mut tail_gaps: Vec<f32> = ranked_gaps
+                .iter()
+                .filter(|&&(rank, _)| bulk_anchor > 0 && rank > bulk_anchor)
+                .map(|&(_, gap)| gap)
+                .collect();
+            if tail_gaps.is_empty() {
+                0.0
+            } else {
+                tail_gaps.sort_unstable_by(f32::total_cmp);
+                let idx = ((LAW_STAGE_TARGET_COVERAGE * tail_gaps.len() as f64).ceil() as usize)
+                    .clamp(1, tail_gaps.len())
+                    - 1;
+                tail_gaps[idx].max(0.0)
+            }
+        };
         // Stop margin: the LAW_STAGE_TARGET_COVERAGE quantile of the pooled
         // `exact − estimate` gaps, read at the bin's UPPER edge (the
         // conservative direction — a larger margin only stops later).
