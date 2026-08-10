@@ -1683,6 +1683,15 @@ impl SupertableReader {
 
         let mut gated = Vec::new();
         let mut scored = Vec::new();
+        // Adaptive-width staging plan, captured at cell-selection time and
+        // consumed by the stage loop at the fan-out: the bulk cell set,
+        // each fine candidate's owning cell, and the escalation stop bound
+        // (the best fine-centroid DISTANCE among the escalation cells —
+        // `None` when any escalation cell is unbounded, which forces the
+        // escalation). Armed only on the law-served cosine default with a
+        // stamped bulk law + width margin.
+        let mut width_staging: Option<(HashSet<u32>, HashMap<(usize, u32), u32>, Option<f32>)> =
+            None;
         // Width the sweep was pinned to (caller nprobe or the width law);
         // `None` on the fine-first default and legacy paths.
         let mut sweep_width: Option<usize> = None;
@@ -1982,6 +1991,34 @@ impl SupertableReader {
                     );
                 }
                 let selected_cells: HashSet<u32> = selected_cells_ordered.iter().copied().collect();
+                // Two-stage width: probe the bulk-law cells first; the rest
+                // of the law width escalates only when the calibrated width
+                // margin cannot rule those cells out against the running
+                // kth exact score (see the stage loop at the fan-out).
+                if law_default
+                    && let Some(routing_ref) = hidden_routing.as_ref()
+                    && routing_ref.width_margin > 0.0
+                    && let Some(bulk) = routing_ref.width_bulk_for_k_at(k)
+                    && bulk > 0
+                    && bulk < selected_cells_ordered.len()
+                {
+                    let bulk_cells: HashSet<u32> =
+                        selected_cells_ordered[..bulk].iter().copied().collect();
+                    let cell_of: HashMap<(usize, u32), u32> = candidates
+                        .iter()
+                        .filter_map(|&(si, cluster, _, cell, _)| cell.map(|c| ((si, cluster), c)))
+                        .collect();
+                    // The stop check needs EVERY escalation cell bounded by
+                    // its routing similarity; a cell without a fine score
+                    // cannot be bounded and forces the escalation.
+                    let fine_of: HashMap<u32, f32> = fine_ranked.iter().copied().collect();
+                    let bound = selected_cells_ordered[bulk..]
+                        .iter()
+                        .map(|c| fine_of.get(c).copied())
+                        .collect::<Option<Vec<f32>>>()
+                        .map(|ds| ds.into_iter().fold(f32::INFINITY, f32::min));
+                    width_staging = Some((bulk_cells, cell_of, bound));
+                }
                 // Wave-pooled depth is the p=1 read-volume model: keep runs
                 // per drain wave so reads track wave count, not probed-cell
                 // count — which also means widening the cell sweep alone
@@ -2434,229 +2471,381 @@ impl SupertableReader {
         // carries no bitmaps and fans out all units at once (matching
         // main's concurrency — every superfile GET overlaps on tokio).
         let fanout_t0 = io_counters::phase_start();
-        let mut per_superfile = if allow.is_some() {
-            let fanout_width = manifest.options.reader_pool.current_num_threads().max(1);
-            let mut collected = Vec::new();
-            while !units.is_empty() {
-                let n = fanout_width.min(units.len());
-                let wave: Vec<_> = units.drain(..n).collect();
-                collected.extend(
-                    dispatch::fanout_with(self, wave, !hidden_vector_index, false, body.clone())
-                        .await?,
-                );
-            }
-            collected
-        } else {
-            dispatch::fanout_with(self, units, !hidden_vector_index, false, body).await?
-        };
-
-        // Phase C of the deferred-rerank width sweep: select the best
-        // `k x rerank_mult` estimates ACROSS every warm-scanned cell and
-        // superfile, then rerank only those winners where they live. The
-        // estimates are comparable across units — one rotation seed per
-        // column, table-wide — asserted here at the only place different
-        // units' estimates ever meet.
-        if global_shortlist_width.is_some() {
-            // Rerank rows are deliberately NOT in the priced range
-            // counter: `planned_read_ranges` is request-shaped (numbers
-            // commensurate with real object-store requests, which
-            // coalesce survivor rows into a handful of GETs), and the
-            // platform prices it at a per-request rate. The rerank leg's
-            // cost is CPU-dominated and carried by the priced CPU
-            // watermark; the row counts stay visible in the
-            // rows-reranked / candidates diagnostics.
-            let pooled = {
-                let mut guard = scan_pool.lock().unwrap_or_else(PoisonError::into_inner);
-                mem::take(&mut *guard)
-            };
-            if !pooled.is_empty() {
-                // Hard error, not debug_assert: this is the one site where
-                // estimates from different superfiles are pooled and ranked
-                // against each other. Backstopped by the open-time seed
-                // check today, but if a future path ever admits a
-                // differently-seeded unit, fail the query loudly instead of
-                // silently ranking incomparable estimates.
-                if pooled.windows(2).any(|w| w[0].1 != w[1].1) {
-                    return Err(QueryError::Execute(
-                        "pooled 1-bit estimates require one rotation seed per column".into(),
-                    ));
-                }
-                // Mirror phase A/C's `k_fetch = k + replica_overhead` in the
-                // global cut so boundary replicas (dormant today: overhead
-                // is 0 with replication off) cannot take shortlist slots
-                // from distinct rows before the stable-id dedup. Taken
-                // over ALL scanned units — not just the pooled (warm)
-                // ones — so under replication the selection cap is
-                // temperature-invariant and always agrees with the
-                // canonical priced budget above, which uses the same max.
-                // (Pooled membership shifts with cache temperature: a
-                // fully cold unit reranks in-scan and pools nothing, so
-                // a pooled-only max could shrink the cap on cold runs.)
-                let replica_overhead =
-                    usize::try_from(max_replica_overhead.load(atomic::Ordering::Relaxed))
-                        .unwrap_or(0);
-                let mut flat: Vec<(usize, ScanCandidate)> = pooled
-                    .into_iter()
-                    .flat_map(|(si, _, _, cands)| cands.into_iter().map(move |c| (si, c)))
-                    .collect();
-                // Per-cell floor ONLY under an explicit caller nprobe. The
-                // floor exists for the #494 inversion — far cells' 1-bit
-                // noise evicting near cells' true neighbors from the fixed
-                // budget as a CALLER widens the sweep — so it guards
-                // exactly the widths a caller pins. Law-served defaults
-                // are calibrated against realized recall at their own
-                // stamped width and run floor-free: at law widths the
-                // floor measured +0.0001 recall for ~3.4 ms of extra
-                // rerank at k=100 (Cohere-1M), and at width 1-2 it is a
-                // near-no-op by construction. Re-measured at the WIDENED
-                // widths the #515 admit extension serves (Cohere defaults
-                // with the loop active, diffuse stamps both k): still
-                // floor-free, 0.9955 @ k=100 and 0.9940 @ k=10 — above
-                // the stamped-width baseline, no inversion dip. If a
-                // future gate dips, the targeted fix is arming floor = k
-                // on the extension subset only, not on the law's picks.
-                // Floor = k when it applies:
-                // even if the entire true top-k concentrates in one probed
-                // cell, that cell's floor carries it into the exact rerank
-                // (replicas never collide inside one cell, so the floor
-                // needs no replica overhead).
-                //
-                // (#537) The floor's DEPTH must not shrink as the caller
-                // widens — and the depth that holds recall is the full
-                // per-cell budget, not a share of it. The measured 10M
-                // ladder (see the width-divide comment above the fan-out)
-                // tracks per-cell retention depth almost mechanically:
-                // whole-cell retention serves 0.993, ~6% of a cell serves
-                // 0.85, 20 rows serves 0.51 — in-cell 1-bit ranking is
-                // too weak to concentrate the true neighbors into a thin
-                // cut, so no fixed pool or stamped share survives a wide
-                // sweep. Under an explicit caller nprobe every scanned
-                // cell therefore keeps the same k x rerank_mult depth the
-                // narrow probe would give it: widening adds cells at
-                // constant depth, the exact rerank adjudicates, and cost
-                // is linear in the width the caller asked for — the pin
-                // arm's stated semantics.
-                let cell_floor = if options.nprobe.is_some() {
-                    k.saturating_mul(plan_rerank_mult)
-                } else {
-                    0
-                };
-                // (#515) The LAW's rerank budget is calibrated on drain
-                // rows at the stamped width; when the serve window extends
-                // serving past that width, the same budget starves the
-                // widened candidate set — measured at true defaults on
-                // BioASQ-1M: stamped budget serves 0.9510 where the knee
-                // sits at ~3-6x (rm=32 → 0.9820, rm=64 → 0.9880, flat by
-                // 128). Scale the pooled budget by served-cells over
-                // stamped-width, so the pool grows exactly with the cells
-                // the evidence serves: BioASQ lands at the measured knee;
-                // decisive geometry serves width == stamp and is
-                // unchanged. Explicit caller rerank_mult stays an exact,
-                // unscaled request.
-                let shortlist_limit = deferred_shortlist_limit(
-                    k,
-                    replica_overhead,
-                    plan_rerank_mult,
-                    law_rerank_served,
-                    options.nprobe.is_some(),
-                    served_cells_over_width,
-                );
-                // Regression probe for the serve-the-law scope bug: recall
-                // floors can't see a re-shadowed `options` (the constant
-                // budget only ADDS survivors); the served limit can.
-                #[cfg(feature = "test-helpers")]
-                served_shortlist_probe::record(shortlist_limit, cell_floor);
-                flat = select_global_shortlist(flat, shortlist_limit, cell_floor);
-                let column = Arc::clone(&column_arc2);
-                let query = Arc::clone(&query_arc2);
-                let reader_pool = Arc::clone(&manifest.options.reader_pool);
-                let op_stats_c = self.op_stats.clone();
-                let body_c = move |reader: Arc<SuperfileReader>,
-                                   entry: Arc<SuperfileEntry>,
-                                   _tombstone_cache: Option<Arc<SidecarCache>>,
-                                   _now: Instant,
-                                   selected: Vec<ScanCandidate>| {
-                    let column = Arc::clone(&column);
-                    let query = Arc::clone(&query);
-                    let reader_pool = Arc::clone(&reader_pool);
-                    let op_stats = op_stats_c.clone();
-                    async move {
-                        // Hidden-path invariants: no tombstone sidecars (the
-                        // manifest's deletes apply after the stable-id
-                        // remap upstream), replica slack mirrors phase A.
-                        let replica_overhead = reader
-                            .vec()
-                            .map(|v| (v.n_docs() as usize).saturating_sub(reader.n_docs() as usize))
-                            .unwrap_or(0);
-                        let k_fetch = k.saturating_add(replica_overhead);
-                        let reader_for_ids = Arc::clone(&reader);
-                        let (hits, rerank_kernel_ns) = reader
-                            .vector_rerank_selected(
-                                &column,
-                                &query,
-                                k_fetch,
-                                selected,
-                                Some(reader_pool),
-                            )
-                            .await
-                            .map_err(vector_read_query_error)?;
-                        if let Some(stats) = &op_stats {
-                            stats.add_kernel_cpu_ns(rerank_kernel_ns);
-                        }
-                        let mut tagged = dispatch::tag_hits(&entry, hits);
-                        io_counters::phase_timed_async("vec.stable_id", async {
-                            dispatch::attach_stable_ids(
-                                &reader_for_ids,
-                                &entry,
-                                &mut tagged,
-                                false,
-                                &op_stats,
-                            )
-                            .await
-                        })
-                        .await?;
-                        Ok::<Vec<SuperfileHit>, QueryError>(tagged)
+        // Adaptive-width stages: when the plan is armed (law-served cosine
+        // default with a stamped bulk law + margin), partition the fan-out
+        // units by each fine cluster's owning cell — stage 1 = bulk cells
+        // (plus any candidate without a cell tag, conservatively), stage 2
+        // = the escalation remainder, probed only when the width margin
+        // cannot rule its cells out against the running kth exact score.
+        // One stage = today's path, byte-for-byte.
+        let width_margin_val = hidden_routing
+            .as_ref()
+            .map(|r| r.width_margin)
+            .unwrap_or(0.0);
+        let mut stage_bound: Option<f32> = None;
+        let stage_sets: Vec<
+            Vec<(
+                Arc<SuperfileEntry>,
+                (usize, Vec<u32>, Option<Arc<RoaringBitmap>>),
+            )>,
+        > = match width_staging
+            .as_ref()
+            .filter(|_| allow.is_none() && global_shortlist_width.is_some())
+        {
+            Some((bulk_cells, cell_of, bound)) => {
+                let mut stage1 = Vec::new();
+                let mut stage2 = Vec::new();
+                for (entry, (si, ids, bitmap)) in &units {
+                    let (bulk_ids, tail_ids): (Vec<u32>, Vec<u32>) = ids.iter().partition(|&&c| {
+                        cell_of
+                            .get(&(*si, c))
+                            .map(|cell| bulk_cells.contains(cell))
+                            .unwrap_or(true)
+                    });
+                    if !bulk_ids.is_empty() {
+                        stage1.push((Arc::clone(entry), (*si, bulk_ids, bitmap.clone())));
                     }
-                };
-                // Adaptive stopping: on the law-served default (never under
-                // caller overrides), walk the shortlist in estimate bands —
-                // half the remainder per band, floored — and stop once no
-                // unprocessed candidate can reach the running kth exact
-                // score even granted its estimate plus the calibrated
-                // margin. A stamped margin (> 0) is cosine-only evidence
-                // by construction (the calibration measures gaps on cosine
-                // tables alone), so `BASE − distance` is the exact
-                // similarity scale here. The stamped rerank budget already
-                // capped the shortlist above — stopping only SKIPS work,
-                // never adds candidates.
-                let stop_margin = hidden_routing
-                    .as_ref()
-                    .map(|r| r.rerank_margin)
-                    .filter(|&m| m > 0.0)
-                    .filter(|_| law_rerank_served && options.nprobe.is_none());
-                let band_floor = stop_band_min_rows();
-                let banded = match stop_margin {
-                    Some(margin) if flat.len() > 2 * band_floor => Some(margin),
-                    _ => None,
-                };
-                if let Some(margin) = banded {
-                    // The selection's own total order — deterministic bands.
-                    flat.sort_unstable_by(shortlist_total_order);
-                    // The stop rule's kth is over raw reranked hits;
-                    // replica duplicates (dedup happens downstream) can
-                    // only WEAKEN the kth, firing the stop later — safe.
-                    let k_stop = k.saturating_add(replica_overhead);
-                    let mut exact_dists: Vec<f32> = Vec::new();
-                    let mut cursor = 0usize;
-                    while cursor < flat.len() {
-                        let remaining = flat.len() - cursor;
-                        let band_len = (remaining / 2).max(band_floor).min(remaining);
-                        let band_end = cursor + band_len;
-                        let mut winners_by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
-                        for (si, cand) in &flat[cursor..band_end] {
-                            winners_by_seg.entry(*si).or_default().push(*cand);
+                    if !tail_ids.is_empty() {
+                        stage2.push((Arc::clone(entry), (*si, tail_ids, bitmap.clone())));
+                    }
+                }
+                if stage1.is_empty() || stage2.is_empty() {
+                    vec![units]
+                } else {
+                    stage_bound = *bound;
+                    vec![stage1, stage2]
+                }
+            }
+            None => vec![units],
+        };
+        let mut per_superfile: Vec<Vec<SuperfileHit>> = Vec::new();
+        // Pooled candidates retained ACROSS stages (the global selection in
+        // a later stage competes old and new candidates together), plus the
+        // identity keys of candidates already exactly reranked, so a row
+        // never reranks twice.
+        let mut flat_retained: Vec<(usize, ScanCandidate)> = Vec::new();
+        let mut reranked_keys: HashSet<(usize, usize, u32, u32)> = HashSet::new();
+        for (stage_idx, stage_units) in stage_sets.into_iter().enumerate() {
+            if stage_idx > 0 {
+                // Escalation stop: no remaining cell's best routing
+                // similarity plus the calibrated margin can reach the
+                // running kth exact score — the tail cells cannot change
+                // the top-k. An unbounded tail (any escalation cell
+                // without a fine score) always escalates.
+                let k_stop = k.saturating_add(
+                    usize::try_from(max_replica_overhead.load(atomic::Ordering::Relaxed))
+                        .unwrap_or(0),
+                );
+                if let Some(bound_dist) = stage_bound
+                    && k_stop > 0
+                {
+                    let mut dists: Vec<f32> =
+                        per_superfile.iter().flatten().map(|h| h.score).collect();
+                    if dists.len() >= k_stop {
+                        let (_, kth, _) = dists.select_nth_unstable_by(k_stop - 1, f32::total_cmp);
+                        if width_escalation_stops(*kth, bound_dist, width_margin_val) {
+                            break;
                         }
-                        cursor = band_end;
+                    }
+                }
+            }
+            let mut stage_units = stage_units;
+            let stage_hits = if allow.is_some() {
+                let fanout_width = manifest.options.reader_pool.current_num_threads().max(1);
+                let mut collected = Vec::new();
+                while !stage_units.is_empty() {
+                    let n = fanout_width.min(stage_units.len());
+                    let wave: Vec<_> = stage_units.drain(..n).collect();
+                    collected.extend(
+                        dispatch::fanout_with(
+                            self,
+                            wave,
+                            !hidden_vector_index,
+                            false,
+                            body.clone(),
+                        )
+                        .await?,
+                    );
+                }
+                collected
+            } else {
+                dispatch::fanout_with(self, stage_units, !hidden_vector_index, false, body.clone())
+                    .await?
+            };
+            per_superfile.extend(stage_hits);
+
+            // Phase C of the deferred-rerank width sweep: select the best
+            // `k x rerank_mult` estimates ACROSS every warm-scanned cell and
+            // superfile, then rerank only those winners where they live. The
+            // estimates are comparable across units — one rotation seed per
+            // column, table-wide — asserted here at the only place different
+            // units' estimates ever meet.
+            if global_shortlist_width.is_some() {
+                // Rerank rows are deliberately NOT in the priced range
+                // counter: `planned_read_ranges` is request-shaped (numbers
+                // commensurate with real object-store requests, which
+                // coalesce survivor rows into a handful of GETs), and the
+                // platform prices it at a per-request rate. The rerank leg's
+                // cost is CPU-dominated and carried by the priced CPU
+                // watermark; the row counts stay visible in the
+                // rows-reranked / candidates diagnostics.
+                let pooled = {
+                    let mut guard = scan_pool.lock().unwrap_or_else(PoisonError::into_inner);
+                    mem::take(&mut *guard)
+                };
+                if !pooled.is_empty() {
+                    // Hard error, not debug_assert: this is the one site where
+                    // estimates from different superfiles are pooled and ranked
+                    // against each other. Backstopped by the open-time seed
+                    // check today, but if a future path ever admits a
+                    // differently-seeded unit, fail the query loudly instead of
+                    // silently ranking incomparable estimates.
+                    if pooled.windows(2).any(|w| w[0].1 != w[1].1) {
+                        return Err(QueryError::Execute(
+                            "pooled 1-bit estimates require one rotation seed per column".into(),
+                        ));
+                    }
+                    // Mirror phase A/C's `k_fetch = k + replica_overhead` in the
+                    // global cut so boundary replicas (dormant today: overhead
+                    // is 0 with replication off) cannot take shortlist slots
+                    // from distinct rows before the stable-id dedup. Taken
+                    // over ALL scanned units — not just the pooled (warm)
+                    // ones — so under replication the selection cap is
+                    // temperature-invariant and always agrees with the
+                    // canonical priced budget above, which uses the same max.
+                    // (Pooled membership shifts with cache temperature: a
+                    // fully cold unit reranks in-scan and pools nothing, so
+                    // a pooled-only max could shrink the cap on cold runs.)
+                    let replica_overhead =
+                        usize::try_from(max_replica_overhead.load(atomic::Ordering::Relaxed))
+                            .unwrap_or(0);
+                    flat_retained.extend(
+                        pooled
+                            .into_iter()
+                            .flat_map(|(si, _, _, cands)| cands.into_iter().map(move |c| (si, c))),
+                    );
+                    let mut flat: Vec<(usize, ScanCandidate)> = flat_retained.clone();
+                    // Per-cell floor ONLY under an explicit caller nprobe. The
+                    // floor exists for the #494 inversion — far cells' 1-bit
+                    // noise evicting near cells' true neighbors from the fixed
+                    // budget as a CALLER widens the sweep — so it guards
+                    // exactly the widths a caller pins. Law-served defaults
+                    // are calibrated against realized recall at their own
+                    // stamped width and run floor-free: at law widths the
+                    // floor measured +0.0001 recall for ~3.4 ms of extra
+                    // rerank at k=100 (Cohere-1M), and at width 1-2 it is a
+                    // near-no-op by construction. Re-measured at the WIDENED
+                    // widths the #515 admit extension serves (Cohere defaults
+                    // with the loop active, diffuse stamps both k): still
+                    // floor-free, 0.9955 @ k=100 and 0.9940 @ k=10 — above
+                    // the stamped-width baseline, no inversion dip. If a
+                    // future gate dips, the targeted fix is arming floor = k
+                    // on the extension subset only, not on the law's picks.
+                    // Floor = k when it applies:
+                    // even if the entire true top-k concentrates in one probed
+                    // cell, that cell's floor carries it into the exact rerank
+                    // (replicas never collide inside one cell, so the floor
+                    // needs no replica overhead).
+                    //
+                    // (#537) The floor's DEPTH must not shrink as the caller
+                    // widens — and the depth that holds recall is the full
+                    // per-cell budget, not a share of it. The measured 10M
+                    // ladder (see the width-divide comment above the fan-out)
+                    // tracks per-cell retention depth almost mechanically:
+                    // whole-cell retention serves 0.993, ~6% of a cell serves
+                    // 0.85, 20 rows serves 0.51 — in-cell 1-bit ranking is
+                    // too weak to concentrate the true neighbors into a thin
+                    // cut, so no fixed pool or stamped share survives a wide
+                    // sweep. Under an explicit caller nprobe every scanned
+                    // cell therefore keeps the same k x rerank_mult depth the
+                    // narrow probe would give it: widening adds cells at
+                    // constant depth, the exact rerank adjudicates, and cost
+                    // is linear in the width the caller asked for — the pin
+                    // arm's stated semantics.
+                    let cell_floor = if options.nprobe.is_some() {
+                        k.saturating_mul(plan_rerank_mult)
+                    } else {
+                        0
+                    };
+                    // (#515) The LAW's rerank budget is calibrated on drain
+                    // rows at the stamped width; when the serve window extends
+                    // serving past that width, the same budget starves the
+                    // widened candidate set — measured at true defaults on
+                    // BioASQ-1M: stamped budget serves 0.9510 where the knee
+                    // sits at ~3-6x (rm=32 → 0.9820, rm=64 → 0.9880, flat by
+                    // 128). Scale the pooled budget by served-cells over
+                    // stamped-width, so the pool grows exactly with the cells
+                    // the evidence serves: BioASQ lands at the measured knee;
+                    // decisive geometry serves width == stamp and is
+                    // unchanged. Explicit caller rerank_mult stays an exact,
+                    // unscaled request.
+                    let shortlist_limit = deferred_shortlist_limit(
+                        k,
+                        replica_overhead,
+                        plan_rerank_mult,
+                        law_rerank_served,
+                        options.nprobe.is_some(),
+                        served_cells_over_width,
+                    );
+                    // Regression probe for the serve-the-law scope bug: recall
+                    // floors can't see a re-shadowed `options` (the constant
+                    // budget only ADDS survivors); the served limit can.
+                    #[cfg(feature = "test-helpers")]
+                    served_shortlist_probe::record(shortlist_limit, cell_floor);
+                    flat = select_global_shortlist(flat, shortlist_limit, cell_floor);
+                    // A later stage must not rerank rows an earlier stage
+                    // already scored exactly (their hits are already pooled).
+                    flat.retain(|(si, c)| {
+                        !reranked_keys.contains(&(*si, c.cell_idx, c.pos, c.did))
+                    });
+                    let column = Arc::clone(&column_arc2);
+                    let query = Arc::clone(&query_arc2);
+                    let reader_pool = Arc::clone(&manifest.options.reader_pool);
+                    let op_stats_c = self.op_stats.clone();
+                    let body_c =
+                        move |reader: Arc<SuperfileReader>,
+                              entry: Arc<SuperfileEntry>,
+                              _tombstone_cache: Option<Arc<SidecarCache>>,
+                              _now: Instant,
+                              selected: Vec<ScanCandidate>| {
+                            let column = Arc::clone(&column);
+                            let query = Arc::clone(&query);
+                            let reader_pool = Arc::clone(&reader_pool);
+                            let op_stats = op_stats_c.clone();
+                            async move {
+                                // Hidden-path invariants: no tombstone sidecars (the
+                                // manifest's deletes apply after the stable-id
+                                // remap upstream), replica slack mirrors phase A.
+                                let replica_overhead = reader
+                                    .vec()
+                                    .map(|v| {
+                                        (v.n_docs() as usize)
+                                            .saturating_sub(reader.n_docs() as usize)
+                                    })
+                                    .unwrap_or(0);
+                                let k_fetch = k.saturating_add(replica_overhead);
+                                let reader_for_ids = Arc::clone(&reader);
+                                let (hits, rerank_kernel_ns) = reader
+                                    .vector_rerank_selected(
+                                        &column,
+                                        &query,
+                                        k_fetch,
+                                        selected,
+                                        Some(reader_pool),
+                                    )
+                                    .await
+                                    .map_err(vector_read_query_error)?;
+                                if let Some(stats) = &op_stats {
+                                    stats.add_kernel_cpu_ns(rerank_kernel_ns);
+                                }
+                                let mut tagged = dispatch::tag_hits(&entry, hits);
+                                io_counters::phase_timed_async("vec.stable_id", async {
+                                    dispatch::attach_stable_ids(
+                                        &reader_for_ids,
+                                        &entry,
+                                        &mut tagged,
+                                        false,
+                                        &op_stats,
+                                    )
+                                    .await
+                                })
+                                .await?;
+                                Ok::<Vec<SuperfileHit>, QueryError>(tagged)
+                            }
+                        };
+                    // Adaptive stopping: on the law-served default (never under
+                    // caller overrides), walk the shortlist in estimate bands —
+                    // half the remainder per band, floored — and stop once no
+                    // unprocessed candidate can reach the running kth exact
+                    // score even granted its estimate plus the calibrated
+                    // margin. A stamped margin (> 0) is cosine-only evidence
+                    // by construction (the calibration measures gaps on cosine
+                    // tables alone), so `BASE − distance` is the exact
+                    // similarity scale here. The stamped rerank budget already
+                    // capped the shortlist above — stopping only SKIPS work,
+                    // never adds candidates.
+                    let stop_margin = hidden_routing
+                        .as_ref()
+                        .map(|r| r.rerank_margin)
+                        .filter(|&m| m > 0.0)
+                        .filter(|_| law_rerank_served && options.nprobe.is_none());
+                    let band_floor = stop_band_min_rows();
+                    let banded = match stop_margin {
+                        Some(margin) if flat.len() > 2 * band_floor => Some(margin),
+                        _ => None,
+                    };
+                    if let Some(margin) = banded {
+                        // The selection's own total order — deterministic bands.
+                        flat.sort_unstable_by(shortlist_total_order);
+                        // The stop rule's kth is over raw reranked hits;
+                        // replica duplicates (dedup happens downstream) can
+                        // only WEAKEN the kth, firing the stop later — safe.
+                        let k_stop = k.saturating_add(replica_overhead);
+                        let mut exact_dists: Vec<f32> = Vec::new();
+                        let mut cursor = 0usize;
+                        while cursor < flat.len() {
+                            let remaining = flat.len() - cursor;
+                            let band_len = (remaining / 2).max(band_floor).min(remaining);
+                            let band_end = cursor + band_len;
+                            let mut winners_by_seg: HashMap<usize, Vec<ScanCandidate>> =
+                                HashMap::new();
+                            for (si, cand) in &flat[cursor..band_end] {
+                                reranked_keys.insert((*si, cand.cell_idx, cand.pos, cand.did));
+                                winners_by_seg.entry(*si).or_default().push(*cand);
+                            }
+                            cursor = band_end;
+                            let rerank_units: Vec<(Arc<SuperfileEntry>, Vec<ScanCandidate>)> =
+                                superfiles
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(si, entry)| {
+                                        winners_by_seg
+                                            .remove(&si)
+                                            .map(|sel| (Arc::clone(entry), sel))
+                                    })
+                                    .collect();
+                            if let Some(stats) = &self.op_stats {
+                                // Actual rows this band reranks — skipped bands
+                                // never reach the counter, so the diagnostic
+                                // reflects the adaptive work, not the cap.
+                                let rows: u64 =
+                                    rerank_units.iter().map(|(_, sel)| sel.len() as u64).sum();
+                                stats.add_vector_rows_reranked(rows);
+                            }
+                            let band_hits = dispatch::fanout_with(
+                                self,
+                                rerank_units,
+                                false,
+                                false,
+                                body_c.clone(),
+                            )
+                            .await?;
+                            let done = cursor >= flat.len();
+                            if !done {
+                                exact_dists.extend(band_hits.iter().flatten().map(|h| h.score));
+                                exact_dists.sort_unstable_by(f32::total_cmp);
+                                exact_dists.truncate(k_stop);
+                            }
+                            per_superfile.extend(band_hits);
+                            if done {
+                                break;
+                            }
+                            if exact_dists.len() >= k_stop
+                                && let Some(&kth_dist) = exact_dists.last()
+                            {
+                                let kth_sim = COSINE_DISTANCE_BASE - kth_dist;
+                                let next_best_est = flat[cursor].1.estimate;
+                                if next_best_est + margin < kth_sim {
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        let mut winners_by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
+                        for (si, cand) in flat {
+                            reranked_keys.insert((si, cand.cell_idx, cand.pos, cand.did));
+                            winners_by_seg.entry(si).or_default().push(cand);
+                        }
                         let rerank_units: Vec<(Arc<SuperfileEntry>, Vec<ScanCandidate>)> =
                             superfiles
                                 .iter()
@@ -2668,60 +2857,17 @@ impl SupertableReader {
                                 })
                                 .collect();
                         if let Some(stats) = &self.op_stats {
-                            // Actual rows this band reranks — skipped bands
-                            // never reach the counter, so the diagnostic
-                            // reflects the adaptive work, not the cap.
+                            // Actual winner rows; their planned ranges were
+                            // priced canonically above, from the budget these
+                            // winners were selected under.
                             let rows: u64 =
                                 rerank_units.iter().map(|(_, sel)| sel.len() as u64).sum();
                             stats.add_vector_rows_reranked(rows);
                         }
-                        let band_hits =
-                            dispatch::fanout_with(self, rerank_units, false, false, body_c.clone())
-                                .await?;
-                        let done = cursor >= flat.len();
-                        if !done {
-                            exact_dists.extend(band_hits.iter().flatten().map(|h| h.score));
-                            exact_dists.sort_unstable_by(f32::total_cmp);
-                            exact_dists.truncate(k_stop);
-                        }
-                        per_superfile.extend(band_hits);
-                        if done {
-                            break;
-                        }
-                        if exact_dists.len() >= k_stop
-                            && let Some(&kth_dist) = exact_dists.last()
-                        {
-                            let kth_sim = COSINE_DISTANCE_BASE - kth_dist;
-                            let next_best_est = flat[cursor].1.estimate;
-                            if next_best_est + margin < kth_sim {
-                                break;
-                            }
-                        }
+                        per_superfile.extend(
+                            dispatch::fanout_with(self, rerank_units, false, false, body_c).await?,
+                        );
                     }
-                } else {
-                    let mut winners_by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
-                    for (si, cand) in flat {
-                        winners_by_seg.entry(si).or_default().push(cand);
-                    }
-                    let rerank_units: Vec<(Arc<SuperfileEntry>, Vec<ScanCandidate>)> = superfiles
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(si, entry)| {
-                            winners_by_seg
-                                .remove(&si)
-                                .map(|sel| (Arc::clone(entry), sel))
-                        })
-                        .collect();
-                    if let Some(stats) = &self.op_stats {
-                        // Actual winner rows; their planned ranges were
-                        // priced canonically above, from the budget these
-                        // winners were selected under.
-                        let rows: u64 = rerank_units.iter().map(|(_, sel)| sel.len() as u64).sum();
-                        stats.add_vector_rows_reranked(rows);
-                    }
-                    per_superfile.extend(
-                        dispatch::fanout_with(self, rerank_units, false, false, body_c).await?,
-                    );
                 }
             }
         }
@@ -3921,6 +4067,18 @@ fn deferred_shortlist_limit(
     }
 }
 
+/// The adaptive-width escalation stop: `true` when no remaining cell's
+/// best routing similarity (`COSINE_DISTANCE_BASE − bound_dist`, the best
+/// fine-centroid distance among the escalation cells) plus the calibrated
+/// width margin can reach the running kth exact similarity — the tail
+/// cells provably cannot change the top-k, so stage 2 is skipped. All
+/// quantities are on the cosine similarity scale; the margin is only ever
+/// stamped on cosine tables.
+fn width_escalation_stops(kth_dist: f32, bound_dist: f32, width_margin: f32) -> bool {
+    let kth_sim = COSINE_DISTANCE_BASE - kth_dist;
+    (COSINE_DISTANCE_BASE - bound_dist) + width_margin < kth_sim
+}
+
 /// The shortlist's total order: best estimate first, ties on
 /// `(unit, cell, pos, did)` — shared by [`select_global_shortlist`]'s cut
 /// and the adaptive-stopping band sort so both walk one deterministic
@@ -4197,7 +4355,7 @@ mod tests {
         hidden_hits_user_ids, is_hidden_vector_manifest, law_floor_serve_selection,
         postings_by_cell_from_summaries, projection_is_id_score_only, rerank_mult_from_law,
         score_fine_candidates, select_global_shortlist, stop_band_floor_override,
-        union_cell_selection, vector_read_query_error,
+        union_cell_selection, vector_read_query_error, width_escalation_stops,
     };
     use crate::{
         BoolMode, InfinoError,
@@ -5889,6 +6047,22 @@ mod tests {
     /// Planted neighbors among `hits` (orthogonal docs score exactly 1.0).
     fn near_count(hits: &[SuperfileHit]) -> usize {
         hits.iter().filter(|h| h.score < ORTHOGONAL_SCORE).count()
+    }
+
+    /// The width-escalation stop is conservative in every direction: it
+    /// fires only when the margin-padded best possible similarity of the
+    /// tail cells sits strictly below the kth exact similarity, and any
+    /// tie or unbounded margin keeps probing.
+    #[test]
+    fn width_escalation_stop_rule_is_conservative() {
+        // kth_sim = 0.9; tail's best routing sim = 0.5. Margin 0.3 pads to
+        // 0.8 < 0.9 → stop. Margin 0.5 pads to 1.0 ≥ 0.9 → keep probing.
+        assert!(width_escalation_stops(0.1, 0.5, 0.3));
+        assert!(!width_escalation_stops(0.1, 0.5, 0.5));
+        // Exact tie must NOT stop (strict inequality): 0.5 + 0.4 == 0.9.
+        assert!(!width_escalation_stops(0.1, 0.5, 0.4));
+        // A tail cell ranked better than the kth never stops, margin 0.
+        assert!(!width_escalation_stops(0.5, 0.1, 0.0));
     }
 
     /// The estimate-banded adaptive rerank returns exactly the planted
