@@ -142,6 +142,9 @@ pub struct ColumnReader {
     /// (shared `Arc` so rayon scan tasks can hold it past the reader
     /// borrow). See [`TransposedCodeCache`].
     transposed_codes: Arc<TransposedCodeCache>,
+    /// See [`ResidualNormMaxCache`] — query-independent, so it is built
+    /// once per cluster and reused by every later query.
+    residual_norm_max: Arc<ResidualNormMaxCache>,
     pub name: String,
     pub dim: usize,
     pub n_cent: u32,
@@ -1301,6 +1304,7 @@ impl VectorReader {
 
             columns.push(ColumnReader {
                 transposed_codes: Arc::new(TransposedCodeCache::default()),
+                residual_norm_max: Arc::new(ResidualNormMaxCache::default()),
                 name: cfg.column.clone(),
                 dim,
                 n_cent,
@@ -1921,6 +1925,7 @@ impl VectorReader {
 
         Ok(ColumnReader {
             transposed_codes: Arc::new(TransposedCodeCache::default()),
+            residual_norm_max: Arc::new(ResidualNormMaxCache::default()),
             name: cfg.column.clone(),
             dim,
             n_cent: n_cent_u32,
@@ -4467,6 +4472,42 @@ fn pool_wave_cap(pool: Option<&ThreadPool>) -> usize {
 /// ride the reader cache. Each entry holds the RAII budget reservation
 /// that admitted it; a denied reservation keeps that cluster on the
 /// row-major estimator instead of evicting anything.
+/// Per-cluster maximum stored residual norm, cached across queries. The
+/// value is a property of the immutable superfile, not of any query, so
+/// one full scan of a cluster is enough forever. It is populated ONLY by
+/// an unpruned scan: a pruned scan never reads the blocks it skipped, so
+/// it would understate the maximum, raise the derived threshold and
+/// over-prune. That ordering is self-enforcing — with no cached value
+/// there is no bar, hence no pruning, hence a complete pass.
+#[derive(Default)]
+pub(super) struct ResidualNormMaxCache {
+    clusters: Mutex<HashMap<u32, f32>>,
+}
+
+impl fmt::Debug for ResidualNormMaxCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let n = self.clusters.lock().map(|c| c.len()).unwrap_or(0);
+        f.debug_struct("ResidualNormMaxCache")
+            .field("clusters", &n)
+            .finish()
+    }
+}
+
+impl ResidualNormMaxCache {
+    /// The cached maximum for the cluster at `off`, if a full scan has
+    /// already recorded one.
+    fn get(&self, off: u32) -> Option<f32> {
+        self.clusters.lock().ok()?.get(&off).copied()
+    }
+
+    /// Record a maximum observed over EVERY row of the cluster at `off`.
+    fn put(&self, off: u32, norm_max: f32) {
+        if let Ok(mut clusters) = self.clusters.lock() {
+            clusters.entry(off).or_insert(norm_max);
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct TransposedCodeCache {
     clusters: Mutex<HashMap<u32, TransposedCluster>>,
@@ -4610,17 +4651,12 @@ impl ClusterResidual {
         }
     }
 
-    /// Record the largest residual norm over the rows this cluster owns
-    /// (`off..off + rows` in cluster-order position space) — one
-    /// streaming pass over 4 bytes per row, against the 96+ bytes per row
-    /// the scan itself reads.
-    fn with_norm_max(mut self, off: u32, rows: usize) -> Self {
-        let start = off as usize * 4;
-        let end = start + rows * 4;
-        self.norm_max = self.norms[start..end]
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().expect("4-byte residual norm")))
-            .fold(0.0f32, f32::max);
+    /// Adopt a previously cached per-cluster maximum norm. `None` leaves
+    /// `norm_max` at zero, which makes [`Self::prune_bar`] decline — the
+    /// cluster's first scan therefore runs in full and records the value
+    /// for every later query.
+    fn with_cached_norm_max(mut self, cached: Option<f32>) -> Self {
+        self.norm_max = cached.unwrap_or(0.0);
         self
     }
 
@@ -4664,13 +4700,25 @@ impl ClusterResidual {
     /// Cohere-10M-scale scans (~1.1M rows/query), erasing the residual
     /// feature's budget win at serve time.
     #[inline]
-    fn estimate_block(&self, pos_base: u32, live: usize, scores: &mut [f32; LUT_BLOCK_ROWS]) {
+    /// Returns the largest norm this block carried — free here, because
+    /// the affine pass already has every one of them in registers, and it
+    /// is what the plane prune needs to convert an estimate-scale bar into
+    /// an accumulator threshold (see [`ResidualNormMaxCache`]).
+    fn estimate_block(
+        &self,
+        pos_base: u32,
+        live: usize,
+        scores: &mut [f32; LUT_BLOCK_ROWS],
+    ) -> f32 {
         let start = pos_base as usize * 4;
         let bytes = &self.norms[start..start + live * 4];
+        let mut norm_max = 0f32;
         for (score, norm_bytes) in scores[..live].iter_mut().zip(bytes.chunks_exact(4)) {
             let norm = f32::from_le_bytes(norm_bytes.try_into().expect("4-byte residual norm"));
+            norm_max = norm_max.max(norm);
             *score = self.q_dot + self.kappa * norm * *score;
         }
+        norm_max
     }
 }
 
@@ -4685,10 +4733,14 @@ fn scan_cluster_transposed(
     lut: &LutQuery,
     residual: Option<&ClusterResidual>,
     prune: Option<&PruneBar>,
+    norm_max_cache: &ResidualNormMaxCache,
     #[cfg(any(test, feature = "test-helpers"))] killed_blocks: Option<&[bool]>,
     acc: &mut Vec<(u32, f32, u32, u32)>,
 ) {
     let mut planes_scanned = 0usize;
+    // Largest residual norm seen across the blocks actually scored. Only
+    // meaningful when nothing was pruned — see `ResidualNormMaxCache`.
+    let mut norm_max_seen = 0f32;
     for_each_code_block_scores(
         transposed,
         cb,
@@ -4712,7 +4764,11 @@ fn scan_cluster_transposed(
             let scores: &[f32; LUT_BLOCK_ROWS] = match residual {
                 Some(res) => {
                     adjusted = *scores;
-                    res.estimate_block(off + base_r as u32, live, &mut adjusted);
+                    let block_norm_max =
+                        res.estimate_block(off + base_r as u32, live, &mut adjusted);
+                    if block_norm_max > norm_max_seen {
+                        norm_max_seen = block_norm_max;
+                    }
                     &adjusted
                 }
                 None => scores,
@@ -4735,6 +4791,17 @@ fn scan_cluster_transposed(
             planes_scanned as u64,
             (cnt.div_ceil(LUT_BLOCK_ROWS) * cb) as u64,
         );
+    }
+    // A scan that pruned nothing saw every row, so its maximum is the
+    // cluster's maximum and can serve every later query. A pruned scan
+    // must NOT record one: it never read the blocks it skipped, so its
+    // maximum could be too low, which would raise the derived threshold
+    // and start dropping true neighbours.
+    if PLANE_PRUNE_ENABLED
+        && norm_max_seen > 0.0
+        && planes_scanned == cnt.div_ceil(LUT_BLOCK_ROWS) * cb
+    {
+        norm_max_cache.put(off, norm_max_seen);
     }
 }
 
@@ -4778,10 +4845,10 @@ async fn scan_shortlist(
         Arc::new(
             cluster_meta
                 .iter()
-                .map(|&(c, off, cnt)| {
+                .map(|&(c, off, _)| {
                     let resolved = ClusterResidual::resolve(r, col, c);
                     if PLANE_PRUNE_ENABLED {
-                        resolved.with_norm_max(off, cnt as usize)
+                        resolved.with_cached_norm_max(col.residual_norm_max.get(off))
                     } else {
                         resolved
                     }
@@ -4859,6 +4926,7 @@ async fn scan_shortlist(
                 lut,
                 cluster_residual,
                 prune.as_ref(),
+                &col.residual_norm_max,
                 #[cfg(any(test, feature = "test-helpers"))]
                 killed_blocks.as_deref(),
                 acc,
@@ -4913,6 +4981,7 @@ async fn scan_shortlist(
         let allow_owned = ctx.allow.clone();
         let deny_owned = ctx.deny.clone();
         let bar_owned = scan_bar.clone();
+        let norm_max_owned = Arc::clone(&col.residual_norm_max);
         let residuals_owned = cluster_residuals.clone();
         let (tx, rx) = oneshot::channel();
         spawn_on(ctx.pool.as_deref(), move || {
@@ -4969,6 +5038,7 @@ async fn scan_shortlist(
                                 lut,
                                 cluster_residual,
                                 prune.as_ref(),
+                                &norm_max_owned,
                                 // The rayon arm never runs under the
                                 // plane-truncation probe (which forces
                                 // the serial arm for a coherent floor).

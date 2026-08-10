@@ -289,7 +289,7 @@ pub mod plane_trunc_probe {
     /// Mark one cell scan finished; periodically emit the totals.
     pub fn cell_done() {
         let cells = CELLS.fetch_add(1, Ordering::Relaxed) + 1;
-        if cells % EMIT_EVERY_CELLS == 0 {
+        if cells.is_multiple_of(EMIT_EVERY_CELLS) {
             emit();
         }
     }
