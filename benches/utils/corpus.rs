@@ -186,72 +186,97 @@ pub(crate) fn chunk_seed(seed: u64, chunk_index: usize) -> u64 {
 /// dimension for a real corpus.
 pub const SYNTHETIC_DIM: usize = 1024;
 
-/// Env selecting the vector corpus source: `synthetic` (the default —
-/// the seeded planted-cluster generator below) or an ann-benchmarks
-/// dataset slug (`glove-25-angular`, `nytimes-256-angular`,
-/// `deep-image-96-angular`, …). A slug names the canonical published
-/// dataset: corpus rows, the official query set, and the official
-/// top-k neighbour ids all travel together in one file.
+/// Vector corpus source, selected by the `corpus=<spec>` bench argument
+/// (see [`set_source`]). Deliberately NOT an env var: the bench tier's
+/// only env-tunable knobs are the two doc counts, and a corpus that can
+/// silently change from the environment is exactly the class of drift
+/// that makes two runs incomparable.
 ///
-/// Real datasets are vector-only today: FTS / SQL / combined modalities
-/// keep the synthetic corpus and say so rather than silently mixing a
-/// synthetic text corpus with real vectors. Extending real-corpus
-/// coverage to those modalities is why this lives in `benches/` rather
-/// than in a vector-only external harness.
-pub const CORPUS_SOURCE_ENV: &str = "INFINO_BENCH_CORPUS";
-
-/// Env naming the directory that holds (or will receive) real dataset
-/// files. One `<slug>.hdf5` per dataset, matching the host's layout.
-pub const CORPUS_DIR_ENV: &str = "INFINO_BENCH_CORPUS_DIR";
-
-/// Row-slab size for streaming a real corpus into the mmap: bounded peak
-/// memory (slab x dim x 4 bytes) rather than the whole dataset, which is
-/// multi-GB for the larger slugs.
-const H5_SLAB_ROWS: usize = 8_192;
-
-/// Connect timeout for a real-dataset download.
-const CORPUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Whole-download deadline: generous enough for the largest published
-/// dataset on a slow link, finite so a half-open connection cannot hang a
-/// bench run forever.
-const CORPUS_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(3 * 3600);
-
-/// Which vector corpus feeds the benches. Resolved once per process
-/// from [`CORPUS_SOURCE_ENV`].
-#[derive(Debug)]
+/// Specs:
+///
+/// * `synthetic` — the seeded planted-cluster generator (the default).
+/// * `annb:<slug>` — a published ann-benchmarks dataset
+///   (`annb:glove-100-angular`). One HDF5 file carries corpus rows, the
+///   official query set, and official top-k neighbour ids, so ground
+///   truth needs no recompute and recall is comparable to published
+///   numbers.
+/// * `hf:<repo>` — a Hugging Face parquet dataset
+///   (`hf:KShivendu/dbpedia-entities-openai-1M`). Real embeddings at
+///   scale (that one is 1M x 1536) and, when the repo carries text
+///   columns, the only source that can feed FTS and SQL as well as
+///   vectors. No shipped ground truth: truth is computed over the rows
+///   actually ingested.
+/// * `parquet:<dir>` — a local directory in the VDBBench layout
+///   (`shuffle_train.parquet` + `test.parquet`). No download, no vendor
+///   host in source; reads corpora already staged on a bench box.
+///
+/// Real corpora are vector-only today except where a source carries text
+/// columns; FTS / SQL / combined modalities otherwise keep the synthetic
+/// corpus and say so rather than silently mixing corpora.
+#[derive(Debug, Clone)]
 pub enum CorpusSource {
     /// Seeded planted-cluster generator (the historical default).
     Synthetic,
     /// Published ann-benchmarks dataset `slug`, staged under `dir`.
-    Real { dir: PathBuf, slug: String },
+    AnnBenchmarks { dir: PathBuf, slug: String },
+    /// Hugging Face parquet dataset `repo`, staged under `dir`.
+    HuggingFace { dir: PathBuf, repo: String },
+    /// Local VDBBench-layout parquet directory.
+    LocalParquet { dir: PathBuf },
 }
 
-/// The process-wide corpus source. Panics on an unknown
-/// [`CORPUS_SOURCE_ENV`] value or a `cohere` selection without
-/// [`CORPUS_DIR_ENV`] — both are configuration errors a run must not
-/// silently paper over.
-pub fn corpus_source() -> &'static CorpusSource {
-    static SOURCE: OnceLock<CorpusSource> = OnceLock::new();
-    SOURCE.get_or_init(|| match env::var(CORPUS_SOURCE_ENV).ok().as_deref() {
-        None | Some("") | Some("synthetic") => CorpusSource::Synthetic,
-        Some(slug) => {
-            let dir = env::var(CORPUS_DIR_ENV).unwrap_or_else(|_| {
-                panic!("{CORPUS_SOURCE_ENV}={slug} requires {CORPUS_DIR_ENV}=<dataset dir>")
-            });
-            CorpusSource::Real {
-                dir: PathBuf::from(dir),
-                slug: slug.to_string(),
-            }
+/// Where downloaded corpora are staged, set alongside the spec.
+static SOURCE: OnceLock<CorpusSource> = OnceLock::new();
+
+/// Parse and install the corpus source for this process. First call wins,
+/// mirroring [`crate::dataset::set_prefix`]. `dir` is where downloadable
+/// sources stage their files. Returns an error string for an unparseable
+/// spec so the caller can fail with usage rather than panicking deep in a
+/// build.
+pub fn set_source(spec: &str, dir: Option<&str>) -> Result<(), String> {
+    let staged = |what: &str| -> Result<PathBuf, String> {
+        dir.map(PathBuf::from)
+            .ok_or_else(|| format!("corpus={spec} needs corpus-dir=<path> to stage {what}"))
+    };
+    let source = match spec.split_once(':') {
+        None if spec == "synthetic" => CorpusSource::Synthetic,
+        Some(("annb", slug)) if !slug.is_empty() => CorpusSource::AnnBenchmarks {
+            dir: staged("the dataset file")?,
+            slug: slug.to_string(),
+        },
+        Some(("hf", repo)) if repo.contains('/') => CorpusSource::HuggingFace {
+            dir: staged("the dataset shards")?,
+            repo: repo.to_string(),
+        },
+        Some(("parquet", d)) if !d.is_empty() => CorpusSource::LocalParquet {
+            dir: PathBuf::from(d),
+        },
+        _ => {
+            return Err(format!(
+                "unknown corpus spec {spec:?} (expected synthetic | annb:<slug> | \
+                 hf:<owner/repo> | parquet:<dir>)"
+            ));
         }
-    })
+    };
+    let _ = SOURCE.set(source);
+    Ok(())
+}
+
+/// The process-wide corpus source; [`CorpusSource::Synthetic`] until set.
+pub fn corpus_source() -> &'static CorpusSource {
+    SOURCE.get_or_init(|| CorpusSource::Synthetic)
 }
 
 /// Short corpus name for reports and dataset sidecars.
 pub fn corpus_label() -> &'static str {
     match corpus_source() {
         CorpusSource::Synthetic => "synthetic",
-        CorpusSource::Real { slug, .. } => slug,
+        CorpusSource::AnnBenchmarks { slug, .. } => slug,
+        CorpusSource::HuggingFace { repo, .. } => repo,
+        CorpusSource::LocalParquet { dir } => dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("parquet"),
     }
 }
 
@@ -262,7 +287,8 @@ pub fn dim() -> usize {
     static DIM_ONCE: OnceLock<usize> = OnceLock::new();
     *DIM_ONCE.get_or_init(|| match corpus_source() {
         CorpusSource::Synthetic => SYNTHETIC_DIM,
-        CorpusSource::Real { dir, slug } => real_corpus_dim(dir, slug),
+        CorpusSource::AnnBenchmarks { dir, slug } => real_corpus_dim(dir, slug),
+        other => panic!("{} corpus reader is not wired yet", corpus_kind(other)),
     })
 }
 
@@ -308,13 +334,24 @@ pub fn supertable_docs() -> usize {
 fn clamp_docs_to_corpus(n: usize) -> usize {
     match corpus_source() {
         CorpusSource::Synthetic => n,
-        CorpusSource::Real { dir, slug } => {
+        CorpusSource::AnnBenchmarks { dir, slug } => {
             let rows = real_corpus_rows(dir, slug);
             if n > rows {
                 eprintln!("[corpus] requested {n} docs but the real corpus holds {rows}; clamping");
             }
             n.min(rows)
         }
+        other => panic!("{} corpus reader is not wired yet", corpus_kind(other)),
+    }
+}
+
+/// Human name of a source kind, for the not-yet-wired reports above.
+fn corpus_kind(source: &CorpusSource) -> &'static str {
+    match source {
+        CorpusSource::Synthetic => "synthetic",
+        CorpusSource::AnnBenchmarks { .. } => "ann-benchmarks",
+        CorpusSource::HuggingFace { .. } => "hugging-face parquet",
+        CorpusSource::LocalParquet { .. } => "local parquet",
     }
 }
 
@@ -909,6 +946,19 @@ fn vector_corpus_byte_len_for_dim(n_docs: usize, dim: usize) -> IoResult<u64> {
 
 // ─── Real-corpus (ann-benchmarks HDF5) source ─────────────────────────
 
+/// Row-slab size for streaming a real corpus into the mmap: bounded peak
+/// memory (slab x dim x 4 bytes) rather than the whole dataset, which is
+/// multi-GB for the larger datasets.
+const H5_SLAB_ROWS: usize = 8_192;
+
+/// Connect timeout for a dataset download.
+const CORPUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whole-download deadline: generous enough for the largest published
+/// dataset on a slow link, finite so a half-open connection cannot hang a
+/// bench run forever.
+const CORPUS_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(3 * 3600);
+
 /// Canonical ann-benchmarks dataset host: an academic, vendor-neutral
 /// mirror serving the same `*-angular.hdf5` / `*-euclidean.hdf5` files the
 /// published ANN benchmarks are run against. Overridable for a local
@@ -1180,7 +1230,10 @@ pub fn bench_queries(
         CorpusSource::Synthetic => {
             generate_realistic_queries(vectors, n_docs, n_queries, seed, normalize_each, sigma)
         }
-        CorpusSource::Real { dir, slug } => real_queries(dir, slug, n_queries, normalize_each),
+        CorpusSource::AnnBenchmarks { dir, slug } => {
+            real_queries(dir, slug, n_queries, normalize_each)
+        }
+        other => panic!("{} corpus reader is not wired yet", corpus_kind(other)),
     }
 }
 

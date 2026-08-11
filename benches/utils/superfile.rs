@@ -1072,7 +1072,7 @@ pub mod vector {
                 // synthetic source corpus as heap RAM.
                 let n = n_docs();
                 match corpus::corpus_source() {
-                    corpus::CorpusSource::Real { dir, slug } => {
+                    corpus::CorpusSource::AnnBenchmarks { dir, slug } => {
                         corpus::MmapVectorCorpus::from_hdf5(dir, slug, n, corpus::dim(), true)
                             .expect("load real dataset for the superfile tier")
                     }
@@ -1082,6 +1082,7 @@ pub mod vector {
                         CORPUS_ROT_SEED,
                         true,
                     ),
+                    other => panic!("{other:?} corpus reader is not wired yet"),
                 }
             })
             .as_slice()

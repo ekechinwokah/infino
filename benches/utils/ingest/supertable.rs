@@ -419,14 +419,14 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
     // post-drain → delta → compact). Generate base + that tail once so
     // the delta batch does not regenerate.
     let corpus_docs = n_docs + docs_per_commit();
-    if matches!(corpus::corpus_source(), corpus::CorpusSource::Real { .. })
+    if !matches!(corpus::corpus_source(), corpus::CorpusSource::Synthetic)
         && (modality.has_text() || modality.has_sql())
     {
         panic!(
             "{} names a real dataset, which provides vectors only; the {} modality needs \
              text/scalar
              columns — run it on the synthetic corpus",
-            corpus::CORPUS_SOURCE_ENV,
+            corpus::corpus_label(),
             modality_label(modality)
         );
     }
@@ -458,7 +458,7 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
                         path.display()
                     )
                 })
-        } else if let corpus::CorpusSource::Real { dir, slug } = corpus::corpus_source() {
+        } else if let corpus::CorpusSource::AnnBenchmarks { dir, slug } = corpus::corpus_source() {
             // Real dataset: base + delta rows when it is deep enough, else
             // base-only (the delta tail regenerates, the same contract as a
             // base-only persisted corpus above).
