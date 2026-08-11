@@ -1514,10 +1514,19 @@ fn assert_expected_cold_reads(
     ceilings_second: &[(&str, u64, u64)],
     steady_law_width: u64,
 ) {
+    // The ceiling tables were derived on the synthetic corpus at dim 1024,
+    // where a probed cell is ~6 MiB and so fits inside one 8 MiB cold
+    // coalesce window — one GET per cell. A wider corpus breaks that: at
+    // dim 1536 with p90 cells of ~8.4K rows a single cell spans ~25 MiB,
+    // i.e. several islands, so the per-cell GET cost scales with the row
+    // width. Scale the allowance rather than the measurement (a real
+    // regression still trips it; legitimate geometry no longer does).
+    // Exactly 1 at dim 1024, so every synthetic run is unchanged.
+    let width_scale = (crate::corpus::dim() as u64).div_ceil(1024);
     // The ceiling tables assume a width-1 probe (one coalesced cell-GET);
     // a stamped law width w reads w cells by design, adding w-1 GETs to
     // both cold windows.
-    let law_extra = steady_law_width.saturating_sub(1);
+    let law_extra = steady_law_width.saturating_sub(1) * width_scale;
     let user_data = split
         .first_query
         .class_io(storage_meter::UriClass::UserData)
