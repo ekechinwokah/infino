@@ -347,11 +347,23 @@ fn clamp_docs_to_corpus(n: usize) -> usize {
             n.min(rows)
         }
         source => {
+            // Queries are the rows past the ingested prefix, so the ingest
+            // must stop short of the dataset's end or there is nothing held
+            // out to query with.
             let rows = parquet_rows(&parquet_shards_for(source));
-            if n > rows {
-                eprintln!("[corpus] requested {n} docs but the dataset holds {rows}; clamping");
+            let ingestable = rows.saturating_sub(PARQUET_QUERY_RESERVE_ROWS);
+            assert!(
+                ingestable > 0,
+                "dataset holds {rows} rows, fewer than the {PARQUET_QUERY_RESERVE_ROWS}-row \
+                 query reserve"
+            );
+            if n > ingestable {
+                eprintln!(
+                    "[corpus] requested {n} docs; dataset holds {rows} and reserves \
+                     {PARQUET_QUERY_RESERVE_ROWS} for held-out queries, clamping to {ingestable}"
+                );
             }
-            n.min(rows)
+            n.min(ingestable)
         }
     }
 }
@@ -1168,6 +1180,11 @@ const HF_RESOLVE_BASE: &str = "https://huggingface.co";
 /// dbpedia-entities-openai-1M, `emb` elsewhere); both are read.
 const PARQUET_VECTOR_COLUMNS: [&str; 2] = ["openai", "emb"];
 
+/// Rows held back from the end of a parquet dataset to serve as queries.
+/// Generous relative to any battery's query count, and small relative to
+/// the datasets this source is for.
+const PARQUET_QUERY_RESERVE_ROWS: usize = 8_192;
+
 /// Rows kept in memory while converting a parquet batch.
 const PARQUET_BATCH_ROWS: usize = 1_024;
 
@@ -1206,14 +1223,11 @@ pub fn parquet_shards_for(source: &CorpusSource) -> Vec<PathBuf> {
 /// and otherwise ask the Hub's tree endpoint for the file list. The tree
 /// endpoint is the one metadata route that answers unauthenticated.
 fn hf_download_shards(dir: &Path, repo: &str) {
-    let already: bool = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .any(|e| e.path().extension().is_some_and(|x| x == "parquet"));
-    if already {
-        return;
-    }
+    // Reconcile against the Hub's shard list rather than treating any
+    // parquet file as "already staged": a partially downloaded directory
+    // would otherwise be accepted, silently shrinking the corpus to
+    // whatever happened to be present (measured: one shard's 38,462 rows
+    // standing in for a 1M-row dataset).
     let url = format!("{HF_RESOLVE_BASE}/api/datasets/{repo}/tree/main/data");
     let client = http_client();
     let listing = client
@@ -1243,6 +1257,17 @@ fn hf_download_shards(dir: &Path, repo: &str) {
         "{repo} listing returned no parquet shards: {}",
         &listing[..listing.len().min(200)]
     );
+    let missing = names
+        .iter()
+        .filter(|n| !dir.join(n.rsplit('/').next().unwrap_or(n)).exists())
+        .count();
+    if missing > 0 {
+        eprintln!(
+            "[corpus] {repo}: {}/{} shards staged, fetching {missing}...",
+            names.len() - missing,
+            names.len()
+        );
+    }
     for name in &names {
         let leaf = name.rsplit('/').next().unwrap_or(name);
         download_if_absent(
