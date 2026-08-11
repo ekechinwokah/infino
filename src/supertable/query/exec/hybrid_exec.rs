@@ -85,8 +85,8 @@ use crate::{
                 vector_exec::arg_to_query_vector,
             },
             vector::{
-                calibrated_query, hits_id_score_batch, id_score_projection_indices,
-                user_placement_for_scalar_resolve,
+                calibrated_query, free_columns_unambiguous, hits_id_score_batch,
+                id_score_projection_indices, user_placement_for_scalar_resolve,
             },
         },
     },
@@ -225,7 +225,8 @@ impl Supertable {
                 // unstamped hit falls through to the general path,
                 // which resolves ids by placement.
                 let id_column = reader.options().id_column.as_str();
-                if let Some(indices) = id_score_projection_indices(projection, id_column)
+                if free_columns_unambiguous(&reader.options().schema, id_column)
+                    && let Some(indices) = id_score_projection_indices(projection, id_column)
                     && hits.iter().all(|h| h.stable_id.is_some())
                 {
                     return hits_id_score_batch(&reader, &hits)?
