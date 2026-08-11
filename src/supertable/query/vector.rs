@@ -1297,6 +1297,16 @@ const ID_SCORE_SCORE_COLUMN: usize = 1;
 /// DataFusion column indices back to names — so a third free column
 /// cannot be added to one path and forgotten on the other.
 pub(crate) fn free_column_slot(name: &str, id_column: &str) -> Option<usize> {
+    // An id column literally named `score` makes the two free names one
+    // name: the match below would answer `score` with the id slot. The
+    // general path resolves it the same way (`index_of` takes the first
+    // field, which is the id), so this changes no result today — it
+    // stops the two paths from drifting if either resolution order
+    // changes, and keeps the classifier from silently answering an
+    // ambiguous request.
+    if id_column == SCORE_COLUMN {
+        return None;
+    }
     match name {
         n if n == id_column => Some(ID_SCORE_ID_COLUMN),
         n if n == SCORE_COLUMN => Some(ID_SCORE_SCORE_COLUMN),
@@ -1318,10 +1328,11 @@ pub(crate) fn free_column_slot(name: &str, id_column: &str) -> Option<usize> {
 /// allocation (building the scalar schema per query would cost the
 /// fast path the very work it exists to skip).
 pub(crate) fn free_columns_unambiguous(user_schema: &Schema, id_column: &str) -> bool {
-    !user_schema
-        .fields()
-        .iter()
-        .any(|f| f.name() == SCORE_COLUMN || f.name() == id_column)
+    id_column != SCORE_COLUMN
+        && !user_schema
+            .fields()
+            .iter()
+            .any(|f| f.name() == SCORE_COLUMN || f.name() == id_column)
 }
 
 /// Public-API projection policy: positions into the synthesized batch,
@@ -4290,6 +4301,14 @@ mod tests {
             !free_columns_unambiguous(&shadows_id, id),
             "a user column matching the id column must decline the fast path"
         );
+
+        // An id column named `score` collapses the two free names into
+        // one. The general path answers `score` with the id (index_of
+        // takes the first field, which is the id), so declining here
+        // changes no result — it keeps the classifier from answering an
+        // ambiguous request and stops the paths drifting.
+        assert_eq!(free_column_slot(SCORE_COLUMN, SCORE_COLUMN), None);
+        assert!(!free_columns_unambiguous(&clean, SCORE_COLUMN));
     }
 
     /// The SQL TVF classifies by DataFusion column INDEX and the public
