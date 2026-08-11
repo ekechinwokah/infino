@@ -419,11 +419,12 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
     // post-drain → delta → compact). Generate base + that tail once so
     // the delta batch does not regenerate.
     let corpus_docs = n_docs + docs_per_commit();
-    if matches!(corpus::corpus_source(), corpus::CorpusSource::Cohere { .. })
+    if matches!(corpus::corpus_source(), corpus::CorpusSource::Real { .. })
         && (modality.has_text() || modality.has_sql())
     {
         panic!(
-            "{}=cohere provides vectors only; the {} modality needs text/scalar \
+            "{} names a real dataset, which provides vectors only; the {} modality needs \
+             text/scalar
              columns — run it on the synthetic corpus",
             corpus::CORPUS_SOURCE_ENV,
             modality_label(modality)
@@ -457,21 +458,21 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
                         path.display()
                     )
                 })
-        } else if let corpus::CorpusSource::Cohere { dir } = corpus::corpus_source() {
-            // Real corpus: base + delta rows straight from the dataset when it
-            // is deep enough, else base-only (the delta tail regenerates, the
-            // same contract as a base-only persisted corpus above).
+        } else if let corpus::CorpusSource::Real { dir, slug } = corpus::corpus_source() {
+            // Real dataset: base + delta rows when it is deep enough, else
+            // base-only (the delta tail regenerates, the same contract as a
+            // base-only persisted corpus above).
             eprintln!(
-                "[supertable_ingest] loading {} ×{} vector corpus from {}...",
+                "[supertable_ingest] loading {} ×{} {slug} vectors from {}...",
                 fmt_count(n_docs),
                 dim(),
                 dir.display()
             );
-            MmapVectorCorpus::from_parquet(dir, corpus_docs, true)
-                .or_else(|_| MmapVectorCorpus::from_parquet(dir, n_docs, true))
+            MmapVectorCorpus::from_hdf5(dir, slug, corpus_docs, dim(), true)
+                .or_else(|_| MmapVectorCorpus::from_hdf5(dir, slug, n_docs, dim(), true))
                 .unwrap_or_else(|error| {
                     panic!(
-                        "failed to load the real corpus from {} with either {corpus_docs} \
+                        "failed to load {slug} from {} with either {corpus_docs} \
                          (base + delta) or {n_docs} (base-only) rows: {error}",
                         dir.display()
                     )

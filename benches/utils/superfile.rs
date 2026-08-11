@@ -1072,9 +1072,9 @@ pub mod vector {
                 // synthetic source corpus as heap RAM.
                 let n = n_docs();
                 match corpus::corpus_source() {
-                    corpus::CorpusSource::Cohere { dir } => {
-                        corpus::MmapVectorCorpus::from_parquet(dir, n, true)
-                            .expect("load real corpus for the superfile tier")
+                    corpus::CorpusSource::Real { dir, slug } => {
+                        corpus::MmapVectorCorpus::from_hdf5(dir, slug, n, corpus::dim(), true)
+                            .expect("load real dataset for the superfile tier")
                     }
                     corpus::CorpusSource::Synthetic => corpus::MmapVectorCorpus::generate(
                         n,
@@ -1267,7 +1267,7 @@ pub mod vector {
         let start_p = sweep_start_probe();
         let start_r = sweep_start_rerank();
         let n_cent = corpus::n_cent(n_docs);
-        let floor = exec_vec::CORRECTNESS_RECALL_FLOOR;
+        let floor = exec_vec::RecallFloors::SUPERFILE.correctness;
 
         let (probes, reranks, sweep_label) = if let Some(max_p) = sweep_probe_max() {
             let min_p = sweep_probe_min();
@@ -1511,6 +1511,7 @@ pub mod vector {
                 ground_truth_correctness(),
                 queries_calibration(),
                 gt_cal,
+                exec_vec::RecallFloors::SUPERFILE,
                 phases.warm,
                 phases.cold,
                 3,

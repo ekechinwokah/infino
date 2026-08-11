@@ -36,13 +36,10 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use arrow_array::{
-    Array, Decimal128Array, FixedSizeListArray, Float32Array, LargeListArray, LargeStringArray,
-    ListArray, RecordBatch,
-};
+use arrow_array::{Decimal128Array, Float32Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
@@ -62,7 +59,6 @@ use infino::{
     test_helpers::default_tokenizer,
 };
 use memmap2::Mmap;
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
@@ -191,17 +187,35 @@ pub(crate) fn chunk_seed(seed: u64, chunk_index: usize) -> u64 {
 pub const SYNTHETIC_DIM: usize = 1024;
 
 /// Env selecting the vector corpus source: `synthetic` (the default —
-/// the seeded planted-cluster generator below) or `cohere` (a real
-/// dataset in the VDBBench parquet layout; requires [`CORPUS_DIR_ENV`]).
-/// Real corpora are vector-only: FTS / SQL / combined modalities keep
-/// the synthetic corpus and panic if asked to run on a real one.
+/// the seeded planted-cluster generator below) or an ann-benchmarks
+/// dataset slug (`glove-25-angular`, `nytimes-256-angular`,
+/// `deep-image-96-angular`, …). A slug names the canonical published
+/// dataset: corpus rows, the official query set, and the official
+/// top-k neighbour ids all travel together in one file.
+///
+/// Real datasets are vector-only today: FTS / SQL / combined modalities
+/// keep the synthetic corpus and say so rather than silently mixing a
+/// synthetic text corpus with real vectors. Extending real-corpus
+/// coverage to those modalities is why this lives in `benches/` rather
+/// than in a vector-only external harness.
 pub const CORPUS_SOURCE_ENV: &str = "INFINO_BENCH_CORPUS";
 
-/// Env naming the directory holding a real corpus's parquet files:
-/// `shuffle_train.parquet` (ingest rows, `emb` list<f32> column) and
-/// `test.parquet` (query rows, same column) — the VDBBench dataset
-/// layout, so a directory prepared for VDBBench works here unchanged.
+/// Env naming the directory that holds (or will receive) real dataset
+/// files. One `<slug>.hdf5` per dataset, matching the host's layout.
 pub const CORPUS_DIR_ENV: &str = "INFINO_BENCH_CORPUS_DIR";
+
+/// Row-slab size for streaming a real corpus into the mmap: bounded peak
+/// memory (slab x dim x 4 bytes) rather than the whole dataset, which is
+/// multi-GB for the larger slugs.
+const H5_SLAB_ROWS: usize = 8_192;
+
+/// Connect timeout for a real-dataset download.
+const CORPUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whole-download deadline: generous enough for the largest published
+/// dataset on a slow link, finite so a half-open connection cannot hang a
+/// bench run forever.
+const CORPUS_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(3 * 3600);
 
 /// Which vector corpus feeds the benches. Resolved once per process
 /// from [`CORPUS_SOURCE_ENV`].
@@ -209,8 +223,8 @@ pub const CORPUS_DIR_ENV: &str = "INFINO_BENCH_CORPUS_DIR";
 pub enum CorpusSource {
     /// Seeded planted-cluster generator (the historical default).
     Synthetic,
-    /// Real dataset in the VDBBench parquet layout at `dir`.
-    Cohere { dir: PathBuf },
+    /// Published ann-benchmarks dataset `slug`, staged under `dir`.
+    Real { dir: PathBuf, slug: String },
 }
 
 /// The process-wide corpus source. Panics on an unknown
@@ -221,19 +235,14 @@ pub fn corpus_source() -> &'static CorpusSource {
     static SOURCE: OnceLock<CorpusSource> = OnceLock::new();
     SOURCE.get_or_init(|| match env::var(CORPUS_SOURCE_ENV).ok().as_deref() {
         None | Some("") | Some("synthetic") => CorpusSource::Synthetic,
-        Some("cohere") => {
+        Some(slug) => {
             let dir = env::var(CORPUS_DIR_ENV).unwrap_or_else(|_| {
-                panic!(
-                    "{CORPUS_SOURCE_ENV}=cohere requires {CORPUS_DIR_ENV}=<dir with \
-                     shuffle_train.parquet + test.parquet>"
-                )
+                panic!("{CORPUS_SOURCE_ENV}={slug} requires {CORPUS_DIR_ENV}=<dataset dir>")
             });
-            CorpusSource::Cohere {
+            CorpusSource::Real {
                 dir: PathBuf::from(dir),
+                slug: slug.to_string(),
             }
-        }
-        Some(other) => {
-            panic!("unknown {CORPUS_SOURCE_ENV}={other:?} (expected synthetic|cohere)")
         }
     })
 }
@@ -242,7 +251,7 @@ pub fn corpus_source() -> &'static CorpusSource {
 pub fn corpus_label() -> &'static str {
     match corpus_source() {
         CorpusSource::Synthetic => "synthetic",
-        CorpusSource::Cohere { .. } => "cohere",
+        CorpusSource::Real { slug, .. } => slug,
     }
 }
 
@@ -253,7 +262,7 @@ pub fn dim() -> usize {
     static DIM_ONCE: OnceLock<usize> = OnceLock::new();
     *DIM_ONCE.get_or_init(|| match corpus_source() {
         CorpusSource::Synthetic => SYNTHETIC_DIM,
-        CorpusSource::Cohere { dir } => real_corpus_dim(dir),
+        CorpusSource::Real { dir, slug } => real_corpus_dim(dir, slug),
     })
 }
 
@@ -299,8 +308,8 @@ pub fn supertable_docs() -> usize {
 fn clamp_docs_to_corpus(n: usize) -> usize {
     match corpus_source() {
         CorpusSource::Synthetic => n,
-        CorpusSource::Cohere { dir } => {
-            let rows = real_corpus_rows(dir);
+        CorpusSource::Real { dir, slug } => {
+            let rows = real_corpus_rows(dir, slug);
             if n > rows {
                 eprintln!("[corpus] requested {n} docs but the real corpus holds {rows}; clamping");
             }
@@ -807,7 +816,22 @@ impl MmapVectorCorpus {
     }
 
     fn from_file(file: File, n_docs: usize, tmp: Option<TempDir>) -> IoResult<Self> {
-        let expected = vector_corpus_byte_len(n_docs)?;
+        Self::from_file_with_dim(file, n_docs, dim(), tmp)
+    }
+
+    /// As [`Self::from_file`] but with the row width passed in rather than
+    /// read from the process-wide [`dim`]. Real-dataset loads use this: the
+    /// dataset's own width is known from its file, and `dim()` resolves once
+    /// per process from env — so validating against it would reject a
+    /// correctly-sized corpus whenever the two disagree (which is precisely
+    /// what happens in tests, and would happen for any second dataset).
+    fn from_file_with_dim(
+        file: File,
+        n_docs: usize,
+        dim: usize,
+        tmp: Option<TempDir>,
+    ) -> IoResult<Self> {
+        let expected = vector_corpus_byte_len_for_dim(n_docs, dim)?;
         let actual = file.metadata()?.len();
         if actual != expected {
             return Err(Error::new(
@@ -823,7 +847,7 @@ impl MmapVectorCorpus {
             _tmp: tmp,
             map,
             n_docs,
-            dim: dim(),
+            dim,
         })
     }
 
@@ -862,7 +886,11 @@ impl MmapVectorCorpus {
 }
 
 fn vector_corpus_byte_len(n_docs: usize) -> IoResult<u64> {
-    let row_bytes = dim()
+    vector_corpus_byte_len_for_dim(n_docs, dim())
+}
+
+fn vector_corpus_byte_len_for_dim(n_docs: usize, dim: usize) -> IoResult<u64> {
+    let row_bytes = dim
         .checked_mul(size_of::<f32>())
         .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "vector corpus row size overflow"))?;
     let total = n_docs.checked_mul(row_bytes).ok_or_else(|| {
@@ -879,49 +907,53 @@ fn vector_corpus_byte_len(n_docs: usize) -> IoResult<u64> {
     })
 }
 
-// ─── Real-corpus (parquet) source ─────────────────────────────────────
+// ─── Real-corpus (ann-benchmarks HDF5) source ─────────────────────────
 
-/// Train-rows file of the VDBBench dataset layout.
-const REAL_TRAIN_FILE: &str = "shuffle_train.parquet";
-/// Query-rows file of the VDBBench dataset layout.
-const REAL_TEST_FILE: &str = "test.parquet";
-/// Embedding column name in both files.
-const REAL_EMB_COLUMN: &str = "emb";
-
-/// Env overriding the download base for real-corpus files. Defaults to
-/// the public bucket VDBBench itself downloads from, so the fetched
-/// bytes are identical to a VDBBench-prepared directory.
+/// Canonical ann-benchmarks dataset host: an academic, vendor-neutral
+/// mirror serving the same `*-angular.hdf5` / `*-euclidean.hdf5` files the
+/// published ANN benchmarks are run against. Overridable for a local
+/// mirror; nothing here depends on a vendor's dataset bucket.
 pub const CORPUS_URL_ENV: &str = "INFINO_BENCH_CORPUS_URL";
 
-/// Public dataset bucket (VDBBench's own source of truth).
-const DEFAULT_CORPUS_URL_BASE: &str = "https://assets.zilliz.com/benchmark/";
+/// Default download base for [`CORPUS_URL_ENV`].
+const DEFAULT_CORPUS_URL_BASE: &str = "https://ann-benchmarks.com";
 
-/// Resolve one real-corpus file, downloading it into `dir` when absent.
-/// The dataset slug is `dir`'s basename (the VDBBench layout:
-/// `.../cohere/cohere_medium_1m/shuffle_train.parquet`), so any dataset
-/// in that layout fetches without extra configuration. Present files
-/// are never re-downloaded or verified — a directory the caller
-/// prepared by hand is trusted as-is.
-fn real_corpus_path(dir: &Path, name: &str) -> PathBuf {
-    let path = dir.join(name);
+/// Corpus rows dataset inside the HDF5 file.
+const H5_TRAIN: &str = "train";
+/// Query rows dataset.
+const H5_TEST: &str = "test";
+/// Official top-k neighbour ids per query (dataset row indices) — the
+/// published ground truth, so recall needs no brute-force recompute and
+/// the numbers are directly comparable to ann-benchmarks results.
+const H5_NEIGHBORS: &str = "neighbors";
+
+/// Resolve the dataset file, downloading it once when absent. The file name
+/// is the dataset slug plus `.hdf5` (`glove-25-angular` ->
+/// `glove-25-angular.hdf5`), matching the host's own layout, so a slug is
+/// the only thing a caller configures. Present files are used as-is.
+/// Streams to `<file>.part` and renames, so an interrupted download never
+/// leaves a truncated file under the real name, and verifies the received
+/// length against `Content-Length` when the server provides one.
+fn real_corpus_file(dir: &Path, slug: &str) -> PathBuf {
+    let name = format!("{slug}.hdf5");
+    let path = dir.join(&name);
     if path.exists() {
         return path;
     }
-    let slug = dir.file_name().and_then(|s| s.to_str()).unwrap_or_else(|| {
-        panic!(
-            "{CORPUS_DIR_ENV}={} has no basename to use as a dataset slug",
-            dir.display()
-        )
-    });
     let base = env::var(CORPUS_URL_ENV).unwrap_or_else(|_| DEFAULT_CORPUS_URL_BASE.to_string());
-    let url = format!("{}/{slug}/{name}", base.trim_end_matches('/'));
+    let url = format!("{}/{name}", base.trim_end_matches('/'));
     eprintln!(
         "[corpus] {name} missing from {}; downloading {url}...",
         dir.display()
     );
     std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
+    // connect_timeout bounds a dead host; the blocking client's read path has
+    // no per-read deadline, so a whole-request timeout is the available stall
+    // guard — sized for a multi-GB file on a slow link rather than left
+    // unbounded, which would hang a run on a half-open connection.
     let client = reqwest::blocking::Client::builder()
-        .timeout(None)
+        .connect_timeout(CORPUS_CONNECT_TIMEOUT)
+        .timeout(CORPUS_DOWNLOAD_TIMEOUT)
         .build()
         .expect("build http client");
     let mut resp = client
@@ -930,23 +962,38 @@ fn real_corpus_path(dir: &Path, name: &str) -> PathBuf {
         .and_then(reqwest::blocking::Response::error_for_status)
         .unwrap_or_else(|e| {
             panic!(
-                "download {url} failed: {e}\nplace {name} in {} manually (VDBBench layout) or set {CORPUS_URL_ENV}",
+                "download {url} failed: {e}\nstage {name} in {} manually or set \
+                 {CORPUS_URL_ENV} to a mirror",
                 dir.display()
             )
         });
-    if let Some(len) = resp.content_length() {
+    let expected = resp.content_length();
+    if let Some(len) = expected {
         eprintln!("[corpus]   size: {}", rss::fmt_bytes(len));
     }
     let tmp = dir.join(format!("{name}.part"));
     let mut out = BufWriter::new(
         File::create(&tmp).unwrap_or_else(|e| panic!("create {}: {e}", tmp.display())),
     );
-    std::io::copy(&mut resp, &mut out)
-        .and_then(|_| out.into_inner().map_err(|e| e.into_error())?.sync_all())
+    let written = std::io::copy(&mut resp, &mut out)
+        .and_then(|n| {
+            out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+            Ok(n)
+        })
         .unwrap_or_else(|e| {
             let _ = std::fs::remove_file(&tmp);
             panic!("stream {url} to {}: {e}", tmp.display())
         });
+    // Integrity: a truncated-but-200 response is otherwise accepted
+    // silently and then fails as a confusing parse error deep in a run.
+    if let Some(len) = expected
+        && written != len
+    {
+        let _ = std::fs::remove_file(&tmp);
+        panic!(
+            "{url}: received {written} bytes, Content-Length said {len} — refusing partial data"
+        );
+    }
     std::fs::rename(&tmp, &path).unwrap_or_else(|e| {
         let _ = std::fs::remove_file(&tmp);
         panic!("finalize {}: {e}", path.display())
@@ -955,145 +1002,166 @@ fn real_corpus_path(dir: &Path, name: &str) -> PathBuf {
     path
 }
 
-/// Open one parquet file's record-batch reader (VDBBench layout).
-fn parquet_batches(path: &Path) -> ParquetRecordBatchReader {
-    let file = File::open(path)
-        .unwrap_or_else(|e| panic!("open real-corpus parquet {}: {e}", path.display()));
-    ParquetRecordBatchReaderBuilder::try_new(file)
-        .and_then(|b| b.build())
-        .unwrap_or_else(|e| panic!("read real-corpus parquet {}: {e}", path.display()))
+/// Open the dataset file for `slug` under `dir`, fetching it if needed.
+fn open_h5(dir: &Path, slug: &str) -> hdf5::File {
+    let path = real_corpus_file(dir, slug);
+    hdf5::File::open(&path).unwrap_or_else(|e| panic!("open HDF5 dataset {}: {e}", path.display()))
 }
 
-/// Row count of the real corpus's train file, from parquet metadata
-/// (no data read).
-pub fn real_corpus_rows(dir: &Path) -> usize {
-    let path = real_corpus_path(dir, REAL_TRAIN_FILE);
-    let file = File::open(&path)
-        .unwrap_or_else(|e| panic!("open real-corpus parquet {}: {e}", path.display()));
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .unwrap_or_else(|e| panic!("read real-corpus parquet {}: {e}", path.display()));
-    reader.metadata().file_metadata().num_rows() as usize
+/// Shape of one 2-D dataset: `(rows, cols)`.
+fn h5_shape(file: &hdf5::File, name: &str) -> (usize, usize) {
+    let ds = file
+        .dataset(name)
+        .unwrap_or_else(|e| panic!("dataset {name:?} missing from the HDF5 file: {e}"));
+    let shape = ds.shape();
+    assert_eq!(
+        shape.len(),
+        2,
+        "dataset {name:?} must be 2-D, got shape {shape:?}"
+    );
+    (shape[0], shape[1])
 }
 
-/// Embedding width of the real corpus, from the train file's first row.
-fn real_corpus_dim(dir: &Path) -> usize {
-    let mut reader = parquet_batches(&real_corpus_path(dir, REAL_TRAIN_FILE));
-    let batch = reader
-        .next()
-        .expect("real corpus train parquet has at least one batch")
-        .expect("read first train batch");
-    let rows = emb_rows(&batch);
-    rows.first().map(Vec::len).expect("non-empty train batch")
+/// Corpus row count of the real dataset (metadata only, no data read).
+pub fn real_corpus_rows(dir: &Path, slug: &str) -> usize {
+    h5_shape(&open_h5(dir, slug), H5_TRAIN).0
 }
 
-/// The `emb` column of one batch as owned fp32 rows. Accepts the list
-/// encodings the VDBBench preparers emit (`List`/`LargeList`/
-/// `FixedSizeList` of `Float32`).
-fn emb_rows(batch: &RecordBatch) -> Vec<Vec<f32>> {
-    let col = batch
-        .column_by_name(REAL_EMB_COLUMN)
-        .unwrap_or_else(|| panic!("real corpus parquet lacks a {REAL_EMB_COLUMN:?} column"));
-    let values_of = |values: &dyn Array, start: usize, len: usize| -> Vec<f32> {
-        let f = values
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .expect("emb values are f32");
-        (start..start + len).map(|i| f.value(i)).collect()
-    };
-    if let Some(l) = col.as_any().downcast_ref::<ListArray>() {
-        (0..l.len())
-            .map(|i| {
-                let start = l.value_offsets()[i] as usize;
-                let end = l.value_offsets()[i + 1] as usize;
-                values_of(l.values().as_ref(), start, end - start)
-            })
-            .collect()
-    } else if let Some(l) = col.as_any().downcast_ref::<LargeListArray>() {
-        (0..l.len())
-            .map(|i| {
-                let start = l.value_offsets()[i] as usize;
-                let end = l.value_offsets()[i + 1] as usize;
-                values_of(l.values().as_ref(), start, end - start)
-            })
-            .collect()
-    } else if let Some(l) = col.as_any().downcast_ref::<FixedSizeListArray>() {
-        let w = l.value_length() as usize;
-        (0..l.len())
-            .map(|i| values_of(l.values().as_ref(), i * w, w))
-            .collect()
-    } else {
-        panic!(
-            "unsupported {REAL_EMB_COLUMN:?} encoding {:?} (expected List/LargeList/FixedSizeList of Float32)",
-            col.data_type()
-        )
-    }
+/// Embedding width of the real dataset.
+pub fn real_corpus_dim(dir: &Path, slug: &str) -> usize {
+    h5_shape(&open_h5(dir, slug), H5_TRAIN).1
 }
 
 impl MmapVectorCorpus {
-    /// Materialize the first `n_docs` rows of a real corpus (VDBBench
-    /// parquet layout) into the standard corpus mmap. Rows stream
-    /// batch-by-batch — peak memory is one record batch. Errors when the
-    /// dataset holds fewer than `n_docs` rows, mirroring [`Self::open`]'s
-    /// size check so callers can fall back to a base-only shape.
-    pub fn from_parquet(dir: &Path, n_docs: usize, normalize_each: bool) -> IoResult<Self> {
-        let available = real_corpus_rows(dir);
-        if available < n_docs {
+    /// Materialize the first `n_docs` corpus rows of a real dataset into the
+    /// standard corpus mmap. Rows stream in row-slabs, so peak memory is one
+    /// slab rather than the dataset. `dim` is passed explicitly (not read
+    /// from the process-wide [`dim`]) so the write/normalize path is
+    /// exercisable offline in tests.
+    pub fn from_hdf5(
+        dir: &Path,
+        slug: &str,
+        n_docs: usize,
+        dim: usize,
+        normalize_each: bool,
+    ) -> IoResult<Self> {
+        let file = open_h5(dir, slug);
+        let (rows, cols) = h5_shape(&file, H5_TRAIN);
+        if cols != dim {
             return Err(Error::new(
                 ErrorKind::InvalidData,
-                format!(
-                    "real corpus at {} holds {available} rows; {n_docs} requested",
-                    dir.display()
-                ),
+                format!("dataset {slug} is {cols}-dim; {dim} requested"),
             ));
         }
+        if rows < n_docs {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("dataset {slug} holds {rows} rows; {n_docs} requested"),
+            ));
+        }
+        let ds = file
+            .dataset(H5_TRAIN)
+            .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
         let tmp = TempDir::new().expect("create MmapVectorCorpus tempdir");
         let path = tmp.path().join("corpus.bin");
         let mut writer = BufWriter::new(File::create(&path)?);
-        let dim = dim();
-        let mut written = 0usize;
-        'outer: for batch in parquet_batches(&real_corpus_path(dir, REAL_TRAIN_FILE)) {
-            let batch = batch.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
-            for mut row in emb_rows(&batch) {
-                assert_eq!(row.len(), dim, "real corpus row width drifted mid-file");
+        let mut done = 0usize;
+        while done < n_docs {
+            let take = (n_docs - done).min(H5_SLAB_ROWS);
+            let slab: ndarray::Array2<f32> =
+                ds.read_slice_2d(ndarray::s![done..done + take, ..])
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+            for mut row in slab.outer_iter().map(|r| r.to_vec()) {
                 if normalize_each {
                     normalize(&mut row);
                 }
                 let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
                 writer.write_all(&bytes)?;
-                written += 1;
-                if written == n_docs {
-                    break 'outer;
-                }
             }
+            done += take;
         }
         writer.flush()?;
         writer
             .into_inner()
             .map_err(|e| e.into_error())?
             .sync_all()?;
-        Self::from_file(File::open(&path)?, n_docs, Some(tmp))
+        Self::from_file_with_dim(File::open(&path)?, n_docs, dim, Some(tmp))
     }
 }
 
-/// The real corpus's query vectors (`test.parquet`), strided so `n`
-/// queries sample the whole file rather than its head. Real queries are
-/// the point of a real corpus: the drain calibrates on corpus rows, so
-/// query-vs-row distribution mismatch only shows up when the queries
-/// are the dataset's own.
-pub fn real_queries(dir: &Path, n_queries: usize, normalize_each: bool) -> Vec<Vec<f32>> {
-    let mut all: Vec<Vec<f32>> = Vec::new();
-    for batch in parquet_batches(&real_corpus_path(dir, REAL_TEST_FILE)) {
-        let batch = batch.expect("read test batch");
-        all.extend(emb_rows(&batch));
-    }
-    assert!(!all.is_empty(), "real corpus test parquet is empty");
-    if normalize_each {
-        for q in &mut all {
-            normalize(q);
-        }
-    }
-    let stride = (all.len() / n_queries).max(1);
-    all.into_iter().step_by(stride).take(n_queries).collect()
+/// The dataset's own query vectors (`test`), first `n_queries` in file
+/// order — the published query set, so the neighbour ids below line up with
+/// them by index.
+pub fn real_queries(
+    dir: &Path,
+    slug: &str,
+    n_queries: usize,
+    normalize_each: bool,
+) -> Vec<Vec<f32>> {
+    let file = open_h5(dir, slug);
+    let (rows, _) = h5_shape(&file, H5_TEST);
+    let take = n_queries.min(rows);
+    let ds = file.dataset(H5_TEST).expect("test dataset");
+    let slab: ndarray::Array2<f32> = ds
+        .read_slice_2d(ndarray::s![0..take, ..])
+        .unwrap_or_else(|e| panic!("read {H5_TEST}: {e}"));
+    slab.outer_iter()
+        .map(|r| {
+            let mut v = r.to_vec();
+            if normalize_each {
+                normalize(&mut v);
+            }
+            v
+        })
+        .collect()
+}
+
+/// The dataset's OFFICIAL top-`k` neighbour ids for the first `n_queries`
+/// queries, as corpus row indices. Published ground truth: no brute-force
+/// recompute, and recall computed against it is directly comparable to
+/// ann-benchmarks numbers.
+///
+/// **Only valid for a FULL-corpus ingest.** The published neighbours are the
+/// true top-k over every row of the dataset; on a truncated corpus a query's
+/// true neighbours are generally different rows, so the published list is
+/// simply the wrong answer — dropping the out-of-range ids would leave a
+/// short list that silently overstates recall. Callers ingesting a subset
+/// must compute ground truth over the rows they actually ingested
+/// ([`brute_force_topk`]). This asserts rather than degrading, because a
+/// wrong ground truth produces a plausible number that is not measuring
+/// anything.
+pub fn real_ground_truth(
+    dir: &Path,
+    slug: &str,
+    n_queries: usize,
+    k: usize,
+    n_docs: usize,
+) -> Vec<Vec<u32>> {
+    let rows = real_corpus_rows(dir, slug);
+    assert_eq!(
+        n_docs, rows,
+        "official ground truth for {slug} covers all {rows} rows; it cannot grade a \
+         {n_docs}-row ingest — recompute truth over the ingested rows instead"
+    );
+    let file = open_h5(dir, slug);
+    let (rows, cols) = h5_shape(&file, H5_NEIGHBORS);
+    let take = n_queries.min(rows);
+    assert!(
+        k <= cols,
+        "dataset {slug} ships {cols} neighbours per query; k={k} requested"
+    );
+    let ds = file.dataset(H5_NEIGHBORS).expect("neighbors dataset");
+    let slab: ndarray::Array2<i32> = ds
+        .read_slice_2d(ndarray::s![0..take, 0..k])
+        .unwrap_or_else(|e| panic!("read {H5_NEIGHBORS}: {e}"));
+    slab.outer_iter()
+        .map(|r| {
+            r.iter()
+                .filter(|&&id| id >= 0 && (id as usize) < n_docs)
+                .map(|&id| id as u32)
+                .collect()
+        })
+        .collect()
 }
 
 /// The bench query battery for the MAIN vector corpus: dataset test
@@ -1112,7 +1180,7 @@ pub fn bench_queries(
         CorpusSource::Synthetic => {
             generate_realistic_queries(vectors, n_docs, n_queries, seed, normalize_each, sigma)
         }
-        CorpusSource::Cohere { dir } => real_queries(dir, n_queries, normalize_each),
+        CorpusSource::Real { dir, slug } => real_queries(dir, slug, n_queries, normalize_each),
     }
 }
 
@@ -2122,81 +2190,109 @@ mod tests {
         assert_eq!(combined.augmented, augmented);
     }
 
-    /// A real corpus round-trips from the VDBBench parquet layout into the
-    /// standard mmap: row order and values preserved (modulo the requested
-    /// normalization), row-count shortfall is an error (the base-only
-    /// fallback contract), and the strided query loader samples the whole
-    /// test file.
+    /// `from_hdf5` and the query / ground-truth readers round-trip a fixture
+    /// this test writes itself, so the write + normalize path is exercised
+    /// offline — no network, no staged dataset. `dim` is passed explicitly
+    /// for exactly this reason: the process-wide `dim()` resolves once from
+    /// env and would pin whatever the first caller in the process asked for.
     #[test]
-    fn real_corpus_parquet_round_trip() {
-        use arrow_array::{ArrayRef, ListArray, types::Float32Type};
-        use parquet::arrow::ArrowWriter;
-
-        const ROWS: usize = 20;
+    fn real_corpus_hdf5_round_trip() {
+        const ROWS: usize = 40;
         const TEST_DIM: usize = 4;
+        const QUERIES: usize = 6;
+        const NEIGHBORS: usize = 5;
+
         let dir = TempDir::new().expect("fixture dir");
-        let write = |name: &str, rows: usize, offset: f32| {
-            let lists: Vec<Option<Vec<Option<f32>>>> = (0..rows)
-                .map(|r| {
-                    Some(
-                        (0..TEST_DIM)
-                            .map(|d| Some(offset + (r * TEST_DIM + d) as f32))
-                            .collect(),
-                    )
-                })
-                .collect();
-            let emb = ListArray::from_iter_primitive::<Float32Type, _, _>(lists);
-            let batch = RecordBatch::try_from_iter(vec![("emb", Arc::new(emb) as ArrayRef)])
-                .expect("batch");
-            let file = File::create(dir.path().join(name)).expect("create parquet");
-            let mut w = ArrowWriter::try_new(file, batch.schema(), None).expect("writer");
-            w.write(&batch).expect("write");
-            w.close().expect("close");
-        };
-        write(REAL_TRAIN_FILE, ROWS, 1.0);
-        write(REAL_TEST_FILE, 10, 100.0);
+        let slug = "fixture-4-angular";
+        let train: Vec<f32> = (0..ROWS * TEST_DIM).map(|i| 1.0 + i as f32).collect();
+        let test: Vec<f32> = (0..QUERIES * TEST_DIM).map(|i| 100.0 + i as f32).collect();
+        // Includes one out-of-range id to pin the truncated-corpus filter.
+        let neigh: Vec<i32> = (0..QUERIES * NEIGHBORS)
+            .map(|i| {
+                if i == 0 {
+                    ROWS as i32 + 1
+                } else {
+                    (i % ROWS) as i32
+                }
+            })
+            .collect();
+        {
+            let f = hdf5::File::create(dir.path().join(format!("{slug}.hdf5"))).expect("create");
+            f.new_dataset::<f32>()
+                .shape([ROWS, TEST_DIM])
+                .create(H5_TRAIN)
+                .expect("train ds")
+                .write(
+                    &ndarray::Array2::from_shape_vec((ROWS, TEST_DIM), train.clone())
+                        .expect("shape"),
+                )
+                .expect("write train");
+            f.new_dataset::<f32>()
+                .shape([QUERIES, TEST_DIM])
+                .create(H5_TEST)
+                .expect("test ds")
+                .write(
+                    &ndarray::Array2::from_shape_vec((QUERIES, TEST_DIM), test.clone())
+                        .expect("shape"),
+                )
+                .expect("write test");
+            f.new_dataset::<i32>()
+                .shape([QUERIES, NEIGHBORS])
+                .create(H5_NEIGHBORS)
+                .expect("neighbors ds")
+                .write(
+                    &ndarray::Array2::from_shape_vec((QUERIES, NEIGHBORS), neigh).expect("shape"),
+                )
+                .expect("write neighbors");
+        }
 
-        assert_eq!(real_corpus_rows(dir.path()), ROWS);
-        assert_eq!(real_corpus_dim(dir.path()), TEST_DIM);
+        assert_eq!(real_corpus_rows(dir.path(), slug), ROWS);
+        assert_eq!(real_corpus_dim(dir.path(), slug), TEST_DIM);
 
-        // NOTE: from_parquet sizes rows against the PROCESS dim(), which in
-        // this test process resolves to the synthetic dim — so exercise the
-        // row plumbing through emb_rows/real_queries (dim-independent) and
-        // validate from_parquet's shortfall contract, which fires before any
-        // row is read.
-        let err = match MmapVectorCorpus::from_parquet(dir.path(), ROWS + 1, false) {
-            Err(e) => e,
-            Ok(_) => panic!("row shortfall must be an error"),
-        };
-        assert!(err.to_string().contains("holds 20 rows"), "{err}");
+        // Un-normalized load preserves row order and values exactly.
+        let raw =
+            MmapVectorCorpus::from_hdf5(dir.path(), slug, ROWS, TEST_DIM, false).expect("load raw");
+        assert_eq!(raw.as_slice(), train.as_slice());
 
-        let qs = real_queries(dir.path(), 5, false);
-        assert_eq!(qs.len(), 5);
-        assert_eq!(qs[0].len(), TEST_DIM);
-        // Strided: first query is test row 0, second is test row 2 (10/5=2).
-        assert_eq!(qs[0][0], 100.0);
-        assert_eq!(qs[1][0], 100.0 + (2 * TEST_DIM) as f32);
-        // Normalization applies per row when asked.
-        let qn = real_queries(dir.path(), 1, true);
-        let norm: f32 = qn[0].iter().map(|v| v * v).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-5, "normalized query norm {norm}");
-    }
+        // Normalized load makes every row unit, same order.
+        let unit = MmapVectorCorpus::from_hdf5(dir.path(), slug, ROWS, TEST_DIM, true)
+            .expect("load normalized");
+        for (i, row) in unit.as_slice().chunks_exact(TEST_DIM).enumerate() {
+            let norm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-5, "row {i} norm {norm}");
+            let want = &train[i * TEST_DIM..(i + 1) * TEST_DIM];
+            let want_norm: f32 = want.iter().map(|v| v * v).sum::<f32>().sqrt();
+            for (d, v) in row.iter().enumerate() {
+                assert!((v - want[d] / want_norm).abs() < 1e-5, "row {i} dim {d}");
+            }
+        }
 
-    /// Live-network smoke for the on-demand download (ignored: needs
-    /// outbound HTTPS). Pulls only the ~3 MB test.parquet of the public
-    /// Cohere-1M dataset into an empty dir and parses it.
-    #[test]
-    #[ignore = "network: downloads test.parquet from the public dataset bucket"]
-    fn real_corpus_download_smoke() {
-        let tmp = TempDir::new().expect("tmp");
-        let dir = tmp.path().join("cohere_medium_1m");
-        let qs = real_queries(&dir, 3, true);
-        assert_eq!(qs.len(), 3);
-        assert_eq!(qs[0].len(), 768);
-        assert!(dir.join(REAL_TEST_FILE).exists());
+        // Row shortfall and dim mismatch are errors, never silent loads.
         assert!(
-            !dir.join(REAL_TRAIN_FILE).exists(),
-            "train must not download for queries"
+            MmapVectorCorpus::from_hdf5(dir.path(), slug, ROWS + 1, TEST_DIM, false).is_err(),
+            "row shortfall must be an error"
         );
+        assert!(
+            MmapVectorCorpus::from_hdf5(dir.path(), slug, ROWS, TEST_DIM + 1, false).is_err(),
+            "dim mismatch must be an error"
+        );
+
+        // Queries in file order, normalized on request.
+        let qs = real_queries(dir.path(), slug, 3, false);
+        assert_eq!(qs.len(), 3);
+        assert_eq!(qs[0], test[..TEST_DIM].to_vec());
+        let qn = real_queries(dir.path(), slug, 1, true);
+        let norm: f32 = qn[0].iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "query norm {norm}");
+
+        // Official ground truth: out-of-corpus ids dropped, rest in range.
+        let gt = real_ground_truth(dir.path(), slug, QUERIES, NEIGHBORS, ROWS);
+        assert_eq!(gt.len(), QUERIES);
+        assert_eq!(
+            gt[0].len(),
+            NEIGHBORS - 1,
+            "the planted out-of-range id must be filtered"
+        );
+        assert!(gt.iter().flatten().all(|&id| (id as usize) < ROWS));
     }
 }
