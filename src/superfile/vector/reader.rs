@@ -5084,9 +5084,6 @@ async fn scan_shortlist(
                             truncate_to_top_estimates(&mut acc, coarse_limit);
                         }
                     }
-                    // One publish per chunk: a single selection, and it
-                    // raises the bar for whichever cells are still scanning.
-                    publish_scan_bar(bar_owned.as_ref(), &mut acc, coarse_limit);
                     (acc, thread_cpu_delta_ns(kernel_start))
                 })
                 .reduce(
@@ -5110,7 +5107,9 @@ async fn scan_shortlist(
                 let cluster_residual = cluster_residuals.as_ref().map(|v| &v[idx]);
                 let bar = load_scan_bar(scan_bar.as_ref());
                 scan_vec(&mut acc, cluster_residual, bar, item);
-                publish_scan_bar(scan_bar.as_ref(), &mut acc, coarse_limit);
+                if bar.is_none() {
+                    publish_scan_bar(scan_bar.as_ref(), &mut acc, coarse_limit);
+                }
                 if acc.len() >= cap {
                     truncate_to_top_estimates(&mut acc, coarse_limit);
                 }
