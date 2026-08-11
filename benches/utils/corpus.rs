@@ -350,8 +350,14 @@ fn clamp_docs_to_corpus(n: usize) -> usize {
             // Queries are the rows past the ingested prefix, so the ingest
             // must stop short of the dataset's end or there is nothing held
             // out to query with.
+            // Budget: ingest + delta commit + held-out queries must all fit
+            // inside the dataset. The delta is a fraction of the ingest, so
+            // solve for the ingest rather than subtracting a constant — a
+            // shortfall here previously surfaced as an opaque ground-truth
+            // size assertion after a full ingest had already run.
             let rows = parquet_rows(&parquet_shards_for(source));
-            let ingestable = rows.saturating_sub(PARQUET_QUERY_RESERVE_ROWS);
+            let usable = rows.saturating_sub(PARQUET_QUERY_RESERVE_ROWS);
+            let ingestable = (usable as f64 / (1.0 + PARQUET_DELTA_HEADROOM)) as usize;
             assert!(
                 ingestable > 0,
                 "dataset holds {rows} rows, fewer than the {PARQUET_QUERY_RESERVE_ROWS}-row \
@@ -359,8 +365,9 @@ fn clamp_docs_to_corpus(n: usize) -> usize {
             );
             if n > ingestable {
                 eprintln!(
-                    "[corpus] requested {n} docs; dataset holds {rows} and reserves \
-                     {PARQUET_QUERY_RESERVE_ROWS} for held-out queries, clamping to {ingestable}"
+                    "[corpus] requested {n} docs; dataset holds {rows}, reserving \
+                     {PARQUET_QUERY_RESERVE_ROWS} rows for held-out queries plus delta \
+                     headroom — clamping to {ingestable}"
                 );
             }
             n.min(ingestable)
@@ -1184,6 +1191,13 @@ const PARQUET_VECTOR_COLUMNS: [&str; 2] = ["openai", "emb"];
 /// Generous relative to any battery's query count, and small relative to
 /// the datasets this source is for.
 const PARQUET_QUERY_RESERVE_ROWS: usize = 8_192;
+
+/// Headroom the ingest needs BEYOND its doc count, as a fraction: the
+/// supertable battery's delta phase appends one more commit's worth of
+/// rows (`n_docs / n_commits`), and its lifecycle ground truth requires
+/// the corpus to contain them. Sized for the smallest commit count the
+/// bench uses, so the reserve is never short.
+const PARQUET_DELTA_HEADROOM: f64 = 1.0 / 8.0;
 
 /// Rows kept in memory while converting a parquet batch.
 const PARQUET_BATCH_ROWS: usize = 1_024;
