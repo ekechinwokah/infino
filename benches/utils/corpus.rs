@@ -1193,11 +1193,13 @@ const PARQUET_VECTOR_COLUMNS: [&str; 2] = ["openai", "emb"];
 const PARQUET_QUERY_RESERVE_ROWS: usize = 8_192;
 
 /// Headroom the ingest needs BEYOND its doc count, as a fraction: the
-/// supertable battery's delta phase appends one more commit's worth of
-/// rows (`n_docs / n_commits`), and its lifecycle ground truth requires
-/// the corpus to contain them. Sized for the smallest commit count the
+/// supertable battery's delta phase appends exactly ONE more commit's
+/// worth of rows (`n_docs / n_commits`), and its lifecycle ground truth
+/// requires the corpus to contain them. The commit count never drops below
+/// `ingest::supertable::MIN_COMMIT_CHUNKS` (16) and only rises with scale,
+/// so one sixteenth is the exact worst case, not an estimate. Sized for the smallest commit count the
 /// bench uses, so the reserve is never short.
-const PARQUET_DELTA_HEADROOM: f64 = 1.0 / 8.0;
+const PARQUET_DELTA_HEADROOM: f64 = 1.0 / 16.0;
 
 /// Rows kept in memory while converting a parquet batch.
 const PARQUET_BATCH_ROWS: usize = 1_024;
