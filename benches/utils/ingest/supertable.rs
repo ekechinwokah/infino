@@ -419,18 +419,28 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
     // post-drain → delta → compact). Generate base + that tail once so
     // the delta batch does not regenerate.
     let corpus_docs = n_docs + docs_per_commit();
-    if !matches!(corpus::corpus_source(), corpus::CorpusSource::Synthetic)
-        && (modality.has_text() || modality.has_sql())
-    {
+    if !corpus::corpus_has_text() && (modality.has_text() || modality.has_sql()) {
         panic!(
-            "{} names a real dataset, which provides vectors only; the {} modality needs \
-             text/scalar
-             columns — run it on the synthetic corpus",
+            "corpus {} carries no text column, so the {} modality cannot run on it — \
+             use a text-bearing dataset (e.g. hf:KShivendu/dbpedia-entities-openai-1M) \
+             or the synthetic corpus",
             corpus::corpus_label(),
             modality_label(modality)
         );
     }
     let text = modality.has_text().then(|| {
+        if !matches!(corpus::corpus_source(), corpus::CorpusSource::Synthetic) {
+            let source = corpus::corpus_source();
+            eprintln!(
+                "[supertable_ingest] loading {} {} text docs...",
+                fmt_count(corpus_docs),
+                corpus::corpus_label()
+            );
+            let shards = corpus::parquet_shards_for(source);
+            return MmapTextCorpus::from_parquet_shards(&shards, corpus_docs)
+                .or_else(|_| MmapTextCorpus::from_parquet_shards(&shards, n_docs))
+                .unwrap_or_else(|e| panic!("failed to load the dataset's text column: {e}"));
+        }
         eprintln!(
             "[supertable_ingest] generating {} -doc text corpus (mmap-backed)...",
             fmt_count(corpus_docs)

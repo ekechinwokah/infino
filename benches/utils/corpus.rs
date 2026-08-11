@@ -1177,6 +1177,110 @@ impl MmapVectorCorpus {
 
 // ─── Real-corpus (parquet) source ─────────────────────────────────────
 
+/// Text column names accepted in a parquet dataset, in priority order.
+/// A dataset carrying one of these can drive the FTS and SQL tiers on the
+/// same rows the vector tier ingests — the reason real corpora belong in
+/// `benches/` rather than in a vector-only harness.
+const PARQUET_TEXT_COLUMNS: [&str; 3] = ["text", "title", "body"];
+
+/// Whether the active corpus can supply text (and therefore feed FTS /
+/// SQL). Synthetic always can; a parquet dataset can when it carries one
+/// of [`PARQUET_TEXT_COLUMNS`]; an ann-benchmarks dataset never can — its
+/// HDF5 files hold vectors only.
+pub fn corpus_has_text() -> bool {
+    match corpus_source() {
+        CorpusSource::Synthetic => true,
+        CorpusSource::AnnBenchmarks { .. } => false,
+        source => {
+            let shards = parquet_shards_for(source);
+            let first = shards.first().expect("at least one shard");
+            let f = File::open(first).unwrap_or_else(|e| panic!("open {}: {e}", first.display()));
+            let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+                .unwrap_or_else(|e| panic!("read {}: {e}", first.display()));
+            let schema = reader.schema();
+            PARQUET_TEXT_COLUMNS
+                .iter()
+                .any(|n| schema.column_with_name(n).is_some())
+        }
+    }
+}
+
+/// The text column of one batch as owned strings.
+fn parquet_text_rows(batch: &RecordBatch) -> Vec<String> {
+    let col = PARQUET_TEXT_COLUMNS
+        .iter()
+        .find_map(|name| batch.column_by_name(name))
+        .unwrap_or_else(|| {
+            panic!("parquet batch has none of the text columns {PARQUET_TEXT_COLUMNS:?}")
+        });
+    if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
+        (0..a.len()).map(|i| a.value(i).to_string()).collect()
+    } else if let Some(a) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+        (0..a.len()).map(|i| a.value(i).to_string()).collect()
+    } else {
+        panic!(
+            "text column must be Utf8 or LargeUtf8, got {:?}",
+            col.data_type()
+        )
+    }
+}
+
+impl MmapTextCorpus {
+    /// Materialize the first `n_docs` text rows of a parquet dataset into
+    /// the standard text-corpus mmap, streaming batch by batch. Newlines in
+    /// the source are replaced with spaces: the mmap format is one document
+    /// per line, so an embedded newline would split one document into two.
+    pub fn from_parquet_shards(shards: &[PathBuf], n_docs: usize) -> IoResult<Self> {
+        let tmp = TempDir::new().expect("create MmapTextCorpus tempdir");
+        let path = tmp.path().join("corpus.txt");
+        let mut writer = BufWriter::new(File::create(&path)?);
+        let mut offsets: Vec<u64> = Vec::with_capacity(n_docs + 1);
+        let mut pos = 0u64;
+        offsets.push(0);
+        let mut written = 0usize;
+        'outer: for shard in shards {
+            let f = File::open(shard)?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+                .and_then(|b| b.with_batch_size(PARQUET_BATCH_ROWS).build())
+                .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+            for batch in reader {
+                let batch = batch.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+                for doc in parquet_text_rows(&batch) {
+                    let line = doc.replace(['\n', '\r'], " ");
+                    writer.write_all(line.as_bytes())?;
+                    writer.write_all(b"\n")?;
+                    pos += line.len() as u64 + 1;
+                    offsets.push(pos);
+                    written += 1;
+                    if written == n_docs {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if written < n_docs {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("parquet dataset holds {written} text rows; {n_docs} requested"),
+            ));
+        }
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|e| e.into_error())?
+            .sync_all()?;
+        let file = File::open(&path)?;
+        // SAFETY: read-only mapping of a file this function just wrote and
+        // fsynced, and which nothing mutates while the corpus owns it.
+        let map = unsafe { Mmap::map(&file)? };
+        Ok(Self {
+            _tmp: tmp,
+            map,
+            offsets,
+        })
+    }
+}
+
 /// Hugging Face resolve base. Only the file endpoint is used — the `/api/`
 /// metadata endpoint requires credentials, so shard names come from a
 /// manifest read (below) rather than a directory listing.
