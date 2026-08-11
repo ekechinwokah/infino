@@ -429,7 +429,10 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
         );
     }
     let text = modality.has_text().then(|| {
-        if !matches!(corpus::corpus_source(), corpus::CorpusSource::Synthetic) {
+        if !matches!(
+            corpus::corpus_source(),
+            corpus::CorpusSource::Synthetic { .. }
+        ) {
             let source = corpus::corpus_source();
             eprintln!(
                 "[supertable_ingest] loading {} {} text docs...",
@@ -445,7 +448,14 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
             "[supertable_ingest] generating {} -doc text corpus (mmap-backed)...",
             fmt_count(corpus_docs)
         );
-        MmapTextCorpus::generate(corpus_docs, CORPUS_TEXT_SEED)
+        MmapTextCorpus::generate_shaped(
+            corpus_docs,
+            CORPUS_TEXT_SEED,
+            matches!(
+                corpus::corpus_source(),
+                corpus::CorpusSource::Synthetic { realistic: true }
+            ),
+        )
     });
     let vectors = modality.has_vector().then(|| {
         if let Some(path) = explicit_vector_path.as_deref() {
@@ -468,12 +478,13 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
                         path.display()
                     )
                 })
-        } else if !matches!(corpus::corpus_source(), corpus::CorpusSource::Synthetic)
-            && !matches!(
-                corpus::corpus_source(),
-                corpus::CorpusSource::AnnBenchmarks { .. }
-            )
-        {
+        } else if !matches!(
+            corpus::corpus_source(),
+            corpus::CorpusSource::Synthetic { .. }
+        ) && !matches!(
+            corpus::corpus_source(),
+            corpus::CorpusSource::AnnBenchmarks { .. }
+        ) {
             // Parquet dataset (downloaded or local): the tail past `n_docs`
             // stays uningested so it can serve as held-out queries.
             let source = corpus::corpus_source();
@@ -512,7 +523,16 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
                 fmt_count(corpus_docs),
                 dim()
             );
-            MmapVectorCorpus::generate(corpus_docs, corpus::n_cent(n_docs), CORPUS_VEC_SEED, true)
+            MmapVectorCorpus::generate_shaped(
+                corpus_docs,
+                corpus::n_cent(n_docs),
+                CORPUS_VEC_SEED,
+                true,
+                matches!(
+                    corpus::corpus_source(),
+                    corpus::CorpusSource::Synthetic { realistic: true }
+                ),
+            )
         }
     });
     // `Modality::Sql` is the one shape that ingests an embedding column
