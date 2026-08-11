@@ -1082,7 +1082,14 @@ pub mod vector {
                         CORPUS_ROT_SEED,
                         true,
                     ),
-                    other => panic!("{other:?} corpus reader is not wired yet"),
+                    // Parquet dataset (downloaded or local).
+                    source => corpus::MmapVectorCorpus::from_parquet_shards(
+                        &corpus::parquet_shards_for(source),
+                        n,
+                        corpus::dim(),
+                        true,
+                    )
+                    .expect("load parquet dataset for the superfile tier"),
                 }
             })
             .as_slice()

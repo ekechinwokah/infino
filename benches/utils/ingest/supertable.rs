@@ -458,6 +458,25 @@ pub fn prepare_corpus(modality: Modality) -> PreparedCorpus {
                         path.display()
                     )
                 })
+        } else if !matches!(corpus::corpus_source(), corpus::CorpusSource::Synthetic)
+            && !matches!(
+                corpus::corpus_source(),
+                corpus::CorpusSource::AnnBenchmarks { .. }
+            )
+        {
+            // Parquet dataset (downloaded or local): the tail past `n_docs`
+            // stays uningested so it can serve as held-out queries.
+            let source = corpus::corpus_source();
+            eprintln!(
+                "[supertable_ingest] loading {} ×{} {} vectors...",
+                fmt_count(n_docs),
+                dim(),
+                corpus::corpus_label()
+            );
+            let shards = corpus::parquet_shards_for(source);
+            MmapVectorCorpus::from_parquet_shards(&shards, corpus_docs, dim(), true)
+                .or_else(|_| MmapVectorCorpus::from_parquet_shards(&shards, n_docs, dim(), true))
+                .unwrap_or_else(|error| panic!("failed to load the parquet dataset: {error}"))
         } else if let corpus::CorpusSource::AnnBenchmarks { dir, slug } = corpus::corpus_source() {
             // Real dataset: base + delta rows when it is deep enough, else
             // base-only (the delta tail regenerates, the same contract as a

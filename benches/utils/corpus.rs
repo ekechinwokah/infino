@@ -39,7 +39,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arrow_array::{Decimal128Array, Float32Array, LargeStringArray, RecordBatch};
+use arrow_array::{
+    Array, Decimal128Array, FixedSizeListArray, Float32Array, Float64Array, LargeListArray,
+    LargeStringArray, ListArray, RecordBatch,
+};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
@@ -59,6 +62,7 @@ use infino::{
     test_helpers::default_tokenizer,
 };
 use memmap2::Mmap;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
@@ -206,9 +210,10 @@ pub const SYNTHETIC_DIM: usize = 1024;
 ///   columns, the only source that can feed FTS and SQL as well as
 ///   vectors. No shipped ground truth: truth is computed over the rows
 ///   actually ingested.
-/// * `parquet:<dir>` — a local directory in the VDBBench layout
-///   (`shuffle_train.parquet` + `test.parquet`). No download, no vendor
-///   host in source; reads corpora already staged on a bench box.
+/// * `parquet:<dir>` — every `*.parquet` in a local directory, read in
+///   sorted name order. No download and no naming convention: a directory
+///   of shards from any producer works, including one a `hf:` run already
+///   staged.
 ///
 /// Real corpora are vector-only today except where a source carries text
 /// columns; FTS / SQL / combined modalities otherwise keep the synthetic
@@ -221,7 +226,7 @@ pub enum CorpusSource {
     AnnBenchmarks { dir: PathBuf, slug: String },
     /// Hugging Face parquet dataset `repo`, staged under `dir`.
     HuggingFace { dir: PathBuf, repo: String },
-    /// Local VDBBench-layout parquet directory.
+    /// Local directory of parquet shards.
     LocalParquet { dir: PathBuf },
 }
 
@@ -288,7 +293,7 @@ pub fn dim() -> usize {
     *DIM_ONCE.get_or_init(|| match corpus_source() {
         CorpusSource::Synthetic => SYNTHETIC_DIM,
         CorpusSource::AnnBenchmarks { dir, slug } => real_corpus_dim(dir, slug),
-        other => panic!("{} corpus reader is not wired yet", corpus_kind(other)),
+        source => parquet_dim(&parquet_shards_for(source)),
     })
 }
 
@@ -341,7 +346,13 @@ fn clamp_docs_to_corpus(n: usize) -> usize {
             }
             n.min(rows)
         }
-        other => panic!("{} corpus reader is not wired yet", corpus_kind(other)),
+        source => {
+            let rows = parquet_rows(&parquet_shards_for(source));
+            if n > rows {
+                eprintln!("[corpus] requested {n} docs but the dataset holds {rows}; clamping");
+            }
+            n.min(rows)
+        }
     }
 }
 
@@ -959,13 +970,9 @@ const CORPUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// bench run forever.
 const CORPUS_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(3 * 3600);
 
-/// Canonical ann-benchmarks dataset host: an academic, vendor-neutral
-/// mirror serving the same `*-angular.hdf5` / `*-euclidean.hdf5` files the
-/// published ANN benchmarks are run against. Overridable for a local
-/// mirror; nothing here depends on a vendor's dataset bucket.
-pub const CORPUS_URL_ENV: &str = "INFINO_BENCH_CORPUS_URL";
-
-/// Default download base for [`CORPUS_URL_ENV`].
+/// Canonical ann-benchmarks dataset host: the academic, vendor-neutral
+/// mirror serving the `*-angular.hdf5` / `*-euclidean.hdf5` files the
+/// published ANN benchmarks are run against.
 const DEFAULT_CORPUS_URL_BASE: &str = "https://ann-benchmarks.com";
 
 /// Corpus rows dataset inside the HDF5 file.
@@ -986,34 +993,44 @@ const H5_NEIGHBORS: &str = "neighbors";
 /// length against `Content-Length` when the server provides one.
 fn real_corpus_file(dir: &Path, slug: &str) -> PathBuf {
     let name = format!("{slug}.hdf5");
-    let path = dir.join(&name);
+    let url = format!("{DEFAULT_CORPUS_URL_BASE}/{name}");
+    download_if_absent(dir, &name, &url)
+}
+
+/// Shared blocking HTTP client for corpus downloads: bounded connect and
+/// whole-transfer deadlines, so a dead host fails fast and a half-open
+/// connection to a multi-GB file cannot hang a run forever.
+fn http_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(CORPUS_CONNECT_TIMEOUT)
+        .timeout(CORPUS_DOWNLOAD_TIMEOUT)
+        .build()
+        .expect("build http client")
+}
+
+/// Fetch `url` into `dir/name` unless already present. Streams to
+/// `<name>.part` and renames, so an interrupted transfer never leaves a
+/// truncated file under the real name, and verifies the received length
+/// against `Content-Length` when the server sends one — a
+/// truncated-but-200 response would otherwise be accepted silently and
+/// then surface as a confusing parse error deep in a run.
+fn download_if_absent(dir: &Path, name: &str, url: &str) -> PathBuf {
+    let path = dir.join(name);
     if path.exists() {
         return path;
     }
-    let base = env::var(CORPUS_URL_ENV).unwrap_or_else(|_| DEFAULT_CORPUS_URL_BASE.to_string());
-    let url = format!("{}/{name}", base.trim_end_matches('/'));
     eprintln!(
         "[corpus] {name} missing from {}; downloading {url}...",
         dir.display()
     );
     std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
-    // connect_timeout bounds a dead host; the blocking client's read path has
-    // no per-read deadline, so a whole-request timeout is the available stall
-    // guard — sized for a multi-GB file on a slow link rather than left
-    // unbounded, which would hang a run on a half-open connection.
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(CORPUS_CONNECT_TIMEOUT)
-        .timeout(CORPUS_DOWNLOAD_TIMEOUT)
-        .build()
-        .expect("build http client");
-    let mut resp = client
-        .get(&url)
+    let mut resp = http_client()
+        .get(url)
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
         .unwrap_or_else(|e| {
             panic!(
-                "download {url} failed: {e}\nstage {name} in {} manually or set \
-                 {CORPUS_URL_ENV} to a mirror",
+                "download {url} failed: {e}\nstage {name} in {} manually instead",
                 dir.display()
             )
         });
@@ -1139,6 +1156,292 @@ impl MmapVectorCorpus {
     }
 }
 
+// ─── Real-corpus (parquet) source ─────────────────────────────────────
+
+/// Hugging Face resolve base. Only the file endpoint is used — the `/api/`
+/// metadata endpoint requires credentials, so shard names come from a
+/// manifest read (below) rather than a directory listing.
+const HF_RESOLVE_BASE: &str = "https://huggingface.co";
+
+/// Vector column names accepted in a parquet dataset, in priority order.
+/// Datasets name the embedding column differently (`openai` in
+/// dbpedia-entities-openai-1M, `emb` elsewhere); both are read.
+const PARQUET_VECTOR_COLUMNS: [&str; 2] = ["openai", "emb"];
+
+/// Rows kept in memory while converting a parquet batch.
+const PARQUET_BATCH_ROWS: usize = 1_024;
+
+/// One parquet dataset's shard files, in ingest order. A `hf:` source
+/// downloads any that are missing first; both then read the directory, so
+/// there is no naming convention to satisfy and no producer-specific
+/// layout in this code.
+pub fn parquet_shards_for(source: &CorpusSource) -> Vec<PathBuf> {
+    if let CorpusSource::HuggingFace { dir, repo } = source {
+        hf_download_shards(dir, repo);
+    }
+    let dir = match source {
+        CorpusSource::LocalParquet { dir } | CorpusSource::HuggingFace { dir, .. } => dir,
+        other => panic!("{} is not a parquet source", corpus_kind(other)),
+    };
+    let mut shards: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
+        .collect();
+    shards.sort();
+    assert!(
+        !shards.is_empty(),
+        "{} holds no *.parquet shards",
+        dir.display()
+    );
+    shards
+}
+
+/// Resolve a Hugging Face dataset's shard files, downloading any that are
+/// absent. Shard names follow the Hub's own convention
+/// (`data/train-<i>-of-<n>-<hash>.parquet`), which cannot be derived — so
+/// the first shard's name is required once via [`HF_SHARDS_ENV`]-free
+/// discovery: we read the local directory when it already holds shards,
+/// and otherwise ask the Hub's tree endpoint for the file list. The tree
+/// endpoint is the one metadata route that answers unauthenticated.
+fn hf_download_shards(dir: &Path, repo: &str) {
+    let already: bool = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| e.path().extension().is_some_and(|x| x == "parquet"));
+    if already {
+        return;
+    }
+    let url = format!("{HF_RESOLVE_BASE}/api/datasets/{repo}/tree/main/data");
+    let client = http_client();
+    let listing = client
+        .get(&url)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .and_then(|r| r.text())
+        .unwrap_or_else(|e| {
+            panic!(
+                "list {repo} shards via {url} failed: {e}\nstage the dataset's \
+                 data/*.parquet files in {} manually instead",
+                dir.display()
+            )
+        });
+    // Minimal extraction: the listing is JSON objects each carrying a
+    // "path" field; no JSON dependency needed for one field.
+    let mut names: Vec<String> = listing
+        .split("\"path\":\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .filter(|n| n.ends_with(".parquet"))
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    assert!(
+        !names.is_empty(),
+        "{repo} listing returned no parquet shards: {}",
+        &listing[..listing.len().min(200)]
+    );
+    for name in &names {
+        let leaf = name.rsplit('/').next().unwrap_or(name);
+        download_if_absent(
+            dir,
+            leaf,
+            &format!("{HF_RESOLVE_BASE}/datasets/{repo}/resolve/main/{name}"),
+        );
+    }
+}
+
+/// Row count of a parquet dataset, from footer metadata only.
+fn parquet_rows(shards: &[PathBuf]) -> usize {
+    shards
+        .iter()
+        .map(|p| {
+            let f = File::open(p).unwrap_or_else(|e| panic!("open {}: {e}", p.display()));
+            ParquetRecordBatchReaderBuilder::try_new(f)
+                .unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+                .metadata()
+                .file_metadata()
+                .num_rows() as usize
+        })
+        .sum()
+}
+
+/// Vector width of a parquet dataset, from its first row.
+fn parquet_dim(shards: &[PathBuf]) -> usize {
+    let first = shards.first().expect("at least one shard");
+    let f = File::open(first).unwrap_or_else(|e| panic!("open {}: {e}", first.display()));
+    let mut reader = ParquetRecordBatchReaderBuilder::try_new(f)
+        .and_then(|b| b.with_batch_size(1).build())
+        .unwrap_or_else(|e| panic!("read {}: {e}", first.display()));
+    let batch = reader
+        .next()
+        .expect("shard has at least one row")
+        .unwrap_or_else(|e| panic!("decode {}: {e}", first.display()));
+    parquet_vector_rows(&batch)
+        .first()
+        .map(Vec::len)
+        .expect("non-empty batch")
+}
+
+/// The vector column of one batch as owned fp32 rows. Accepts the list
+/// encodings these datasets use and downcasts f64 values (the
+/// dbpedia-entities-openai-1M column is `list<double>`, 12 KB a row on the
+/// wire) to the f32 the engine ingests.
+fn parquet_vector_rows(batch: &RecordBatch) -> Vec<Vec<f32>> {
+    let col = PARQUET_VECTOR_COLUMNS
+        .iter()
+        .find_map(|name| batch.column_by_name(name))
+        .unwrap_or_else(|| {
+            panic!(
+                "parquet batch has none of the vector columns {PARQUET_VECTOR_COLUMNS:?}; \
+                 columns are {:?}",
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name())
+                    .collect::<Vec<_>>()
+            )
+        });
+    let values_at = |values: &dyn Array, start: usize, len: usize| -> Vec<f32> {
+        if let Some(f) = values.as_any().downcast_ref::<Float32Array>() {
+            (start..start + len).map(|i| f.value(i)).collect()
+        } else if let Some(d) = values.as_any().downcast_ref::<Float64Array>() {
+            (start..start + len).map(|i| d.value(i) as f32).collect()
+        } else {
+            panic!(
+                "vector values must be f32 or f64, got {:?}",
+                values.data_type()
+            )
+        }
+    };
+    if let Some(l) = col.as_any().downcast_ref::<ListArray>() {
+        (0..l.len())
+            .map(|i| {
+                let (s, e) = (
+                    l.value_offsets()[i] as usize,
+                    l.value_offsets()[i + 1] as usize,
+                );
+                values_at(l.values().as_ref(), s, e - s)
+            })
+            .collect()
+    } else if let Some(l) = col.as_any().downcast_ref::<LargeListArray>() {
+        (0..l.len())
+            .map(|i| {
+                let (s, e) = (
+                    l.value_offsets()[i] as usize,
+                    l.value_offsets()[i + 1] as usize,
+                );
+                values_at(l.values().as_ref(), s, e - s)
+            })
+            .collect()
+    } else if let Some(l) = col.as_any().downcast_ref::<FixedSizeListArray>() {
+        let w = l.value_length() as usize;
+        (0..l.len())
+            .map(|i| values_at(l.values().as_ref(), i * w, w))
+            .collect()
+    } else {
+        panic!("unsupported vector encoding {:?}", col.data_type())
+    }
+}
+
+impl MmapVectorCorpus {
+    /// Materialize the first `n_docs` rows of a parquet dataset into the
+    /// standard corpus mmap, streaming batch by batch so peak memory is one
+    /// batch. `dim` is explicit for the same reason as [`Self::from_hdf5`].
+    pub fn from_parquet_shards(
+        shards: &[PathBuf],
+        n_docs: usize,
+        dim: usize,
+        normalize_each: bool,
+    ) -> IoResult<Self> {
+        let tmp = TempDir::new().expect("create MmapVectorCorpus tempdir");
+        let path = tmp.path().join("corpus.bin");
+        let mut writer = BufWriter::new(File::create(&path)?);
+        let mut written = 0usize;
+        'outer: for shard in shards {
+            let f = File::open(shard)?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+                .and_then(|b| b.with_batch_size(PARQUET_BATCH_ROWS).build())
+                .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+            for batch in reader {
+                let batch = batch.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+                for mut row in parquet_vector_rows(&batch) {
+                    if row.len() != dim {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            format!("row width {} != {dim} in {}", row.len(), shard.display()),
+                        ));
+                    }
+                    if normalize_each {
+                        normalize(&mut row);
+                    }
+                    let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    writer.write_all(&bytes)?;
+                    written += 1;
+                    if written == n_docs {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if written < n_docs {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("parquet dataset holds {written} rows; {n_docs} requested"),
+            ));
+        }
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|e| e.into_error())?
+            .sync_all()?;
+        Self::from_file_with_dim(File::open(&path)?, n_docs, dim, Some(tmp))
+    }
+}
+
+/// Held-out query rows for a parquet dataset: the rows immediately PAST
+/// the ingested prefix. They are in the dataset and never in the table, so
+/// they are genuinely held out rather than self-queries, and no dataset
+/// needs to ship a separate query file.
+pub fn parquet_queries(
+    source: &CorpusSource,
+    n_docs: usize,
+    n_queries: usize,
+    normalize_each: bool,
+) -> Vec<Vec<f32>> {
+    let shards = parquet_shards_for(source);
+    let mut out: Vec<Vec<f32>> = Vec::with_capacity(n_queries);
+    let mut seen = 0usize;
+    for shard in &shards {
+        let f = File::open(shard).unwrap_or_else(|e| panic!("open {}: {e}", shard.display()));
+        let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+            .and_then(|b| b.with_batch_size(PARQUET_BATCH_ROWS).build())
+            .unwrap_or_else(|e| panic!("read {}: {e}", shard.display()));
+        for batch in reader {
+            for mut row in parquet_vector_rows(&batch.expect("decode batch")) {
+                if seen >= n_docs {
+                    if out.len() == n_queries {
+                        return out;
+                    }
+                    if normalize_each {
+                        normalize(&mut row);
+                    }
+                    out.push(row);
+                }
+                seen += 1;
+            }
+        }
+    }
+    assert!(
+        !out.is_empty(),
+        "no rows past {n_docs} to query with; ingest fewer rows or use a deeper dataset"
+    );
+    out
+}
+
 /// The dataset's own query vectors (`test`), first `n_queries` in file
 /// order — the published query set, so the neighbour ids below line up with
 /// them by index.
@@ -1233,7 +1536,9 @@ pub fn bench_queries(
         CorpusSource::AnnBenchmarks { dir, slug } => {
             real_queries(dir, slug, n_queries, normalize_each)
         }
-        other => panic!("{} corpus reader is not wired yet", corpus_kind(other)),
+        // Parquet sources hold back the rows past the ingested prefix, so
+        // `n_docs` must be the ingested count, not the dataset's size.
+        source => parquet_queries(source, n_docs, n_queries, normalize_each),
     }
 }
 
