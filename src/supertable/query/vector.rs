@@ -3811,8 +3811,15 @@ impl SupertableReader {
                 }
             };
             let id_column = self.options().id_column.as_str();
+            // GUARDED on every hit carrying a stamp, exactly as the hybrid
+            // path guards its own fast path (`hybrid_exec.rs`): a superfile
+            // entry with no row-id base stamps `stable_id: None`
+            // (`dispatch.rs`), and `hits_id_score_batch` treats that as an
+            // upstream bug. Falling through resolves the id by placement
+            // instead of failing the query.
             if free_columns_unambiguous(&self.options().schema, id_column)
                 && let Some(indices) = id_score_projection_indices(projection, id_column)
+                && hits.iter().all(|hit| hit.stable_id.is_some())
             {
                 let batch = hits_id_score_batch(self, &hits)?
                     .project(&indices)

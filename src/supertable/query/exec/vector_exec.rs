@@ -420,7 +420,11 @@ impl ExecutionPlan for VectorSearchExec {
                 }
             }
             .map_err(search_query_df_error)?;
-            if let Some(indices) = id_score_projection {
+            // Same stamp guard as the hybrid exec path: unstamped hits fall
+            // through to placement rather than failing the query.
+            if let Some(indices) = id_score_projection
+                && hits.iter().all(|hit| hit.stable_id.is_some())
+            {
                 return hits_id_score_batch(&reader, &hits)
                     .map_err(|e| DataFusionError::Execution(e.to_string()))?
                     .project(&indices)

@@ -12,9 +12,11 @@
 use std::{sync::Arc, thread};
 
 use arrow_array::{
-    ArrayRef, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
+    Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array,
+    LargeStringArray, RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::prelude::{Expr, col, lit};
 use infino::{
     ConnectOptions, Connection, IndexSpec, Metric, connect, connect_with,
     runtime_metrics::op_stats::{OpStats, with_op_stats},
@@ -1138,4 +1140,111 @@ fn placement_memo_releases_its_budget_bytes() {
     let mut w = st.writer().expect("writer");
     w.append(&vector_batch(schema)).expect("append after memo");
     w.commit().expect("commit after memo");
+}
+
+/// A FILTERED vector query projecting `_id`/`score` must not return
+/// hidden-deleted rows — and this pins WHY it doesn't.
+///
+/// The fast path returns straight from search-wave stamps, skipping
+/// `user_placement_for_scalar_resolve`, which is where the identity-level
+/// delete filter lives. Unlike the global route, the filtered route has no
+/// retain of its own, so the omission looks unsafe. It is not, for a reason
+/// worth pinning: the filtered route derives its hidden allow-set from the
+/// USER-table allow bitmaps (`stable_ids_from_user_allow_async`), and those
+/// have already had `subtract_tombstones` applied in
+/// `fanout_candidate_bitmaps`. A deleted row is therefore dropped at the
+/// predicate leg and never becomes a candidate id, so no deleted row can
+/// reach the fast path in the first place.
+///
+/// That upstream subtraction is load-bearing and invisible from the
+/// projection code. This test fails if it is ever removed or bypassed.
+#[test]
+fn a_filtered_id_score_query_excludes_deleted_rows() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_vector_table(&dir);
+    let query = row_vec(3);
+    let opts = VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE);
+    let filter = || VectorFilter {
+        column: "title",
+        query: "vec",
+        mode: BoolMode::Or,
+    };
+
+    // Identify the top-k by BOTH id and title in one pass: the title drives
+    // the delete predicate, the id is what the fast path must stop serving.
+    // This arm projects a scalar column, so it goes through placement — the
+    // arm under test is the `["_id", "score"]` one below.
+    let before = st
+        .vector_search(
+            "emb",
+            &query,
+            VECTOR_K,
+            opts,
+            Some(filter()),
+            Some(&["_id", "title", "score"]),
+        )
+        .expect("filtered search before delete");
+    let (ids_before, titles) = ids_and_titles(&before);
+    assert_eq!(
+        ids_before.len(),
+        VECTOR_K,
+        "fixture must fill k before any delete"
+    );
+
+    let preds: Vec<Expr> = titles.iter().map(|t| lit(t.as_str())).collect();
+    let stats = st
+        .delete(col("title").in_list(preds, false))
+        .expect("delete");
+    assert_eq!(
+        stats.n_tombstoned() as usize,
+        ids_before.len(),
+        "every top-k row must tombstone"
+    );
+
+    // The arm under test: `["_id", "score"]` takes the fast path.
+    let after = st
+        .vector_search(
+            "emb",
+            &query,
+            VECTOR_K,
+            opts,
+            Some(filter()),
+            Some(&["_id", "score"]),
+        )
+        .expect("filtered search after delete");
+    let (ids_after, _) = ids_and_titles(&after);
+    for id in &ids_after {
+        assert!(
+            !ids_before.contains(id),
+            "filtered id/score fast path returned deleted _id {id}"
+        );
+    }
+    assert_eq!(
+        ids_after.len(),
+        VECTOR_K,
+        "filtered result underflowed instead of backfilling past tombstones"
+    );
+}
+
+/// `_id`s, and titles when the projection carried them.
+fn ids_and_titles(batches: &[RecordBatch]) -> (Vec<i128>, Vec<String>) {
+    let mut ids = Vec::new();
+    let mut titles = Vec::new();
+    for b in batches {
+        let id_col = b
+            .column_by_name("_id")
+            .expect("_id column")
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("_id is decimal128");
+        ids.extend((0..id_col.len()).map(|i| id_col.value(i)));
+        if let Some(col) = b.column_by_name("title") {
+            let t = col
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("title is large utf8");
+            titles.extend((0..t.len()).map(|i| t.value(i).to_owned()));
+        }
+    }
+    (ids, titles)
 }
