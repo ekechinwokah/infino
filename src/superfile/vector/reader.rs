@@ -3567,9 +3567,20 @@ impl VectorReader {
                         budget,
                     };
                     let coarse_limit = k.saturating_mul(rerank_mult);
+                    // Record `vec.shortlist` here too. It was only recorded
+                    // on the immediate probe path, but every warm
+                    // hidden-index query is served by THIS arm, so the 1-bit
+                    // scan went untimed on the path that dominates the
+                    // query — it surfaced as unattributed `vec.fanout_wall`,
+                    // leaving the engine unable to see its own largest
+                    // phase.
+                    let shortlist_t0 = io_counters::phase_start();
                     let (shortlist, scan_kernel_ns) =
                         scan_shortlist(col, cb, &cluster_meta, &blocks, true, coarse_limit, &ctx)
                             .await?;
+                    if let Some(t0) = shortlist_t0 {
+                        io_counters::phase_record("vec.shortlist", t0.elapsed().as_micros() as u64);
+                    }
                     tally.kernel_cpu_ns += scan_kernel_ns;
                     let cands = shortlist
                         .into_iter()

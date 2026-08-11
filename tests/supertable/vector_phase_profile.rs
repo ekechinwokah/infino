@@ -56,7 +56,15 @@ async fn vector_phase_profile() {
         &table_dir,
         infino::ConnectOptions::default()
             .with_cache_dir(&cache_dir)
-            .with_cache_budget_bytes(21_474_836_480),
+            .with_cache_budget_bytes(
+                env::var("INFINO_DIAG_CACHE_GIB")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(20)
+                    * 1024
+                    * 1024
+                    * 1024,
+            ),
     )
     .expect("connect");
     let table = conn.open_table("vdbbench_infino").expect("open table");
