@@ -198,7 +198,13 @@ pub const SYNTHETIC_DIM: usize = 1024;
 ///
 /// Specs:
 ///
-/// * `synthetic` — the seeded planted-cluster generator (the default).
+/// * `synthetic` — the seeded generator in its REALISTIC shape (the
+///   default): Zipf vocabulary, anisotropic vectors, unequal cluster
+///   populations. Deterministic and offline, and measures in the same band
+///   as real corpora.
+/// * `synthetic-planted` — the historical isotropic / uniform-vocabulary
+///   shape, for comparison against numbers recorded before the default
+///   changed.
 /// * `annb:<slug>` — a published ann-benchmarks dataset
 ///   (`annb:glove-100-angular`). One HDF5 file carries corpus rows, the
 ///   official query set, and official top-k neighbour ids, so ground
@@ -250,8 +256,13 @@ pub fn set_source(spec: &str, dir: Option<&str>) -> Result<(), String> {
             .ok_or_else(|| format!("corpus={spec} needs corpus-dir=<path> to stage {what}"))
     };
     let source = match spec.split_once(':') {
-        None if spec == "synthetic" => CorpusSource::Synthetic { realistic: false },
-        None if spec == "synthetic-real" => CorpusSource::Synthetic { realistic: true },
+        // `synthetic` IS the realistic shape: it is the default every bench
+        // and CI leg runs, so the default must be the one that measures
+        // like real data. `synthetic-planted` keeps the historical
+        // isotropic / uniform-vocabulary generator for comparison against
+        // numbers recorded before the switch.
+        None if spec == "synthetic" => CorpusSource::Synthetic { realistic: true },
+        None if spec == "synthetic-planted" => CorpusSource::Synthetic { realistic: false },
         Some(("annb", slug)) if !slug.is_empty() => CorpusSource::AnnBenchmarks {
             dir: staged("the dataset file")?,
             slug: slug.to_string(),
@@ -266,7 +277,7 @@ pub fn set_source(spec: &str, dir: Option<&str>) -> Result<(), String> {
         _ => {
             return Err(format!(
                 "unknown corpus spec {spec:?} (expected synthetic | annb:<slug> | \
-                 synthetic-real | annb:<slug> | hf:<owner/repo> | parquet:<dir>)"
+                 synthetic-planted | annb:<slug> | hf:<owner/repo> | parquet:<dir>)"
             ));
         }
     };
@@ -276,14 +287,14 @@ pub fn set_source(spec: &str, dir: Option<&str>) -> Result<(), String> {
 
 /// The process-wide corpus source; [`CorpusSource::Synthetic`] until set.
 pub fn corpus_source() -> &'static CorpusSource {
-    SOURCE.get_or_init(|| CorpusSource::Synthetic { realistic: false })
+    SOURCE.get_or_init(|| CorpusSource::Synthetic { realistic: true })
 }
 
 /// Short corpus name for reports and dataset sidecars.
 pub fn corpus_label() -> &'static str {
     match corpus_source() {
-        CorpusSource::Synthetic { realistic: false } => "synthetic",
-        CorpusSource::Synthetic { realistic: true } => "synthetic-real",
+        CorpusSource::Synthetic { realistic: true } => "synthetic",
+        CorpusSource::Synthetic { realistic: false } => "synthetic-planted",
         CorpusSource::AnnBenchmarks { slug, .. } => slug,
         CorpusSource::HuggingFace { repo, .. } => repo,
         CorpusSource::LocalParquet { dir } => dir
@@ -386,8 +397,8 @@ fn clamp_docs_to_corpus(n: usize) -> usize {
 /// Human name of a source kind, for the not-yet-wired reports above.
 fn corpus_kind(source: &CorpusSource) -> &'static str {
     match source {
-        CorpusSource::Synthetic { realistic: false } => "synthetic",
-        CorpusSource::Synthetic { realistic: true } => "synthetic-real",
+        CorpusSource::Synthetic { realistic: true } => "synthetic",
+        CorpusSource::Synthetic { realistic: false } => "synthetic-planted",
         CorpusSource::AnnBenchmarks { .. } => "ann-benchmarks",
         CorpusSource::HuggingFace { .. } => "hugging-face parquet",
         CorpusSource::LocalParquet { .. } => "local parquet",
