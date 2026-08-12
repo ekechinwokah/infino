@@ -1381,18 +1381,14 @@ pub mod vector {
         rss::{PeakSampler, RssStats},
     };
 
-    /// Recall correctness gate (high-nprobe sanity check). A regression
-    /// tripwire, never the acceptance bar (0.99 on the standard supertable
-    /// bench): 0.70 accommodates the UNCALIBRATED lifecycle states — a
-    /// pre-drain table has no stamped laws and serves a width-1 probe, which
-    /// on realistic geometry recalls well below a calibrated table (measured
-    /// on the realistic synthetic shape and on real corpora alike). The
-    /// calibrated states clear 0.99 with room; this floor exists to catch a
-    /// run that has broken badly, not to certify quality.
-    pub const CORRECTNESS_RECALL_FLOOR: f32 = 0.70;
-    /// Default `(nprobe, rerank)` config gate — same role and reasoning as
-    /// the correctness floor above.
-    pub const DEFAULT_CONFIG_RECALL_FLOOR: f32 = 0.70;
+    /// Recall correctness gate (high-nprobe sanity check). Temporarily
+    /// lowered while the post-drain drain-clustering recall gap is under
+    /// investigation (10M post-drain peaks ~0.975 at nprobe=64); restore to
+    /// 0.98 once cell assignment is fixed.
+    pub const CORRECTNESS_RECALL_FLOOR: f32 = 0.80;
+    /// Default `(nprobe, rerank)` config gate — lower bar so large-scale
+    /// pre-drain staging runs can complete while routing is tuned.
+    pub const DEFAULT_CONFIG_RECALL_FLOOR: f32 = 0.80;
 
     /// Per-tier recall tripwires. These are regression floors, never the
     /// acceptance bar (0.99 on the standard supertable bench) — they exist

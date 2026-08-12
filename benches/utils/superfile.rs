@@ -1076,15 +1076,12 @@ pub mod vector {
                         corpus::MmapVectorCorpus::from_hdf5(dir, slug, n, corpus::dim(), true)
                             .expect("load real dataset for the superfile tier")
                     }
-                    corpus::CorpusSource::Synthetic { realistic } => {
-                        corpus::MmapVectorCorpus::generate_shaped(
-                            n,
-                            corpus::n_cent(n),
-                            CORPUS_ROT_SEED,
-                            true,
-                            *realistic,
-                        )
-                    }
+                    corpus::CorpusSource::Synthetic => corpus::MmapVectorCorpus::generate(
+                        n,
+                        corpus::n_cent(n),
+                        CORPUS_ROT_SEED,
+                        true,
+                    ),
                     // Parquet dataset (downloaded or local).
                     source => corpus::MmapVectorCorpus::from_parquet_shards(
                         &corpus::parquet_shards_for(source),

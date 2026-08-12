@@ -317,10 +317,8 @@ fn print_usage_and_exit(code: i32) -> ! {
          Diagnostic: scale | tombstone | update | sql-diag | fts-diag | object-store | concurrent | disk-warm | recall_while_ingest,\n\
          \x20           or `diagnostic` for the grouped set / `diagnostic <names>` for a subset\n\
          \n\
-         corpus=<spec>     : corpus source (default synthetic)\n\
-         \x20   synthetic          seeded generator, realistic shape (Zipf\n\
-         \x20                      vocabulary, anisotropic vectors) — the default\n\
-         \x20   synthetic-planted  historical isotropic / uniform shape\n\
+         corpus=<spec>     : vector corpus source (default synthetic)\n\
+         \x20   synthetic          seeded planted-cluster generator\n\
          \x20   annb:<slug>        published ann-benchmarks dataset; ships official\n\
          \x20                      queries + top-k neighbours (glove-100-angular,\n\
          \x20                      sift-128-euclidean, deep-image-96-angular, ...)\n\

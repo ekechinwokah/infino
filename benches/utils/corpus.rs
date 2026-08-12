@@ -198,13 +198,7 @@ pub const SYNTHETIC_DIM: usize = 1024;
 ///
 /// Specs:
 ///
-/// * `synthetic` — the seeded generator in its REALISTIC shape (the
-///   default): Zipf vocabulary, anisotropic vectors, unequal cluster
-///   populations. Deterministic and offline, and measures in the same band
-///   as real corpora.
-/// * `synthetic-planted` — the historical isotropic / uniform-vocabulary
-///   shape, for comparison against numbers recorded before the default
-///   changed.
+/// * `synthetic` — the seeded planted-cluster generator (the default).
 /// * `annb:<slug>` — a published ann-benchmarks dataset
 ///   (`annb:glove-100-angular`). One HDF5 file carries corpus rows, the
 ///   official query set, and official top-k neighbour ids, so ground
@@ -226,14 +220,8 @@ pub const SYNTHETIC_DIM: usize = 1024;
 /// corpus and say so rather than silently mixing corpora.
 #[derive(Debug, Clone)]
 pub enum CorpusSource {
-    /// Seeded generator. `realistic: false` is the historical
-    /// planted-cluster / uniform-vocabulary shape every recorded bench
-    /// number and CI baseline was measured on, kept byte-identical.
-    /// `realistic: true` keeps determinism but plants the distributional
-    /// features that make real corpora hard — see
-    /// [`MmapTextCorpus::generate_shaped`] and
-    /// [`MmapVectorCorpus::generate_shaped`].
-    Synthetic { realistic: bool },
+    /// Seeded planted-cluster generator (the historical default).
+    Synthetic,
     /// Published ann-benchmarks dataset `slug`, staged under `dir`.
     AnnBenchmarks { dir: PathBuf, slug: String },
     /// Hugging Face parquet dataset `repo`, staged under `dir`.
@@ -256,13 +244,7 @@ pub fn set_source(spec: &str, dir: Option<&str>) -> Result<(), String> {
             .ok_or_else(|| format!("corpus={spec} needs corpus-dir=<path> to stage {what}"))
     };
     let source = match spec.split_once(':') {
-        // `synthetic` IS the realistic shape: it is the default every bench
-        // and CI leg runs, so the default must be the one that measures
-        // like real data. `synthetic-planted` keeps the historical
-        // isotropic / uniform-vocabulary generator for comparison against
-        // numbers recorded before the switch.
-        None if spec == "synthetic" => CorpusSource::Synthetic { realistic: true },
-        None if spec == "synthetic-planted" => CorpusSource::Synthetic { realistic: false },
+        None if spec == "synthetic" => CorpusSource::Synthetic,
         Some(("annb", slug)) if !slug.is_empty() => CorpusSource::AnnBenchmarks {
             dir: staged("the dataset file")?,
             slug: slug.to_string(),
@@ -277,7 +259,7 @@ pub fn set_source(spec: &str, dir: Option<&str>) -> Result<(), String> {
         _ => {
             return Err(format!(
                 "unknown corpus spec {spec:?} (expected synthetic | annb:<slug> | \
-                 synthetic-planted | annb:<slug> | hf:<owner/repo> | parquet:<dir>)"
+                 hf:<owner/repo> | parquet:<dir>)"
             ));
         }
     };
@@ -287,14 +269,13 @@ pub fn set_source(spec: &str, dir: Option<&str>) -> Result<(), String> {
 
 /// The process-wide corpus source; [`CorpusSource::Synthetic`] until set.
 pub fn corpus_source() -> &'static CorpusSource {
-    SOURCE.get_or_init(|| CorpusSource::Synthetic { realistic: true })
+    SOURCE.get_or_init(|| CorpusSource::Synthetic)
 }
 
 /// Short corpus name for reports and dataset sidecars.
 pub fn corpus_label() -> &'static str {
     match corpus_source() {
-        CorpusSource::Synthetic { realistic: true } => "synthetic",
-        CorpusSource::Synthetic { realistic: false } => "synthetic-planted",
+        CorpusSource::Synthetic => "synthetic",
         CorpusSource::AnnBenchmarks { slug, .. } => slug,
         CorpusSource::HuggingFace { repo, .. } => repo,
         CorpusSource::LocalParquet { dir } => dir
@@ -310,7 +291,7 @@ pub fn corpus_label() -> &'static str {
 pub fn dim() -> usize {
     static DIM_ONCE: OnceLock<usize> = OnceLock::new();
     *DIM_ONCE.get_or_init(|| match corpus_source() {
-        CorpusSource::Synthetic { .. } => SYNTHETIC_DIM,
+        CorpusSource::Synthetic => SYNTHETIC_DIM,
         CorpusSource::AnnBenchmarks { dir, slug } => real_corpus_dim(dir, slug),
         source => parquet_dim(&parquet_shards_for(source)),
     })
@@ -357,7 +338,7 @@ pub fn supertable_docs() -> usize {
 /// measures a different scale than the caller asked for.
 fn clamp_docs_to_corpus(n: usize) -> usize {
     match corpus_source() {
-        CorpusSource::Synthetic { .. } => n,
+        CorpusSource::Synthetic => n,
         CorpusSource::AnnBenchmarks { dir, slug } => {
             let rows = real_corpus_rows(dir, slug);
             if n > rows {
@@ -397,8 +378,7 @@ fn clamp_docs_to_corpus(n: usize) -> usize {
 /// Human name of a source kind, for the not-yet-wired reports above.
 fn corpus_kind(source: &CorpusSource) -> &'static str {
     match source {
-        CorpusSource::Synthetic { realistic: true } => "synthetic",
-        CorpusSource::Synthetic { realistic: false } => "synthetic-planted",
+        CorpusSource::Synthetic => "synthetic",
         CorpusSource::AnnBenchmarks { .. } => "ann-benchmarks",
         CorpusSource::HuggingFace { .. } => "hugging-face parquet",
         CorpusSource::LocalParquet { .. } => "local parquet",
@@ -551,85 +531,7 @@ pub struct MmapTextCorpus {
     offsets: Vec<u64>,
 }
 
-/// Zipf exponent for the realistic vocabulary. ~1.07 is the classic
-/// English-text fit: a handful of terms carry enormous posting lists while
-/// most of the vocabulary is rare. The uniform shape the planted corpus
-/// uses erases exactly that skew, which is what makes real FTS expensive.
-const ZIPF_EXPONENT: f64 = 1.07;
-
-/// Vocabulary size for the realistic shape. Large enough that the tail is
-/// genuinely rare at bench scales, small enough that the sampling table
-/// stays trivial.
-const ZIPF_VOCAB: usize = 50_000;
-
 impl MmapTextCorpus {
-    /// Shape-dispatching constructor. The planted shape is unchanged; the
-    /// realistic shape draws its body terms from a Zipf-distributed
-    /// vocabulary instead of a uniform one, so posting lists are skewed the
-    /// way real text skews them: a few very common terms, a long rare tail,
-    /// and phrase cost that depends on where the terms sit in that
-    /// distribution. Each document keeps its unique `doc{:07}` token so the
-    /// df=1 correctness oracle still has something to resolve.
-    pub fn generate_shaped(n_docs: usize, seed: u64, realistic: bool) -> Self {
-        if realistic {
-            Self::generate_zipf(n_docs, seed)
-        } else {
-            Self::generate(n_docs, seed)
-        }
-    }
-
-    /// Realistic-vocabulary generator: same on-disk format and same
-    /// determinism as [`Self::generate`], Zipf-sampled body terms.
-    pub fn generate_zipf(n_docs: usize, seed: u64) -> Self {
-        let tmp = TempDir::new().expect("create MmapTextCorpus tempdir");
-        let path = tmp.path().join("corpus.txt");
-        // Inverse-CDF table over the vocabulary: cumulative 1/(i+1)^s,
-        // normalized. One binary search per token draw.
-        let weights: Vec<f64> = (0..ZIPF_VOCAB)
-            .map(|i| 1.0 / ((i + 1) as f64).powf(ZIPF_EXPONENT))
-            .collect();
-        let total: f64 = weights.iter().sum();
-        let mut cdf = Vec::with_capacity(ZIPF_VOCAB);
-        let mut acc = 0.0;
-        for w in &weights {
-            acc += w / total;
-            cdf.push(acc);
-        }
-        use rand::RngExt;
-        let mut rng = StdRng::seed_from_u64(seed);
-        let mut writer = BufWriter::new(File::create(&path).expect("create text corpus"));
-        let mut offsets: Vec<u64> = Vec::with_capacity(n_docs + 1);
-        let mut pos = 0u64;
-        offsets.push(0);
-        for doc in 0..n_docs {
-            let mut line = format!("doc{doc:07}");
-            for _ in 0..TOKENS_PER_DOC {
-                let u: f64 = rng.random_range(0.0..1.0);
-                let idx = cdf.partition_point(|&c| c < u).min(ZIPF_VOCAB - 1);
-                line.push_str(&format!(" term{idx:05}"));
-            }
-            line.push('\n');
-            writer.write_all(line.as_bytes()).expect("write doc");
-            pos += line.len() as u64;
-            offsets.push(pos);
-        }
-        writer.flush().expect("flush");
-        writer
-            .into_inner()
-            .expect("into_inner")
-            .sync_all()
-            .expect("fsync");
-        let file = File::open(&path).expect("reopen text corpus");
-        // SAFETY: read-only mapping of a file just written and fsynced here,
-        // never mutated while the corpus owns it.
-        let map = unsafe { Mmap::map(&file) }.expect("mmap text corpus");
-        Self {
-            _tmp: tmp,
-            map,
-            offsets,
-        }
-    }
-
     pub fn generate(n_docs: usize, seed: u64) -> Self {
         let tmp = TempDir::new().expect("create MmapTextCorpus tempdir");
         let path = tmp.path().join("corpus.txt");
@@ -864,133 +766,7 @@ pub struct MmapVectorCorpus {
     dim: usize,
 }
 
-/// Spectrum decay for the realistic vector shape: per-cluster noise is
-/// scaled by `SPECTRUM_DECAY^d` across dimensions, so variance concentrates
-/// in a few directions instead of being isotropic. Real embeddings are
-/// strongly anisotropic; isotropic blobs are what let a width-1 probe find
-/// every true neighbour, which is the flattery this shape removes
-/// (measured: recall 1.000 at width 1 on the planted shape versus 0.555 on
-/// a real 1536-dim corpus at the same width).
-const SPECTRUM_DECAY: f32 = 0.94;
-
-/// Zipf exponent on cluster POPULATIONS for the realistic shape. The
-/// planted shape assigns rows round-robin, giving every cell the same size;
-/// real corpora have a few huge clusters and many small ones, which is what
-/// makes per-cell budgets and cell-size caps behave differently.
-const CLUSTER_POP_EXPONENT: f64 = 1.2;
-
 impl MmapVectorCorpus {
-    /// Shape-dispatching constructor: planted (unchanged) or realistic.
-    pub fn generate_shaped(
-        n_docs: usize,
-        n_cent: usize,
-        seed: u64,
-        normalize_each: bool,
-        realistic: bool,
-    ) -> Self {
-        if realistic {
-            Self::generate_realistic(n_docs, n_cent, seed, normalize_each)
-        } else {
-            Self::generate(n_docs, n_cent, seed, normalize_each)
-        }
-    }
-
-    /// Anisotropic, unequally-populated generator. Same determinism and same
-    /// on-disk format as [`Self::generate`]; two distributional differences:
-    /// each cluster's noise is shaped by a decaying spectrum (variance in a
-    /// few directions, not all of them), and cluster populations follow a
-    /// Zipf law instead of round-robin. Ground truth is recomputed from the
-    /// actual corpus either way, so recall stays measurable.
-    pub fn generate_realistic(
-        n_docs: usize,
-        n_cent: usize,
-        seed: u64,
-        normalize_each: bool,
-    ) -> Self {
-        use rand::RngExt;
-        let dim = dim();
-        let tmp = TempDir::new().expect("create MmapVectorCorpus tempdir");
-        let path = tmp.path().join("corpus.bin");
-        let mut rng = StdRng::seed_from_u64(seed);
-        let dist = StandardNormal;
-        // Cluster centres, plus a per-cluster rotation of the decaying
-        // spectrum so different clusters stretch along different directions.
-        let centres: Vec<Vec<f32>> = (0..n_cent)
-            .map(|_| {
-                (0..dim)
-                    .map(|_| {
-                        let x: f64 = dist.sample(&mut rng);
-                        x as f32
-                    })
-                    .collect()
-            })
-            .collect();
-        let spectra: Vec<Vec<f32>> = (0..n_cent)
-            .map(|_| {
-                let mut scale: Vec<f32> = (0..dim).map(|d| SPECTRUM_DECAY.powi(d as i32)).collect();
-                // Shuffle so the high-variance axes differ per cluster.
-                for i in (1..dim).rev() {
-                    let j = rng.random_range(0..=i);
-                    scale.swap(i, j);
-                }
-                scale
-            })
-            .collect();
-        // Zipf populations, scaled to n_docs.
-        let raw: Vec<f64> = (0..n_cent)
-            .map(|i| 1.0 / ((i + 1) as f64).powf(CLUSTER_POP_EXPONENT))
-            .collect();
-        let total: f64 = raw.iter().sum();
-        let mut pops: Vec<usize> = raw
-            .iter()
-            .map(|w| ((w / total) * n_docs as f64).round() as usize)
-            .collect();
-        // Fix rounding so the populations sum to exactly n_docs.
-        let assigned: usize = pops.iter().sum();
-        if assigned < n_docs {
-            pops[0] += n_docs - assigned;
-        } else if assigned > n_docs {
-            let mut excess = assigned - n_docs;
-            for p in pops.iter_mut() {
-                let take = excess.min(*p);
-                *p -= take;
-                excess -= take;
-                if excess == 0 {
-                    break;
-                }
-            }
-        }
-        let mut writer = BufWriter::new(File::create(&path).expect("create vector corpus"));
-        for (cluster, &pop) in pops.iter().enumerate() {
-            for _ in 0..pop {
-                let mut v: Vec<f32> = (0..dim)
-                    .map(|d| {
-                        let noise: f64 = dist.sample(&mut rng);
-                        centres[cluster][d] + (noise as f32) * spectra[cluster][d]
-                    })
-                    .collect();
-                if normalize_each {
-                    normalize(&mut v);
-                }
-                let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-                writer.write_all(&bytes).expect("write row");
-            }
-        }
-        writer.flush().expect("flush");
-        writer
-            .into_inner()
-            .expect("into_inner")
-            .sync_all()
-            .expect("fsync");
-        Self::from_file_with_dim(
-            File::open(&path).expect("reopen vector corpus"),
-            n_docs,
-            dim,
-            Some(tmp),
-        )
-        .expect("open generated corpus")
-    }
-
     pub fn generate(n_docs: usize, n_cent: usize, seed: u64, normalize_each: bool) -> Self {
         Self::generate_range(0, n_docs, n_cent, seed, normalize_each)
     }
@@ -1413,7 +1189,7 @@ const PARQUET_TEXT_COLUMNS: [&str; 3] = ["text", "title", "body"];
 /// HDF5 files hold vectors only.
 pub fn corpus_has_text() -> bool {
     match corpus_source() {
-        CorpusSource::Synthetic { .. } => true,
+        CorpusSource::Synthetic => true,
         CorpusSource::AnnBenchmarks { .. } => false,
         source => {
             let shards = parquet_shards_for(source);
@@ -1899,7 +1675,7 @@ pub fn bench_queries(
     sigma: f32,
 ) -> Vec<Vec<f32>> {
     match corpus_source() {
-        CorpusSource::Synthetic { .. } => {
+        CorpusSource::Synthetic => {
             generate_realistic_queries(vectors, n_docs, n_queries, seed, normalize_each, sigma)
         }
         CorpusSource::AnnBenchmarks { dir, slug } => {
