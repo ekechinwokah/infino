@@ -413,6 +413,40 @@ struct BufferedBatch {
     vectors: Vec<Arc<Float32Array>>,
 }
 
+/// Owned `Arc<Float32Array>` handles for each declared vector column of
+/// `batch`. The handles share the batch's underlying Arrow buffers — no bytes
+/// copied — so the result outlives the borrow that `split_vectors`' `&[f32]`
+/// slices are tied to.
+pub(in crate::supertable) fn owned_vector_arrays(
+    batch: &RecordBatch,
+    options: &SupertableOptions,
+) -> Result<Vec<Arc<Float32Array>>, BuildError> {
+    let mut vectors = Vec::with_capacity(options.vector_columns.len());
+    for vc in &options.vector_columns {
+        let col_idx = batch
+            .schema()
+            .index_of(&vc.column)
+            .map_err(|_| BuildError::BatchSchemaMismatch)?;
+
+        let fsl = batch
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .ok_or(BuildError::BatchSchemaMismatch)?;
+
+        let values = fsl.values();
+
+        let f32_arr = values
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or(BuildError::BatchSchemaMismatch)?
+            .clone();
+
+        vectors.push(Arc::new(f32_arr));
+    }
+    Ok(vectors)
+}
+
 /// Zero-copy view of one vector column across the buffered batches:
 /// `row(local)` resolves a commit-wide row ordinal to its `&[f32]` slice
 /// inside the owning batch's Arrow buffer. Replaces the commit-time
@@ -993,32 +1027,9 @@ impl SupertableWriter {
         // Validate + split. Batch schema is user_schema (no id col).
         let (scalar_no_id, _vector_slices) = split_vectors(batch, options)?;
 
-        // Re-derive owned Arc<Float32Array> handles for each vector column. We can't keep the &[f32] slices from
-        // split_vectors in the buffer (their lifetime is tied to `batch`, which the caller reclaims after this returns).
-        // The Arc<Float32Array> shares the same underlying buffer — no bytes copied.
-        let mut vectors = Vec::with_capacity(options.vector_columns.len());
-        for vc in &options.vector_columns {
-            let col_idx = batch
-                .schema()
-                .index_of(&vc.column)
-                .map_err(|_| BuildError::BatchSchemaMismatch)?;
-
-            let fsl = batch
-                .column(col_idx)
-                .as_any()
-                .downcast_ref::<FixedSizeListArray>()
-                .ok_or(BuildError::BatchSchemaMismatch)?;
-
-            let values = fsl.values();
-
-            let f32_arr = values
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or(BuildError::BatchSchemaMismatch)?
-                .clone();
-
-            vectors.push(Arc::new(f32_arr));
-        }
+        // Owned handles for the buffer: the &[f32] slices from split_vectors
+        // are tied to `batch`, which the caller reclaims after this returns.
+        let vectors = owned_vector_arrays(batch, options)?;
 
         // Mint one id per row and prepend the id column. Lock
         // is uncontended in practice (writer-slot exclusivity
@@ -1744,8 +1755,13 @@ impl SupertableWriter {
                 .first()
                 .map(|vc| vc.metric)
                 .unwrap_or(Metric::L2Sq);
-            let (outputs, cell_hints) =
-                commit_shards_via_drain(buffer, &self.inner, &pack_grid, metric)?;
+            let (outputs, cell_hints) = commit_shards_via_drain(
+                buffer,
+                &self.inner,
+                &pack_grid,
+                metric,
+                packed_cell_shard_count(&self.inner.options),
+            )?;
             let build_elapsed = commit_t0.elapsed();
             let output_bytes: usize = outputs.iter().map(|output| output.bytes.len()).sum();
             let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
@@ -5292,8 +5308,10 @@ fn build_prepared_from_spilled_cells(
 ///
 /// 1. assign the **whole buffer** to global cells in one pass (drain's core;
 ///    the boundary-replica budget is batch-global, exactly like drain),
-/// 2. group whole cells into ≤ `n_writers` shard files (`cell % N` — drain's
-///    [`group_cells_by_packed_shard`]),
+/// 2. group whole cells into ≤ `n_packed_shards` shard files (`cell % N` —
+///    drain's [`group_cells_by_packed_shard`]; the commit path passes
+///    [`packed_cell_shard_count`], the update append phase passes 1 so its
+///    single preallocated superfile id covers every cell),
 /// 3. each writer: `rayon::join` — drain pack (fp32→Sq8→materialized fine
 ///    IVF) ‖ Parquet+FTS for that shard's primary rows — then splice + finish.
 ///
@@ -5305,6 +5323,7 @@ fn commit_shards_via_drain(
     inner: &SupertableInner,
     clusters: &ClusterCentroids,
     metric: Metric,
+    n_packed_shards: usize,
 ) -> Result<(Vec<ShardOutput>, Vec<Option<u32>>), BuildError> {
     let stage_t0 = time::Instant::now();
     let vc = inner
@@ -5394,8 +5413,7 @@ fn commit_shards_via_drain(
         .into_iter()
         .map(|group| (group.cell_id, group))
         .collect();
-    let packed_shards =
-        group_cells_by_packed_shard(assigned_cells, packed_cell_shard_count(&inner.options));
+    let packed_shards = group_cells_by_packed_shard(assigned_cells, n_packed_shards);
 
     let options = &inner.options;
     let shard_outputs = fanout_shards(&inner.options.writer_pool, &packed_shards, |task| {
@@ -5430,6 +5448,60 @@ fn commit_shards_via_drain(
         outputs.push(entry.1);
     }
     Ok((outputs, cell_hints))
+}
+
+/// Build ONE cell-directory-packed superfile from an update's replacement
+/// rows — the WAL append phase's counterpart of [`commit_shards_via_drain`].
+///
+/// A single packed shard keeps the WAL's one-`preallocated_superfile_id`
+/// recovery contract: every cell the rows land in packs into the same file
+/// behind its cell directory. Routing through the commit path's build keeps
+/// update superfiles on the committed vector shape (cell routing + boundary
+/// replicas included); an unpacked plain build here is not a valid
+/// drained-side maintenance input — the drain materializer and the per-cell
+/// compaction merges both fail closed on it.
+pub(in crate::supertable) fn build_packed_update_superfile(
+    inner: &SupertableInner,
+    scalar_with_id: RecordBatch,
+    vectors: Vec<Arc<Float32Array>>,
+) -> Result<Bytes, BuildError> {
+    let pack_grid = inner
+        .manifest
+        .load()
+        .get_global_vector_index()
+        .ok_or_else(|| {
+            BuildError::Store(
+                "vector columns present but global cell grid missing for the update append phase"
+                    .into(),
+            )
+        })?
+        .into_user_grid();
+    let metric = inner
+        .options
+        .vector_columns
+        .first()
+        .map(|vc| vc.metric)
+        .unwrap_or(Metric::L2Sq);
+    let expected_rows = scalar_with_id.num_rows() as u64;
+    let buffer = [BufferedBatch {
+        scalar: scalar_with_id,
+        vectors,
+    }];
+    let (mut outputs, _cell_hints) =
+        commit_shards_via_drain(&buffer, inner, &pack_grid, metric, 1)?;
+    let output = outputs.pop().ok_or(BuildError::NoDocsToBuild)?;
+    if !outputs.is_empty() || output.n_docs != expected_rows {
+        // Every replacement row is a primary of exactly one cell, so the
+        // single-shard build must return one output carrying every row;
+        // anything else would corrupt the WAL's row accounting.
+        return Err(BuildError::Store(format!(
+            "packed update build must emit one superfile with all rows: \
+             {} extra output(s), {} of {expected_rows} row(s) packed",
+            outputs.len(),
+            output.n_docs,
+        )));
+    }
+    Ok(output.bytes)
 }
 
 /// One writer, one packed shard (a group of whole cells): drain pack of the
