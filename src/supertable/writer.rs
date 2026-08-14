@@ -193,6 +193,11 @@ const DRAIN_ID_BATCH_ROWS: usize = 64 * 1024;
 /// One mebibyte; converts `superfile_buffer_split_mb` into bytes.
 const MIB: usize = 1 << 20;
 
+/// Packed-shard count for the update append phase: every cell an update's
+/// replacement rows land in packs into ONE superfile, so the WAL's single
+/// `preallocated_superfile_id` covers the whole build (the recovery contract).
+const UPDATE_PACKED_SHARDS: usize = 1;
+
 pub(in crate::supertable) const DRAIN_CHECKPOINT_SCHEMA: u32 = 1;
 /// Local checkpoint filename inside one epoch scratch directory.
 const DRAIN_LOCAL_CHECKPOINT_FILE: &str = "checkpoint.json";
@@ -5488,7 +5493,7 @@ pub(in crate::supertable) fn build_packed_update_superfile(
         vectors,
     }];
     let (mut outputs, _cell_hints) =
-        commit_shards_via_drain(&buffer, inner, &pack_grid, metric, 1)?;
+        commit_shards_via_drain(&buffer, inner, &pack_grid, metric, UPDATE_PACKED_SHARDS)?;
     let output = outputs.pop().ok_or(BuildError::NoDocsToBuild)?;
     if !outputs.is_empty() || output.n_docs != expected_rows {
         // Every replacement row is a primary of exactly one cell, so the
