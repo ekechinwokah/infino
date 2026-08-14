@@ -262,6 +262,9 @@ jobs:
           swap-storage: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # System HDF5: examples link dev-dependencies, which include
+      # `infino-bench-utils`, and that crate links the system library.
+      - run: sudo apt-get update -y && sudo apt-get install -y libhdf5-dev
       # Frozen fixture → no embedder, key, or network. Reports recall@k + every
       # hybrid miss in the log, and fails only below the tolerance floor.
       - run: cargo run --example locomo-recall -- --fail-under=0.68
