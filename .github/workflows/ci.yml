@@ -45,6 +45,10 @@ jobs:
           if ! command -v cargo-llvm-cov &> /dev/null; then
             cargo install cargo-llvm-cov --locked
           fi
+      # System HDF5 for `infino-bench-utils` (a dev-dependency of the
+      # main crate, so any workspace `cargo test` compiles it). The
+      # crate links the system library; the runner image ships none.
+      - run: sudo apt-get update -y && sudo apt-get install -y libhdf5-dev
       - run: make ci
       - name: RustFS storage wire + smoke tests
         run: cargo test --features test-helpers --test supertable 'storage::rustfs_s3_wire::|storage::smoke_rustfs::' -- --test-threads=1
