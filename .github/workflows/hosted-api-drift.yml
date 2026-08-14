@@ -32,8 +32,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # System HDF5 for the `infino-bench-utils` dev-dependency, which
-      # any `cargo test` of the main crate compiles.
-      - run: sudo apt-get update -y && sudo apt-get install -y libhdf5-dev
       # `--ignored` runs exactly the ignored drift test (kept out of `make ci`).
       - run: cargo test --features remote --test remote -- --ignored
