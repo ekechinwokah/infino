@@ -324,7 +324,8 @@ fn print_usage_and_exit(code: i32) -> ! {
          \x20                      sift-128-euclidean, deep-image-96-angular, ...)\n\
          \x20   hf:<owner/repo>    Hugging Face parquet dataset; real embeddings at\n\
          \x20                      scale, ground truth computed from the ingested rows\n\
-         \x20   parquet:<dir>      local VDBBench-layout directory (no download)\n\
+         \x20   parquet:<dir>      local directory of *.parquet shards, read in\n\
+         \x20                      name order (no download)\n\
          corpus-dir=<path> : where downloadable corpora are staged\n\
          \n\
          Examples:\n\

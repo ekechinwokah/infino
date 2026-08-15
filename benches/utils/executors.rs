@@ -1421,14 +1421,31 @@ pub mod vector {
             correctness: CORRECTNESS_RECALL_FLOOR,
             default_config: DEFAULT_CONFIG_RECALL_FLOOR,
         };
-        /// Uncalibrated single-superfile tier: loose enough that a real
-        /// dataset's legitimately lower default-config recall is reported
-        /// rather than aborting the run, still tight enough that a broken
-        /// index (which collapses toward chance) trips it.
-        pub const SUPERFILE: Self = Self {
+        /// Uncalibrated single-superfile tier on a REAL corpus: loose
+        /// enough that the legitimately lower default-config recall is
+        /// reported rather than aborting the run, still tight enough that
+        /// a broken index (which collapses toward chance) trips it.
+        const SUPERFILE_REAL: Self = Self {
             correctness: 0.60,
             default_config: 0.60,
         };
+        /// Uncalibrated single-superfile tier on the synthetic corpus: the
+        /// fixed probe width is tuned against the planted clusters, so
+        /// synthetic runs sit ~0.99 and the supertable tripwires keep
+        /// their full sensitivity here — only real corpora need the loose
+        /// floor above.
+        const SUPERFILE_SYNTHETIC: Self = Self {
+            correctness: CORRECTNESS_RECALL_FLOOR,
+            default_config: DEFAULT_CONFIG_RECALL_FLOOR,
+        };
+
+        /// The superfile tier's floors for the active corpus source.
+        pub fn superfile() -> Self {
+            match corpus::corpus_source() {
+                corpus::CorpusSource::Synthetic => Self::SUPERFILE_SYNTHETIC,
+                _ => Self::SUPERFILE_REAL,
+            }
+        }
     }
     pub const CORRECTNESS_NPROBE: usize = 64;
     pub const CORRECTNESS_RERANK_MULT: usize = 256;

@@ -1275,7 +1275,7 @@ pub mod vector {
         let start_p = sweep_start_probe();
         let start_r = sweep_start_rerank();
         let n_cent = corpus::n_cent(n_docs);
-        let floor = exec_vec::RecallFloors::SUPERFILE.correctness;
+        let floor = exec_vec::RecallFloors::superfile().correctness;
 
         let (probes, reranks, sweep_label) = if let Some(max_p) = sweep_probe_max() {
             let min_p = sweep_probe_min();
@@ -1519,7 +1519,7 @@ pub mod vector {
                 ground_truth_correctness(),
                 queries_calibration(),
                 gt_cal,
-                exec_vec::RecallFloors::SUPERFILE,
+                exec_vec::RecallFloors::superfile(),
                 phases.warm,
                 phases.cold,
                 3,
