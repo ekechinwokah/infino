@@ -114,48 +114,69 @@ pub(crate) fn binary_to_utf8(array: &ArrayRef) -> (ArrayRef, usize) {
 /// `Date32`, whose physical representation *is* a day count — no rounding
 /// or timezone math, just a widening reinterpret. Mirrors datafusion's
 /// `CAST(CAST(.. AS INTEGER) AS DATE)`, which the upstream harness relies
-/// on to make the same source column queryable as a date.
+/// on to make the same source column queryable as a date. Idempotent: a
+/// column already stored as `Date32` (or another already-supported target
+/// type) passes through unchanged, since `cast_schema_for_sql` makes such
+/// columns a schema no-op and this must not then panic on a downcast.
+/// Out-of-range values become NULL (a SAFE cast, matching upstream's
+/// `cast(.., Int32)`) instead of silently wrapping into a wrong date.
 fn event_date_to_date32(array: &ArrayRef) -> ArrayRef {
-    let days: Vec<Option<i32>> = match array.data_type() {
-        DataType::UInt16 => array
-            .as_any()
-            .downcast_ref::<UInt16Array>()
-            .expect("invariant: data_type checked above")
-            .iter()
-            .map(|v| v.map(i32::from))
-            .collect(),
-        DataType::UInt32 => array
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .expect("invariant: data_type checked above")
-            .iter()
-            .map(|v| v.map(|v| v as i32))
-            .collect(),
-        DataType::Int16 => array
-            .as_any()
-            .downcast_ref::<Int16Array>()
-            .expect("invariant: data_type checked above")
-            .iter()
-            .map(|v| v.map(i32::from))
-            .collect(),
-        DataType::Int32 => array
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("invariant: data_type checked above")
-            .iter()
-            .collect(),
-        DataType::Int64 => array
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("invariant: data_type checked above")
-            .iter()
-            .map(|v| v.map(|v| v as i32))
-            .collect(),
-        other => {
-            panic!("{CLICKBENCH_EVENT_DATE_COLUMN} column has unsupported integer type {other:?}")
+    match array.data_type() {
+        DataType::Date32 => Arc::clone(array),
+        DataType::UInt16 => {
+            let days: Vec<Option<i32>> = array
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .expect("invariant: data_type checked above")
+                .iter()
+                .map(|v| v.map(i32::from))
+                .collect();
+            Arc::new(Date32Array::from(days))
         }
-    };
-    Arc::new(Date32Array::from(days))
+        DataType::UInt32 => {
+            let days: Vec<Option<i32>> = array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .expect("invariant: data_type checked above")
+                .iter()
+                .map(|v| v.and_then(|v| i32::try_from(v).ok()))
+                .collect();
+            Arc::new(Date32Array::from(days))
+        }
+        DataType::Int16 => {
+            let days: Vec<Option<i32>> = array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .expect("invariant: data_type checked above")
+                .iter()
+                .map(|v| v.map(i32::from))
+                .collect();
+            Arc::new(Date32Array::from(days))
+        }
+        DataType::Int32 => {
+            let days: Vec<Option<i32>> = array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("invariant: data_type checked above")
+                .iter()
+                .collect();
+            Arc::new(Date32Array::from(days))
+        }
+        DataType::Int64 => {
+            let days: Vec<Option<i32>> = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("invariant: data_type checked above")
+                .iter()
+                .map(|v| v.and_then(|v| i32::try_from(v).ok()))
+                .collect();
+            Arc::new(Date32Array::from(days))
+        }
+        other => panic!(
+            "{CLICKBENCH_EVENT_DATE_COLUMN} column has unsupported type {other:?}: expected an \
+             integer day count or an already-converted Date32"
+        ),
+    }
 }
 
 /// Convert every `Binary`/`LargeBinary` column of one batch to `Utf8` and
@@ -273,6 +294,7 @@ pub fn open(source: &CorpusSource, max_rows: usize) -> ParquetSqlCorpus {
 #[cfg(test)]
 mod tests {
     use arrow_array::{Date32Array, UInt16Array};
+    use chrono::NaiveDate;
     use parquet::arrow::ArrowWriter;
     use tempfile::TempDir;
 
@@ -289,6 +311,10 @@ mod tests {
         STRADDLE_FIRST_BATCH_ROWS + STRADDLE_RETAINED_FROM_SECOND_BATCH;
     /// Embedding width for the vector-spec-derivation fixture below.
     const EMBEDDING_TEST_DIM: i32 = 8;
+    /// Day count for the `EventDate` conversion test: 2013-07-14, verified
+    /// independently against `chrono` in the test rather than asserted by
+    /// comment alone (2013-07-01 is day 15887, not this constant).
+    const EVENT_DATE_DAY_COUNT: u16 = 15900;
 
     #[test]
     fn binary_columns_become_utf8_in_the_derived_schema() {
@@ -324,15 +350,28 @@ mod tests {
 
     #[test]
     fn event_date_values_convert_from_integer_day_count_to_date32() {
+        // Independently derive the expected day count from a real calendar
+        // date so this test can actually catch an epoch or interpretation
+        // error, rather than re-asserting the conversion's own identity map.
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid epoch date");
+        let calendar_date = NaiveDate::from_ymd_opt(2013, 7, 14).expect("valid calendar date");
+        let expected_days = i32::try_from((calendar_date - epoch).num_days())
+            .expect("day offset fits in i32 for a 21st-century date");
+        assert_eq!(
+            EVENT_DATE_DAY_COUNT as i32, expected_days,
+            "EVENT_DATE_DAY_COUNT must match the calendar date this test claims it represents"
+        );
+
         let src_schema = Arc::new(Schema::new(vec![Field::new(
             CLICKBENCH_EVENT_DATE_COLUMN,
             DataType::UInt16,
-            false,
+            true,
         )]));
-        // Day count 15900 -> 2013-07-01, matching the upstream harness's
-        // CAST(CAST(.. AS INTEGER) AS DATE) semantics.
-        const EVENT_DATE_DAY_COUNT: u16 = 15900;
-        let array: ArrayRef = Arc::new(UInt16Array::from(vec![EVENT_DATE_DAY_COUNT]));
+        let array: ArrayRef = Arc::new(UInt16Array::from(vec![
+            Some(EVENT_DATE_DAY_COUNT),
+            None,
+            Some(u16::MAX),
+        ]));
         let batch = RecordBatch::try_new(Arc::clone(&src_schema), vec![array]).expect("batch");
 
         let target_schema = cast_schema_for_sql(&src_schema);
@@ -344,7 +383,73 @@ mod tests {
             .as_any()
             .downcast_ref::<Date32Array>()
             .expect("Date32 column");
+        assert_eq!(dates.value(0), expected_days);
+        assert!(dates.is_null(1), "a NULL input must stay NULL");
+        assert_eq!(
+            dates.value(2),
+            u16::MAX as i32,
+            "u16::MAX must widen exactly with no truncation"
+        );
+    }
+
+    #[test]
+    fn event_date_column_already_date32_passes_through_unchanged() {
+        // A dataset that already stores `EventDate` as `Date32` makes
+        // `cast_schema_for_sql` a schema no-op; `convert_batch` must not then
+        // panic trying to downcast a Date32 array as an integer day count.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            CLICKBENCH_EVENT_DATE_COLUMN,
+            DataType::Date32,
+            true,
+        )]));
+        let array: ArrayRef = Arc::new(Date32Array::from(vec![
+            Some(EVENT_DATE_DAY_COUNT as i32),
+            None,
+        ]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).expect("batch");
+
+        let target_schema = cast_schema_for_sql(&schema);
+        let (converted, lossy_rows) = convert_batch(&target_schema, &batch);
+
+        assert_eq!(lossy_rows, 0);
+        let dates = converted
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .expect("Date32 column");
         assert_eq!(dates.value(0), EVENT_DATE_DAY_COUNT as i32);
+        assert!(dates.is_null(1), "a NULL input must stay NULL");
+    }
+
+    #[test]
+    fn event_date_out_of_range_integers_become_null_instead_of_wrapping() {
+        // A SAFE cast: values that don't fit in i32 must become NULL,
+        // matching upstream's `cast(col, Int32)`, never a silently wrapped
+        // (and wrong) date.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            CLICKBENCH_EVENT_DATE_COLUMN,
+            DataType::Int64,
+            true,
+        )]));
+        let array: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(EVENT_DATE_DAY_COUNT as i64),
+            Some(i64::from(i32::MAX) + 1),
+            Some(i64::from(i32::MIN) - 1),
+        ]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).expect("batch");
+
+        let target_schema = cast_schema_for_sql(&schema);
+        let (converted, lossy_rows) = convert_batch(&target_schema, &batch);
+
+        assert_eq!(lossy_rows, 0);
+        let dates = converted
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .expect("Date32 column");
+        assert_eq!(dates.value(0), EVENT_DATE_DAY_COUNT as i32);
+        assert!(dates.is_null(1), "i32::MAX + 1 must not silently wrap");
+        assert!(dates.is_null(2), "i32::MIN - 1 must not silently wrap");
     }
 
     #[test]

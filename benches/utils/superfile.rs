@@ -1936,6 +1936,7 @@ pub mod sql {
                 artifact.corpus_bytes,
                 &artifact.result,
                 stored,
+                artifact.lossy_rows,
             );
         }
         let warm_sets = phases
@@ -2491,12 +2492,17 @@ pub mod sql {
         corpus_bytes: u64,
         result: &EngineSqlResult,
         stored_bytes: u64,
+        lossy_rows: usize,
     ) {
         // Real corpus: whatever columns its dataset carries, not the fixed list.
         // Anchor and "Corpus" meaning both diverge by arm: the real arm's
         // Corpus is in-memory Arrow batch bytes (see `payload_bytes` at the
         // call site), the synthetic arm's is raw generated text bytes plus an
         // `emb` top-up — sharing an anchor would diff one against the other.
+        //
+        // `subtitle` stays empty on both arms: it is part of the report's Δ
+        // delta key (`anchor|subtitle|label|header`), so anything arm-specific
+        // belongs in `note` instead, where it can't break Δ continuity.
         let (anchor, schema_desc, corpus_note) = match corpus::corpus_source() {
             corpus::CorpusSource::Synthetic => (
                 "bench/sql/build",
@@ -2535,19 +2541,25 @@ pub mod sql {
                 cells
             })
             .collect();
+        let note = lossy_rows_note(
+            format!(
+                "Build path: `SupertableWriter::append` + `commit` into an in-memory supertable, \
+                 through the engine-generic `run_sql` driver the cross-engine comparison also \
+                 uses. Rows are by writer count: `1 writer` is the canonical build queries run \
+                 against; `N writers` is the sharded parallel build. Δ is vs the previous run. \
+                 {corpus_note}"
+            ),
+            lossy_rows,
+        );
         report.emit(&Section {
             anchor: anchor.into(),
             title: format!(
                 "Superfile SQL — ingest, single superfile / in-memory ({} rows: {schema_desc})",
                 fmt_count(actual_docs)
             ),
-            note: "Build path: `SupertableWriter::append` + `commit` into an in-memory supertable, through \
-                   the engine-generic `run_sql` driver the cross-engine comparison also uses. Rows are by \
-                   writer count: `1 writer` is the canonical build queries run against; `N writers` is the \
-                   sharded parallel build. Δ is vs the previous run."
-                .into(),
+            note,
             blocks: vec![Block {
-                subtitle: corpus_note,
+                subtitle: String::new(),
                 headers: super::ingest_headers(),
                 rows,
             }],
