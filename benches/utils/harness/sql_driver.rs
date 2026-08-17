@@ -52,6 +52,11 @@ pub struct SqlQueryStats {
     pub p50: Duration,
     pub rss: RssStats,
     pub rows: usize,
+    /// Amortized on-CPU seconds of one timed iteration (all-thread schedstat
+    /// delta over the loop), when sampled. The cost model prices compute only
+    /// from measured CPU, so `None` makes the query report NOT METERED rather
+    /// than a wall-clock guess.
+    pub cpu_s: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +154,9 @@ fn measure_sql<E: SqlEngine>(
         };
         let mut samples = Vec::with_capacity(cfg.iters.max(1));
         let mut broke_mid_loop = false;
+        // Sampled across the timed loop only, so the untimed warmup read
+        // above is excluded from the per-query compute the cost model bills.
+        let cpu0 = cpu::process_cpu_ns();
         for _ in 0..cfg.iters.max(1) {
             let t0 = Instant::now();
             match read() {
@@ -163,6 +171,7 @@ fn measure_sql<E: SqlEngine>(
                 }
             }
         }
+        let cpu_s = cpu::cpu_seconds_since(cpu0);
         let rss = sampler.stop_stats();
         if broke_mid_loop {
             continue; // no stable timing for a query that panicked partway through
@@ -172,6 +181,7 @@ fn measure_sql<E: SqlEngine>(
             p50: percentile_duration(&mut samples, 50),
             rss,
             rows: warm.rows,
+            cpu_s: cpu_s.map(|s| s / samples.len() as f64),
         });
     }
     if !skipped.is_empty() {
@@ -372,6 +382,33 @@ mod tests {
         );
         assert_eq!(result.queries.len(), 1);
         assert_eq!(result.queries[0].rows, 7);
+    }
+
+    /// Every measured query carries its own on-CPU seconds: the cost model
+    /// prices compute only from a sampled figure, so a `None` here silently
+    /// drops the query from the serving table instead of pricing it.
+    #[test]
+    fn timed_queries_record_measured_cpu_seconds() {
+        let queries = [SqlQuery {
+            name: "q",
+            sql: "SELECT 1",
+        }];
+        let (result, _index) = run_sql_with_index::<StubEngine>(
+            SqlRunConfig {
+                iters: 4,
+                parallel: 1,
+            },
+            &[],
+            &queries,
+        );
+        // Unsampled on a host without per-thread CPU accounting; the sampler
+        // is the thing under test only where it can report at all.
+        if cpu::process_cpu_ns().is_some() {
+            assert!(
+                result.queries[0].cpu_s.is_some(),
+                "timed loop must sample on-CPU seconds"
+            );
+        }
     }
 
     struct FlakyEngine;

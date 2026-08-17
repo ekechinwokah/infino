@@ -1876,9 +1876,9 @@ pub mod sql {
         cost,
         executors::{payload_bytes, sql as exec_sql, sql::SqlRead},
         harness::{
-            EngineSqlResult, InfinoSqlEngine, InfinoSqlIndex, SQL_DIM, SqlRow, SqlRunConfig,
-            build_supertable_with_options, run_sql_batches_with_index, run_sql_with_index,
-            sample_query_csv, scatter_key, sql_options,
+            EngineSqlResult, InfinoSqlEngine, InfinoSqlIndex, SQL_DIM, SqlQuery, SqlQueryStats,
+            SqlRow, SqlRunConfig, build_supertable_with_options, run_sql_batches_with_index,
+            run_sql_with_index, sample_query_csv, scatter_key, sql_options,
         },
         markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
         report::{Better, Block, Cell, Report, Section, metric, text},
@@ -1890,6 +1890,13 @@ pub mod sql {
     /// Deterministic category labels assigned round-robin by doc id, so the
     /// planted distribution is exactly known for the correctness gate.
     const CATEGORIES: &[&str] = &["rust", "python", "go", "sql"];
+
+    /// Report anchors for the schema-driven (real-corpus) arm. Deliberately
+    /// distinct from the synthetic ones: both arms persist into the same
+    /// `sql.json`, and a shared key would diff a real corpus against the
+    /// synthetic baseline every recorded number in the repo comes from.
+    const REAL_CORPUS_QUERY_ANCHOR: &str = "bench/sql/query/schema-driven";
+    const REAL_CORPUS_COST_ANCHOR: &str = "bench/sql/superfile/cost/schema-driven";
 
     /// Build the planted `(doc_id, title, category, score)` rows borrowing
     /// titles from the shared mmap corpus. `category` cycles through
@@ -1993,8 +2000,172 @@ pub mod sql {
                 n_docs,
                 &cost::warm_from_sql(sets),
             );
+        } else if phases.warm {
+            // No synthetic fixture but warm was asked for: a real corpus. Its
+            // own query battery already ran inside the driver, so price the
+            // cell from those measurements rather than dropping them.
+            emit_real_corpus_warm(&mut report, &artifact);
         }
         report.save();
+    }
+
+    /// Warm + cost report for a schema-driven corpus, built from the query
+    /// battery the driver already timed. `payload_bytes` needs the returned
+    /// batches, which the driver's row count can't give, so each measured
+    /// query gets one extra untimed call — the same convention the synthetic
+    /// path's `timed` helper uses.
+    fn emit_real_corpus_warm(report: &mut Report, artifact: &SqlBuildArtifact) {
+        let battery = artifact.battery;
+        let warm: Vec<cost::WarmQueryCost> = artifact
+            .result
+            .queries
+            .iter()
+            .filter_map(|stat| warm_cost_for(&artifact.index, stat, battery))
+            .collect();
+        if warm.is_empty() {
+            eprintln!(
+                "[superfile_sql] no query in the {} battery produced a timing — nothing to price",
+                corpus::corpus_label(),
+            );
+            return;
+        }
+        eprintln!(
+            "[superfile_sql] pricing {} of {} {} queries ({} skipped, excluded from the cost \
+             model); cold is not measured for this corpus and is reported unmetered",
+            warm.len(),
+            battery.len(),
+            corpus::corpus_label(),
+            artifact.result.skipped.len(),
+        );
+        emit_real_corpus_queries(report, artifact, &warm, battery.len());
+        let b = artifact
+            .result
+            .builds
+            .last()
+            .expect("harness records at least one build row");
+        super::emit_cost_warm(
+            report,
+            REAL_CORPUS_COST_ANCHOR,
+            format!(
+                "Superfile SQL — cost model ({}, {} rows)",
+                corpus::corpus_label(),
+                fmt_count(artifact.actual_docs)
+            ),
+            b.wall.as_secs_f64(),
+            b.writers as u32,
+            b.cpu_s,
+            Some(b.rss.peak_rss_bytes),
+            stored_bytes(&artifact.index),
+            artifact.corpus_bytes,
+            artifact.actual_docs,
+            &warm,
+        );
+    }
+
+    fn warm_cost_for(
+        index: &InfinoSqlIndex,
+        stat: &SqlQueryStats,
+        battery: &[SqlQuery],
+    ) -> Option<cost::WarmQueryCost> {
+        let sql = battery.iter().find(|q| q.name == stat.name)?.sql;
+        let (payload_rows, payload_bytes) = index.query_payload(sql);
+        Some(cost::WarmQueryCost {
+            name: stat.name.to_string(),
+            p50_s: stat.p50.as_secs_f64(),
+            cpu_s: stat.cpu_s,
+            payload_rows,
+            payload_bytes,
+        })
+    }
+
+    /// Per-query warm table for a real corpus. Deliberately narrower than the
+    /// synthetic `emit_query`: the driver samples one percentile and no cold
+    /// path exists here, so p90/p99 and the cold columns are absent rather
+    /// than filled with numbers nothing measured.
+    fn emit_real_corpus_queries(
+        report: &mut Report,
+        artifact: &SqlBuildArtifact,
+        warm: &[cost::WarmQueryCost],
+        planned: usize,
+    ) {
+        let resident = rss::current_anon_rss_bytes().unwrap_or(0);
+        let rows: Vec<Vec<Cell>> = warm
+            .iter()
+            .map(|w| {
+                let p50_ns = w.p50_s * 1e9;
+                vec![
+                    text(w.name.clone()),
+                    text(fmt_count(w.payload_rows as usize)),
+                    text(rss::fmt_bytes(w.payload_bytes)),
+                    text(cost::egress_cell_per_million(w.payload_bytes)),
+                    metric(p50_ns, fmt_time(p50_ns), Better::Lower),
+                    text(cost::warm_cell_per_million(
+                        w.cpu_s,
+                        w.p50_s,
+                        resident,
+                        w.payload_bytes,
+                    )),
+                ]
+            })
+            .collect();
+        report.emit(&Section {
+            anchor: REAL_CORPUS_QUERY_ANCHOR.into(),
+            title: format!(
+                "Superfile SQL — {} query battery, single superfile ({} rows)",
+                corpus::corpus_label(),
+                fmt_count(artifact.actual_docs)
+            ),
+            note: skip_note(planned, warm.len(), &artifact.result.skipped),
+            blocks: vec![Block {
+                subtitle: String::new(),
+                headers: real_corpus_query_headers(),
+                rows,
+            }],
+        });
+    }
+
+    /// The battery's denominator, stated in the report: which queries were
+    /// measured, which were dropped, and why — so a partial battery can never
+    /// read as a complete one.
+    fn skip_note(planned: usize, measured: usize, skipped: &[(&'static str, String)]) -> String {
+        let mut note = format!(
+            "Warm p50 over `query_sql` against the canonical 1-writer table (in-memory). \
+             Cold is NOT MEASURED for this corpus — there is no schema-driven cold path yet, \
+             so the cost model reports it unmetered rather than as a zero. \
+             **{measured} of {planned} queries measured.**"
+        );
+        if skipped.is_empty() {
+            return note;
+        }
+        let names: Vec<&str> = skipped.iter().map(|(name, _)| *name).collect();
+        let mut reasons: Vec<&str> = Vec::new();
+        for (_, reason) in skipped {
+            if !reasons.contains(&reason.as_str()) {
+                reasons.push(reason);
+            }
+        }
+        note.push_str(&format!(
+            " {} skipped and excluded from every figure here and in the cost model: {}. \
+             Reason(s): {}.",
+            skipped.len(),
+            names.join(", "),
+            reasons.join(" | "),
+        ));
+        note
+    }
+
+    fn real_corpus_query_headers() -> Vec<String> {
+        [
+            "Query",
+            "Rows",
+            "Payload",
+            "Egress $/1M",
+            "warm p50",
+            "Warm $/1M",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
     }
 
     /// The fixed `SqlRow` fixture + sampled query literals the exec_sql
@@ -2004,9 +2175,11 @@ pub mod sql {
         query_inputs: exec_sql::QueryInputs,
     }
 
-    /// exec_sql's warm/cold battery assumes the synthetic fixture; a real
-    /// corpus has none, so this logs why and returns `None` instead of
-    /// measuring the wrong columns.
+    /// exec_sql's warm/cold battery asserts planted counts and samples its
+    /// literals from planted columns; a real corpus has neither, so this logs
+    /// why and returns `None` instead of measuring the wrong columns. Only the
+    /// synthetic battery is skipped — a real corpus is measured through its own
+    /// query battery (see [`emit_real_corpus_warm`]).
     fn synthetic_extras_for<'a>(
         synthetic: &'a Option<SyntheticSqlExtras>,
         phase: &str,
@@ -2014,7 +2187,8 @@ pub mod sql {
         let extras = synthetic.as_ref();
         if extras.is_none() {
             eprintln!(
-                "[superfile_sql] skipping {phase}: corpus {:?} has no schema-driven {phase} path yet",
+                "[superfile_sql] skipping the synthetic {phase} battery: corpus {:?} has no planted \
+                 fixture, so its oracles and sampled literals do not exist",
                 corpus::corpus_label(),
             );
         }
@@ -2027,6 +2201,9 @@ pub mod sql {
         corpus_bytes: u64,
         actual_docs: usize,
         synthetic: Option<SyntheticSqlExtras>,
+        /// The battery the driver was handed — the one place the query text
+        /// behind each `SqlQueryStats.name` can be recovered.
+        battery: &'static [SqlQuery],
         result: EngineSqlResult,
         index: InfinoSqlIndex,
     }
@@ -2090,6 +2267,7 @@ pub mod sql {
                         corpus,
                         query_inputs,
                     }),
+                    battery: &[], // scalar battery measured via crate::executors::sql
                     result,
                     index,
                 }
@@ -2121,6 +2299,7 @@ pub mod sql {
                     corpus_bytes,
                     actual_docs,
                     synthetic: None,
+                    battery: queries,
                     result,
                     index,
                 }
@@ -2332,5 +2511,38 @@ pub mod sql {
                 rows,
             }],
         });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::skip_note;
+
+        const PLANNED: usize = 43;
+        const MEASURED: usize = 36;
+
+        /// A partial battery must state its own denominator, name every
+        /// dropped query, and say the numbers exclude them.
+        #[test]
+        fn skip_note_states_the_denominator_and_names_the_skips() {
+            let skipped = vec![
+                ("q36", "cast error".to_string()),
+                ("q37", "cast error".to_string()),
+            ];
+            let note = skip_note(PLANNED, MEASURED, &skipped);
+            assert!(note.contains("36 of 43 queries measured"), "{note}");
+            assert!(note.contains("2 skipped"), "{note}");
+            assert!(note.contains("q36, q37"), "{note}");
+            // Identical reasons collapse to one — a 7-way repeat of the same
+            // DataFusion error would otherwise bury the note.
+            assert_eq!(note.matches("cast error").count(), 1, "{note}");
+        }
+
+        /// A complete battery says so without a skip clause.
+        #[test]
+        fn skip_note_omits_the_clause_when_nothing_was_skipped() {
+            let note = skip_note(PLANNED, PLANNED, &[]);
+            assert!(note.contains("43 of 43 queries measured"), "{note}");
+            assert!(!note.contains("skipped and excluded"), "{note}");
+        }
     }
 }
