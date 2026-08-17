@@ -30,11 +30,10 @@ pub mod vector_driver;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use infino::superfile::vector::distance::Metric;
-
 pub use driver::{
     BuildStat, EngineFtsResult, FtsQuery, PhaseStats, QueryStats, run_fts, run_fts_with_index,
 };
+use infino::superfile::vector::distance::Metric;
 pub use infino_engine::{
     InfinoFtsEngine, InfinoFtsIndex, build_positionless, parallel_build_positionless,
 };
