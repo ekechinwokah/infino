@@ -4,14 +4,14 @@
 //! Schema-driven SQL corpus: derives a queryable Arrow schema from a
 //! parquet dataset's own columns (no fixed [`crate::harness::SqlRow`]
 //! fixture) and streams the shards through it, converting `Binary` /
-//! `LargeBinary` columns to `LargeUtf8` since the SQL engines under test
-//! don't index raw bytes.
+//! `LargeBinary` columns to `Utf8` since the SQL engines under test don't
+//! index raw bytes, and the ClickBench `EventDate` column to `Date32`.
 
 use std::{fs::File, str::from_utf8, sync::Arc};
 
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, RecordBatch,
-    RecordBatchReader,
+    Array, ArrayRef, BinaryArray, Date32Array, Int16Array, Int32Array, Int64Array,
+    LargeBinaryArray, RecordBatch, RecordBatchReader, StringArray, UInt16Array, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use infino::superfile::vector::distance::Metric;
@@ -21,6 +21,13 @@ use crate::{
     corpus::{CorpusSource, PARQUET_BATCH_ROWS, PARQUET_VECTOR_COLUMNS, parquet_shards_for},
     harness::{SqlCorpusSpec, SqlVectorSpec},
 };
+
+/// The ClickBench `hits` dataset's day-count column. Named here (not
+/// inline) so the int -> Date32 special case is visible in one place;
+/// kept in parity with the upstream Infino ClickBench harness
+/// (`infino/bench/src/main.rs`) so query results and row counts are
+/// comparable to published numbers.
+const CLICKBENCH_EVENT_DATE_COLUMN: &str = "EventDate";
 
 /// A schema-driven SQL corpus: a dataset's own Arrow schema (binary
 /// columns rewritten to text) plus the batches read up to `max_rows`.
@@ -50,27 +57,34 @@ impl ParquetSqlCorpus {
 }
 
 /// Map each field's type to what the SQL engines under test can index:
-/// `Binary` / `LargeBinary` become `LargeUtf8`, everything else passes
-/// through unchanged. Nullability is preserved.
+/// `EventDate` becomes `Date32` (ClickBench's `hits` stores it as an
+/// integer day count), `Binary` / `LargeBinary` become `Utf8`, everything
+/// else passes through unchanged. Nullability is preserved.
 pub(crate) fn cast_schema_for_sql(schema: &Schema) -> SchemaRef {
     let fields: Vec<Field> = schema
         .fields()
         .iter()
-        .map(|f| match f.data_type() {
-            DataType::Binary | DataType::LargeBinary => {
-                Field::new(f.name(), DataType::LargeUtf8, f.is_nullable())
+        .map(|f| {
+            if f.name() == CLICKBENCH_EVENT_DATE_COLUMN {
+                Field::new(f.name(), DataType::Date32, f.is_nullable())
+            } else {
+                match f.data_type() {
+                    DataType::Binary | DataType::LargeBinary => {
+                        Field::new(f.name(), DataType::Utf8, f.is_nullable())
+                    }
+                    _ => f.as_ref().clone(),
+                }
             }
-            _ => f.as_ref().clone(),
         })
         .collect();
     Arc::new(Schema::new(fields))
 }
 
-/// Convert one `Binary`/`LargeBinary` column to `LargeUtf8`. Null stays
-/// null; valid UTF-8 passes through; invalid bytes are replaced lossily
-/// and counted. Not the arrow `cast` kernel: `cast` errors on invalid
-/// UTF-8, and real datasets (ClickBench `hits` included) carry some.
-pub(crate) fn binary_to_large_utf8(array: &ArrayRef) -> (ArrayRef, usize) {
+/// Convert one `Binary`/`LargeBinary` column to `Utf8`. Null stays null;
+/// valid UTF-8 passes through; invalid bytes are replaced lossily and
+/// counted. Not the arrow `cast` kernel: `cast` errors on invalid UTF-8,
+/// and real datasets (ClickBench `hits` included) carry some.
+pub(crate) fn binary_to_utf8(array: &ArrayRef) -> (ArrayRef, usize) {
     let mut lossy_rows = 0;
     let mut convert = |bytes: Option<&[u8]>| -> Option<String> {
         let bytes = bytes?;
@@ -89,31 +103,83 @@ pub(crate) fn binary_to_large_utf8(array: &ArrayRef) -> (ArrayRef, usize) {
         a.iter().map(&mut convert).collect()
     } else {
         panic!(
-            "binary_to_large_utf8 expects Binary or LargeBinary, got {:?}",
+            "binary_to_utf8 expects Binary or LargeBinary, got {:?}",
             array.data_type()
         )
     };
-    (Arc::new(LargeStringArray::from(values)), lossy_rows)
+    (Arc::new(StringArray::from(values)), lossy_rows)
 }
 
-/// Convert every `Binary`/`LargeBinary` column of one batch to `LargeUtf8`,
-/// against the already-derived `schema`. Returns the converted batch and
-/// the number of rows across the batch that needed lossy replacement.
+/// Convert an integer day-count column (`EventDate`'s on-disk type) to
+/// `Date32`, whose physical representation *is* a day count — no rounding
+/// or timezone math, just a widening reinterpret. Mirrors datafusion's
+/// `CAST(CAST(.. AS INTEGER) AS DATE)`, which the upstream harness relies
+/// on to make the same source column queryable as a date.
+fn event_date_to_date32(array: &ArrayRef) -> ArrayRef {
+    let days: Vec<Option<i32>> = match array.data_type() {
+        DataType::UInt16 => array
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("invariant: data_type checked above")
+            .iter()
+            .map(|v| v.map(i32::from))
+            .collect(),
+        DataType::UInt32 => array
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("invariant: data_type checked above")
+            .iter()
+            .map(|v| v.map(|v| v as i32))
+            .collect(),
+        DataType::Int16 => array
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .expect("invariant: data_type checked above")
+            .iter()
+            .map(|v| v.map(i32::from))
+            .collect(),
+        DataType::Int32 => array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("invariant: data_type checked above")
+            .iter()
+            .collect(),
+        DataType::Int64 => array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("invariant: data_type checked above")
+            .iter()
+            .map(|v| v.map(|v| v as i32))
+            .collect(),
+        other => {
+            panic!("{CLICKBENCH_EVENT_DATE_COLUMN} column has unsupported integer type {other:?}")
+        }
+    };
+    Arc::new(Date32Array::from(days))
+}
+
+/// Convert every `Binary`/`LargeBinary` column of one batch to `Utf8` and
+/// `EventDate` (int day count) to `Date32`, against the already-derived
+/// `schema`. Returns the converted batch and the number of rows across
+/// the batch that needed lossy UTF-8 replacement.
 fn convert_batch(schema: &SchemaRef, batch: &RecordBatch) -> (RecordBatch, usize) {
     let mut lossy_rows = 0;
     let columns: Vec<ArrayRef> = schema
         .fields()
         .iter()
         .zip(batch.columns())
-        .map(|(field, column)| match field.data_type() {
-            DataType::LargeUtf8
-                if matches!(column.data_type(), DataType::Binary | DataType::LargeBinary) =>
+        .map(|(field, column)| {
+            if field.name() == CLICKBENCH_EVENT_DATE_COLUMN {
+                event_date_to_date32(column)
+            } else if field.data_type() == &DataType::Utf8
+                && matches!(column.data_type(), DataType::Binary | DataType::LargeBinary)
             {
-                let (converted, rows) = binary_to_large_utf8(column);
+                let (converted, rows) = binary_to_utf8(column);
                 lossy_rows += rows;
                 converted
+            } else {
+                Arc::clone(column)
             }
-            _ => Arc::clone(column),
         })
         .collect();
     let converted = RecordBatch::try_new(Arc::clone(schema), columns)
@@ -206,6 +272,7 @@ pub fn open(source: &CorpusSource, max_rows: usize) -> ParquetSqlCorpus {
 
 #[cfg(test)]
 mod tests {
+    use arrow_array::{Date32Array, UInt16Array};
     use parquet::arrow::ArrowWriter;
     use tempfile::TempDir;
 
@@ -224,20 +291,60 @@ mod tests {
     const EMBEDDING_TEST_DIM: i32 = 8;
 
     #[test]
-    fn binary_columns_become_large_utf8_in_the_derived_schema() {
+    fn binary_columns_become_utf8_in_the_derived_schema() {
         let schema = Schema::new(vec![
             Field::new("Title", DataType::Binary, true),
             Field::new("URL", DataType::LargeBinary, true),
             Field::new("UserID", DataType::Int64, false),
         ]);
         let out = cast_schema_for_sql(&schema);
-        assert_eq!(out.field(0).data_type(), &DataType::LargeUtf8);
-        assert_eq!(out.field(1).data_type(), &DataType::LargeUtf8);
+        assert_eq!(out.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(out.field(1).data_type(), &DataType::Utf8);
         assert_eq!(
             out.field(2).data_type(),
             &DataType::Int64,
             "non-binary columns must pass through untouched"
         );
+    }
+
+    #[test]
+    fn event_date_column_becomes_date32_in_the_derived_schema() {
+        let schema = Schema::new(vec![
+            Field::new(CLICKBENCH_EVENT_DATE_COLUMN, DataType::UInt16, false),
+            Field::new("UserID", DataType::Int64, false),
+        ]);
+        let out = cast_schema_for_sql(&schema);
+        assert_eq!(
+            out.field(0).data_type(),
+            &DataType::Date32,
+            "EventDate must be cast to Date32 for parity with the upstream harness"
+        );
+        assert_eq!(out.field(1).data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn event_date_values_convert_from_integer_day_count_to_date32() {
+        let src_schema = Arc::new(Schema::new(vec![Field::new(
+            CLICKBENCH_EVENT_DATE_COLUMN,
+            DataType::UInt16,
+            false,
+        )]));
+        // Day count 15900 -> 2013-07-01, matching the upstream harness's
+        // CAST(CAST(.. AS INTEGER) AS DATE) semantics.
+        const EVENT_DATE_DAY_COUNT: u16 = 15900;
+        let array: ArrayRef = Arc::new(UInt16Array::from(vec![EVENT_DATE_DAY_COUNT]));
+        let batch = RecordBatch::try_new(Arc::clone(&src_schema), vec![array]).expect("batch");
+
+        let target_schema = cast_schema_for_sql(&src_schema);
+        let (converted, lossy_rows) = convert_batch(&target_schema, &batch);
+
+        assert_eq!(lossy_rows, 0);
+        let dates = converted
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .expect("Date32 column");
+        assert_eq!(dates.value(0), EVENT_DATE_DAY_COUNT as i32);
     }
 
     #[test]
@@ -248,12 +355,12 @@ mod tests {
             Some(&[0xffu8, 0xfe][..]),
             None,
         ]));
-        let (converted, replaced) = binary_to_large_utf8(&array);
+        let (converted, replaced) = binary_to_utf8(&array);
         assert_eq!(replaced, 1, "exactly one row had invalid bytes");
         let strings = converted
             .as_any()
-            .downcast_ref::<LargeStringArray>()
-            .expect("large utf8");
+            .downcast_ref::<StringArray>()
+            .expect("utf8");
         assert_eq!(strings.value(0), "ok");
         assert!(strings.is_null(2), "nulls stay null");
     }
