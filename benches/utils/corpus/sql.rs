@@ -18,13 +18,9 @@ use infino::superfile::vector::distance::Metric;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::{
-    corpus::{CorpusSource, PARQUET_VECTOR_COLUMNS, parquet_shards_for},
+    corpus::{CorpusSource, PARQUET_BATCH_ROWS, PARQUET_VECTOR_COLUMNS, parquet_shards_for},
     harness::{SqlCorpusSpec, SqlVectorSpec},
 };
-
-/// Rows per streamed Parquet batch. Matches the corpus module's reader
-/// chunking so memory behaviour is the same across corpus paths.
-const SQL_BATCH_ROWS: usize = 1_024;
 
 /// A schema-driven SQL corpus: a dataset's own Arrow schema (binary
 /// columns rewritten to text) plus the batches read up to `max_rows`.
@@ -170,7 +166,7 @@ pub fn open(source: &CorpusSource, max_rows: usize) -> ParquetSqlCorpus {
         let file = File::open(shard).unwrap_or_else(|e| panic!("open {}: {e}", shard.display()));
         let reader = ParquetRecordBatchReaderBuilder::try_new(file)
             .unwrap_or_else(|e| panic!("read {}: {e}", shard.display()))
-            .with_batch_size(SQL_BATCH_ROWS)
+            .with_batch_size(PARQUET_BATCH_ROWS)
             .build()
             .unwrap_or_else(|e| panic!("build reader {}: {e}", shard.display()));
         let schema = spec
@@ -216,7 +212,7 @@ mod tests {
     use super::*;
 
     /// Rows in the straddling-batch regression fixture's first (full) batch.
-    const STRADDLE_FIRST_BATCH_ROWS: usize = SQL_BATCH_ROWS;
+    const STRADDLE_FIRST_BATCH_ROWS: usize = PARQUET_BATCH_ROWS;
     /// Rows in the fixture's second batch, which straddles `max_rows`.
     const STRADDLE_SECOND_BATCH_ROWS: usize = 300;
     /// Rows kept from the second batch — the rest is discarded as over quota.
@@ -224,6 +220,8 @@ mod tests {
     /// `max_rows` for the fixture: exactly the retained-row count.
     const STRADDLE_MAX_ROWS: usize =
         STRADDLE_FIRST_BATCH_ROWS + STRADDLE_RETAINED_FROM_SECOND_BATCH;
+    /// Embedding width for the vector-spec-derivation fixture below.
+    const EMBEDDING_TEST_DIM: i32 = 8;
 
     #[test]
     fn binary_columns_become_large_utf8_in_the_derived_schema() {
@@ -274,9 +272,33 @@ mod tests {
         assert!(spec.vector.is_none());
     }
 
+    /// A `FixedSizeList<Float32>` column named after one of
+    /// [`PARQUET_VECTOR_COLUMNS`] must be picked up as the corpus's vector
+    /// spec, with `dim` read from the list size.
+    #[test]
+    fn spec_has_a_vector_spec_when_an_embedding_column_is_present() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("Title", DataType::LargeUtf8, true),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    EMBEDDING_TEST_DIM,
+                ),
+                true,
+            ),
+        ]));
+        let spec = spec_from_schema(schema);
+        let vector = spec
+            .vector
+            .expect("FixedSizeList<Float32> column must yield a vector spec");
+        assert_eq!(vector.column, "emb");
+        assert_eq!(vector.dim, EMBEDDING_TEST_DIM as usize);
+    }
+
     #[test]
     fn lossy_rows_excludes_rows_discarded_by_the_max_rows_truncation() {
-        // First batch fills SQL_BATCH_ROWS with valid ASCII. Second batch
+        // First batch fills PARQUET_BATCH_ROWS with valid ASCII. Second batch
         // straddles `max_rows`: its retained prefix is valid UTF-8, its
         // discarded tail is invalid UTF-8 that must never be counted.
         let mut values: Vec<Vec<u8>> = (0..STRADDLE_FIRST_BATCH_ROWS)

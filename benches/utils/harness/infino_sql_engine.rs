@@ -290,7 +290,7 @@ impl SqlEngine for InfinoSqlEngine {
 
 /// Supertable options for a schema-driven corpus: the dataset's own schema,
 /// its declared FTS columns, and its embedding column when it has one.
-pub fn spec_options(spec: &SqlCorpusSpec) -> SupertableOptions {
+fn spec_options(spec: &SqlCorpusSpec) -> SupertableOptions {
     let fts = spec
         .fts_columns
         .iter()
@@ -320,6 +320,25 @@ pub fn spec_options(spec: &SqlCorpusSpec) -> SupertableOptions {
     .expect("invariant: schema-driven supertable options are well-formed")
 }
 
+/// Appends every batch to `table` and commits once — the write-side tail
+/// shared by a freshly created table and one already handed to the engine.
+fn append_batches_and_commit(table: &Supertable, batches: &[RecordBatch]) {
+    let mut writer = table.writer().expect("writer");
+    for batch in batches {
+        writer.append(batch).expect("append batch");
+    }
+    writer.commit().expect("commit");
+    drop(writer);
+}
+
+/// Builds one in-memory supertable from `batches` via the public writer
+/// API, mirroring [`build_supertable`] for the schema-driven ingest path.
+fn build_supertable_from_batches(spec: &SqlCorpusSpec, batches: &[RecordBatch]) -> Supertable {
+    let table = Supertable::create(spec_options(spec)).expect("create supertable");
+    append_batches_and_commit(&table, batches);
+    table
+}
+
 impl SchemaDrivenSqlEngine for InfinoSqlEngine {
     fn create_with_spec(spec: &SqlCorpusSpec) -> Self::Index {
         InfinoSqlIndex {
@@ -332,12 +351,7 @@ impl SchemaDrivenSqlEngine for InfinoSqlEngine {
             .table
             .as_ref()
             .expect("invariant: created with a spec");
-        let mut writer = table.writer().expect("writer");
-        for batch in batches {
-            writer.append(batch).expect("append batch");
-        }
-        writer.commit().expect("commit");
-        drop(writer);
+        append_batches_and_commit(table, batches);
     }
 
     fn parallel_write_batches(spec: &SqlCorpusSpec, batches: &[RecordBatch], writers: usize) {
@@ -345,16 +359,7 @@ impl SchemaDrivenSqlEngine for InfinoSqlEngine {
         let per_writer = batches.len().div_ceil(writers);
         let built: Vec<Supertable> = batches
             .par_chunks(per_writer.max(1))
-            .map(|chunk| {
-                let table = Supertable::create(spec_options(spec)).expect("create supertable");
-                let mut writer = table.writer().expect("writer");
-                for batch in chunk {
-                    writer.append(batch).expect("append batch");
-                }
-                writer.commit().expect("commit");
-                drop(writer);
-                table
-            })
+            .map(|chunk| build_supertable_from_batches(spec, chunk))
             .collect();
         std::hint::black_box(built);
     }

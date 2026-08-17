@@ -1895,6 +1895,7 @@ pub mod sql {
     /// distinct from the synthetic ones: both arms persist into the same
     /// `sql.json`, and a shared key would diff a real corpus against the
     /// synthetic baseline every recorded number in the repo comes from.
+    const REAL_CORPUS_BUILD_ANCHOR: &str = "bench/sql/build/schema-driven";
     const REAL_CORPUS_QUERY_ANCHOR: &str = "bench/sql/query/schema-driven";
     const REAL_CORPUS_COST_ANCHOR: &str = "bench/sql/superfile/cost/schema-driven";
 
@@ -1978,9 +1979,9 @@ pub mod sql {
                 .last()
                 .expect("harness records at least one build row");
             // `warm_sets` is `Some` only when `synthetic` is (see
-            // `synthetic_extras_for`) — restores the exact pre-schema-driven
-            // argument here (text bytes only, no emb top-up), unaffected by
-            // `artifact.corpus_bytes` now covering the real-corpus arm too.
+            // `synthetic_extras_for`): raw text bytes only —
+            // `artifact.corpus_bytes` also carries the emb top-up and the
+            // real-corpus arm's Arrow payload, neither wanted here.
             let synthetic_corpus_bytes = artifact
                 .synthetic
                 .as_ref()
@@ -2020,7 +2021,7 @@ pub mod sql {
             .result
             .queries
             .iter()
-            .filter_map(|stat| warm_cost_for(&artifact.index, stat, battery))
+            .map(|stat| warm_cost_for(&artifact.index, stat, battery))
             .collect();
         if warm.is_empty() {
             eprintln!(
@@ -2066,16 +2067,20 @@ pub mod sql {
         index: &InfinoSqlIndex,
         stat: &SqlQueryStats,
         battery: &[SqlQuery],
-    ) -> Option<cost::WarmQueryCost> {
-        let sql = battery.iter().find(|q| q.name == stat.name)?.sql;
+    ) -> cost::WarmQueryCost {
+        let sql = battery
+            .iter()
+            .find(|q| q.name == stat.name)
+            .expect("invariant: every measured stat's name comes from this battery")
+            .sql;
         let (payload_rows, payload_bytes) = index.query_payload(sql);
-        Some(cost::WarmQueryCost {
+        cost::WarmQueryCost {
             name: stat.name.to_string(),
             p50_s: stat.p50.as_secs_f64(),
             cpu_s: stat.cpu_s,
             payload_rows,
             payload_bytes,
-        })
+        }
     }
 
     /// Per-query warm table for a real corpus. Deliberately narrower than the
@@ -2115,7 +2120,10 @@ pub mod sql {
                 corpus::corpus_label(),
                 fmt_count(artifact.actual_docs)
             ),
-            note: skip_note(planned, warm.len(), &artifact.result.skipped),
+            note: lossy_rows_note(
+                skip_note(planned, warm.len(), &artifact.result.skipped),
+                artifact.lossy_rows,
+            ),
             blocks: vec![Block {
                 subtitle: String::new(),
                 headers: real_corpus_query_headers(),
@@ -2151,6 +2159,19 @@ pub mod sql {
             names.join(", "),
             reasons.join(" | "),
         ));
+        note
+    }
+
+    /// Appends the dataset's lossy-UTF-8 replacement count to a report note,
+    /// when non-zero — genuinely useful provenance for a real corpus, absent
+    /// for the synthetic arm which never needs the lossy fallback.
+    fn lossy_rows_note(mut note: String, lossy_rows: usize) -> String {
+        if lossy_rows > 0 {
+            note.push_str(&format!(
+                " {} rows contained invalid UTF-8 in a binary column and were replaced lossily.",
+                fmt_count(lossy_rows)
+            ));
+        }
         note
     }
 
@@ -2206,6 +2227,9 @@ pub mod sql {
         battery: &'static [SqlQuery],
         result: EngineSqlResult,
         index: InfinoSqlIndex,
+        /// Rows the real-corpus loader replaced lossily (invalid UTF-8 in a
+        /// binary column); always zero for the synthetic arm, which has none.
+        lossy_rows: usize,
     }
 
     /// One `building N rows...` progress line, shared by both corpus arms.
@@ -2270,6 +2294,7 @@ pub mod sql {
                     battery: &[], // scalar battery measured via crate::executors::sql
                     result,
                     index,
+                    lossy_rows: 0,
                 }
             }
             source => {
@@ -2279,6 +2304,7 @@ pub mod sql {
                 );
                 let corpus = corpus::sql::open(source, n_docs);
                 let actual_docs = corpus.n_rows();
+                let lossy_rows = corpus.lossy_rows();
                 let corpus_bytes = payload_bytes(corpus.batches()).1;
                 log_build_start(phases, actual_docs, Some(corpus::corpus_label()));
                 // Empty unless `phases.warm`: this call always runs (warm/cold
@@ -2302,6 +2328,7 @@ pub mod sql {
                     battery: queries,
                     result,
                     index,
+                    lossy_rows,
                 }
             }
         }
@@ -2466,11 +2493,25 @@ pub mod sql {
         stored_bytes: u64,
     ) {
         // Real corpus: whatever columns its dataset carries, not the fixed list.
-        let schema_desc = match corpus::corpus_source() {
-            corpus::CorpusSource::Synthetic => {
-                format!("title + bucket + key + category + rating + emb[{SQL_DIM}]")
-            }
-            _ => format!("schema-driven from {}", corpus::corpus_label()),
+        // Anchor and "Corpus" meaning both diverge by arm: the real arm's
+        // Corpus is in-memory Arrow batch bytes (see `payload_bytes` at the
+        // call site), the synthetic arm's is raw generated text bytes plus an
+        // `emb` top-up — sharing an anchor would diff one against the other.
+        let (anchor, schema_desc, corpus_note) = match corpus::corpus_source() {
+            corpus::CorpusSource::Synthetic => (
+                "bench/sql/build",
+                format!("title + bucket + key + category + rating + emb[{SQL_DIM}]"),
+                "Corpus is raw generated text bytes (title/bucket/key/category/rating), \
+                 topped up for the inline-generated `emb` column."
+                    .to_string(),
+            ),
+            _ => (
+                REAL_CORPUS_BUILD_ANCHOR,
+                format!("schema-driven from {}", corpus::corpus_label()),
+                "Corpus is the in-memory Arrow `RecordBatch` payload for the loaded dataset, \
+                 not its on-disk parquet size."
+                    .to_string(),
+            ),
         };
         let rows: Vec<Vec<Cell>> = result
             .builds
@@ -2495,7 +2536,7 @@ pub mod sql {
             })
             .collect();
         report.emit(&Section {
-            anchor: "bench/sql/build".into(),
+            anchor: anchor.into(),
             title: format!(
                 "Superfile SQL — ingest, single superfile / in-memory ({} rows: {schema_desc})",
                 fmt_count(actual_docs)
@@ -2506,7 +2547,7 @@ pub mod sql {
                    sharded parallel build. Δ is vs the previous run."
                 .into(),
             blocks: vec![Block {
-                subtitle: String::new(),
+                subtitle: corpus_note,
                 headers: super::ingest_headers(),
                 rows,
             }],
@@ -2515,10 +2556,92 @@ pub mod sql {
 
     #[cfg(test)]
     mod tests {
-        use super::skip_note;
+        use std::sync::Arc;
+
+        use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use super::{skip_note, warm_cost_for};
+        use crate::harness::{
+            InfinoSqlEngine, SqlCorpusSpec, SqlQuery, SqlRunConfig, run_sql_batches_with_index,
+        };
 
         const PLANNED: usize = 43;
         const MEASURED: usize = 36;
+        /// Rows in the tiny schema-driven fixture the pricing test builds.
+        const PRICING_TEST_ROWS: i64 = 8;
+        const PRICING_TEST_BATTERY: &[SqlQuery] = &[
+            SqlQuery {
+                name: "count_all",
+                sql: "SELECT COUNT(*) FROM supertable",
+            },
+            SqlQuery {
+                name: "filtered",
+                sql: "SELECT n FROM supertable WHERE n < 4",
+            },
+        ];
+
+        fn pricing_test_batch() -> (SqlCorpusSpec, RecordBatch) {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("name", DataType::LargeUtf8, false),
+                Field::new("n", DataType::Int64, false),
+            ]));
+            let names = LargeStringArray::from(
+                (0..PRICING_TEST_ROWS)
+                    .map(|i| format!("row{i}"))
+                    .collect::<Vec<_>>(),
+            );
+            let ns = Int64Array::from((0..PRICING_TEST_ROWS).collect::<Vec<_>>());
+            let batch =
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(names), Arc::new(ns)])
+                    .expect("batch");
+            let spec = SqlCorpusSpec {
+                schema,
+                fts_columns: Vec::new(),
+                vector: None,
+            };
+            (spec, batch)
+        }
+
+        /// A measured real-corpus battery prices every surviving query, and
+        /// the measured/skipped split accounts for the whole planned
+        /// battery — the arithmetic the report note's "N of M measured"
+        /// line relies on.
+        #[test]
+        fn warm_cost_for_prices_every_measured_query_and_arithmetic_holds() {
+            let (spec, batch) = pricing_test_batch();
+            let cfg = SqlRunConfig {
+                iters: 1,
+                parallel: 1,
+            };
+            let (result, index) = run_sql_batches_with_index::<InfinoSqlEngine>(
+                cfg,
+                &spec,
+                &[batch],
+                PRICING_TEST_BATTERY,
+            );
+
+            let warm: Vec<_> = result
+                .queries
+                .iter()
+                .map(|stat| warm_cost_for(&index, stat, PRICING_TEST_BATTERY))
+                .collect();
+
+            assert!(
+                !warm.is_empty(),
+                "a measured battery must produce at least one warm cost entry"
+            );
+            assert_eq!(
+                warm.len(),
+                result.queries.len(),
+                "every measured stat must be priced"
+            );
+            assert_eq!(
+                warm.len() + result.skipped.len(),
+                PRICING_TEST_BATTERY.len(),
+                "measured + skipped must equal the planned battery size"
+            );
+        }
 
         /// A partial battery must state its own denominator, name every
         /// dropped query, and say the numbers exclude them.
