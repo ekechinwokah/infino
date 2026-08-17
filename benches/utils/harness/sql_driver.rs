@@ -66,19 +66,25 @@ pub fn run_sql<E: SqlEngine>(
     result
 }
 
-pub fn run_sql_with_index<E: SqlEngine>(
+/// Shared measurement skeleton: 1-writer ingest, optional N-writer probe,
+/// then the query battery. Ingest is supplied as closures so the row path
+/// and the schema-driven batch path share one copy of the timing logic.
+fn measure_sql<E: SqlEngine>(
     cfg: SqlRunConfig,
-    rows: &[SqlRow<'_>],
+    index: E::Index,
+    n_rows: usize,
+    ingest_1w: impl FnOnce(&mut E::Index),
+    ingest_nw: impl FnOnce(usize),
     queries: &[SqlQuery],
 ) -> (EngineSqlResult, E::Index) {
     eprintln!(
         "[harness/sql] {}: building 1-writer table over {} rows...",
         E::name(),
-        fmt_count(rows.len()),
+        fmt_count(n_rows),
     );
-    let mut index = E::open();
+    let mut index = index;
     let sampler = PeakSampler::start_default();
-    let ((), wall, cpu_s) = cpu::timed(|| E::write(&mut index, rows));
+    let ((), wall, cpu_s) = cpu::timed(|| ingest_1w(&mut index));
     let rss = sampler.stop_stats();
     let mut builds = vec![SqlBuildStat {
         writers: 1,
@@ -94,7 +100,7 @@ pub fn run_sql_with_index<E: SqlEngine>(
             cfg.parallel,
         );
         let sampler = PeakSampler::start_default();
-        let ((), wall, cpu_s) = cpu::timed(|| E::parallel_write(rows, cfg.parallel));
+        let ((), wall, cpu_s) = cpu::timed(|| ingest_nw(cfg.parallel));
         let rss = sampler.stop_stats();
         builds.push(SqlBuildStat {
             writers: cfg.parallel,
@@ -144,6 +150,21 @@ pub fn run_sql_with_index<E: SqlEngine>(
     )
 }
 
+pub fn run_sql_with_index<E: SqlEngine>(
+    cfg: SqlRunConfig,
+    rows: &[SqlRow<'_>],
+    queries: &[SqlQuery],
+) -> (EngineSqlResult, E::Index) {
+    measure_sql::<E>(
+        cfg,
+        E::open(),
+        rows.len(),
+        |index| E::write(index, rows),
+        |writers| E::parallel_write(rows, writers),
+        queries,
+    )
+}
+
 fn percentile_duration(samples: &mut [Duration], percentile: usize) -> Duration {
     if samples.is_empty() {
         return Duration::ZERO;
@@ -151,4 +172,96 @@ fn percentile_duration(samples: &mut [Duration], percentile: usize) -> Duration 
     samples.sort_unstable();
     let rank = ((percentile as f64 / 100.0) * samples.len() as f64).ceil() as usize;
     samples[rank.saturating_sub(1).min(samples.len() - 1)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::{Capabilities, SqlEngine, SqlOutput, SqlRow};
+
+    struct StubEngine;
+    #[derive(Default)]
+    struct StubIndex {
+        rows_written: usize,
+    }
+
+    impl SqlEngine for StubEngine {
+        type Index = StubIndex;
+        fn name() -> &'static str {
+            "stub"
+        }
+        fn capabilities() -> Capabilities {
+            Capabilities {
+                sql: true,
+                ..Default::default()
+            }
+        }
+        fn create() -> Self::Index {
+            StubIndex::default()
+        }
+        fn write(index: &mut Self::Index, rows: &[SqlRow<'_>]) {
+            index.rows_written = rows.len();
+        }
+        fn parallel_write(_rows: &[SqlRow<'_>], _writers: usize) {}
+        fn read(_index: &Self::Index, _sql: &str) -> SqlOutput {
+            SqlOutput { rows: 7 }
+        }
+        fn close(_index: &mut Self::Index) {}
+        fn delete(_index: Self::Index) {}
+    }
+
+    /// Compile-time proof that the public row-path signature is unchanged:
+    /// this is exactly how an out-of-repo engine calls it.
+    #[test]
+    fn run_sql_with_index_keeps_its_row_signature() {
+        let rows = [SqlRow {
+            doc_id: 0,
+            title: "a",
+            category: "c",
+            score: 1,
+        }];
+        let queries = [SqlQuery {
+            name: "q",
+            sql: "SELECT 1",
+        }];
+        let (result, index) = run_sql_with_index::<StubEngine>(
+            SqlRunConfig {
+                iters: 1,
+                parallel: 1,
+            },
+            &rows,
+            &queries,
+        );
+        assert_eq!(index.rows_written, 1);
+        assert_eq!(result.engine, "stub");
+        assert_eq!(
+            result.builds.len(),
+            1,
+            "parallel=1 must not add a build row"
+        );
+        assert_eq!(result.queries.len(), 1);
+        assert_eq!(result.queries[0].rows, 7);
+    }
+
+    /// The N-writer probe runs only above parallel=1, and receives the
+    /// configured writer count.
+    #[test]
+    fn parallel_probe_runs_only_above_one_writer() {
+        let rows = [SqlRow {
+            doc_id: 0,
+            title: "a",
+            category: "c",
+            score: 1,
+        }];
+        let (result, _index) = run_sql_with_index::<StubEngine>(
+            SqlRunConfig {
+                iters: 1,
+                parallel: 4,
+            },
+            &rows,
+            &[],
+        );
+        assert_eq!(result.builds.len(), 2);
+        assert_eq!(result.builds[1].writers, 4);
+    }
 }
