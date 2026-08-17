@@ -59,6 +59,10 @@ pub struct EngineSqlResult {
     pub engine: &'static str,
     pub builds: Vec<SqlBuildStat>,
     pub queries: Vec<SqlQueryStats>,
+    /// Queries whose read panicked (name, panic message) — dropped from
+    /// `queries` rather than fabricating a timing, but never silently: this
+    /// is the machine-readable record of what the panic already printed.
+    pub skipped: Vec<(&'static str, String)>,
 }
 
 pub fn run_sql<E: SqlEngine>(
@@ -127,30 +131,42 @@ fn measure_sql<E: SqlEngine>(
         );
     }
     let mut queries_out = Vec::with_capacity(queries.len());
-    let mut unplannable = Vec::new();
-    // A query a real dataset's schema can't satisfy (e.g. a type DataFusion
-    // won't implicitly cast) must not take down every other query's timing
-    // and the report that depends on it — catch, count, and keep going.
-    let prev_hook = panic::take_hook();
-    panic::set_hook(Box::new(|_| {}));
+    let mut skipped: Vec<(&'static str, String)> = Vec::new();
     for q in queries {
         let sampler = PeakSampler::start_default();
-        let warm = match panic::catch_unwind(AssertUnwindSafe(|| E::read(&index, q.sql))) {
+        // A panicking read — whether a schema the query can't be planned
+        // against, or a genuine engine bug — must not take down every other
+        // query's timing. The default panic hook still prints the message
+        // (that IS the diagnostic); this only stops it from being fatal.
+        let read = || panic::catch_unwind(AssertUnwindSafe(|| E::read(&index, q.sql)));
+        let warm = match read() {
             Ok(out) => out,
             Err(payload) => {
                 sampler.stop_stats();
-                unplannable.push((q.name, panic_payload_message(&payload)));
+                skipped.push((q.name, panic_payload_message(&*payload)));
                 continue;
             }
         };
         let mut samples = Vec::with_capacity(cfg.iters.max(1));
+        let mut broke_mid_loop = false;
         for _ in 0..cfg.iters.max(1) {
             let t0 = Instant::now();
-            let out = E::read(&index, q.sql);
-            samples.push(t0.elapsed());
-            std::hint::black_box(out);
+            match read() {
+                Ok(out) => {
+                    samples.push(t0.elapsed());
+                    std::hint::black_box(out);
+                }
+                Err(payload) => {
+                    skipped.push((q.name, panic_payload_message(&*payload)));
+                    broke_mid_loop = true;
+                    break;
+                }
+            }
         }
         let rss = sampler.stop_stats();
+        if broke_mid_loop {
+            continue; // no stable timing for a query that panicked partway through
+        }
         queries_out.push(SqlQueryStats {
             name: q.name,
             p50: percentile_duration(&mut samples, 50),
@@ -158,18 +174,14 @@ fn measure_sql<E: SqlEngine>(
             rows: warm.rows,
         });
     }
-    panic::set_hook(prev_hook);
-    if !unplannable.is_empty() {
+    if !skipped.is_empty() {
         eprintln!(
-            "[harness/sql] {}: {} of {} queries could not be planned or executed \
-             against this schema and were skipped:",
+            "[harness/sql] {}: {} of {} queries panicked and were skipped (see the panic \
+             output above for each)",
             E::name(),
-            unplannable.len(),
+            skipped.len(),
             queries.len(),
         );
-        for (name, message) in &unplannable {
-            eprintln!("[harness/sql]   {name}: {message}");
-        }
     }
 
     (
@@ -177,6 +189,7 @@ fn measure_sql<E: SqlEngine>(
             engine: E::name(),
             builds,
             queries: queries_out,
+            skipped,
         },
         index,
     )
@@ -218,7 +231,9 @@ pub fn run_sql_batches_with_index<E: SchemaDrivenSqlEngine>(
 
 /// Best-effort text for a caught panic payload — `catch_unwind` only
 /// guarantees `Any`, and the two payload shapes `panic!`/`.expect()` use
-/// cover it in practice.
+/// cover it in practice. Callers must pass `&*payload`, not `&payload`: the
+/// latter coerces to the boxed pointer's own (uninformative) `Any` impl
+/// instead of the panic value it points to.
 fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
     payload
         .downcast_ref::<&str>()
@@ -238,7 +253,10 @@ fn percentile_duration(samples: &mut [Duration], percentile: usize) -> Duration 
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use arrow_array::{ArrayRef, Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
@@ -385,24 +403,28 @@ mod tests {
         fn delete(_index: Self::Index) {}
     }
 
-    /// One query in the battery panicking (the real-world case: DataFusion
-    /// can't plan it against the dataset's schema) must not take down the
-    /// rest of the battery or lose the report the caller builds from it.
+    /// A panicking query FIRST in the battery must not take down the two
+    /// that follow it: they still get measured with real timings, and the
+    /// panic is recorded rather than dropped on the floor.
     #[test]
-    fn one_unplannable_query_is_skipped_not_fatal() {
+    fn unplannable_query_first_does_not_stop_the_rest() {
         let queries = [
-            SqlQuery {
-                name: "ok",
-                sql: "GOOD",
-            },
             SqlQuery {
                 name: "unplannable",
                 sql: "BAD",
             },
+            SqlQuery {
+                name: "ok1",
+                sql: "GOOD1",
+            },
+            SqlQuery {
+                name: "ok2",
+                sql: "GOOD2",
+            },
         ];
         let (result, _index) = run_sql_with_index::<FlakyEngine>(
             SqlRunConfig {
-                iters: 1,
+                iters: 2,
                 parallel: 1,
             },
             &[],
@@ -410,10 +432,92 @@ mod tests {
         );
         assert_eq!(
             result.queries.len(),
-            1,
-            "the unplannable query is dropped, not fabricated a timing"
+            2,
+            "both surviving queries are measured, not just the ones after the panic ceases"
         );
-        assert_eq!(result.queries[0].name, "ok");
+        assert_eq!(result.queries[0].name, "ok1");
+        assert_eq!(result.queries[1].name, "ok2");
+        assert!(
+            result.queries.iter().all(|q| q.rows == 1),
+            "survivors carry the engine's real row count, not a placeholder"
+        );
+        assert_eq!(
+            result.skipped.len(),
+            1,
+            "the panic is counted, not silently dropped"
+        );
+        assert_eq!(result.skipped[0].0, "unplannable");
+        assert!(
+            result.skipped[0]
+                .1
+                .contains("a query DataFusion can't plan"),
+            "the panic message is preserved: {:?}",
+            result.skipped[0].1
+        );
+    }
+
+    struct MidLoopFlakyEngine;
+    struct MidLoopFlakyIndex {
+        calls: AtomicUsize,
+    }
+
+    /// Panics on the third call (the warm read plus the first timed
+    /// iteration succeed; the second timed iteration panics) — the shape a
+    /// state-poisoning bug takes: fine at first, then breaks partway
+    /// through the timed loop rather than on the very first read.
+    impl SqlEngine for MidLoopFlakyEngine {
+        type Index = MidLoopFlakyIndex;
+        fn name() -> &'static str {
+            "mid-loop-flaky"
+        }
+        fn capabilities() -> Capabilities {
+            Capabilities {
+                sql: true,
+                ..Default::default()
+            }
+        }
+        fn create() -> Self::Index {
+            MidLoopFlakyIndex {
+                calls: AtomicUsize::new(0),
+            }
+        }
+        fn write(_index: &mut Self::Index, _rows: &[SqlRow<'_>]) {}
+        fn parallel_write(_rows: &[SqlRow<'_>], _writers: usize) {}
+        fn read(index: &Self::Index, _sql: &str) -> SqlOutput {
+            const PANICS_ON_CALL: usize = 3;
+            let call = index.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            assert_ne!(call, PANICS_ON_CALL, "panics after the warm read succeeded");
+            SqlOutput { rows: 1 }
+        }
+        fn close(_index: &mut Self::Index) {}
+        fn delete(_index: Self::Index) {}
+    }
+
+    /// [`sql_driver::measure_sql`] must catch a panic from the timed loop's
+    /// `E::read`, not only the warm read before it — otherwise a query that
+    /// is fine on its first call but breaks on a later one kills the whole
+    /// battery with zero diagnostics, worse than never catching panics at
+    /// all.
+    #[test]
+    fn panic_mid_timed_loop_is_caught_not_fatal() {
+        let queries = [SqlQuery {
+            name: "mid-loop",
+            sql: "Q",
+        }];
+        let (result, _index) = run_sql_with_index::<MidLoopFlakyEngine>(
+            SqlRunConfig {
+                iters: 3,
+                parallel: 1,
+            },
+            &[],
+            &queries,
+        );
+        assert!(
+            result.queries.is_empty(),
+            "a query that panics partway through has no stable timing to report"
+        );
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].0, "mid-loop");
     }
 
     /// The N-writer probe runs only above parallel=1, and receives the
