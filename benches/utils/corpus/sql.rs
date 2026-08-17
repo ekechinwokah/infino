@@ -179,11 +179,16 @@ pub fn open(source: &CorpusSource, max_rows: usize) -> ParquetSqlCorpus {
             .clone();
         for batch in reader {
             let batch = batch.unwrap_or_else(|e| panic!("read batch {}: {e}", shard.display()));
-            let (mut converted, rows) = convert_batch(&schema, &batch);
+            // Slice to the retained prefix BEFORE converting: `lossy_rows` must count
+            // only rows that end up in `batches`, never a discarded straddling tail.
+            let keep = batch.num_rows().min(max_rows - n_rows);
+            let batch = if keep < batch.num_rows() {
+                batch.slice(0, keep)
+            } else {
+                batch
+            };
+            let (converted, rows) = convert_batch(&schema, &batch);
             lossy_rows += rows;
-            if n_rows + converted.num_rows() > max_rows {
-                converted = converted.slice(0, max_rows - n_rows);
-            }
             n_rows += converted.num_rows();
             batches.push(converted);
             if n_rows >= max_rows {
@@ -205,7 +210,20 @@ pub fn open(source: &CorpusSource, max_rows: usize) -> ParquetSqlCorpus {
 
 #[cfg(test)]
 mod tests {
+    use parquet::arrow::ArrowWriter;
+    use tempfile::TempDir;
+
     use super::*;
+
+    /// Rows in the straddling-batch regression fixture's first (full) batch.
+    const STRADDLE_FIRST_BATCH_ROWS: usize = SQL_BATCH_ROWS;
+    /// Rows in the fixture's second batch, which straddles `max_rows`.
+    const STRADDLE_SECOND_BATCH_ROWS: usize = 300;
+    /// Rows kept from the second batch — the rest is discarded as over quota.
+    const STRADDLE_RETAINED_FROM_SECOND_BATCH: usize = 100;
+    /// `max_rows` for the fixture: exactly the retained-row count.
+    const STRADDLE_MAX_ROWS: usize =
+        STRADDLE_FIRST_BATCH_ROWS + STRADDLE_RETAINED_FROM_SECOND_BATCH;
 
     #[test]
     fn binary_columns_become_large_utf8_in_the_derived_schema() {
@@ -254,5 +272,55 @@ mod tests {
             "schema-driven corpora index no FTS columns"
         );
         assert!(spec.vector.is_none());
+    }
+
+    #[test]
+    fn lossy_rows_excludes_rows_discarded_by_the_max_rows_truncation() {
+        // First batch fills SQL_BATCH_ROWS with valid ASCII. Second batch
+        // straddles `max_rows`: its retained prefix is valid UTF-8, its
+        // discarded tail is invalid UTF-8 that must never be counted.
+        let mut values: Vec<Vec<u8>> = (0..STRADDLE_FIRST_BATCH_ROWS)
+            .map(|i| format!("row{i}").into_bytes())
+            .collect();
+        for i in 0..STRADDLE_SECOND_BATCH_ROWS {
+            let global = STRADDLE_FIRST_BATCH_ROWS + i;
+            values.push(if i < STRADDLE_RETAINED_FROM_SECOND_BATCH {
+                format!("row{global}").into_bytes()
+            } else {
+                vec![0xffu8, 0xfe]
+            });
+        }
+        let array: ArrayRef = Arc::new(BinaryArray::from(
+            values.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "junk",
+            DataType::Binary,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).expect("batch");
+
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("shard-0.parquet");
+        let file = File::create(&path).expect("create parquet shard");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("arrow writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let source = CorpusSource::LocalParquet {
+            dir: dir.path().to_path_buf(),
+        };
+        let corpus = open(&source, STRADDLE_MAX_ROWS);
+
+        assert_eq!(
+            corpus.n_rows(),
+            STRADDLE_MAX_ROWS,
+            "truncates exactly at max_rows"
+        );
+        assert_eq!(
+            corpus.lossy_rows(),
+            0,
+            "invalid UTF-8 in the discarded tail must not be counted"
+        );
     }
 }
