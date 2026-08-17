@@ -11,7 +11,9 @@
 
 use std::time::{Duration, Instant};
 
-use super::{SqlEngine, SqlRow};
+use arrow_array::RecordBatch;
+
+use super::{SchemaDrivenSqlEngine, SqlCorpusSpec, SqlEngine, SqlRow};
 use crate::{
     cpu,
     markdown::fmt_count,
@@ -165,6 +167,25 @@ pub fn run_sql_with_index<E: SqlEngine>(
     )
 }
 
+/// Schema-driven counterpart to [`run_sql_with_index`]: same measurement
+/// skeleton, batches instead of the fixed row fixture.
+pub fn run_sql_batches_with_index<E: SchemaDrivenSqlEngine>(
+    cfg: SqlRunConfig,
+    spec: &SqlCorpusSpec,
+    batches: &[RecordBatch],
+    queries: &[SqlQuery],
+) -> (EngineSqlResult, E::Index) {
+    let n_rows = batches.iter().map(RecordBatch::num_rows).sum();
+    measure_sql::<E>(
+        cfg,
+        E::create_with_spec(spec),
+        n_rows,
+        |index| E::write_batches(index, batches),
+        |writers| E::parallel_write_batches(spec, batches, writers),
+        queries,
+    )
+}
+
 fn percentile_duration(samples: &mut [Duration], percentile: usize) -> Duration {
     if samples.is_empty() {
         return Duration::ZERO;
@@ -176,8 +197,15 @@ fn percentile_duration(samples: &mut [Duration], percentile: usize) -> Duration 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+
     use super::*;
-    use crate::harness::{Capabilities, SqlEngine, SqlOutput, SqlRow};
+    use crate::harness::{
+        Capabilities, SchemaDrivenSqlEngine, SqlCorpusSpec, SqlEngine, SqlOutput, SqlRow,
+    };
 
     struct StubEngine;
     #[derive(Default)]
@@ -208,6 +236,50 @@ mod tests {
         }
         fn close(_index: &mut Self::Index) {}
         fn delete(_index: Self::Index) {}
+    }
+
+    impl SchemaDrivenSqlEngine for StubEngine {
+        fn create_with_spec(_spec: &SqlCorpusSpec) -> Self::Index {
+            StubIndex::default()
+        }
+        fn write_batches(index: &mut Self::Index, batches: &[RecordBatch]) {
+            index.rows_written = batches.iter().map(RecordBatch::num_rows).sum();
+        }
+        fn parallel_write_batches(
+            _spec: &SqlCorpusSpec,
+            _batches: &[RecordBatch],
+            _writers: usize,
+        ) {
+        }
+    }
+
+    fn stub_batch(rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let col = Int64Array::from((0..rows as i64).collect::<Vec<_>>());
+        RecordBatch::try_new(schema, vec![Arc::new(col) as ArrayRef]).expect("stub batch")
+    }
+
+    /// The batch path reports the summed row count of its batches and
+    /// reuses the same skeleton as the row path.
+    #[test]
+    fn batch_path_counts_rows_across_batches() {
+        let batches = [stub_batch(3), stub_batch(5)];
+        let spec = SqlCorpusSpec {
+            schema: batches[0].schema(),
+            fts_columns: Vec::new(),
+            vector: None,
+        };
+        let (result, index) = run_sql_batches_with_index::<StubEngine>(
+            SqlRunConfig {
+                iters: 1,
+                parallel: 1,
+            },
+            &spec,
+            &batches,
+            &[],
+        );
+        assert_eq!(index.rows_written, 8);
+        assert_eq!(result.builds.len(), 1);
     }
 
     /// Compile-time proof that the public row-path signature is unchanged:
