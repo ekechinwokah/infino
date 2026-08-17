@@ -1874,11 +1874,11 @@ pub mod sql {
     use crate::{
         corpus::{self, MmapTextCorpus},
         cost,
-        executors::{sql as exec_sql, sql::SqlRead},
+        executors::{payload_bytes, sql as exec_sql, sql::SqlRead},
         harness::{
             EngineSqlResult, InfinoSqlEngine, InfinoSqlIndex, SQL_DIM, SqlRow, SqlRunConfig,
-            build_supertable_with_options, run_sql_with_index, sample_query_csv, scatter_key,
-            sql_options,
+            build_supertable_with_options, run_sql_batches_with_index, run_sql_with_index,
+            sample_query_csv, scatter_key, sql_options,
         },
         markdown::{fmt_bandwidth, fmt_count, fmt_throughput, fmt_time},
         report::{Better, Block, Cell, Report, Section, metric, text},
@@ -1917,25 +1917,27 @@ pub mod sql {
             phases.warm,
             phases.cold,
         );
-        let (corpus, query_inputs, result, index) = build_warm_artifact(n_docs, phases);
+        let (corpus_bytes, synthetic, result, index) = build_warm_artifact(n_docs, phases);
 
         let mut report = Report::load("sql");
         if phases.build {
             let stored = stored_bytes(&index);
-            emit_build(&mut report, n_docs, &corpus, &result, stored);
+            emit_build(&mut report, n_docs, corpus_bytes, &result, stored);
         }
         let warm_sets = phases.warm.then(|| {
+            let extras = synthetic_extras_or_panic(&synthetic, "warm");
             exec_sql::assert_correct(&index, n_docs, "superfile_sql");
             exec_sql::measure_query_sets(
                 &index,
-                &query_inputs,
+                &extras.query_inputs,
                 exec_sql::ITERS,
                 "superfile_sql",
                 exec_sql::HIGH_CARD_SQL,
             )
         });
         let cold = phases.cold.then(|| {
-            let corpus_rows = corpus.rows();
+            let extras = synthetic_extras_or_panic(&synthetic, "cold");
+            let corpus_rows = extras.corpus.rows();
             let rows = sql_rows(&corpus_rows);
             measure_cold_queries(&rows)
         });
@@ -1964,7 +1966,7 @@ pub mod sql {
                 b.cpu_s,
                 Some(b.rss.peak_rss_bytes),
                 stored_bytes(&index),
-                corpus.total_bytes(),
+                corpus_bytes,
                 n_docs,
                 &cost::warm_from_sql(sets),
             );
@@ -1972,47 +1974,141 @@ pub mod sql {
         report.save();
     }
 
-    /// Build the canonical one-writer SQL table and run the warm scalar SQL
-    /// battery through the shared SQL driver.
+    /// Corpus artifacts the exec_sql-based warm/cold path needs: the fixed
+    /// `SqlRow` fixture (`title`/`category`/`key` columns) it assumes, plus
+    /// the query literals sampled from it. A schema-driven real corpus has
+    /// no such columns, so it carries none of this — [`synthetic_extras_or_panic`]
+    /// is the loud failure warm/cold hit instead of measuring the wrong shape.
+    struct SyntheticSqlExtras {
+        corpus: MmapTextCorpus,
+        query_inputs: exec_sql::QueryInputs,
+    }
+
+    /// Warm/cold measurement here is exec_sql's fixed-schema battery, which
+    /// only makes sense over the synthetic `SqlRow` fixture. Schema-driven
+    /// real corpora don't have one yet (their own query battery runs inline
+    /// during the build, see [`build_warm_artifact`]) — fail loudly naming
+    /// the corpus rather than measuring the wrong columns or falling back
+    /// to synthetic data.
+    fn synthetic_extras_or_panic<'a>(
+        synthetic: &'a Option<SyntheticSqlExtras>,
+        phase: &str,
+    ) -> &'a SyntheticSqlExtras {
+        synthetic.as_ref().unwrap_or_else(|| {
+            panic!(
+                "[superfile_sql] {phase} phase needs the synthetic SqlRow fixture; corpus \
+                 {:?} has no schema-driven {phase} path yet (build works; real-corpus warm/cold \
+                 is future work)",
+                corpus::corpus_label(),
+            )
+        })
+    }
+
+    /// Build the canonical one-writer SQL table for whichever corpus source
+    /// is active, returning the raw ingest payload size (for the build
+    /// report's bandwidth/size cells) alongside the synthetic-only warm/cold
+    /// extras (`None` for a real corpus — see [`SyntheticSqlExtras`]).
+    ///
+    /// Synthetic keeps the original path unchanged: generate, `sql_rows`,
+    /// `run_sql_with_index` with an empty query list (the warm battery runs
+    /// separately through `exec_sql`). Any other corpus source streams the
+    /// dataset's own schema through the schema-driven driver and runs the
+    /// ClickBench battery inline, since that battery has no exec_sql
+    /// counterpart for an arbitrary schema.
     fn build_warm_artifact(
         n_docs: usize,
         phases: Phases,
     ) -> (
-        MmapTextCorpus,
-        exec_sql::QueryInputs,
+        u64,
+        Option<SyntheticSqlExtras>,
         EngineSqlResult,
         InfinoSqlIndex,
     ) {
-        eprintln!(
-            "[superfile_sql] generating {}-row Zipfian corpus...",
-            fmt_count(n_docs)
-        );
-        let corpus = MmapTextCorpus::generate(n_docs, 1);
-        let corpus_rows = corpus.rows();
-        let mid = corpus_rows.len() / 2;
-        let query_inputs = exec_sql::QueryInputs {
-            qv: sample_query_csv(),
-            sample_title: corpus_rows[mid].1.replace('\'', "''"),
-            sample_key: scatter_key(corpus_rows[mid].0),
-            n_docs,
-        };
-        let rows = sql_rows(&corpus_rows);
+        match corpus::corpus_source() {
+            corpus::CorpusSource::Synthetic => {
+                eprintln!(
+                    "[superfile_sql] generating {}-row Zipfian corpus...",
+                    fmt_count(n_docs)
+                );
+                let corpus = MmapTextCorpus::generate(n_docs, 1);
+                let corpus_rows = corpus.rows();
+                let mid = corpus_rows.len() / 2;
+                let query_inputs = exec_sql::QueryInputs {
+                    qv: sample_query_csv(),
+                    sample_title: corpus_rows[mid].1.replace('\'', "''"),
+                    sample_key: scatter_key(corpus_rows[mid].0),
+                    n_docs,
+                };
+                let rows = sql_rows(&corpus_rows);
 
-        if phases.build {
-            eprintln!(
-                "[superfile_sql] building 1-writer supertable over {} rows...",
-                fmt_count(n_docs),
-            );
+                if phases.build {
+                    eprintln!(
+                        "[superfile_sql] building 1-writer supertable over {} rows...",
+                        fmt_count(n_docs),
+                    );
+                }
+                let (result, index) = run_sql_with_index::<InfinoSqlEngine>(
+                    SqlRunConfig {
+                        iters: exec_sql::ITERS,
+                        parallel: corpus::parallel_writers(),
+                    },
+                    &rows,
+                    &[], // scalar battery measured via crate::executors::sql
+                );
+                // The ingested schema also carries a `SQL_DIM`-wide `emb` column
+                // (see `harness::infino_sql_engine::sql_schema`) generated inline by
+                // `emb_for`, not through this `MmapTextCorpus` — so the text-only
+                // `total_bytes()` must be topped up with the embedding bytes or
+                // "Corpus"/"Bandwidth"/"Stored %" silently ignore the largest
+                // ingested column.
+                let corpus_bytes =
+                    corpus.total_bytes() + (n_docs * SQL_DIM * size_of::<f32>()) as u64;
+                (
+                    corpus_bytes,
+                    Some(SyntheticSqlExtras {
+                        corpus,
+                        query_inputs,
+                    }),
+                    result,
+                    index,
+                )
+            }
+            source => {
+                eprintln!(
+                    "[superfile_sql] loading real corpus ({}) for schema-driven SQL...",
+                    corpus::corpus_label(),
+                );
+                let corpus = corpus::sql::open(source, n_docs);
+                let corpus_bytes = payload_bytes(corpus.batches()).1;
+                if phases.build {
+                    eprintln!(
+                        "[superfile_sql] building 1-writer supertable over {} rows ({})...",
+                        fmt_count(corpus.n_rows()),
+                        corpus::corpus_label(),
+                    );
+                }
+                // Gated on `phases.warm`, mirroring the synthetic arm's empty
+                // list above: `build_warm_artifact` always runs (warm/cold need
+                // the table too), so an unconditional battery here would run 43
+                // ClickBench queries — and any resulting failure — during a
+                // `build`-only invocation that never asked for them.
+                let queries = if phases.warm {
+                    corpus::clickbench::queries()
+                } else {
+                    &[]
+                };
+                let (result, index) = run_sql_batches_with_index::<InfinoSqlEngine>(
+                    SqlRunConfig {
+                        iters: exec_sql::ITERS,
+                        parallel: corpus::parallel_writers(),
+                    },
+                    corpus.spec(),
+                    corpus.batches(),
+                    queries,
+                );
+                (corpus_bytes, None, result, index)
+            }
         }
-        let (result, index) = run_sql_with_index::<InfinoSqlEngine>(
-            SqlRunConfig {
-                iters: exec_sql::ITERS,
-                parallel: corpus::parallel_writers(),
-            },
-            &rows,
-            &[], // scalar battery measured via crate::executors::sql
-        );
-        (corpus, query_inputs, result, index)
     }
 
     struct ColdSqlArtifact {
@@ -2169,17 +2265,19 @@ pub mod sql {
     fn emit_build(
         report: &mut Report,
         n_docs: usize,
-        corpus: &MmapTextCorpus,
+        corpus_bytes: u64,
         result: &EngineSqlResult,
         stored_bytes: u64,
     ) {
-        // The ingested schema also carries a `SQL_DIM`-wide `emb` column
-        // (see `harness::infino_sql_engine::sql_schema`) generated inline by
-        // `emb_for`, not through this `MmapTextCorpus` — so the text-only
-        // `total_bytes()` must be topped up with the embedding bytes or
-        // "Corpus"/"Bandwidth"/"Stored %" silently ignore the largest
-        // ingested column.
-        let corpus_bytes = corpus.total_bytes() + (n_docs * SQL_DIM * size_of::<f32>()) as u64;
+        // The fixed synthetic schema is worth spelling out in full; a
+        // schema-driven real corpus has whatever columns its own dataset
+        // carries, so naming the corpus is the accurate substitute.
+        let schema_desc = match corpus::corpus_source() {
+            corpus::CorpusSource::Synthetic => {
+                format!("title + bucket + key + category + rating + emb[{SQL_DIM}]")
+            }
+            _ => format!("schema-driven from {}", corpus::corpus_label()),
+        };
         let rows: Vec<Vec<Cell>> = result
             .builds
             .iter()
@@ -2205,7 +2303,7 @@ pub mod sql {
         report.emit(&Section {
             anchor: "bench/sql/build".into(),
             title: format!(
-                "Superfile SQL — ingest, single superfile / in-memory ({} rows: title + bucket + key + category + rating + emb[{SQL_DIM}])",
+                "Superfile SQL — ingest, single superfile / in-memory ({} rows: {schema_desc})",
                 fmt_count(n_docs)
             ),
             note: "Build path: `SupertableWriter::append` + `commit` into an in-memory supertable, through \
