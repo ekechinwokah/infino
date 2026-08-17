@@ -691,6 +691,7 @@ fn page_floor(off: usize) -> usize {
 
 pub mod combined;
 pub mod grading;
+pub mod sql;
 
 pub use combined::SequentialSyntheticCorpus;
 
