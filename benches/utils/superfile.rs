@@ -658,6 +658,9 @@ pub mod fts {
         n_docs: usize,
         phases: Phases,
     ) -> (MmapTextCorpus, EngineFtsResult, InfinoFtsIndex) {
+        // This cell has no real-corpus reader; refuse `corpus=` loudly
+        // rather than silently measuring generated text under its label.
+        corpus::require_synthetic("superfile fts");
         eprintln!(
             "[superfile_fts] generating {}-doc Zipfian corpus...",
             fmt_count(n_docs)
@@ -1983,6 +1986,8 @@ pub mod sql {
         EngineSqlResult,
         InfinoSqlIndex,
     ) {
+        // Same guard as the FTS cell: synthetic-only, refuse a real corpus.
+        corpus::require_synthetic("superfile sql");
         eprintln!(
             "[superfile_sql] generating {}-row Zipfian corpus...",
             fmt_count(n_docs)

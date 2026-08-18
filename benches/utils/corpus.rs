@@ -1183,6 +1183,25 @@ impl MmapVectorCorpus {
 /// `benches/` rather than in a vector-only harness.
 const PARQUET_TEXT_COLUMNS: [&str; 3] = ["text", "title", "body"];
 
+/// Refuse a real corpus for a bench cell that only generates synthetic
+/// data. Falling back silently would measure generated data under the
+/// real corpus's label — and worse, `clamp_docs_to_corpus` sizes the run
+/// to the real dataset's row count, so the report would be shaped by rows
+/// the cell never read. The supertable tier is where real-corpus text and
+/// SQL runs live; the superfile micro-cells stay synthetic until they
+/// grow real readers of their own.
+pub fn require_synthetic(cell: &str) {
+    if !matches!(corpus_source(), CorpusSource::Synthetic) {
+        panic!(
+            "corpus {} is not supported by the `{cell}` cell: it measures its \
+             synthetic corpus only, so running it under a real corpus label \
+             would report numbers for data it never read — drop `corpus=` for \
+             this cell, or run the supertable tier, which consumes real corpora",
+            corpus_label()
+        );
+    }
+}
+
 /// Whether the active corpus can supply text (and therefore feed FTS /
 /// SQL). Synthetic always can; a parquet dataset can when it carries one
 /// of [`PARQUET_TEXT_COLUMNS`]; an ann-benchmarks dataset never can — its

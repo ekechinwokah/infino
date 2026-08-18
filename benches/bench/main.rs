@@ -317,7 +317,10 @@ fn print_usage_and_exit(code: i32) -> ! {
          Diagnostic: scale | tombstone | update | sql-diag | fts-diag | object-store | concurrent | disk-warm | recall_while_ingest,\n\
          \x20           or `diagnostic` for the grouped set / `diagnostic <names>` for a subset\n\
          \n\
-         corpus=<spec>     : vector corpus source (default synthetic)\n\
+         corpus=<spec>     : corpus source (default synthetic). Vector cells\n\
+         \x20                   always consume it; supertable fts/sql consume its\n\
+         \x20                   text (the dataset must carry a text column);\n\
+         \x20                   superfile fts/sql are synthetic-only and refuse it.\n\
          \x20   synthetic          seeded planted-cluster generator\n\
          \x20   annb:<slug>        published ann-benchmarks dataset; ships official\n\
          \x20                      queries + top-k neighbours (glove-100-angular,\n\
