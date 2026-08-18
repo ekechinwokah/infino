@@ -319,8 +319,9 @@ fn print_usage_and_exit(code: i32) -> ! {
          \n\
          corpus=<spec>     : corpus source (default synthetic). Vector cells\n\
          \x20                   always consume it; supertable fts/sql consume its\n\
-         \x20                   text (the dataset must carry a text column);\n\
-         \x20                   superfile fts/sql are synthetic-only and refuse it.\n\
+         \x20                   text (the dataset must carry a text column); the\n\
+         \x20                   superfile sql cell ingests its schema; superfile\n\
+         \x20                   fts is synthetic-only and refuses it.\n\
          \x20   synthetic          seeded planted-cluster generator\n\
          \x20   annb:<slug>        published ann-benchmarks dataset; ships official\n\
          \x20                      queries + top-k neighbours (glove-100-angular,\n\

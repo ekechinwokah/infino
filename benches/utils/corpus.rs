@@ -689,8 +689,10 @@ fn page_floor(off: usize) -> usize {
     off & !(PAGE_BYTES - 1)
 }
 
+pub mod clickbench;
 pub mod combined;
 pub mod grading;
+pub mod sql;
 
 pub use combined::SequentialSyntheticCorpus;
 
@@ -1187,9 +1189,10 @@ const PARQUET_TEXT_COLUMNS: [&str; 3] = ["text", "title", "body"];
 /// data. Falling back silently would measure generated data under the
 /// real corpus's label — and worse, `clamp_docs_to_corpus` sizes the run
 /// to the real dataset's row count, so the report would be shaped by rows
-/// the cell never read. The supertable tier is where real-corpus text and
-/// SQL runs live; the superfile micro-cells stay synthetic until they
-/// grow real readers of their own.
+/// the cell never read. Real-corpus text lives on the supertable tier;
+/// the superfile SQL cell reads real corpora through its schema-driven
+/// path, and the superfile FTS cell stays synthetic until it grows a
+/// reader of its own.
 pub fn require_synthetic(cell: &str) {
     if !matches!(corpus_source(), CorpusSource::Synthetic) {
         panic!(
