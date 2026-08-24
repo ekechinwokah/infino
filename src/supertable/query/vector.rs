@@ -106,7 +106,7 @@ use crate::{
         fts::reader::BoolMode,
         vector::{
             distance::{Metric, distance, normalize, relative_score_window},
-            hnsw::{self, HnswParams, Sq16Scorer, encode_hnsw},
+            hnsw::{self, HnswParams, NodeScorer, PlaneScorer, Sq4Scorer, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
             reader::ScanCandidate,
         },
@@ -1573,6 +1573,13 @@ fn warn_hnsw_no_resident_graph(column: &str, has_graph_ref: bool) {
 /// the codes, and return the encoded bundle bytes. `Ok(None)` when the
 /// column is absent, not Sq16, or empty; `Err` only on a genuine read
 /// fault (the drain treats that as "skip the graph", never fatal).
+/// Rotation seed for a freshly built Sq4 resident plane. Private to the
+/// plane (it need not match the column's RaBitQ rotation — any seeded
+/// orthogonal rotation isotropizes the coordinates); persisted in the
+/// bundle so decode reconstructs the identical rotation, and inherited by
+/// incremental drains like the ruler and `(m0, ef)`.
+const HNSW_PLANE_ROT_SEED: u64 = 0x5147_5240_7031_A11E;
+
 /// Held-out query count for calibration recall measurement.
 const HNSW_CALIB_QUERIES: usize = 200;
 /// The `k` calibration and the incremental recall re-check measure at (the
@@ -1907,27 +1914,50 @@ pub(crate) async fn assemble_hnsw_sections(
     // Calibrate on the reader pool, not inline on the tokio worker or the
     // global rayon pool. The scorer owns the (multi-GB) plane, so move it into
     // the closure and hand it back for the encode below rather than cloning.
-    let (target_recall, recall_slack, ef_construction) = (
+    //
+    // The plane codec is gated here and NOWHERE else: the resident plane is
+    // built, calibrated, registered, persisted and served as one codec, and
+    // calibration measures recall WITH that codec — so a plane too coarse to
+    // clear the register floor declines itself to ivf through the existing
+    // None→fallback, with no separate safety mechanism. The (CPU-bound) Sq4
+    // re-quantization of the decoded Sq16 rows runs inside the pool closure
+    // with the calibration it feeds.
+    let (target_recall, recall_slack, ef_construction, plane_codec) = (
         vcfg.target_recall,
         vcfg.hnsw_recall_slack,
         vcfg.hnsw_ef_construction,
+        vcfg.hnsw_plane,
     );
-    let (scorer, choice, graph) = run_on_pool(
+    let (plane, choice, graph) = run_on_pool(
         Some(&manifest.options.reader_pool),
         "hnsw calibrate: reader pool dropped result",
         move || {
-            let (choice, graph) = hnsw::calibrate_graph(
-                &scorer,
-                &m0_cands,
-                &ef_cands,
-                target_recall,
-                recall_slack,
-                ef_construction,
-                HNSW_CALIB_QUERIES,
-                HNSW_CALIB_RECALL_K,
-                HNSW_CALIB_SEED,
-            );
-            (scorer, choice, graph)
+            let plane = plane_from_sq16(scorer, plane_codec);
+            let (choice, graph) = match &plane {
+                PlaneScorer::Sq16(s) => hnsw::calibrate_graph(
+                    s,
+                    &m0_cands,
+                    &ef_cands,
+                    target_recall,
+                    recall_slack,
+                    ef_construction,
+                    HNSW_CALIB_QUERIES,
+                    HNSW_CALIB_RECALL_K,
+                    HNSW_CALIB_SEED,
+                ),
+                PlaneScorer::Sq4(s) => hnsw::calibrate_graph(
+                    s,
+                    &m0_cands,
+                    &ef_cands,
+                    target_recall,
+                    recall_slack,
+                    ef_construction,
+                    HNSW_CALIB_QUERIES,
+                    HNSW_CALIB_RECALL_K,
+                    HNSW_CALIB_SEED,
+                ),
+            };
+            (plane, choice, graph)
         },
     )
     .await
@@ -1956,13 +1986,35 @@ pub(crate) async fn assemble_hnsw_sections(
     );
     let graph = graph.expect("registered choice carries its pruned graph");
     Ok(Some(encode_hnsw(
-        scorer.codes(),
-        &doc_ids,
-        &graph,
-        dim,
-        choice.ef,
-        column,
+        &plane, &doc_ids, &graph, dim, choice.ef, column,
     )))
+}
+
+/// Build the resident plane the config gates, from the Sq16 codes the
+/// drained superfiles hold. Sq16 adopts the codes verbatim (zero copy
+/// beyond the collect); the Sq4 codecs re-quantize the decoded rows onto
+/// a freshly fitted per-coordinate ruler. CPU-bound — callers run it on
+/// the reader pool.
+fn plane_from_sq16(scorer: Sq16Scorer, codec: config::VectorHnswPlane) -> PlaneScorer {
+    match codec {
+        config::VectorHnswPlane::Sq16 => PlaneScorer::Sq16(scorer),
+        config::VectorHnswPlane::Sq4 => PlaneScorer::Sq4(Sq4Scorer::from_sq16_plane(
+            scorer.codes(),
+            scorer.dim(),
+            scorer.len(),
+            false,
+            HNSW_PLANE_ROT_SEED,
+            None,
+        )),
+        config::VectorHnswPlane::Sq4Residual => PlaneScorer::Sq4(Sq4Scorer::from_sq16_plane(
+            scorer.codes(),
+            scorer.dim(),
+            scorer.len(),
+            true,
+            HNSW_PLANE_ROT_SEED,
+            None,
+        )),
+    }
 }
 
 /// Incrementally extend a prior persisted `hnsw` graph with a
@@ -2061,14 +2113,66 @@ pub(crate) async fn assemble_hnsw_incremental(
     // graph would be inconsistent), and the stamped query beam carries forward.
     let inherited_m0 = prior.graph.base_degree();
     let inherited_ef = prior.ef_search;
-    let mut codes = prior.scorer.codes().to_vec();
-    codes.extend_from_slice(&new_codes);
     let mut doc_ids = prior.doc_ids;
     doc_ids.extend_from_slice(&new_doc_ids);
     let total = doc_ids.len();
-    // The scorer owns the extended plane; the encoder borrows it back via
-    // `scorer.codes()` rather than holding a second owned copy.
-    let scorer = Sq16Scorer::from_codes(codes, dim, total);
+    // The plane CODEC is inherited from the prior bundle exactly like
+    // (m0, ef): the resident nodes were built, calibrated and registered on
+    // that codec's geometry, so the delta must land on the same plane — and
+    // for the fitted Sq4 codecs, on the same RULER (the first-input-ruler
+    // rule the adaptive rerank codecs follow on merge; a refit would move
+    // every existing node's reconstruction). A config change to
+    // `vector.hnsw_plane` therefore takes effect on the next FULL rebuild,
+    // not mid-extend.
+    // The scorer owns the extended plane; the encoder borrows it back
+    // rather than holding a second owned copy.
+    let scorer = match &prior.scorer {
+        PlaneScorer::Sq16(prior_sq16) => {
+            let mut codes = prior_sq16.codes().to_vec();
+            codes.extend_from_slice(&new_codes);
+            PlaneScorer::Sq16(Sq16Scorer::from_codes(codes, dim, total))
+        }
+        PlaneScorer::Sq4(prior_sq4) => {
+            let (pcodes, pres, offset, step) = prior_sq4.parts();
+            let delta = Sq4Scorer::from_sq16_plane(
+                &new_codes,
+                dim,
+                new_doc_ids.len(),
+                prior_sq4.has_residual(),
+                prior_sq4.rot_seed(),
+                Some((offset, step)),
+            );
+            let (dcodes, dres, _, _) = delta.parts();
+            let mut codes = pcodes.to_vec();
+            codes.extend_from_slice(dcodes);
+            let residual = match (pres, dres) {
+                (Some(a), Some(b)) => {
+                    let mut r = a.to_vec();
+                    r.extend_from_slice(b);
+                    Some(r)
+                }
+                (None, None) => None,
+                // A prior bundle cannot disagree with a delta it derived:
+                // `from_sq16_plane` was told the prior's residual-ness.
+                _ => return Ok(None),
+            };
+            let offset = offset.to_vec();
+            let step = step.to_vec();
+            match Sq4Scorer::from_parts(
+                codes,
+                residual,
+                offset,
+                step,
+                prior_sq4.rot_seed(),
+                dim,
+                total,
+            ) {
+                Some(sc) => PlaneScorer::Sq4(sc),
+                // Shape mismatch means a corrupt prior plane: full rebuild.
+                None => return Ok(None),
+            }
+        }
+    };
     let vcfg = &config::global().vector;
     let (target_recall, recall_slack, ef_construction, probe_cap) = (
         vcfg.target_recall,
@@ -2091,7 +2195,10 @@ pub(crate) async fn assemble_hnsw_incremental(
                 ..HnswParams::default()
             };
             // Insert ONLY the new node range into a copy of the prior graph.
-            let graph = prior_graph.extend(&scorer, params);
+            let graph = match &scorer {
+                PlaneScorer::Sq16(s) => prior_graph.extend(s, params),
+                PlaneScorer::Sq4(s) => prior_graph.extend(s, params),
+            };
             // Re-check recall on the grown graph. The base-layer degree
             // requirement rises with N, so inherited `(m0, ef)` calibrated at a
             // smaller population can drift below the bar as an append-only table
@@ -2105,37 +2212,102 @@ pub(crate) async fn assemble_hnsw_incremental(
             // recheck ~O(probe_cap) regardless of how large the table has grown.
             let recall = if total > probe_cap {
                 let step = total / probe_cap;
-                let stride_bytes = dim * 2;
-                let mut sample: Vec<u8> = Vec::with_capacity(probe_cap * stride_bytes);
-                for (i, row) in scorer.codes().chunks_exact(stride_bytes).enumerate() {
-                    if i.is_multiple_of(step) {
-                        sample.extend_from_slice(row);
+                match &scorer {
+                    PlaneScorer::Sq16(full) => {
+                        let stride_bytes = dim * 2;
+                        let mut sample: Vec<u8> = Vec::with_capacity(probe_cap * stride_bytes);
+                        for (i, row) in full.codes().chunks_exact(stride_bytes).enumerate() {
+                            if i.is_multiple_of(step) {
+                                sample.extend_from_slice(row);
+                            }
+                        }
+                        let pn = sample.len() / stride_bytes;
+                        let psc = Sq16Scorer::from_codes(sample, dim, pn);
+                        hnsw::calibrate_graph(
+                            &psc,
+                            &[inherited_m0],
+                            &[inherited_ef],
+                            target_recall,
+                            recall_slack,
+                            ef_construction,
+                            HNSW_CALIB_QUERIES,
+                            HNSW_CALIB_RECALL_K,
+                            HNSW_CALIB_SEED,
+                        )
+                        .0
+                        .recall
+                    }
+                    PlaneScorer::Sq4(full) => {
+                        // Same strided subsample over the packed rows; the
+                        // sample inherits the full plane's ruler verbatim,
+                        // so its recall measures the served codec.
+                        let (codes, res, offset, ruler_step) = full.parts();
+                        // Packed rows span the ROTATED (padded) space.
+                        let stride_bytes = dim.next_power_of_two().div_ceil(2);
+                        let mut sc: Vec<u8> = Vec::with_capacity(probe_cap * stride_bytes);
+                        let mut sr: Option<Vec<u8>> = res.map(|_| Vec::new());
+                        for i in 0..total {
+                            if i.is_multiple_of(step) {
+                                sc.extend_from_slice(
+                                    &codes[i * stride_bytes..(i + 1) * stride_bytes],
+                                );
+                                if let (Some(sr), Some(res)) = (sr.as_mut(), res) {
+                                    sr.extend_from_slice(
+                                        &res[i * stride_bytes..(i + 1) * stride_bytes],
+                                    );
+                                }
+                            }
+                        }
+                        let pn = sc.len() / stride_bytes;
+                        match Sq4Scorer::from_parts(
+                            sc,
+                            sr,
+                            offset.to_vec(),
+                            ruler_step.to_vec(),
+                            full.rot_seed(),
+                            dim,
+                            pn,
+                        ) {
+                            Some(psc) => {
+                                hnsw::calibrate_graph(
+                                    &psc,
+                                    &[inherited_m0],
+                                    &[inherited_ef],
+                                    target_recall,
+                                    recall_slack,
+                                    ef_construction,
+                                    HNSW_CALIB_QUERIES,
+                                    HNSW_CALIB_RECALL_K,
+                                    HNSW_CALIB_SEED,
+                                )
+                                .0
+                                .recall
+                            }
+                            // A malformed sample cannot certify the bar:
+                            // report zero so the caller does a full rebuild.
+                            None => 0.0,
+                        }
                     }
                 }
-                let pn = sample.len() / stride_bytes;
-                let psc = Sq16Scorer::from_codes(sample, dim, pn);
-                hnsw::calibrate_graph(
-                    &psc,
-                    &[inherited_m0],
-                    &[inherited_ef],
-                    target_recall,
-                    recall_slack,
-                    ef_construction,
-                    HNSW_CALIB_QUERIES,
-                    HNSW_CALIB_RECALL_K,
-                    HNSW_CALIB_SEED,
-                )
-                .0
-                .recall
             } else {
-                hnsw::measure_recall(
-                    &graph,
-                    &scorer,
-                    inherited_ef,
-                    HNSW_CALIB_RECALL_K,
-                    HNSW_CALIB_QUERIES,
-                    HNSW_CALIB_SEED,
-                )
+                match &scorer {
+                    PlaneScorer::Sq16(s) => hnsw::measure_recall(
+                        &graph,
+                        s,
+                        inherited_ef,
+                        HNSW_CALIB_RECALL_K,
+                        HNSW_CALIB_QUERIES,
+                        HNSW_CALIB_SEED,
+                    ),
+                    PlaneScorer::Sq4(s) => hnsw::measure_recall(
+                        &graph,
+                        s,
+                        inherited_ef,
+                        HNSW_CALIB_RECALL_K,
+                        HNSW_CALIB_QUERIES,
+                        HNSW_CALIB_SEED,
+                    ),
+                }
             };
             (scorer, graph, recall)
         },
@@ -2147,7 +2319,7 @@ pub(crate) async fn assemble_hnsw_incremental(
     }
     let new_high_water = doc_ids.iter().copied().max().unwrap_or(prior_high_water);
     Ok(Some((
-        encode_hnsw(scorer.codes(), &doc_ids, &graph, dim, inherited_ef, column),
+        encode_hnsw(&scorer, &doc_ids, &graph, dim, inherited_ef, column),
         new_high_water,
         inserted,
     )))
@@ -2228,23 +2400,25 @@ impl SupertableReader {
                     .data
                     .as_ref()
                     .expect("data present: checked before dispatch");
-                data.graph
-                    .search(&data.scorer, &query_owned, k_fetch, ef)
-                    .into_iter()
-                    .filter_map(|(node, dist)| {
-                        // Shift the graph's `−dot` onto the ivf/scan arm's
-                        // `1 − dot` cosine scale so the cross-arm merge
-                        // (top_k_ascending) compares like with like. Monotonic
-                        // in `dist`, so intra-arm order is unchanged; the public
-                        // `score` column stays non-negative.
-                        Some(SuperfileHit {
-                            superfile: SuperfileUri(Uuid::nil()),
-                            local_doc_id: 0,
-                            score: 1.0 + dist,
-                            stable_id: Some(*data.doc_ids.get(node as usize)?),
-                        })
+                match &data.scorer {
+                    PlaneScorer::Sq16(s) => data.graph.search(s, &query_owned, k_fetch, ef),
+                    PlaneScorer::Sq4(s) => data.graph.search(s, &query_owned, k_fetch, ef),
+                }
+                .into_iter()
+                .filter_map(|(node, dist)| {
+                    // Shift the graph's `−dot` onto the ivf/scan arm's
+                    // `1 − dot` cosine scale so the cross-arm merge
+                    // (top_k_ascending) compares like with like. Monotonic
+                    // in `dist`, so intra-arm order is unchanged; the public
+                    // `score` column stays non-negative.
+                    Some(SuperfileHit {
+                        superfile: SuperfileUri(Uuid::nil()),
+                        local_doc_id: 0,
+                        score: 1.0 + dist,
+                        stable_id: Some(*data.doc_ids.get(node as usize)?),
                     })
-                    .collect()
+                })
+                .collect()
             },
         )
         .await

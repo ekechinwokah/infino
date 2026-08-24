@@ -109,6 +109,59 @@ impl RandomRotation {
     /// thread-local scratch buffer (one allocation per thread, reused),
     /// then copies the leading `dim` components into `out`.
     #[inline]
+    /// [`Self::apply`] keeping EVERY padded component: `out` has length
+    /// `padded_dim`, not `dim`. On a power-of-two `dim` this is `apply`;
+    /// on any other `dim` the sliced form is a projection (energy leaks
+    /// into the padding lanes it drops), while the padded form is an
+    /// exact isometry — `⟨R x, R q⟩ = ⟨x, q⟩` bit-for-bit in exact
+    /// arithmetic. A codec that SCORES in rotated space (the Sq4 resident
+    /// plane) must keep the padded components or every non-pow2 dim pays
+    /// a silent dot-product error; the 1-bit sign codes tolerate the
+    /// sliced form by design and keep using `apply`.
+    pub fn apply_padded(&self, x: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(x.len(), self.dim);
+        debug_assert_eq!(out.len(), self.padded_dim);
+        let m = self.padded_dim;
+        let scale = 1.0 / (m as f32).sqrt();
+        out[..self.dim].copy_from_slice(x);
+        out[self.dim..].fill(0.0);
+        for stage_signs in &self.signs {
+            apply_signs(out, stage_signs);
+            walsh_hadamard(out);
+            scale_in_place(out, scale);
+        }
+    }
+
+    /// Inverse of [`Self::apply_padded`]: `x_padded` (length
+    /// `padded_dim`) back to the original space, sliced to `dim`. Each
+    /// stage is self-inverse (the normalized WHT is symmetric orthogonal
+    /// and a `±1` diagonal is its own inverse), so the inverse applies
+    /// the stages in reverse order with the per-stage operations
+    /// swapped: un-transform, then un-flip.
+    pub fn apply_inverse_padded(&self, x_padded: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(x_padded.len(), self.padded_dim);
+        debug_assert_eq!(out.len(), self.dim);
+        let m = self.padded_dim;
+        let scale = 1.0 / (m as f32).sqrt();
+        SCRATCH.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            buf.extend_from_slice(x_padded);
+            for stage_signs in self.signs.iter().rev() {
+                walsh_hadamard(&mut buf);
+                scale_in_place(&mut buf, scale);
+                apply_signs(&mut buf, stage_signs);
+            }
+            out.copy_from_slice(&buf[..self.dim]);
+        });
+    }
+
+    /// Transform working size: `dim` rounded up to a power of two — the
+    /// component count [`Self::apply_padded`] produces.
+    pub fn padded_dim(&self) -> usize {
+        self.padded_dim
+    }
+
     pub fn apply(&self, x: &[f32], out: &mut [f32]) {
         debug_assert_eq!(x.len(), self.dim);
         debug_assert_eq!(out.len(), self.dim);
@@ -380,6 +433,43 @@ mod tests {
                 "linearity broken at i={i}: got {} expected {expected}",
                 r_combined[i]
             );
+        }
+    }
+
+    /// `apply_padded` must be an exact isometry on every dim (pow2 or
+    /// not): padded dot products equal raw dot products, and the padded
+    /// inverse returns the original vector. This is the property the Sq4
+    /// resident plane scores through; the sliced `apply` deliberately
+    /// does not hold it for non-pow2 dims.
+    #[test]
+    fn padded_apply_is_an_exact_isometry_and_inverts() {
+        for &dim in &[8usize, 24, 96, 768] {
+            let rot = RandomRotation::new(dim, 0xA11CE);
+            let padded = rot.padded_dim();
+            let mut rng = 0x1234_5678_9ABC_DEF0u64;
+            let next = |state: &mut u64| {
+                *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((*state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+            };
+            let a: Vec<f32> = (0..dim).map(|_| next(&mut rng)).collect();
+            let b: Vec<f32> = (0..dim).map(|_| next(&mut rng)).collect();
+            let (mut ra, mut rb) = (vec![0.0f32; padded], vec![0.0f32; padded]);
+            rot.apply_padded(&a, &mut ra);
+            rot.apply_padded(&b, &mut rb);
+            let dot = |x: &[f32], y: &[f32]| -> f32 { x.iter().zip(y).map(|(p, q)| p * q).sum() };
+            let (raw, rotated) = (dot(&a, &b), dot(&ra, &rb));
+            assert!(
+                (raw - rotated).abs() <= 1e-3 * raw.abs().max(1.0),
+                "dim {dim}: padded rotation not an isometry (raw {raw}, rotated {rotated})"
+            );
+            let mut back = vec![0.0f32; dim];
+            rot.apply_inverse_padded(&ra, &mut back);
+            for (orig, inv) in a.iter().zip(&back) {
+                assert!(
+                    (orig - inv).abs() <= 1e-4,
+                    "dim {dim}: inverse rotation diverged ({orig} vs {inv})"
+                );
+            }
         }
     }
 }

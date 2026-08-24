@@ -422,6 +422,19 @@ pub enum DrainConsolidate {
 /// Query search mode for the hidden vector index on the UNFILTERED path.
 /// Selected by `vector.search_mode`. Filtered queries and pre-drain user
 /// tables always take the stamped grid path regardless of this setting.
+/// Codec of the resident `hnsw_ivf` code plane — see
+/// [`VectorConfig::hnsw_plane`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorHnswPlane {
+    /// Fixed-grid 16-bit plane (2 bytes/dim) — the shipped default.
+    Sq16,
+    /// Fitted 4-bit plane (0.5 bytes/dim).
+    Sq4,
+    /// Fitted 4-bit plane plus sub-step residual nibbles (1 byte/dim).
+    Sq4Residual,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VectorSearchMode {
@@ -504,6 +517,18 @@ pub struct VectorSettings {
     /// Default `ivf`; `global_fine_centroid` is experimental (see
     /// [`VectorSearchMode`]).
     pub search_mode: VectorSearchMode,
+    /// For `search_mode = hnsw_ivf`: the codec of the resident code plane
+    /// the graph walks. `sq16` (default) is the shipped fixed-grid plane;
+    /// `sq4` re-quantizes it to fitted 4-bit nibbles (0.5 bytes/dim
+    /// resident, ~4× smaller plane); `sq4_residual` adds a sub-step
+    /// residual nibble plane (1 byte/dim, ~2× smaller). Calibration
+    /// measures recall WITH the gated plane, so a plane too coarse for the
+    /// table's `target_recall` de-registers itself and the table serves
+    /// ivf — changing this knob can shrink the graph's memory or disable
+    /// the graph, never lower served recall below the floor. Takes effect
+    /// at the next full drain rebuild; incremental drains inherit the
+    /// prior bundle's plane codec like they inherit `(m0, ef)`.
+    pub hnsw_plane: VectorHnswPlane,
     /// For `search_mode = global_fine_centroid`: number of fine clusters the
     /// query reads (globally scored, clamped to the table's total). See
     /// `config.yaml` for sizing guidance. Ignored under `search_mode = ivf`.
@@ -621,6 +646,7 @@ impl Default for VectorSettings {
             serve_near_tie_slack: DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK,
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
             search_mode: VectorSearchMode::Ivf,
+            hnsw_plane: VectorHnswPlane::Sq16,
             global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
             global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
             global_fine_coalesce: false,

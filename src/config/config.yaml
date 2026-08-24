@@ -239,6 +239,18 @@ vector:
   # demand near-target recall from the graph or step aside to ivf.
   hnsw_recall_slack: 0.01
 
+  # For search_mode = hnsw_ivf: codec of the resident code plane the graph
+  # walks. sq16 (default, 2 bytes/dim) is the shipped fixed-grid plane;
+  # sq4 re-quantizes it to fitted 4-bit nibbles (0.5 bytes/dim — ~4x
+  # smaller resident plane); sq4_residual adds a sub-step residual nibble
+  # plane (1 byte/dim — ~2x smaller). Calibration measures recall WITH the
+  # gated plane, so a plane too coarse for target_recall de-registers
+  # itself and the table serves ivf: this knob can shrink the graph's
+  # memory or disable the graph, never lower served recall below the
+  # floor. Applies at the next full drain rebuild; incremental drains
+  # inherit the prior bundle's plane codec like they inherit (m0, ef).
+  hnsw_plane: sq16
+
   # For search_mode = hnsw_ivf: scale ceiling for the per-row DATA graph. The
   # resident data HNSW is built at drain and persisted only when the table's
   # doc count is at or below this; above it, only the (much smaller) centroid

@@ -1455,6 +1455,204 @@ pub(crate) fn sq16_adaptive_norm_sq(
     s
 }
 
+/// Levels of a 4-bit code (`Sq4` resident-plane codec).
+pub(crate) const SQ4_LEVELS: u32 = 16;
+/// Largest 4-bit code — the encoder's clamp bound.
+pub(crate) const SQ4_CODE_MAX: f32 = (SQ4_LEVELS - 1) as f32;
+/// Residual centering: the residual nibble is stored biased by this so an
+/// unsigned code carries a signed sub-step correction.
+pub(crate) const SQ4_RESIDUAL_CENTER: f32 = 7.5;
+/// Residual subdivision: one coarse step split into this many residual
+/// units, so coarse+residual give ~240 effective levels over the fitted
+/// range at 1 byte/dim total.
+pub(crate) const SQ4_RESIDUAL_DIVISOR: f32 = 15.0;
+/// Low-nibble mask for the packed (two codes per byte) plane layout.
+const SQ4_NIBBLE_MASK: u8 = 0x0F;
+
+/// `Sq4` resident-plane rerank context: per-query precomputes over the
+/// ROTATED, padded coordinate space the plane is quantized in, so the
+/// per-candidate inner loop is a fused nibble-split + widen + FMA over
+/// the packed bytes — no unpack buffer, no per-candidate allocation.
+///
+/// NegDot-only by design: the plane is the hnsw walk's scorer, whose
+/// convention is `score = −dot` (`hnsw.rs`), and the walk's inputs are
+/// unit vectors, so no per-doc norm leg exists here.
+pub(crate) struct Sq4Kernel {
+    /// Rotated-space component count (`dim.next_power_of_two()`).
+    padded: usize,
+    /// `q_code[d] = rotated_query[d] * step[d]` — per-doc coarse leg is
+    /// `Σ_d q_code[d] * coarse_code[d] as f32`.
+    q_code: Vec<f32>,
+    /// `q_code[d] / SQ4_RESIDUAL_DIVISOR`; present iff the plane carries
+    /// the residual nibble leg.
+    q_residual: Option<Vec<f32>>,
+    /// `Σ_d rq[d]·offset[d]` (− the residual centering term when the
+    /// residual leg exists). Folded in once per candidate.
+    q_dot_offset: f32,
+}
+
+impl Sq4Kernel {
+    /// Build the per-query kernel from the ALREADY-ROTATED query and the
+    /// plane's fitted ruler. The rotation itself is the plane owner's job
+    /// (`hnsw::Sq4Scorer::prepare`): this kernel is pure ruler algebra.
+    pub(crate) fn new(
+        rotated_query: &[f32],
+        offset: &[f32],
+        step: &[f32],
+        with_residual: bool,
+    ) -> Self {
+        let padded = rotated_query.len();
+        debug_assert_eq!(offset.len(), padded);
+        debug_assert_eq!(step.len(), padded);
+        let q_code: Vec<f32> = rotated_query
+            .iter()
+            .zip(step)
+            .map(|(q, st)| q * st)
+            .collect();
+        let q_residual: Option<Vec<f32>> =
+            with_residual.then(|| q_code.iter().map(|v| v / SQ4_RESIDUAL_DIVISOR).collect());
+        let mut q_dot_offset: f32 = rotated_query.iter().zip(offset).map(|(q, o)| q * o).sum();
+        if let Some(qr) = &q_residual {
+            q_dot_offset -= SQ4_RESIDUAL_CENTER * qr.iter().sum::<f32>();
+        }
+        Self {
+            padded,
+            q_code,
+            q_residual,
+            q_dot_offset,
+        }
+    }
+
+    /// `−dot(query, decoded_candidate)` for one packed candidate row
+    /// (plus its packed residual row when the plane carries one). Smaller
+    /// = nearer, matching the walk's convention.
+    #[inline]
+    pub(crate) fn distance_negdot(&self, coarse: &[u8], residual: Option<&[u8]>) -> f32 {
+        let mut dot = self.q_dot_offset + sq4_dot(&self.q_code, coarse, self.padded);
+        if let (Some(qr), Some(res)) = (&self.q_residual, residual) {
+            dot += sq4_dot(qr, res, self.padded);
+        }
+        -dot
+    }
+}
+
+/// Dot-product reduction over a PACKED nibble plane:
+/// `Σ_d q_prime[d] * (nibble(packed, d) as f32)` for `padded` coordinates
+/// (two per byte, low nibble = even coordinate). The nibble split runs
+/// in-register on the SIMD arms — mask + shift + byte interleave, then
+/// the same `vpmovzxbd` widen + FMA the u8 kernels use.
+///
+/// Two-tier dispatch: AVX2 (also taken on AVX-512 hosts —
+/// `avx512f` implies `avx2`, and a native 512-bit nibble arm is deferred
+/// until the codec earns it on measurement), then the portable
+/// `wide::f32x8` fallback for aarch64 / SSE-only hosts.
+#[inline]
+pub(crate) fn sq4_dot(q_prime: &[f32], packed: &[u8], padded: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx512_enabled() || avx2_enabled() {
+            // SAFETY: gated on the runtime CPUID checks; `avx512f`
+            // implies `avx2`, so either gate suffices for the AVX2 arm.
+            return unsafe { sq4_dot_avx2(q_prime, packed, padded) };
+        }
+    }
+    sq4_dot_wide(q_prime, packed, padded)
+}
+
+/// Portable `wide::f32x8` nibble dot. Per-lane scalar nibble extract +
+/// widen — the universal fallback tier, same role as `sq8_dot_wide`.
+#[inline]
+fn sq4_dot_wide(q_prime: &[f32], packed: &[u8], padded: usize) -> f32 {
+    debug_assert_eq!(q_prime.len(), padded);
+    debug_assert_eq!(packed.len(), padded.div_ceil(2));
+    let mut acc = f32x8::ZERO;
+    let mut d = 0;
+    while d + F32X8_LANES <= padded {
+        let qc: [f32; F32X8_LANES] = q_prime[d..d + F32X8_LANES]
+            .try_into()
+            .expect("q_prime[d..d+8] len 8");
+        let mut nc = [0f32; F32X8_LANES];
+        for (j, slot) in nc.iter_mut().enumerate() {
+            let byte = packed[(d + j) / 2];
+            *slot = if (d + j) % 2 == 0 {
+                (byte & SQ4_NIBBLE_MASK) as f32
+            } else {
+                (byte >> 4) as f32
+            };
+        }
+        acc += f32x8::from(qc) * f32x8::from(nc);
+        d += F32X8_LANES;
+    }
+    let mut dot = acc.reduce_add();
+    while d < padded {
+        let byte = packed[d / 2];
+        let code = if d.is_multiple_of(2) {
+            byte & SQ4_NIBBLE_MASK
+        } else {
+            byte >> 4
+        };
+        dot += q_prime[d] * code as f32;
+        d += 1;
+    }
+    dot
+}
+
+/// AVX2 nibble dot: 16 coordinates per iteration from 8 packed bytes.
+/// The split is three byte ops (`vpand` low nibbles, `vpsrlw`+`vpand`
+/// high nibbles, `vpunpcklbw` to restore coordinate order), then two of
+/// the exact widen+FMA steps `sq8_dot_avx2` performs.
+///
+/// # Safety
+///
+/// Callers must ensure the target supports `avx2`; the `sq4_dot`
+/// dispatch gates on the runtime CPUID check.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sq4_dot_avx2(q_prime: &[f32], packed: &[u8], padded: usize) -> f32 {
+    debug_assert_eq!(q_prime.len(), padded);
+    debug_assert_eq!(packed.len(), padded.div_ceil(2));
+    // SAFETY: each iteration reads 8 packed bytes (16 coordinates) and
+    // two 8-f32 windows of `q_prime`. The `d + 16 <= padded` predicate
+    // bounds both: bytes `d/2 .. d/2 + 8` and f32s `d .. d + 16`.
+    // `_mm_loadl_epi64` reads exactly 8 bytes; `_mm256_loadu_ps` reads
+    // 8 f32s. All loads unaligned.
+    unsafe {
+        let nibble_mask = _mm_set1_epi8(SQ4_NIBBLE_MASK as i8);
+        let mut acc = _mm256_setzero_ps();
+        let mut d = 0;
+        while d + 2 * F32X8_LANES <= padded {
+            let bytes = _mm_loadl_epi64(packed.as_ptr().add(d / 2) as *const __m128i);
+            // Even coordinates live in the low nibbles, odd in the high;
+            // interleaving low/high bytes restores coordinate order
+            // 0,1,2,… across the 16 unpacked codes.
+            let lo = _mm_and_si128(bytes, nibble_mask);
+            let hi = _mm_and_si128(_mm_srli_epi16::<4>(bytes), nibble_mask);
+            let inter = _mm_unpacklo_epi8(lo, hi);
+            let c0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(inter));
+            let c1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(inter)));
+            let q0 = _mm256_loadu_ps(q_prime.as_ptr().add(d));
+            let q1 = _mm256_loadu_ps(q_prime.as_ptr().add(d + F32X8_LANES));
+            acc = _mm256_fmadd_ps(q0, c0, acc);
+            acc = _mm256_fmadd_ps(q1, c1, acc);
+            d += 2 * F32X8_LANES;
+        }
+        let mut dot = horizontal_sum_avx256(acc);
+        // Tail (padded is a power of two, so this is 0 or 8 coordinates):
+        // same per-lane extract as the portable tier.
+        while d < padded {
+            let byte = packed[d / 2];
+            let code = if d.is_multiple_of(2) {
+                byte & SQ4_NIBBLE_MASK
+            } else {
+                byte >> 4
+            };
+            dot += q_prime[d] * code as f32;
+            d += 1;
+        }
+        dot
+    }
+}
+
 /// Dot-product reduction for `Sq8Kernel::distance_at`:
 /// `Σ_d q_prime[d] * (code_bytes[d] as f32)` over the first `dim`
 /// dimensions. This is the `q_prime · code` half of the Sq8 distance
@@ -3729,13 +3927,47 @@ mod tests {
 
     // --- AVX-512 parity -------------------------------------------------
 
+    /// The AVX2 nibble arm must agree with the portable tier on every
+    /// length class (pow2 planes only — the padded space is always a
+    /// power of two), including the 8-coordinate tail. This is the test
+    /// that catches a wrong unpack ORDER (low/high nibble interleave),
+    /// which no aggregate recall number reliably would.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn sq4_dot_avx2_matches_wide_across_padded_lengths() {
+        if !(avx2_enabled() || avx512_enabled()) {
+            eprintln!("skipping: host lacks AVX2");
+            return;
+        }
+        let mut state = 0x51D4_D07Au64;
+        let mut next_u64 = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            state
+        };
+        for padded in [8usize, 16, 32, 64, 128, 1024] {
+            let q: Vec<f32> = (0..padded)
+                .map(|_| ((next_u64() >> 33) as f32 / (1u64 << 30) as f32) - 1.0)
+                .collect();
+            let packed: Vec<u8> = (0..padded.div_ceil(2))
+                .map(|_| (next_u64() >> 24) as u8)
+                .collect();
+            let wide = sq4_dot_wide(&q, &packed, padded);
+            // SAFETY: gated on the runtime AVX2/AVX-512 check above.
+            let simd = unsafe { sq4_dot_avx2(&q, &packed, padded) };
+            assert!(
+                (wide - simd).abs() <= 1e-3 * wide.abs().max(1.0),
+                "padded {padded}: avx2 {simd} != wide {wide}"
+            );
+        }
+    }
+
     /// AVX-512 `sq8_dot` agrees with the `wide` baseline
     /// across a length sweep. The dot product is `Σ q_prime[d] *
     /// (code[d] as f32)` so values are integer-magnitude on the
     /// doc side — exact widen, reduction-order is the only divergence.
     /// Tolerance is correspondingly tight.
-    #[test]
     #[cfg(target_arch = "x86_64")]
+    #[test]
     fn sq8_dot_avx512_matches_wide_across_lengths() {
         if !avx512_enabled() {
             eprintln!("sq8_dot_avx512_matches_wide_across_lengths: skipped, no AVX-512");

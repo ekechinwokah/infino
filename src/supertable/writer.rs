@@ -9073,6 +9073,8 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use crate::superfile::vector::hnsw::PlaneScorer;
+
     use arrow_array::{
         Array, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
     };
@@ -9141,11 +9143,13 @@ mod tests {
         let nearest = |data: &crate::superfile::vector::hnsw::HnswIndex, axis: usize| -> f32 {
             let mut q = vec![0.0f32; dim];
             q[axis] = 1.0;
-            data.graph
-                .search(&data.scorer, &q, 5, 128)
-                .into_iter()
-                .map(|(_, d)| d)
-                .fold(f32::INFINITY, f32::min)
+            match &data.scorer {
+                PlaneScorer::Sq16(sc) => data.graph.search(sc, &q, 5, 128),
+                PlaneScorer::Sq4(sc) => data.graph.search(sc, &q, 5, 128),
+            }
+            .into_iter()
+            .map(|(_, d)| d)
+            .fold(f32::INFINITY, f32::min)
         };
 
         // Batch 1 on axes [0, half): append + drain (cells only — the default
