@@ -1254,27 +1254,41 @@ fn sq8_walk_dot_scalar(code_u8: &[u8], q_i8: &[i8]) -> i32 {
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
 unsafe fn sq8_dot_vnni(code_u8: &[u8], q_i8: &[i8]) -> i32 {
     use core::arch::x86_64::{
-        _mm512_dpbusd_epi32, _mm512_loadu_epi8, _mm512_reduce_add_epi32, _mm512_setzero_si512,
+        _mm512_dpbusd_epi32, _mm512_loadu_epi8, _mm512_maskz_loadu_epi8, _mm512_reduce_add_epi32,
+        _mm512_setzero_si512,
     };
-    // SAFETY: called only after avx512f+bw+vnni detection. Each iteration loads
-    // 64 bytes from `code_u8` and `q_i8` strictly below `dim - dim % 64`; the
-    // scalar tail covers the remainder — no read past either slice.
+    // SAFETY: called only after avx512f+bw+vnni detection. A full iteration
+    // loads 64 bytes from each slice strictly below `dim - dim % 64`; a partial
+    // final block loads under a mask covering exactly the remaining bytes. No
+    // read past either slice on either path.
     unsafe {
         let dim = q_i8.len();
         let mut acc = _mm512_setzero_si512();
         let mut d = 0usize;
-        while d + 64 <= dim {
-            let a = _mm512_loadu_epi8(code_u8.as_ptr().add(d) as *const i8);
-            let b = _mm512_loadu_epi8(q_i8.as_ptr().add(d));
+        while d < dim {
+            let remaining = dim - d;
+            // Mask the final partial block rather than falling to a scalar
+            // loop. The remainder looks negligible by coordinate count and is
+            // not by instruction count: at dim 200 it is 8 of 200 coordinates
+            // but a scalar loop over them costs more than the three vector
+            // blocks before it. Absent lanes read as zero and contribute
+            // nothing to the dot.
+            let (a, b) = if remaining >= 64 {
+                (
+                    _mm512_loadu_epi8(code_u8.as_ptr().add(d) as *const i8),
+                    _mm512_loadu_epi8(q_i8.as_ptr().add(d)),
+                )
+            } else {
+                let mask = (!0u64) >> (64 - remaining);
+                (
+                    _mm512_maskz_loadu_epi8(mask, code_u8.as_ptr().add(d) as *const i8),
+                    _mm512_maskz_loadu_epi8(mask, q_i8.as_ptr().add(d)),
+                )
+            };
             acc = _mm512_dpbusd_epi32(acc, a, b);
             d += 64;
         }
-        let mut s = _mm512_reduce_add_epi32(acc);
-        while d < dim {
-            s += code_u8[d] as i32 * q_i8[d] as i32;
-            d += 1;
-        }
-        s
+        _mm512_reduce_add_epi32(acc)
     }
 }
 
@@ -2972,8 +2986,12 @@ mod tests {
     }
 
     /// The SQ8 walk kernel's SIMD tier must match its scalar reference exactly
-    /// (integer dot — bit-exact, no float slack). Covers a 64-aligned width and
-    /// widths with a scalar tail (`dim % 64 != 0`).
+    /// (integer dot — bit-exact, no float slack).
+    ///
+    /// The widths matter: the SIMD tier masks its final partial block rather
+    /// than looping scalar over the remainder, so every `dim % 64` shape
+    /// exercises a different mask — including the degenerate ones (a single
+    /// coordinate, one short of a block, one past a block).
     #[test]
     fn sq8_walk_dot_simd_matches_scalar() {
         let mut st = 0x1234_5678_9abc_def0u64;
@@ -2983,7 +3001,7 @@ mod tests {
             st ^= st << 17;
             st
         };
-        for dim in [64usize, 100, 768] {
+        for dim in [1usize, 63, 64, 65, 100, 128, 200, 768, 1536] {
             let code: Vec<u8> = (0..dim).map(|_| (next() & 0xff) as u8).collect();
             let q: Vec<i8> = (0..dim)
                 .map(|_| ((next() % 255) as i32 - 127) as i8)
