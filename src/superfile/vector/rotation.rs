@@ -52,6 +52,20 @@ use wide::f32x8;
 /// while staying `O(dim·log dim)`.
 const ROTATION_STAGES: usize = 3;
 
+/// Stage depth for the BLOCKED transform, which needs more than the
+/// padded one.
+///
+/// A full power-of-two Walsh–Hadamard mixes every coordinate with every
+/// other in one stage; a block-diagonal one only mixes within its block,
+/// and relies on the inter-stage permutation to carry information across
+/// blocks. Depth is what buys back that mixing, and it is nearly free
+/// here: the transform is `O(dim log dim)` once per query against a scan
+/// that touches every stored row, so at 100K rows the rotation is ~0.01%
+/// of the query. Kept separate from [`ROTATION_STAGES`] because that
+/// depth is part of the 1-bit RaBitQ code construction and changing it
+/// would alter every stored sign code.
+const BLOCKED_STAGES: usize = 6;
+
 /// `wide::f32x8` lane width (butterfly + sign/scale loops).
 ///
 /// The butterfly stays on `wide` (256-bit / AVX2) deliberately: a
@@ -74,9 +88,14 @@ pub struct RandomRotation {
     /// is itself a power of two and the blocked form is just the padded
     /// one.
     blocks: Vec<usize>,
-    /// One seeded permutation of `0..dim` per stage, so the blocked
-    /// transform mixes ACROSS blocks and not only within them.
+    /// One seeded permutation of `0..dim` per blocked stage, so the
+    /// blocked transform mixes ACROSS blocks and not only within them.
     block_perms: Vec<Vec<u32>>,
+    /// `±1` diagonals for the blocked stages, each length `dim`. Separate
+    /// from [`Self::signs`] because the blocked path runs
+    /// [`BLOCKED_STAGES`] stages at width `dim`, not [`ROTATION_STAGES`]
+    /// at width `padded_dim`.
+    blocked_signs: Vec<Vec<f32>>,
 }
 
 /// Decompose `dim` into descending power-of-two blocks: the greedy
@@ -124,7 +143,7 @@ impl RandomRotation {
         let blocks = power_of_two_blocks(dim);
         // Fisher–Yates from the same seeded stream, so the permutations
         // are as reproducible as the sign diagonals.
-        let block_perms = (0..ROTATION_STAGES)
+        let block_perms = (0..BLOCKED_STAGES)
             .map(|_| {
                 let mut perm: Vec<u32> = (0..dim as u32).collect();
                 for i in (1..dim).rev() {
@@ -134,12 +153,26 @@ impl RandomRotation {
                 perm
             })
             .collect();
+        let blocked_signs = (0..BLOCKED_STAGES)
+            .map(|_| {
+                (0..dim)
+                    .map(|_| {
+                        if normal.sample(&mut rng) >= 0.0 {
+                            1.0f32
+                        } else {
+                            -1.0f32
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
         RandomRotation {
             dim,
             padded_dim,
             signs,
             blocks,
             block_perms,
+            blocked_signs,
         }
     }
 
@@ -222,13 +255,13 @@ impl RandomRotation {
             let mut buf = cell.borrow_mut();
             buf.clear();
             buf.resize(self.dim, 0.0);
-            for (stage_signs, perm) in self.signs.iter().zip(&self.block_perms) {
+            for (stage_signs, perm) in self.blocked_signs.iter().zip(&self.block_perms) {
                 // Permute into scratch, then transform back into `out`,
                 // so neither buffer is read and written at once.
                 for (dst, &src) in buf.iter_mut().zip(perm) {
                     *dst = out[src as usize];
                 }
-                apply_signs(&mut buf, &stage_signs[..self.dim]);
+                apply_signs(&mut buf, stage_signs);
                 let mut start = 0;
                 for &block in &self.blocks {
                     let seg = &mut buf[start..start + block];
@@ -252,7 +285,7 @@ impl RandomRotation {
             let mut buf = cell.borrow_mut();
             buf.clear();
             buf.resize(self.dim, 0.0);
-            for (stage_signs, perm) in self.signs.iter().zip(&self.block_perms).rev() {
+            for (stage_signs, perm) in self.blocked_signs.iter().zip(&self.block_perms).rev() {
                 buf.copy_from_slice(out);
                 let mut start = 0;
                 for &block in &self.blocks {
@@ -261,7 +294,7 @@ impl RandomRotation {
                     scale_in_place(seg, 1.0 / (block as f32).sqrt());
                     start += block;
                 }
-                apply_signs(&mut buf, &stage_signs[..self.dim]);
+                apply_signs(&mut buf, stage_signs);
                 // Undo the permutation: `apply_blocked` wrote
                 // `buf[i] = out[perm[i]]`, so scatter back.
                 for (i, &src) in perm.iter().enumerate() {

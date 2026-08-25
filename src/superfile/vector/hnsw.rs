@@ -47,8 +47,8 @@ use rayon::prelude::*;
 
 use crate::superfile::vector::{
     distance::{
-        Metric, SQ4_CODE_MAX, SQ4_RESIDUAL_CENTER, SQ4_RESIDUAL_DIVISOR, Sq4Kernel, Sq16Kernel,
-        dequantize_sq16_into, dot, encode_sq16_row,
+        Metric, SQ4_CODE_MAX, SQ4_LOADING_SIGMAS, SQ4_RESIDUAL_CENTER, SQ4_RESIDUAL_DIVISOR,
+        SQ4_ROW_BLOCK, Sq4Kernel, Sq16Kernel, dequantize_sq16_into, dot, encode_sq16_row,
     },
     rotation::RandomRotation,
 };
@@ -348,33 +348,65 @@ impl Sq4Scorer {
         let (offset, step) = match ruler {
             Some((o, st)) => (o.to_vec(), st.to_vec()),
             None => {
+                // Load the 16 levels over mean ± Z·sigma, NOT over
+                // min/max. A min/max ruler is set by the single most
+                // extreme value in each coordinate, so on a heavy-tailed
+                // coordinate most of the 16 levels cover range that
+                // almost no row occupies, and the rows that do cluster
+                // near the mean share only a handful of codes. Fitting
+                // the second moment instead puts the levels where the
+                // mass is and clamps the tails, which is what the encode
+                // pass below already does for out-of-range values.
+                let mut sum = vec![0.0f64; padded];
+                let mut sumsq = vec![0.0f64; padded];
                 let mut lo = vec![f32::INFINITY; padded];
                 let mut hi = vec![f32::NEG_INFINITY; padded];
                 for i in 0..len {
                     dequantize_sq16_into(&sq16_codes[i * dim * 2..(i + 1) * dim * 2], &mut raw);
                     rot.apply_blocked(&raw, &mut row);
                     for (d, &x) in row.iter().enumerate() {
+                        sum[d] += x as f64;
+                        sumsq[d] += (x as f64) * (x as f64);
                         lo[d] = lo[d].min(x);
                         hi[d] = hi[d].max(x);
                     }
                 }
-                // An empty plane leaves the infinities; normalize so the
-                // stored ruler is always finite and round-trips.
-                let step = (0..padded)
-                    .map(|d| {
+                let n = len.max(1) as f64;
+                let mut offset = vec![0.0f32; padded];
+                let mut step = vec![1.0f32; padded];
+                for d in 0..padded {
+                    let mean = sum[d] / n;
+                    let var = (sumsq[d] / n - mean * mean).max(0.0);
+                    let sigma = var.sqrt();
+                    // A degenerate coordinate (all rows equal, or an
+                    // empty plane) keeps the unit step so the stored
+                    // ruler stays finite and round-trips.
+                    // Only the BARE plane loads over sigma. With a
+                    // residual leg the effective resolution is 8 bits, so
+                    // clamping a coarse code is what hurts — the residual
+                    // nibble then refines an interval the value is not in
+                    // — and the span must cover the data. Measured on
+                    // dbpedia-1536: sigma loading moved the bare plane's
+                    // recall@10 up 0.032 and the residual construction's
+                    // DOWN 0.012. It is also unsafe on multimodal data,
+                    // where sigma reflects the spread BETWEEN modes and a
+                    // sigma-scaled step lands far coarser than the modes
+                    // themselves (the planted-cluster walk test pins
+                    // exactly that).
+                    if with_residual {
                         if lo[d].is_finite() && hi[d] > lo[d] {
-                            (hi[d] - lo[d]) / SQ4_CODE_MAX
-                        } else {
-                            1.0
+                            offset[d] = lo[d];
+                            step[d] = (hi[d] - lo[d]) / SQ4_CODE_MAX;
                         }
-                    })
-                    .collect();
-                for l in lo.iter_mut() {
-                    if !l.is_finite() {
-                        *l = 0.0;
+                    } else if sigma > 0.0 && len > 0 {
+                        let half = SQ4_LOADING_SIGMAS as f64 * sigma;
+                        offset[d] = (mean - half) as f32;
+                        step[d] = (2.0 * half / SQ4_CODE_MAX as f64) as f32;
+                    } else {
+                        offset[d] = mean as f32;
                     }
                 }
-                (lo, step)
+                (offset, step)
             }
         };
         let stride = Self::stride(padded);
@@ -459,6 +491,33 @@ impl Sq4Scorer {
     /// Whether the residual nibble plane is present.
     pub(crate) fn has_residual(&self) -> bool {
         self.residual.is_some()
+    }
+
+    /// Rows a [`Self::score_rows`] pass covers.
+    pub(crate) fn row_block() -> usize {
+        Sq4Kernel::row_block()
+    }
+
+    /// Score [`Self::row_block`] consecutive nodes starting at `first`.
+    ///
+    /// Same results as [`NodeScorer::score`] per node, but the query load
+    /// and the horizontal reduction are amortized across the block —
+    /// which is what a terminal flat scan is bound by at low dimension,
+    /// where a row is too few bytes to hide them. `first + row_block()`
+    /// must be within the plane.
+    pub(crate) fn score_rows(
+        &self,
+        prepared: &Sq4Kernel,
+        first: u32,
+        out: &mut [f32; SQ4_ROW_BLOCK],
+    ) {
+        prepared.distance_negdot_rows(
+            &self.codes,
+            self.residual.as_deref(),
+            Self::stride(self.padded),
+            first as usize,
+            out,
+        );
     }
 
     /// The rotation seed the plane's space derives from — an incremental

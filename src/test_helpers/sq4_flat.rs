@@ -35,7 +35,7 @@ use std::{cmp::Ordering, collections::BinaryHeap};
 use rayon::prelude::*;
 
 use crate::superfile::vector::{
-    distance::encode_sq16_row,
+    distance::{SQ4_ROW_BLOCK, encode_sq16_row},
     hnsw::{NodeScorer, Sq4Scorer},
 };
 
@@ -50,6 +50,21 @@ const RULER_ENTRY_BYTES: usize = 4;
 /// enough that the tail does not idle threads at the corpus sizes a flat
 /// index is used at.
 const SCAN_BLOCK_ROWS: usize = 4_096;
+/// Rotated coordinates below which the scan scores a BLOCK of rows per
+/// pass rather than one row at a time.
+///
+/// The two strategies trade the same two things against each other.
+/// Row-at-a-time reads each row as one sequential run, which is what a
+/// DRAM-streamed plane wants. Row-blocked amortizes the per-row query
+/// load and horizontal reduction, but reads `SQ4_ROW_BLOCK` interleaved
+/// strided streams instead of one sequential one.
+///
+/// Which wins is set by how many vector blocks a row spans: the per-row
+/// fixed cost is roughly one reduction, so it stays under ~10% of the row
+/// once a row spans ~10 blocks — i.e. ~640 coordinates. Measured at 100K
+/// rows: at dim 200 (3 blocks) blocking took the scan 0.326 → 0.190 ms,
+/// while at dim 1536 (24 blocks) it cost 1.455 → 1.652 ms.
+const ROW_BLOCK_MAX_COORDS: usize = 640;
 
 /// One scored candidate, ordered so a [`BinaryHeap`] of bounded size
 /// evicts the current worst (largest score, since lower is nearer).
@@ -159,29 +174,63 @@ impl Sq4FlatIndex {
             return Vec::new();
         }
         let prepared = self.scorer.prepare(query);
-        // Blocked and parallel, matching how the engine's own scan path
-        // runs (rayon for the CPU wave). A single-threaded per-node loop
-        // measures the loop, not the codec: on this hardware it sustained
-        // ~0.76 GB/s against the ~34 GB/s the engine's all-cells Sq16 scan
-        // reaches, so the harness rather than the kernel set the number.
-        let heap = (0..self.len)
+        // Parallel over rows either way (rayon for the CPU wave, as the
+        // engine's own scan does; a single-threaded per-node loop measures
+        // the loop rather than the codec).
+        //
+        // Row-blocking is chosen by shape, not always: see
+        // [`ROW_BLOCK_MAX_COORDS`]. Below the threshold a row is too few
+        // bytes to hide the per-row query load and reduction, so blocking
+        // wins; above it the sequential per-row read is worth more than
+        // the amortization. Rows past the last whole block fall back to
+        // per-node scoring in both cases.
+        let block = if self.dim <= ROW_BLOCK_MAX_COORDS {
+            Sq4Scorer::row_block()
+        } else {
+            // Zero whole blocks ⇒ every row takes the per-node path.
+            self.len + 1
+        };
+        let blocks = self.len / block;
+        let heap = (0..blocks)
             .into_par_iter()
-            .with_min_len(SCAN_BLOCK_ROWS)
+            .with_min_len(SCAN_BLOCK_ROWS / block)
             .fold(
                 || BinaryHeap::<Candidate>::with_capacity(k + 1),
-                |mut heap, node| {
-                    let node = node as u32;
-                    let score = self.scorer.score(&prepared, node);
-                    // The root is the worst kept candidate, so a bounded
-                    // push/pop keeps the k nearest without sorting N.
-                    if heap.len() < k {
-                        heap.push(Candidate { score, node });
-                    } else if heap.peek().is_some_and(|worst| score < worst.score) {
-                        heap.pop();
-                        heap.push(Candidate { score, node });
+                |mut heap, b| {
+                    let first = (b * block) as u32;
+                    let mut scores = [0.0f32; SQ4_ROW_BLOCK];
+                    self.scorer.score_rows(&prepared, first, &mut scores);
+                    for (r, &score) in scores.iter().enumerate() {
+                        let node = first + r as u32;
+                        // The root is the worst kept candidate, so a
+                        // bounded push/pop keeps the k nearest without
+                        // sorting N.
+                        if heap.len() < k {
+                            heap.push(Candidate { score, node });
+                        } else if heap.peek().is_some_and(|worst| score < worst.score) {
+                            heap.pop();
+                            heap.push(Candidate { score, node });
+                        }
                     }
                     heap
                 },
+            )
+            .chain(
+                // Trailing partial block, scored per node.
+                (blocks * block..self.len).into_par_iter().fold(
+                    || BinaryHeap::<Candidate>::with_capacity(k + 1),
+                    |mut heap, node| {
+                        let node = node as u32;
+                        let score = self.scorer.score(&prepared, node);
+                        if heap.len() < k {
+                            heap.push(Candidate { score, node });
+                        } else if heap.peek().is_some_and(|worst| score < worst.score) {
+                            heap.pop();
+                            heap.push(Candidate { score, node });
+                        }
+                        heap
+                    },
+                ),
             )
             .reduce(
                 || BinaryHeap::<Candidate>::with_capacity(k + 1),
@@ -200,5 +249,70 @@ impl Sq4FlatIndex {
         let mut out: Vec<(u32, f32)> = heap.into_iter().map(|c| (c.node, c.score)).collect();
         out.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rotation seed for the fixtures. Any seeded rotation works; fixing
+    /// it keeps a failure reproducible.
+    const TEST_ROT_SEED: u64 = 0x5EED_4F1A;
+    /// Dimensions covering the shapes that exercise different code paths:
+    /// a whole number of VNNI blocks, a non-multiple that needs the masked
+    /// partial block, a dim below one block, and one ABOVE
+    /// [`ROW_BLOCK_MAX_COORDS`] so the row-at-a-time path is covered too
+    /// (the equivalence has to hold on both sides of that switch).
+    const TEST_DIMS: &[usize] = &[128, 200, 32, 1024];
+
+    fn planted(dim: usize, rows: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 33) as f32 / (1u64 << 30) as f32) - 1.0
+        };
+        (0..rows * dim).map(|_| next()).collect()
+    }
+
+    /// The blocked scan must return exactly what per-node scoring would.
+    ///
+    /// This is the load-bearing property of row-blocking: it reorders
+    /// which query loads and reductions happen when, and nothing else. A
+    /// row/query misalignment in the blocked kernel would still produce
+    /// plausible scores and a plausible top-k -- it would just be scoring
+    /// the wrong vectors -- so an aggregate recall number would not
+    /// reliably catch it, and this comparison does.
+    #[test]
+    fn blocked_scan_matches_per_node_scoring() {
+        for &dim in TEST_DIMS {
+            for with_residual in [false, true] {
+                // Rows deliberately not a multiple of the block, so the
+                // trailing partial-block path is covered too.
+                let rows = 5 * Sq4Scorer::row_block() + 3;
+                let vectors = planted(dim, rows, 0x1234_5678);
+                let index = Sq4FlatIndex::build(&vectors, dim, TEST_ROT_SEED, with_residual);
+                let query = planted(dim, 1, 0x9ABC_DEF0);
+                let prepared = index.scorer.prepare(&query);
+                let want: Vec<f32> = (0..rows)
+                    .map(|n| index.scorer.score(&prepared, n as u32))
+                    .collect();
+                let got = index.search(&query, rows);
+                assert_eq!(
+                    got.len(),
+                    rows,
+                    "dim {dim}: scan returned {} rows",
+                    got.len()
+                );
+                for (node, score) in got {
+                    let expected = want[node as usize];
+                    assert!(
+                        (expected - score).abs() <= 1e-4 * expected.abs().max(1.0),
+                        "dim {dim} residual={with_residual} node {node}: blocked \
+                         scan scored {score}, per-node scoring {expected}"
+                    );
+                }
+            }
+        }
     }
 }

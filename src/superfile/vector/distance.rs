@@ -23,7 +23,7 @@ use crate::superfile::vector::rerank_codec::{
     RerankCodec, SQ16_CODE_MAX, SQ16_FIXED_OFFSET, SQ16_FIXED_SCALE,
 };
 #[cfg(target_arch = "x86_64")]
-use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled};
+use crate::superfile::vector::simd_dispatch::{avx2_enabled, avx512_enabled, has_avx512vnni};
 
 /// Residual quantization step divisor for [`RerankCodec::Sq8Residual`].
 /// The signed 8-bit residual code at dim `d` carries
@@ -1459,6 +1459,19 @@ pub(crate) fn sq16_adaptive_norm_sq(
 pub(crate) const SQ4_LEVELS: u32 = 16;
 /// Largest 4-bit code — the encoder's clamp bound.
 pub(crate) const SQ4_CODE_MAX: f32 = (SQ4_LEVELS - 1) as f32;
+
+/// Half-width, in standard deviations, that the 4-bit levels are loaded
+/// over: the ruler spans `mean ± SQ4_LOADING_SIGMAS · sigma` per rotated
+/// coordinate.
+///
+/// A structured rotation drives each coordinate toward a roughly
+/// Gaussian marginal, and the optimal uniform-quantizer loading for a
+/// Gaussian at 16 levels sits near ±2.7σ: wider wastes levels on tails
+/// almost no row occupies, narrower clips mass that matters. The encode
+/// pass clamps beyond the ruler, so the tails degrade gracefully instead
+/// of wrapping.
+pub(crate) const SQ4_LOADING_SIGMAS: f32 = 2.7;
+
 /// Residual centering: the residual nibble is stored biased by this so an
 /// unsigned code carries a signed sub-step correction.
 pub(crate) const SQ4_RESIDUAL_CENTER: f32 = 7.5;
@@ -1489,6 +1502,121 @@ pub(crate) struct Sq4Kernel {
     /// `Σ_d rq[d]·offset[d]` (− the residual centering term when the
     /// residual leg exists). Folded in once per candidate.
     q_dot_offset: f32,
+    /// `q_code` quantized to `i8`, laid out so a VNNI kernel needs no
+    /// per-row shuffle: within each [`VNNI_BLOCK_COORDS`]-coordinate
+    /// block the even coordinates come first, then the odd ones, which is
+    /// the order nibbles fall out of a mask/shift unpack. Reordering the
+    /// query once per query is free; reordering codes would cost a
+    /// shuffle on every stored row.
+    ///
+    /// `None` when the host lacks VNNI or the plane is too short to
+    /// block, in which case the float legs above are used.
+    q_int: Option<Sq4IntQuery>,
+}
+
+/// Coordinates one `vpdpbusd` block covers: 64 `u8` code lanes per
+/// 512-bit register, fed from 32 packed bytes.
+const VNNI_BLOCK_COORDS: usize = 64;
+
+/// Rows scored per pass of the blocked scan.
+///
+/// Two per-row costs do not shrink with dimension: the horizontal
+/// `reduce_add` that collapses 16 lanes to one score, and the caller's
+/// bookkeeping. At 1536d they amortize over 24 vector blocks; at 200d over
+/// 4, which is why a low-dimensional scan is dominated by them. Scoring a
+/// block of rows against one query load amortizes both — the query block
+/// is fetched once per `SQ4_ROW_BLOCK` rows, and the reductions retire
+/// back-to-back instead of each sitting on the critical path.
+///
+/// Eight keeps the accumulators (8 of 32 `zmm` registers) and the query
+/// comfortably in registers.
+pub(crate) const SQ4_ROW_BLOCK: usize = 8;
+
+/// `i8`-quantized query legs plus the scale that converts an integer
+/// accumulator back to a dot product.
+struct Sq4IntQuery {
+    /// Coarse leg, `i8`, in even-then-odd block order.
+    coarse: Vec<i8>,
+    /// Residual leg in the same order; present iff the plane has one.
+    residual: Option<Vec<i8>>,
+    /// `max|q_code| / I8_MAX` — the coarse leg's dequantization step.
+    coarse_scale: f32,
+    /// The residual leg's, which has its own dynamic range.
+    residual_scale: f32,
+}
+
+/// Largest magnitude an `i8` query lane may take. 127, not 128: the
+/// symmetric range keeps the quantizer unbiased, and `vpdpbusd`'s signed
+/// operand is `i8`.
+const I8_MAX: f32 = 127.0;
+
+impl Sq4IntQuery {
+    /// Quantize the float query legs to `i8` in VNNI block order, or
+    /// `None` when the integer path cannot serve this shape.
+    ///
+    /// Quantizing the QUERY rather than the codes is what keeps this
+    /// exact enough to use: the codes are already 4-bit, so the only new
+    /// error is on the query side, one shared scale per leg, and it is
+    /// spread over `padded` independent terms rather than compounding.
+    fn build(padded: usize, q_code: &[f32], q_residual: Option<&[f32]>) -> Option<Self> {
+        // No block-count requirement: a dim that is not a whole number of
+        // blocks (200, say) keeps its remainder on a scalar tail rather
+        // than losing the integer path entirely — gating on divisibility
+        // silently dropped every such corpus back to the float kernel.
+        if !has_avx512vnni() {
+            return None;
+        }
+        let coarse_scale = Self::scale_of(q_code);
+        let residual_scale = q_residual.map_or(1.0, Self::scale_of);
+        Some(Self {
+            coarse: Self::blocked_i8(padded, q_code, coarse_scale),
+            residual: q_residual.map(|r| Self::blocked_i8(padded, r, residual_scale)),
+            coarse_scale,
+            residual_scale,
+        })
+    }
+
+    /// Dequantization step for a leg: its largest magnitude spread over
+    /// the `i8` range. A zero leg keeps a unit scale so the reconstruction
+    /// stays finite.
+    fn scale_of(values: &[f32]) -> f32 {
+        let peak = values.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        if peak > 0.0 { peak / I8_MAX } else { 1.0 }
+    }
+
+    /// Quantize into even-then-odd order within each block, matching the
+    /// nibble unpack.
+    ///
+    /// The buffer is rounded UP to a whole number of blocks and the slots
+    /// past `padded` are left zero, so a partial final block needs no
+    /// scalar path: the kernel masks its code load, the absent codes read
+    /// as zero, and a zero query lane against a zero code contributes
+    /// nothing. That matters most exactly where it looks least
+    /// significant — at `dim = 200` the remainder is 8 of 200
+    /// coordinates, but a scalar loop over them costs more instructions
+    /// than the three vector blocks before it.
+    fn blocked_i8(padded: usize, values: &[f32], scale: f32) -> Vec<i8> {
+        let inv = 1.0 / scale;
+        let quantize = |v: f32| (v * inv).round().clamp(-I8_MAX, I8_MAX) as i8;
+        let blocks = padded.div_ceil(VNNI_BLOCK_COORDS);
+        let mut out = vec![0i8; blocks * VNNI_BLOCK_COORDS];
+        let mut w = 0;
+        for base in (0..blocks * VNNI_BLOCK_COORDS).step_by(VNNI_BLOCK_COORDS) {
+            // Low nibbles carry the even coordinates of the block, high
+            // nibbles the odd ones; emit the query in that same order.
+            for parity in [0usize, 1] {
+                let mut d = base + parity;
+                while d < base + VNNI_BLOCK_COORDS {
+                    if d < padded {
+                        out[w] = quantize(values[d]);
+                    }
+                    w += 1;
+                    d += 2;
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Sq4Kernel {
@@ -1515,11 +1643,13 @@ impl Sq4Kernel {
         if let Some(qr) = &q_residual {
             q_dot_offset -= SQ4_RESIDUAL_CENTER * qr.iter().sum::<f32>();
         }
+        let q_int = Sq4IntQuery::build(padded, &q_code, q_residual.as_deref());
         Self {
             padded,
             q_code,
             q_residual,
             q_dot_offset,
+            q_int,
         }
     }
 
@@ -1528,11 +1658,76 @@ impl Sq4Kernel {
     /// = nearer, matching the walk's convention.
     #[inline]
     pub(crate) fn distance_negdot(&self, coarse: &[u8], residual: Option<&[u8]>) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(qi) = &self.q_int {
+            // SAFETY: `q_int` is only Some when `has_avx512vnni()` held
+            // and `padded` is a whole number of VNNI blocks — the two
+            // preconditions the arm documents.
+            let mut dot = self.q_dot_offset
+                + qi.coarse_scale * unsafe { sq4_dot_vnni(&qi.coarse, coarse, self.padded) } as f32;
+            if let (Some(qr), Some(res)) = (&qi.residual, residual) {
+                dot += qi.residual_scale * unsafe { sq4_dot_vnni(qr, res, self.padded) } as f32;
+            }
+            return -dot;
+        }
         let mut dot = self.q_dot_offset + sq4_dot(&self.q_code, coarse, self.padded);
         if let (Some(qr), Some(res)) = (&self.q_residual, residual) {
             dot += sq4_dot(qr, res, self.padded);
         }
         -dot
+    }
+
+    /// Rows the blocked scan scores per pass; the caller strides by this.
+    pub(crate) const fn row_block() -> usize {
+        SQ4_ROW_BLOCK
+    }
+
+    /// `−dot` for [`SQ4_ROW_BLOCK`] consecutive rows of a row-major plane,
+    /// written into `out`.
+    ///
+    /// Equivalent to calling [`Self::distance_negdot`] on each row —
+    /// the blocked-scan test pins that — but amortizes the per-row query
+    /// load and horizontal reduction. Falls back to the per-row path when
+    /// the integer arm is unavailable, so correctness never depends on
+    /// the host's feature set.
+    pub(crate) fn distance_negdot_rows(
+        &self,
+        plane: &[u8],
+        residual_plane: Option<&[u8]>,
+        stride: usize,
+        first: usize,
+        out: &mut [f32; SQ4_ROW_BLOCK],
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(qi) = &self.q_int {
+            let mut coarse = [0i32; SQ4_ROW_BLOCK];
+            // SAFETY: `q_int` is Some only under the VNNI gate, and the
+            // caller guarantees SQ4_ROW_BLOCK rows exist from `first`.
+            unsafe {
+                sq4_dot_vnni_rows(&qi.coarse, plane, stride, first, self.padded, &mut coarse);
+            }
+            let mut res_acc = [0i32; SQ4_ROW_BLOCK];
+            if let (Some(qr), Some(rp)) = (&qi.residual, residual_plane) {
+                // SAFETY: as above; the residual plane has the same shape.
+                unsafe {
+                    sq4_dot_vnni_rows(qr, rp, stride, first, self.padded, &mut res_acc);
+                }
+            }
+            for r in 0..SQ4_ROW_BLOCK {
+                let mut dot = self.q_dot_offset + qi.coarse_scale * coarse[r] as f32;
+                if qi.residual.is_some() && residual_plane.is_some() {
+                    dot += qi.residual_scale * res_acc[r] as f32;
+                }
+                out[r] = -dot;
+            }
+            return;
+        }
+        for (r, slot) in out.iter_mut().enumerate() {
+            let start = (first + r) * stride;
+            let row = &plane[start..start + stride];
+            let res = residual_plane.map(|rp| &rp[start..start + stride]);
+            *slot = self.distance_negdot(row, res);
+        }
     }
 }
 
@@ -1561,6 +1756,119 @@ pub(crate) fn sq4_dot(q_prime: &[f32], packed: &[u8], padded: usize) -> f32 {
         }
     }
     sq4_dot_wide(q_prime, packed, padded)
+}
+
+/// [`sq4_dot_vnni`] over [`SQ4_ROW_BLOCK`] consecutive rows at once.
+///
+/// The coordinate block is the OUTER loop and the row the inner one, so
+/// each query block is loaded once for all `SQ4_ROW_BLOCK` rows rather than
+/// re-loaded per row, and the `SQ4_ROW_BLOCK` horizontal reductions happen
+/// together at the end instead of one per row on the critical path.
+///
+/// Rows are read at `stride` apart (the plane is row-major), so this
+/// amortizes instruction count but not locality; making the reads
+/// sequential too would require storing the plane block-major.
+///
+/// Callers must ensure the VNNI feature set and that `first + SQ4_ROW_BLOCK`
+/// rows exist in `plane`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn sq4_dot_vnni_rows(
+    q_i8: &[i8],
+    plane: &[u8],
+    stride: usize,
+    first: usize,
+    padded: usize,
+    out: &mut [i32; SQ4_ROW_BLOCK],
+) {
+    // SAFETY: each iteration reads, per row, at most 32 packed bytes from
+    // that row's slice (masked when fewer remain) and 64 query bytes whose
+    // buffer is rounded up to whole blocks. `first + SQ4_ROW_BLOCK <= rows` is
+    // the caller's precondition, so every row offset is in bounds.
+    unsafe {
+        let nibble_mask = _mm256_set1_epi8(SQ4_NIBBLE_MASK as i8);
+        let mut acc = [_mm512_setzero_si512(); SQ4_ROW_BLOCK];
+        let bytes_per_row = padded.div_ceil(2);
+        let mut d = 0;
+        while d < padded {
+            let byte_off = d / 2;
+            let avail = bytes_per_row - byte_off;
+            let q = _mm512_loadu_si512(q_i8.as_ptr().add(d) as *const __m512i);
+            for (r, a) in acc.iter_mut().enumerate() {
+                let row = plane.as_ptr().add((first + r) * stride + byte_off);
+                let bytes = if avail >= VNNI_BLOCK_COORDS / 2 {
+                    _mm256_loadu_si256(row as *const __m256i)
+                } else {
+                    _mm256_maskz_loadu_epi8((1u32 << avail) - 1, row as *const i8)
+                };
+                let lo = _mm256_and_si256(bytes, nibble_mask);
+                let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(bytes), nibble_mask);
+                let codes = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi);
+                *a = _mm512_dpbusd_epi32(*a, codes, q);
+            }
+            d += VNNI_BLOCK_COORDS;
+        }
+        for (r, a) in acc.iter().enumerate() {
+            out[r] = _mm512_reduce_add_epi32(*a);
+        }
+    }
+}
+
+/// Integer nibble dot via `vpdpbusd`: 64 coordinates per iteration
+/// against the float arm's 32, on the bytes as loaded.
+///
+/// Returns the raw `i32` accumulator; the caller scales by the query
+/// leg's step. `packed` holds two codes per byte and `q_i8` is in
+/// even-then-odd block order (see [`Sq4IntQuery`]), so the unpack is a
+/// mask and a shift with no cross-lane shuffle: the low-nibble half and
+/// the high-nibble half are simply concatenated into one register, and
+/// the query was laid out to match.
+///
+/// Callers must ensure `avx512f` + `avx512bw` + `avx512vnni`, which
+/// [`Sq4IntQuery::build`] establishes. Any `padded` is accepted: whole
+/// blocks go through `vpdpbusd` and the remainder through a scalar tail.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn sq4_dot_vnni(q_i8: &[i8], packed: &[u8], padded: usize) -> i32 {
+    debug_assert_eq!(
+        q_i8.len(),
+        padded.div_ceil(VNNI_BLOCK_COORDS) * VNNI_BLOCK_COORDS,
+        "query leg is rounded up to whole VNNI blocks"
+    );
+    debug_assert_eq!(packed.len(), padded.div_ceil(2));
+
+    // SAFETY: each iteration reads 32 packed bytes and 64 query bytes.
+    // The loop bound `d + 64 <= padded` bounds both, since packed holds
+    // `padded/2` bytes and `q_i8` holds `padded`. Loads are unaligned.
+    unsafe {
+        let nibble_mask = _mm256_set1_epi8(SQ4_NIBBLE_MASK as i8);
+        let mut acc = _mm512_setzero_si512();
+        let packed_len = packed.len();
+        let mut d = 0;
+        while d < padded {
+            let byte_off = d / 2;
+            // A partial final block masks its load: absent code bytes
+            // read as zero and pair with the zero query lanes
+            // `blocked_i8` left behind, so no scalar tail is needed.
+            let avail = packed_len - byte_off;
+            let bytes = if avail >= VNNI_BLOCK_COORDS / 2 {
+                _mm256_loadu_si256(packed.as_ptr().add(byte_off) as *const __m256i)
+            } else {
+                let mask = (1u32 << avail) - 1;
+                _mm256_maskz_loadu_epi8(mask, packed.as_ptr().add(byte_off) as *const i8)
+            };
+            let lo = _mm256_and_si256(bytes, nibble_mask);
+            let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(bytes), nibble_mask);
+            // [lo(32 even coords) | hi(32 odd coords)] — the query's own
+            // block order, so no permute is needed here.
+            let codes = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi);
+            let q = _mm512_loadu_si512(q_i8.as_ptr().add(d) as *const __m512i);
+            // Unsigned codes (0..15) against the signed query leg.
+            acc = _mm512_dpbusd_epi32(acc, codes, q);
+            d += VNNI_BLOCK_COORDS;
+        }
+        _mm512_reduce_add_epi32(acc)
+    }
 }
 
 /// 512-bit nibble dot: 32 coordinates per iteration against the AVX2
@@ -4001,6 +4309,53 @@ mod tests {
     /// power of two), including the 8-coordinate tail. This is the test
     /// that catches a wrong unpack ORDER (low/high nibble interleave),
     /// which no aggregate recall number reliably would.
+    /// The VNNI arm quantizes the query to `i8`, so unlike the float arms
+    /// it is NOT exact — what has to hold is that the error stays inside
+    /// the quantization bound. A wrong nibble/query interleave would blow
+    /// straight past that bound while still producing plausible-looking
+    /// numbers, which is exactly the failure this catches.
+    ///
+    /// Bound: each query lane carries at most half a step of error, codes
+    /// reach [`SQ4_CODE_MAX`], and the terms are independent, so the
+    /// accumulated error scales with `sqrt(padded)` rather than `padded`.
+    /// The tolerance below is that bound with room for the reduction
+    /// order differing between arms.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn sq4_dot_vnni_matches_wide_within_quantization_error() {
+        if !has_avx512vnni() {
+            eprintln!("skipping: host lacks AVX-512 VNNI");
+            return;
+        }
+        let mut state = 0x51D4_D07Cu64;
+        let mut next_u64 = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            state
+        };
+        for padded in [8usize, 64, 100, 128, 200, 256, 1024, 1536, 2048] {
+            let q: Vec<f32> = (0..padded)
+                .map(|_| ((next_u64() >> 33) as f32 / (1u64 << 30) as f32) - 1.0)
+                .collect();
+            let packed: Vec<u8> = (0..padded.div_ceil(2))
+                .map(|_| (next_u64() >> 24) as u8)
+                .collect();
+            let exact = sq4_dot_wide(&q, &packed, padded);
+            let scale = Sq4IntQuery::scale_of(&q);
+            let q_i8 = Sq4IntQuery::blocked_i8(padded, &q, scale);
+            // SAFETY: gated on the runtime VNNI check above, and every
+            // `padded` here is a whole number of VNNI blocks.
+            let got = scale * unsafe { sq4_dot_vnni(&q_i8, &packed, padded) } as f32;
+            let bound =
+                0.5 * scale * SQ4_CODE_MAX * (padded as f32).sqrt() + 1e-3 * exact.abs().max(1.0);
+            assert!(
+                (exact - got).abs() <= bound,
+                "padded {padded}: vnni {got} vs exact {exact}, error \
+                 {} exceeds quantization bound {bound}",
+                (exact - got).abs()
+            );
+        }
+    }
+
     /// The 512-bit arm must agree with the portable tier on every length
     /// class, including the narrow planes where only the tail runs. Same
     /// role as the AVX2 test below: the `unpacklo`/`unpackhi` pair is
