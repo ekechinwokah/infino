@@ -80,7 +80,7 @@ use std::{
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
 use arrow_schema::Schema;
-use futures::future::try_join_all;
+use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
 use roaring::RoaringBitmap;
 use tokio::{join, sync::OnceCell};
 use uuid::Uuid;
@@ -106,9 +106,9 @@ use crate::{
         fts::reader::BoolMode,
         vector::{
             distance::{Metric, distance, normalize, relative_score_window},
-            hnsw::{self, HnswParams, NodeScorer, PlaneScorer, Sq4Scorer, Sq16Scorer, encode_hnsw},
+            hnsw::{self, HnswParams, Plane, Sq4Scorer, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
-            reader::ScanCandidate,
+            reader::{ScanCandidate, ScanOutcome},
         },
     },
     supertable::{
@@ -175,6 +175,21 @@ const USER_FINE_RUNS_PER_FRAGMENT: usize = 8;
 /// Explicit caller `nprobe` overrides; the per-run width sweep keeps the
 /// trade measured.
 const FILTERED_USER_CELL_NPROBE: usize = 4;
+/// Cells the UNDRAINED probe may widen to under the near-tie slack,
+/// COSINE columns only.
+///
+/// Bounds the one path with no measurement behind it: until the drain
+/// stamps a width law, nothing has looked at this table's geometry, and
+/// the shared one-cell default is calibrated for planted clusters.
+/// Real embeddings need more — recall@10 0.623 -> 0.932 at 9.4M Cohere,
+/// 0.367 -> 0.844 at 200K, both cosine — and the widening is bounded so
+/// an undrained table cannot fan out across the grid while it waits for
+/// `optimize()`. Non-cosine metrics keep the one-cell default: the
+/// near-tie window is metric-sensitive, and under L2 it admits second
+/// cells on decisive geometry (measured +100% warm p90 on synthetic
+/// l2sq for zero recall gain). Drained serving never reads this: it
+/// pins the stamped width.
+const UNDRAINED_CELL_NPROBE_MAX: usize = 8;
 
 // The admit window keeps the shared
 // `manifest::RABITQ_ADMIT_CELL_SHORTLIST_FRACTION` (20%) slice of the
@@ -744,6 +759,69 @@ fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
         }
     }
     selected
+}
+
+/// In-memory centroid router: an HNSW over the pooled fp32 fine centroids,
+/// used by `ivf_router = centroid_graph` to select the top-`fanout` clusters
+/// globally, bypassing the grid. Experimental, validation-grade — built once
+/// per handle from the resident centroid section (no drain change). A graph
+/// node maps back to the `(superfile index, flat cluster id)` the stamped
+/// per-cell read plan expects, so the downstream read is byte-identical.
+pub(crate) struct CentroidRouterGraph {
+    scorer: crate::superfile::vector::hnsw::Fp32Scorer,
+    graph: crate::superfile::vector::hnsw::Hnsw,
+    node_map: Vec<(usize, u32)>,
+}
+
+/// Unit-normalize in place so the centroid graph's `−dot` scorer ranks by
+/// cosine (the fine centroids are means of unit vectors, not themselves unit).
+fn gfc_unit_normalize(v: &mut [f32]) {
+    let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if n > 0.0 {
+        let inv = 1.0 / n;
+        for x in v.iter_mut() {
+            *x *= inv;
+        }
+    }
+}
+
+/// Build the in-memory centroid router from the resident centroid section.
+/// `readers[si]` corresponds to `superfiles[si]`; centroids are pulled via
+/// `global_fine_cluster_vectors` so the flat ids match the scan path exactly.
+fn build_centroid_router(
+    superfiles: &[Arc<SuperfileEntry>],
+    readers: &[Arc<SuperfileReader>],
+    column: &str,
+    section: &crate::supertable::slow_vector_state::CentroidSection,
+    dim: usize,
+) -> Result<CentroidRouterGraph, QueryError> {
+    use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
+    let mut vecs: Vec<Vec<f32>> = Vec::new();
+    let mut node_map: Vec<(usize, u32)> = Vec::new();
+    for (si, reader) in readers.iter().enumerate() {
+        let Some(vr) = reader.vec() else { continue };
+        // Checked access: a concurrent optimize can shift the reader/superfile
+        // set while the router builds; skip a missing entry rather than panic.
+        let Some(sf) = superfiles.get(si) else {
+            continue;
+        };
+        let sfid = sf.superfile_id;
+        for (flat, mut vec) in vr
+            .global_fine_cluster_vectors(column, section, sfid)
+            .map_err(|e| QueryError::Execute(e.to_string()))?
+        {
+            gfc_unit_normalize(&mut vec);
+            vecs.push(vec);
+            node_map.push((si, flat));
+        }
+    }
+    let scorer = Fp32Scorer::from_vectors(&vecs, dim);
+    let graph = Hnsw::build(&scorer, HnswParams::default());
+    Ok(CentroidRouterGraph {
+        scorer,
+        graph,
+        node_map,
+    })
 }
 
 /// Widen a grid cell cutoff so the probed cells' indexed row counts cover at
@@ -1830,7 +1908,10 @@ pub(crate) async fn assemble_hnsw_sections(
             Some(&manifest.options.reader_pool),
             "hnsw probe calibrate: reader pool dropped result",
             move || {
+                // A Sq16 subsample: walk and reference are the same plane
+                // here, since this probe only sizes `m0` against scale.
                 hnsw::calibrate_graph(
+                    &pscorer,
                     &pscorer,
                     &pm0,
                     &pef,
@@ -1915,27 +1996,42 @@ pub(crate) async fn assemble_hnsw_sections(
     // global rayon pool. The scorer owns the (multi-GB) plane, so move it into
     // the closure and hand it back for the encode below rather than cloning.
     //
-    // The plane codec is gated here and NOWHERE else: the resident plane is
-    // built, calibrated, registered, persisted and served as one codec, and
-    // calibration measures recall WITH that codec — so a plane too coarse to
-    // clear the register floor declines itself to ivf through the existing
-    // None→fallback, with no separate safety mechanism. The (CPU-bound) Sq4
-    // re-quantization of the decoded Sq16 rows runs inside the pool closure
-    // with the calibration it feeds.
-    let (target_recall, recall_slack, ef_construction, plane_codec) = (
+    // The walk codec is gated here and NOWHERE else. Calibration WALKS the
+    // configured plane and GRADES against Sq16, so the recall it reports is
+    // the recall that will be served — codec error included. A plane too
+    // coarse for the table's target therefore declines itself to ivf through
+    // the existing None→fallback, with no separate safety mechanism. Grading
+    // against the walk plane itself could not do that: the ground truth would
+    // carry the same error it is meant to detect.
+    let (target_recall, recall_slack, ef_construction) = (
         vcfg.target_recall,
         vcfg.hnsw_recall_slack,
         vcfg.hnsw_ef_construction,
-        vcfg.hnsw_plane,
     );
-    let (plane, choice, graph) = run_on_pool(
+    let walk = hnsw::WalkCodec::from_config(vcfg.hnsw_plane);
+    let n_rows = doc_ids.len();
+    let (scorer, sq4, choice, graph) = run_on_pool(
         Some(&manifest.options.reader_pool),
         "hnsw calibrate: reader pool dropped result",
         move || {
-            let plane = plane_from_sq16(scorer, plane_codec);
-            let (choice, graph) = match &plane {
-                PlaneScorer::Sq16(s) => hnsw::calibrate_graph(
+            // The 4-bit plane is a re-quantization of the very rows being
+            // calibrated: a rotation and a moment pass per row, so it belongs
+            // on this pool beside the calibration it feeds, never inline on a
+            // tokio worker. Built only when the codec names it.
+            let sq4 = walk.is_sq4().then(|| {
+                hnsw::Sq4Scorer::from_sq16_plane(
+                    scorer.codes(),
+                    dim,
+                    n_rows,
+                    walk.with_residual(),
+                    HNSW_PLANE_ROT_SEED,
+                    None,
+                )
+            });
+            let (choice, graph) = match &sq4 {
+                Some(s) => hnsw::calibrate_graph(
                     s,
+                    &scorer,
                     &m0_cands,
                     &ef_cands,
                     target_recall,
@@ -1945,8 +2041,12 @@ pub(crate) async fn assemble_hnsw_sections(
                     HNSW_CALIB_RECALL_K,
                     HNSW_CALIB_SEED,
                 ),
-                PlaneScorer::Sq4(s) => hnsw::calibrate_graph(
-                    s,
+                // Sq16 and SQ8 both walk representations derived from these
+                // codes, so Sq16 is both the walk and the reference here; the
+                // SQ8 walk's own loss is recovered by the refine.
+                None => hnsw::calibrate_graph(
+                    &scorer,
+                    &scorer,
                     &m0_cands,
                     &ef_cands,
                     target_recall,
@@ -1957,7 +2057,7 @@ pub(crate) async fn assemble_hnsw_sections(
                     HNSW_CALIB_SEED,
                 ),
             };
-            (plane, choice, graph)
+            (scorer, sq4, choice, graph)
         },
     )
     .await
@@ -1986,35 +2086,15 @@ pub(crate) async fn assemble_hnsw_sections(
     );
     let graph = graph.expect("registered choice carries its pruned graph");
     Ok(Some(encode_hnsw(
-        &plane, &doc_ids, &graph, dim, choice.ef, column,
+        scorer.codes(),
+        &doc_ids,
+        &graph,
+        dim,
+        choice.ef,
+        column,
+        walk,
+        sq4.as_ref(),
     )))
-}
-
-/// Build the resident plane the config gates, from the Sq16 codes the
-/// drained superfiles hold. Sq16 adopts the codes verbatim (zero copy
-/// beyond the collect); the Sq4 codecs re-quantize the decoded rows onto
-/// a freshly fitted per-coordinate ruler. CPU-bound — callers run it on
-/// the reader pool.
-fn plane_from_sq16(scorer: Sq16Scorer, codec: config::VectorHnswPlane) -> PlaneScorer {
-    match codec {
-        config::VectorHnswPlane::Sq16 => PlaneScorer::Sq16(scorer),
-        config::VectorHnswPlane::Sq4 => PlaneScorer::Sq4(Sq4Scorer::from_sq16_plane(
-            scorer.codes(),
-            scorer.dim(),
-            scorer.len(),
-            false,
-            HNSW_PLANE_ROT_SEED,
-            None,
-        )),
-        config::VectorHnswPlane::Sq4Residual => PlaneScorer::Sq4(Sq4Scorer::from_sq16_plane(
-            scorer.codes(),
-            scorer.dim(),
-            scorer.len(),
-            true,
-            HNSW_PLANE_ROT_SEED,
-            None,
-        )),
-    }
 }
 
 /// Incrementally extend a prior persisted `hnsw` graph with a
@@ -2113,6 +2193,21 @@ pub(crate) async fn assemble_hnsw_incremental(
     // graph would be inconsistent), and the stamped query beam carries forward.
     let inherited_m0 = prior.graph.base_degree();
     let inherited_ef = prior.ef_search;
+    // The walk codec is inherited exactly like `(m0, ef)`: the resident nodes
+    // were built, calibrated and registered on that plane's geometry, so the
+    // delta must land on the same one. A change to `vector.hnsw_plane` takes
+    // effect at the next FULL rebuild, not mid-extend.
+    let inherited_walk = if prior.sq4.is_some() {
+        if prior.sq4.as_ref().is_some_and(Sq4Scorer::has_residual) {
+            hnsw::WalkCodec::Sq4Residual
+        } else {
+            hnsw::WalkCodec::Sq4
+        }
+    } else if prior.sq8_plane.is_empty() {
+        hnsw::WalkCodec::Sq16
+    } else {
+        hnsw::WalkCodec::Sq8
+    };
     let mut doc_ids = prior.doc_ids;
     doc_ids.extend_from_slice(&new_doc_ids);
     let total = doc_ids.len();
@@ -2124,15 +2219,18 @@ pub(crate) async fn assemble_hnsw_incremental(
     // every existing node's reconstruction). A config change to
     // `vector.hnsw_plane` therefore takes effect on the next FULL rebuild,
     // not mid-extend.
-    // The scorer owns the extended plane; the encoder borrows it back
-    // rather than holding a second owned copy.
-    let scorer = match &prior.scorer {
-        PlaneScorer::Sq16(prior_sq16) => {
-            let mut codes = prior_sq16.codes().to_vec();
-            codes.extend_from_slice(&new_codes);
-            PlaneScorer::Sq16(Sq16Scorer::from_codes(codes, dim, total))
-        }
-        PlaneScorer::Sq4(prior_sq4) => {
+    // The Sq16 plane always extends by concatenation — it is the refine and
+    // calibration reference, and its grid is fixed, so there is nothing to
+    // inherit beyond the codes themselves.
+    let mut sq16_codes = prior.scorer.codes().to_vec();
+    sq16_codes.extend_from_slice(&new_codes);
+    let scorer = Sq16Scorer::from_codes(sq16_codes.clone(), dim, total);
+    // The 4-bit walk plane, when the prior bundle carried one, extends onto
+    // the PRIOR ruler and rotation seed — never a refit. `from_sq16_plane`
+    // with `Some((offset, step))` is what pins that.
+    let sq4 = match &prior.sq4 {
+        None => None,
+        Some(prior_sq4) => {
             let (pcodes, pres, offset, step) = prior_sq4.parts();
             let delta = Sq4Scorer::from_sq16_plane(
                 &new_codes,
@@ -2149,7 +2247,7 @@ pub(crate) async fn assemble_hnsw_incremental(
                 (Some(a), Some(b)) => {
                     let mut r = a.to_vec();
                     r.extend_from_slice(b);
-                    Some(r)
+                    Some(Plane::Owned(r))
                 }
                 (None, None) => None,
                 // A prior bundle cannot disagree with a delta it derived:
@@ -2159,7 +2257,7 @@ pub(crate) async fn assemble_hnsw_incremental(
             let offset = offset.to_vec();
             let step = step.to_vec();
             match Sq4Scorer::from_parts(
-                codes,
+                Plane::Owned(codes),
                 residual,
                 offset,
                 step,
@@ -2167,7 +2265,7 @@ pub(crate) async fn assemble_hnsw_incremental(
                 dim,
                 total,
             ) {
-                Some(sc) => PlaneScorer::Sq4(sc),
+                Some(sc) => Some(sc),
                 // Shape mismatch means a corrupt prior plane: full rebuild.
                 None => return Ok(None),
             }
@@ -2185,7 +2283,7 @@ pub(crate) async fn assemble_hnsw_incremental(
     // The extend fans the new-node inserts across rayon, and the recall
     // recheck is pure CPU; both belong on the reader pool, not inline on the
     // tokio worker or the global rayon pool — matching the full-build path.
-    let (scorer, graph, recall) = run_on_pool(
+    let (scorer, sq4, graph, recall) = run_on_pool(
         Some(&manifest.options.reader_pool),
         "hnsw incremental extend + recheck: reader pool dropped result",
         move || {
@@ -2194,10 +2292,12 @@ pub(crate) async fn assemble_hnsw_incremental(
                 m0: inherited_m0,
                 ..HnswParams::default()
             };
-            // Insert ONLY the new node range into a copy of the prior graph.
-            let graph = match &scorer {
-                PlaneScorer::Sq16(s) => prior_graph.extend(s, params),
-                PlaneScorer::Sq4(s) => prior_graph.extend(s, params),
+            // Insert ONLY the new node range into a copy of the prior graph,
+            // on whichever plane the walk uses — the graph's neighbour lists
+            // must describe the distances the walk will see.
+            let graph = match &sq4 {
+                Some(s) => prior_graph.extend(s, params),
+                None => prior_graph.extend(&scorer, params),
             };
             // Re-check recall on the grown graph. The base-layer degree
             // requirement rises with N, so inherited `(m0, ef)` calibrated at a
@@ -2210,101 +2310,50 @@ pub(crate) async fn assemble_hnsw_incremental(
             // O(corpus) per query, so measure a bounded strided subsample
             // instead — the same probe the full build gates on — keeping the
             // recheck ~O(probe_cap) regardless of how large the table has grown.
+            //
+            // The subsample is always taken from the Sq16 plane: it is the
+            // reference the recall is graded against, and sampling the walk
+            // plane instead would reintroduce grading a codec against itself.
             let recall = if total > probe_cap {
                 let step = total / probe_cap;
-                match &scorer {
-                    PlaneScorer::Sq16(full) => {
-                        let stride_bytes = dim * 2;
-                        let mut sample: Vec<u8> = Vec::with_capacity(probe_cap * stride_bytes);
-                        for (i, row) in full.codes().chunks_exact(stride_bytes).enumerate() {
-                            if i.is_multiple_of(step) {
-                                sample.extend_from_slice(row);
-                            }
-                        }
-                        let pn = sample.len() / stride_bytes;
-                        let psc = Sq16Scorer::from_codes(sample, dim, pn);
-                        hnsw::calibrate_graph(
-                            &psc,
-                            &[inherited_m0],
-                            &[inherited_ef],
-                            target_recall,
-                            recall_slack,
-                            ef_construction,
-                            HNSW_CALIB_QUERIES,
-                            HNSW_CALIB_RECALL_K,
-                            HNSW_CALIB_SEED,
-                        )
-                        .0
-                        .recall
-                    }
-                    PlaneScorer::Sq4(full) => {
-                        // Same strided subsample over the packed rows; the
-                        // sample inherits the full plane's ruler verbatim,
-                        // so its recall measures the served codec.
-                        let (codes, res, offset, ruler_step) = full.parts();
-                        // Packed rows span the ROTATED (padded) space.
-                        // Blocked rotation keeps the rotated space at
-                        // exactly `dim`, so the packed stride carries no
-                        // power-of-two padding.
-                        let stride_bytes = dim.div_ceil(2);
-                        let mut sc: Vec<u8> = Vec::with_capacity(probe_cap * stride_bytes);
-                        let mut sr: Option<Vec<u8>> = res.map(|_| Vec::new());
-                        for i in 0..total {
-                            if i.is_multiple_of(step) {
-                                sc.extend_from_slice(
-                                    &codes[i * stride_bytes..(i + 1) * stride_bytes],
-                                );
-                                if let (Some(sr), Some(res)) = (sr.as_mut(), res) {
-                                    sr.extend_from_slice(
-                                        &res[i * stride_bytes..(i + 1) * stride_bytes],
-                                    );
-                                }
-                            }
-                        }
-                        let pn = sc.len() / stride_bytes;
-                        match Sq4Scorer::from_parts(
-                            sc,
-                            sr,
-                            offset.to_vec(),
-                            ruler_step.to_vec(),
-                            full.rot_seed(),
-                            dim,
-                            pn,
-                        ) {
-                            Some(psc) => {
-                                hnsw::calibrate_graph(
-                                    &psc,
-                                    &[inherited_m0],
-                                    &[inherited_ef],
-                                    target_recall,
-                                    recall_slack,
-                                    ef_construction,
-                                    HNSW_CALIB_QUERIES,
-                                    HNSW_CALIB_RECALL_K,
-                                    HNSW_CALIB_SEED,
-                                )
-                                .0
-                                .recall
-                            }
-                            // A malformed sample cannot certify the bar:
-                            // report zero so the caller does a full rebuild.
-                            None => 0.0,
-                        }
+                let stride_bytes = dim * 2;
+                let mut sample: Vec<u8> = Vec::with_capacity(probe_cap * stride_bytes);
+                for (i, row) in scorer.codes().chunks_exact(stride_bytes).enumerate() {
+                    if i.is_multiple_of(step) {
+                        sample.extend_from_slice(row);
                     }
                 }
+                let pn = sample.len() / stride_bytes;
+                let psc = Sq16Scorer::from_codes(sample, dim, pn);
+                hnsw::calibrate_graph(
+                    &psc,
+                    &psc,
+                    &[inherited_m0],
+                    &[inherited_ef],
+                    target_recall,
+                    recall_slack,
+                    ef_construction,
+                    HNSW_CALIB_QUERIES,
+                    HNSW_CALIB_RECALL_K,
+                    HNSW_CALIB_SEED,
+                )
+                .0
+                .recall
             } else {
-                match &scorer {
-                    PlaneScorer::Sq16(s) => hnsw::measure_recall(
+                match &sq4 {
+                    Some(s) => hnsw::measure_recall(
                         &graph,
                         s,
+                        &scorer,
                         inherited_ef,
                         HNSW_CALIB_RECALL_K,
                         HNSW_CALIB_QUERIES,
                         HNSW_CALIB_SEED,
                     ),
-                    PlaneScorer::Sq4(s) => hnsw::measure_recall(
+                    None => hnsw::measure_recall(
                         &graph,
-                        s,
+                        &scorer,
+                        &scorer,
                         inherited_ef,
                         HNSW_CALIB_RECALL_K,
                         HNSW_CALIB_QUERIES,
@@ -2312,7 +2361,7 @@ pub(crate) async fn assemble_hnsw_incremental(
                     ),
                 }
             };
-            (scorer, graph, recall)
+            (scorer, sq4, graph, recall)
         },
     )
     .await
@@ -2322,7 +2371,16 @@ pub(crate) async fn assemble_hnsw_incremental(
     }
     let new_high_water = doc_ids.iter().copied().max().unwrap_or(prior_high_water);
     Ok(Some((
-        encode_hnsw(&scorer, &doc_ids, &graph, dim, inherited_ef, column),
+        encode_hnsw(
+            scorer.codes(),
+            &doc_ids,
+            &graph,
+            dim,
+            inherited_ef,
+            column,
+            inherited_walk,
+            sq4.as_ref(),
+        ),
         new_high_water,
         inserted,
     )))
@@ -2395,6 +2453,10 @@ impl SupertableReader {
         let manifest = self.manifest();
         let sections_for_walk = Arc::clone(&sections);
         let query_owned = query.to_vec();
+        // SQ8 int8-VNNI walk + Sq16 refine when the SQ8 plane is resident
+        // (built at decode under `vector.hnsw_sq8_walk`); otherwise walk on
+        // Sq16 directly. `hnsw_refine_k` is the re-rank width.
+        let refine_k = config::global().vector.hnsw_refine_k;
         let hits: Vec<SuperfileHit> = run_on_pool(
             Some(&manifest.options.reader_pool),
             "hnsw serving walk: reader pool dropped result",
@@ -2403,25 +2465,34 @@ impl SupertableReader {
                     .data
                     .as_ref()
                     .expect("data present: checked before dispatch");
-                match &data.scorer {
-                    PlaneScorer::Sq16(s) => data.graph.search(s, &query_owned, k_fetch, ef),
-                    PlaneScorer::Sq4(s) => data.graph.search(s, &query_owned, k_fetch, ef),
-                }
-                .into_iter()
-                .filter_map(|(node, dist)| {
-                    // Shift the graph's `−dot` onto the ivf/scan arm's
-                    // `1 − dot` cosine scale so the cross-arm merge
-                    // (top_k_ascending) compares like with like. Monotonic
-                    // in `dist`, so intra-arm order is unchanged; the public
-                    // `score` column stays non-negative.
-                    Some(SuperfileHit {
-                        superfile: SuperfileUri(Uuid::nil()),
-                        local_doc_id: 0,
-                        score: 1.0 + dist,
-                        stable_id: Some(*data.doc_ids.get(node as usize)?),
+                // One dispatch per query, not per candidate: pick the walk
+                // plane the bundle carries and hand the concrete scorer to the
+                // monomorphized walk. A coarse plane re-ranks its beam on Sq16
+                // (`refine_k`), so the plane changes which candidates are
+                // considered, never the order returned.
+                let walked = if let Some(sq4) = &data.sq4 {
+                    data.search_walk_refine(sq4, &query_owned, k_fetch, ef, refine_k)
+                } else if !data.sq8_plane.is_empty() {
+                    data.search_sq8_refine(&query_owned, k_fetch, ef, refine_k)
+                } else {
+                    data.graph.search(&data.scorer, &query_owned, k_fetch, ef)
+                };
+                walked
+                    .into_iter()
+                    .filter_map(|(node, dist)| {
+                        // Shift the graph's `−dot` onto the ivf/scan arm's
+                        // `1 − dot` cosine scale so the cross-arm merge
+                        // (top_k_ascending) compares like with like. Monotonic
+                        // in `dist`, so intra-arm order is unchanged; the public
+                        // `score` column stays non-negative.
+                        Some(SuperfileHit {
+                            superfile: SuperfileUri(Uuid::nil()),
+                            local_doc_id: 0,
+                            score: 1.0 + dist,
+                            stable_id: Some(*data.doc_ids.get(node as usize)?),
+                        })
                     })
-                })
-                .collect()
+                    .collect()
             },
         )
         .await
@@ -2477,17 +2548,18 @@ impl SupertableReader {
                 return Some(Arc::clone(sections));
             }
         }
-        let sections = match fetch_graph_sections(storage.as_ref(), &reference).await {
-            Ok(sections) => Arc::new(sections),
-            Err(error) => {
-                tracing::warn!(
-                    "hnsw graph sections {} unavailable ({error}); falling back to \
+        let sections =
+            match fetch_graph_sections(storage.as_ref(), &reference, /* need_sq8 */ true).await {
+                Ok(sections) => Arc::new(sections),
+                Err(error) => {
+                    tracing::warn!(
+                        "hnsw graph sections {} unavailable ({error}); falling back to \
                      the ivf scan",
-                    reference.uri
-                );
-                return None;
-            }
-        };
+                        reference.uri
+                    );
+                    return None;
+                }
+            };
         // Publish under the cache lock. The gate makes this the only in-flight
         // hydration, so it installs the uri it just fetched.
         {
@@ -2660,18 +2732,15 @@ impl SupertableReader {
             .await
     }
 
-    /// Global-fine fanout (`vector.search_mode = global_fine_centroid`, reading
+    /// Global-fine fanout (`vector.ivf_router = centroid_graph`, reading
     /// `fanout = vector.global_fine_fanout` clusters, clamped to the table's
-    /// cluster total). Phase 1: score `query` against every cell's fp32 fine
-    /// centroids from the resident centroid section (a RAM scan — no superfile
-    /// opens for the scoring) and keep the global top-`fanout`
-    /// `(superfile, flat cluster)` by ascending distance. Phase 2: scan only those clusters per superfile, pool the
-    /// warm survivors across all cells, take one global shortlist cut, and
-    /// exact-rerank where the winners live. The router overrides only cluster
-    /// SELECTION; the byte fetch, 1-bit shortlist, rerank, and id remap are
-    /// the stamped path's own code. A tree/HNSW centroid router replaces the
-    /// brute-force scan later; see
-    /// [`SuperfileReader::global_fine_cluster_scores`].
+    /// cluster total). Phase 1: walk the centroid-HNSW over the resident fp32
+    /// fine centroids (a RAM op — no superfile opens for the selection) and
+    /// keep the global top-`fanout` `(superfile, flat cluster)`. Phase 2: scan
+    /// only those clusters per superfile, pool the warm survivors across all
+    /// cells, take one global shortlist cut, and exact-rerank where the winners
+    /// live. The router overrides only cluster SELECTION; the byte fetch, 1-bit
+    /// shortlist, rerank, and id remap are the stamped path's own code.
     async fn global_fine_fanout(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
@@ -2698,37 +2767,59 @@ impl SupertableReader {
         // Phase 1: build the global candidate pool. Scores are comparable
         // across cells/superfiles (one metric + one query), so a single
         // top-`fc` cut over the pool is a valid global selection.
+        // Open every eligible superfile reader (phase 2 needs them regardless
+        // of how the top-`fanout` clusters are selected).
         let mut readers: Vec<Arc<SuperfileReader>> = Vec::with_capacity(superfiles.len());
-        let mut cands: Vec<(usize, u32, f32)> = Vec::new();
         for entry in superfiles.iter() {
             let reader =
                 dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
                     .await?;
-            let si = readers.len();
-            if let Some(vr) = reader.vec() {
-                let scores = vr
-                    .global_fine_cluster_scores(column, query, section.as_ref(), entry.superfile_id)
-                    .map_err(|e| QueryError::Execute(e.to_string()))?;
-                for (flat, score) in scores {
-                    cands.push((si, flat, score));
-                }
-            }
             readers.push(reader);
         }
-        if cands.is_empty() {
+
+        // Cluster selection: the centroid-router HNSW walks a graph over the
+        // resident fp32 fine centroids to pick the top-`fanout` clusters; phase
+        // 2 then reads only those clusters. The graph is built once (cached) at
+        // the first query from the same fine centroids, so a graph node maps
+        // back to the exact `flat` cluster id and the read plan is identical.
+        let by_sf: HashMap<usize, Vec<u32>> = {
+            let cache = Arc::clone(&manifest.options.centroid_router_cache);
+            let router = {
+                let sfs = superfiles.to_vec();
+                let rdrs = readers.clone();
+                let col = column.to_string();
+                let sect = Arc::clone(&section);
+                let dim = query.len();
+                cache
+                    .get_or_try_init(|| async move {
+                        build_centroid_router(&sfs, &rdrs, &col, sect.as_ref(), dim).map(Arc::new)
+                    })
+                    .await?
+                    .clone()
+            };
+            let mut q = query.to_vec();
+            gfc_unit_normalize(&mut q);
+            let fc = fanout.clamp(1, router.node_map.len().max(1));
+            // `ef` governs graph-vs-exact parity; `global_fine_graph_ef = 0`
+            // auto-selects `fanout * 2`.
+            let ef_cfg = config::global().vector.global_fine_graph_ef;
+            let ef = if ef_cfg > 0 {
+                ef_cfg
+            } else {
+                fc.saturating_mul(2)
+            }
+            .max(fc);
+            let hits = router.graph.search(&router.scorer, &q, fc, ef);
+            let mut m: HashMap<usize, Vec<u32>> = HashMap::new();
+            for (node, _) in hits {
+                if let Some(&(si, flat)) = router.node_map.get(node as usize) {
+                    m.entry(si).or_default().push(flat);
+                }
+            }
+            m
+        };
+        if by_sf.is_empty() {
             return Ok(Vec::new());
-        }
-        // `cands` now holds EVERY fine cluster across all cells/superfiles;
-        // clamp the requested fanout to that total. Global top-`fc` by
-        // ascending distance (smaller = nearer).
-        let fc = fanout.clamp(1, cands.len());
-        if cands.len() > fc {
-            cands.select_nth_unstable_by(fc - 1, |a, b| a.2.total_cmp(&b.2));
-            cands.truncate(fc);
-        }
-        let mut by_sf: HashMap<usize, Vec<u32>> = HashMap::new();
-        for (si, flat, _) in cands {
-            by_sf.entry(si).or_default().push(flat);
         }
 
         // Phase 2: DEFERRED per-cell scan on the selected clusters, pooling
@@ -2740,35 +2831,65 @@ impl SupertableReader {
         // ~4% of the true top-k at 10M (all neighbors are read — recall@100
         // is 1.0 — but a single cross-cell exact rerank is needed to seat
         // them in the top-k).
+        // Parallelize the per-cell cold scan across superfiles. Each selected
+        // superfile's scan is independent, and the stamped whole-cell path
+        // already fans out this way (`fanout_with`). A serial loop here
+        // RTT-serializes the cold Blob reads — the graph router's dominant cold
+        // cost — so run them concurrently, bounded to the reader-pool width
+        // (the same cap every other fan-out here uses). `coalesce` expands each
+        // touched cell's selection to its [min..max] contiguous span.
+        let coalesce = config::global().vector.global_fine_coalesce;
+        let scan_width = manifest.options.reader_pool.current_num_threads().max(1);
+        // Share the connection memory budget and reader pool across the
+        // concurrent scans, matching the stamped fan-out: cold fetches then gate
+        // on `OverBudget` and score on the reader pool. A serial loop needed
+        // neither (one fetch in flight), but concurrency does.
+        let scan_pool = Arc::clone(&manifest.options.reader_pool);
+        let scan_budget = Arc::clone(&manifest.options.connection_memory_budget);
+        // Build the per-superfile scan futures in a plain loop (concrete
+        // borrows) rather than a lifetime-generic `.map()` closure, then run
+        // them concurrently bounded to the pool width.
+        let mut scan_futs = Vec::new();
+        for (si, flats) in by_sf {
+            let Some(vr) = readers[si].as_ref().vec() else {
+                continue;
+            };
+            let pool = Arc::clone(&scan_pool);
+            let budget = Arc::clone(&scan_budget);
+            scan_futs.push(async move {
+                let flats = if coalesce {
+                    vr.coalesce_flats_to_cell_spans(&flats)
+                } else {
+                    flats
+                };
+                let scan = vr
+                    .search_clusters_scan_async(
+                        column,
+                        query,
+                        k,
+                        &flats,
+                        rerank_mult,
+                        rerank_mult,
+                        None,
+                        None,
+                        Some(pool),
+                        Some(budget),
+                    )
+                    .await
+                    .map_err(|e| QueryError::Execute(e.to_string()))?;
+                Ok::<_, QueryError>((si, scan))
+            });
+        }
+        let scans: Vec<(usize, ScanOutcome)> = stream::iter(scan_futs)
+            .buffer_unordered(scan_width)
+            .try_collect()
+            .await?;
+        // Tag + stable-id attach + pool the survivors (cheap, post-I/O).
         let mut per_superfile: Vec<Vec<SuperfileHit>> = Vec::new();
         let mut pooled: Vec<(usize, ScanCandidate)> = Vec::new();
-        for (si, flats) in by_sf {
+        for (si, scan) in scans {
             let entry = &superfiles[si];
             let reader = readers[si].as_ref();
-            let Some(vr) = reader.vec() else { continue };
-            // Per-cell coalesced read (`vector.global_fine_coalesce`): expand
-            // each touched cell's selection to its [min..max] contiguous span
-            // so the cell reads as one GET instead of scattered clusters.
-            let flats = if config::global().vector.global_fine_coalesce {
-                vr.coalesce_flats_to_cell_spans(&flats)
-            } else {
-                flats
-            };
-            let scan = vr
-                .search_clusters_scan_async(
-                    column,
-                    query,
-                    k,
-                    &flats,
-                    rerank_mult,
-                    rerank_mult,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .await
-                .map_err(|e| QueryError::Execute(e.to_string()))?;
             // Cold cells rerank in-scan; take their exact hits directly.
             if !scan.hits.is_empty() {
                 let mut tagged = dispatch::tag_hits(entry, scan.hits);
@@ -2818,7 +2939,7 @@ impl SupertableReader {
         let (resolved_nprobe, _) = options.resolve(filtered);
         let manifest = self.manifest();
         let hidden_vector_index = is_hidden_vector_manifest(manifest);
-        // Global-fine routing (`vector.search_mode = global_fine_centroid`):
+        // Global-fine routing (`vector.ivf_router = centroid_graph`):
         // select the top-`global_fine_fanout` fine centroids GLOBALLY across
         // every cell/superfile from the resident centroid section, bypassing
         // the grid + stamped-law selection, and read only those clusters.
@@ -2858,14 +2979,38 @@ impl SupertableReader {
             warn_hnsw_no_resident_graph(column, manifest.slow_vector_state_graphs_blob().is_some());
             // fall through to the ivf scan below
         }
+        // The centroid router ranks by cosine (unit-normalized centroids, a
+        // -dot scorer), so it is only correct for a Cosine column. A NegDot or
+        // L2Sq table falls through to the stamped router rather than being
+        // mis-ranked; per-metric centroid scoring is a router-productionization
+        // follow-on.
+        let centroid_graph_metric_ok = manifest
+            .options
+            .vector_columns
+            .iter()
+            .find(|vc| vc.column == column)
+            .is_some_and(|vc| {
+                matches!(
+                    vc.metric,
+                    crate::superfile::vector::distance::Metric::Cosine
+                )
+            });
         if !filtered
             && hidden_vector_index
-            && vcfg.search_mode == config::VectorSearchMode::GlobalFineCentroid
+            && vcfg.search_mode == config::VectorSearchMode::Ivf
+            && vcfg.ivf_router == config::IvfRouter::CentroidGraph
             && vcfg.global_fine_fanout > 0
+            && centroid_graph_metric_ok
         {
-            let fanout = vcfg.global_fine_fanout;
             return self
-                .global_fine_fanout(&superfiles, column, query, k, &options, fanout)
+                .global_fine_fanout(
+                    &superfiles,
+                    column,
+                    query,
+                    k,
+                    &options,
+                    vcfg.global_fine_fanout,
+                )
                 .await;
         }
         // Borrow routing — do not clone the VectorCell centroid grid just to
@@ -3035,7 +3180,31 @@ impl SupertableReader {
                     nprobe_max: FILTERED_USER_CELL_NPROBE,
                     ..CellRoutingParams::default()
                 }
+            } else if metric == Metric::Cosine {
+                // UNDRAINED tail: no drain has run, so no law has been
+                // stamped and nothing has measured this table's geometry.
+                // The shipped one-cell probe is calibrated against
+                // planted-cluster geometry and collapses on real
+                // embeddings -- measured recall@10 0.623 at 9.4M Cohere,
+                // 0.367 at 200K. Let the near-tie widening reach further
+                // HERE ONLY: a drained table serves its stamped width
+                // instead, so a table whose law says one cell keeps its
+                // single cell rather than being widened by a default.
+                CellRoutingParams {
+                    nprobe_max: UNDRAINED_CELL_NPROBE_MAX,
+                    ..CellRoutingParams::default()
+                }
             } else {
+                // Non-cosine UNDRAINED tail keeps the one-cell default.
+                // The near-tie window (`τ = d*·(1+slack)`) is
+                // metric-sensitive: under L2 the second-nearest cells sit
+                // within the window on decisive geometry far more often
+                // than under cosine, so the widened cap fires where it
+                // buys nothing -- measured +100% warm p90 on the synthetic
+                // l2sq lane (5.40 -> 10.81 ms) at unchanged ~0.99 recall.
+                // The collapse the cap exists to cover (0.367 / 0.623)
+                // was measured on cosine embeddings only; widening another
+                // metric's undrained tail takes its own measurement first.
                 CellRoutingParams::default()
             };
             // Per-table probe-width law: when the drain calibrated one and
@@ -3055,20 +3224,39 @@ impl SupertableReader {
             // exactly where a flat config floor was measured scale-fragile:
             // 10M post-drain 0.982 at floor 4 vs 0.996 at 8, identical
             // latency).
+            // The stamped fine-depth law applies to FILTERED queries too.
+            // It is consumed as a floor (`max`), so it can only deepen a
+            // read, never narrow one — and an allow-set needs at least the
+            // unfiltered depth, not less: only a fraction of what a cell
+            // yields is eligible, so the matching neighbours sit deeper in
+            // the fine ranking than the unfiltered top-k ever has to reach.
+            // Filtered was pinned to the fixed FILTERED_HIDDEN_FINE_NPROBE
+            // floor while the drain's own measurement sat unused, which is
+            // the shape of the loss on real corpora (measured post-drain on
+            // Cohere: 0.793 at 200K falling to 0.630 at 9.4M as cells grow,
+            // against 0.997 unfiltered on the same table).
             if hidden_vector_index
-                && !filtered
                 && let Some(fine) = hidden_routing.and_then(|r| r.fine_for_k_at(k))
             {
                 cell_routing.fine_nprobe = cell_routing.fine_nprobe.max(fine);
             }
-            let law_width: Option<usize> =
-                if hidden_vector_index && !filtered && options.nprobe.is_none() {
-                    hidden_routing
-                        .and_then(|r| r.width_for_k_at(k))
-                        .filter(|w| *w > LAW_WIDTH_WITHIN_DEFAULT)
-                } else {
-                    None
-                };
+            // The stamped width law serves FILTERED queries too. Sweeping
+            // every cell (`FILTERED_HIDDEN_CELL_NPROBE`) was a fallback for
+            // not consulting it: wide-and-shallow costs more reads than the
+            // law's cell set AND misses, because an allow-set's eligible
+            // neighbours sit deeper in the fine ranking rather than in
+            // farther cells. With the fine-depth law above now applying,
+            // filtered reads the law's cell set at whole-cell depth. It
+            // stops there: the near-tie serve window below is gated on
+            // `law_default`, which keeps its `!filtered` condition, so no
+            // extension cells are added for filtered.
+            let law_width: Option<usize> = if hidden_vector_index && options.nprobe.is_none() {
+                hidden_routing
+                    .and_then(|r| r.width_for_k_at(k))
+                    .filter(|w| *w > LAW_WIDTH_WITHIN_DEFAULT)
+            } else {
+                None
+            };
             // Depth the DEFAULT (unpinned) path would read per cell — the
             // stamped fine-depth law over the routing base. Captured before
             // the pin lifts `fine_nprobe` to MAX: #515 serve-window
@@ -5071,7 +5259,7 @@ fn subtract_tombstones(
     if let Some(cache) = tombstone_cache {
         let deleted = cache
             .bitmap_for(entry.superfile_id, now)
-            .map_err(|e| QueryError::Store(format!("tombstone cache: {e}")))?;
+            .map_err(|e| QueryError::build(format!("tombstone cache: {e}"), &e))?;
         if !deleted.is_empty() {
             *bm -= &*deleted;
         }
@@ -5614,6 +5802,30 @@ mod tests {
         assert_eq!(admit_shortlist_window(1024), 205);
         // Ceil, not floor: a fractional slice rounds up.
         assert_eq!(admit_shortlist_window(241), 49);
+    }
+
+    /// The wider undrained probe stays scoped to the undrained branch.
+    ///
+    /// Widening `CellRoutingParams::default()` instead would reach every
+    /// path that falls back to it — including a DRAINED table whose
+    /// stamped width law is one cell, where the law filters to `None`
+    /// (`LAW_WIDTH_WITHIN_DEFAULT`), no pin happens, and the default is
+    /// what serves. That regression is invisible to recall (planted
+    /// clusters already serve ~1.0) and shows up only as cold-GET fan,
+    /// which is why it is asserted here rather than left to a bench.
+    #[test]
+    fn undrained_cap_is_scoped_and_wider_than_the_shared_default() {
+        let shared = CellRoutingParams::default();
+        assert_eq!(
+            (shared.nprobe_min, shared.nprobe_max),
+            (1, 1),
+            "the shared routing fallback must stay a one-cell probe"
+        );
+        assert!(
+            super::UNDRAINED_CELL_NPROBE_MAX > shared.nprobe_max,
+            "the undrained cap must exceed the shared default, or the \
+             undrained branch widens nothing"
+        );
     }
 
     /// The self-measured admit extension (#515) follows the query's own
@@ -8000,8 +8212,11 @@ mod tests {
             let bundle = block_on(super::assemble_hnsw_sections(manifest, "emb", &None))
                 .expect("assemble ok")
                 .expect("sq16 rows must assemble into a graph");
-            let decoded =
-                crate::superfile::vector::hnsw::decode_hnsw(&bundle).expect("decode data bundle");
+            let decoded = crate::superfile::vector::hnsw::decode_hnsw(
+                &bytes::Bytes::from(bundle),
+                crate::superfile::vector::hnsw::WalkCodec::Sq8,
+            )
+            .expect("decode data bundle");
             assert_eq!(
                 decoded.graph.len(),
                 decoded.doc_ids.len(),

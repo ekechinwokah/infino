@@ -287,9 +287,9 @@ const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 500_000;
 const DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D: f64 = 8.0;
 /// Default k-means training points per centroid for per-cell sub-builds.
 const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
-/// Default fine-cluster fanout for `search_mode = global_fine_centroid`.
+/// Default fine-cluster fanout for `ivf_router = centroid_graph`.
 const DEFAULT_VECTOR_GLOBAL_FINE_FANOUT: usize = 1024;
-/// Default exact-rerank over-fetch for `search_mode = global_fine_centroid` —
+/// Default exact-rerank over-fetch for `ivf_router = centroid_graph` —
 /// the measured knee; scoped to this path so it never shifts the stamped,
 /// filtered, or user-table defaults.
 const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT: usize = 128;
@@ -318,6 +318,10 @@ const DEFAULT_VECTOR_TARGET_RECALL: f64 = 0.99;
 /// more hard high-dim tables on the graph; tighten it to demand near-target
 /// recall from the graph or step aside to ivf.
 const DEFAULT_VECTOR_HNSW_RECALL_SLACK: f64 = 0.01;
+/// Default for `hnsw_refine_k`: re-rank the SQ8 walk's top 256 on full Sq16.
+/// The knee for k ≤ 100 — recall matches the Sq16 walk and saturates here, so
+/// a wider refine only adds tail cost.
+const DEFAULT_VECTOR_HNSW_REFINE_K: usize = 256;
 /// Base-layer degree candidates the drain calibrator sweeps (ascending).
 pub const HNSW_M0_CANDIDATES: &[usize] = &[32, 64, 128, 256];
 /// Query-beam (`ef`) candidates the drain calibrator sweeps (ascending),
@@ -419,22 +423,40 @@ pub enum DrainConsolidate {
     Splice,
 }
 
-/// Query search mode for the hidden vector index on the UNFILTERED path.
-/// Selected by `vector.search_mode`. Filtered queries and pre-drain user
-/// tables always take the stamped grid path regardless of this setting.
-/// Codec of the resident `hnsw_ivf` code plane — see
-/// [`VectorConfig::hnsw_plane`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Resident plane the `hnsw_ivf` graph walk scores candidates on. Selected by
+/// `vector.hnsw_plane`.
+///
+/// Every variant re-ranks its final beam on the full Sq16 plane, which is
+/// always resident. So this decides which candidates reach the beam and what
+/// the walk costs per candidate — never the returned order. That is why a
+/// coarser walk plane buys latency rather than costing recall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VectorHnswPlane {
-    /// Fixed-grid 16-bit plane (2 bytes/dim) — the shipped default.
+    /// Fixed-grid 16-bit plane (2 bytes/dim). The only variant that adds no
+    /// plane, and so the smallest resident footprint; also the slowest walk.
     Sq16,
-    /// Fitted 4-bit plane (0.5 bytes/dim).
+    /// DEFAULT. Int8 plane derived from the Sq16 high byte (+1 byte/dim),
+    /// scored with an int8-VNNI kernel. Roughly halves warm walk latency at
+    /// unchanged recall. Derivable from Sq16 on read, so selecting it never
+    /// requires a rebuild.
+    #[default]
+    Sq8,
+    /// Fitted 4-bit plane in rotated space (+0.5 bytes/dim), scored with the
+    /// AVX-512 / VNNI nibble kernel: half SQ8's plane bytes and fewer bytes
+    /// touched per candidate. NOT derivable on read — the fit needs a rotation
+    /// and a moment pass over the corpus — so it is written at drain and takes
+    /// effect at the next full rebuild. Incremental drains inherit the prior
+    /// bundle's plane and ruler, as they inherit `(m0, ef)`.
     Sq4,
-    /// Fitted 4-bit plane plus sub-step residual nibbles (1 byte/dim).
+    /// [`Self::Sq4`] plus sub-step residual nibbles (+1 byte/dim total), which
+    /// recover most of the 4-bit reconstruction error. Same rebuild caveat.
     Sq4Residual,
 }
 
+/// Query search mode for the hidden vector index on the UNFILTERED path.
+/// Selected by `vector.search_mode`. Filtered queries and pre-drain user
+/// tables always take the stamped grid path regardless of this setting.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VectorSearchMode {
@@ -445,10 +467,6 @@ pub enum VectorSearchMode {
     /// queries.
     #[default]
     Ivf,
-    /// EXPERIMENTAL (opt-in): score every fine centroid globally and read the
-    /// top `vector.global_fine_fanout` clusters, bypassing the grid. A
-    /// cold-read win at scale, not at small scale — see `config.yaml`.
-    GlobalFineCentroid,
     /// OPT-IN (`hnsw_ivf`): walk a resident in-memory HNSW graph built over
     /// every row's Sq16 codes, bypassing the grid, cell selection, and disk
     /// reads. Built at drain and held resident (RAM-pinned) for corpora
@@ -458,6 +476,21 @@ pub enum VectorSearchMode {
     /// or a different column) always serves `ivf`. Search walks the graph at
     /// the `k`-scaled `ef` law.
     HnswIvf,
+}
+
+/// Cluster router for `search_mode = ivf`: how a query selects which cells or
+/// clusters to read. Selected by `vector.ivf_router`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IvfRouter {
+    /// DEFAULT. Grid routing to cells, then the manifest's stamped per-cell
+    /// width. The established path.
+    #[default]
+    Stamped,
+    /// EXPERIMENTAL (opt-in): score fine centroids via an HNSW over the
+    /// resident fp32 fine centroids and read the top `global_fine_fanout`
+    /// clusters, bypassing the grid. A cold-read win at scale.
+    CentroidGraph,
 }
 
 /// Vector-index build / search / drain tuning knobs. Grouped so the
@@ -517,31 +550,32 @@ pub struct VectorSettings {
     /// Default `ivf`; `global_fine_centroid` is experimental (see
     /// [`VectorSearchMode`]).
     pub search_mode: VectorSearchMode,
-    /// For `search_mode = hnsw_ivf`: the codec of the resident code plane
-    /// the graph walks. `sq16` (default) is the shipped fixed-grid plane;
-    /// `sq4` re-quantizes it to fitted 4-bit nibbles (0.5 bytes/dim
-    /// resident, ~4× smaller plane); `sq4_residual` adds a sub-step
-    /// residual nibble plane (1 byte/dim, ~2× smaller). Calibration
-    /// measures recall WITH the gated plane, so a plane too coarse for the
-    /// table's `target_recall` de-registers itself and the table serves
-    /// ivf — changing this knob can shrink the graph's memory or disable
-    /// the graph, never lower served recall below the floor. Takes effect
-    /// at the next full drain rebuild; incremental drains inherit the
-    /// prior bundle's plane codec like they inherit `(m0, ef)`.
+    /// For `search_mode = hnsw_ivf`: which resident plane the graph walk
+    /// scores candidates on. Every variant re-ranks its final beam on the
+    /// full Sq16 plane, so this decides which candidates reach the beam and
+    /// what each costs — never the returned order. See
+    /// [`VectorHnswPlane`] for each variant's bytes and rebuild semantics.
+    /// Ignored under any other search mode.
     pub hnsw_plane: VectorHnswPlane,
-    /// For `search_mode = global_fine_centroid`: number of fine clusters the
-    /// query reads (globally scored, clamped to the table's total). See
-    /// `config.yaml` for sizing guidance. Ignored under `search_mode = ivf`.
+    /// For `search_mode = ivf`: the cluster router — the established stamped
+    /// grid, or the centroid-HNSW over the resident fp32 fine centroids.
+    /// Ignored under `search_mode = hnsw_ivf`.
+    pub ivf_router: IvfRouter,
+    /// For `ivf_router = centroid_graph`: number of fine clusters the query
+    /// reads (globally scored, clamped to the table's total). See `config.yaml`
+    /// for sizing guidance. Ignored otherwise.
     pub global_fine_fanout: usize,
-    /// For `search_mode = global_fine_centroid`: the exact-rerank over-fetch
+    /// For `ivf_router = centroid_graph`: the exact-rerank over-fetch
     /// multiplier for this path specifically (a caller-set `rerank_mult`
     /// still wins). Scoped here rather than the shared default so tuning
-    /// it never touches the ivf / filtered / user-table paths.
+    /// it never touches the stamped / filtered / user-table paths.
     pub global_fine_rerank_mult: usize,
-    /// For `search_mode = global_fine_centroid`: coalesce the selected
-    /// clusters within each cell into contiguous reads. Ignored under
-    /// `search_mode = ivf`.
+    /// For `ivf_router = centroid_graph`: coalesce the selected clusters
+    /// within each cell into contiguous reads. Ignored otherwise.
     pub global_fine_coalesce: bool,
+    /// For `ivf_router = centroid_graph`: the centroid-HNSW walk's `ef`
+    /// (candidate breadth). `0` = auto (`fanout * 2`). Ignored otherwise.
+    pub global_fine_graph_ef: usize,
     /// For `search_mode = hnsw_ivf`: the upper bound on the calibration ef grid —
     /// the drain sweeps [`HNSW_EF_CANDIDATES`] up to this ceiling and stamps
     /// the winning `ef` per table into the persisted bundle. Must be at least
@@ -565,6 +599,14 @@ pub struct VectorSettings {
     /// Recall shortfall below `target_recall` the hnsw graph is still accepted
     /// at before the drain gives up and serves ivf (`floor = target - this`).
     pub hnsw_recall_slack: f64,
+
+    /// For `search_mode = hnsw_ivf` with `hnsw_sq8_walk`: how many of the SQ8
+    /// walk's nearest candidates to re-rank on full Sq16 before returning the
+    /// top `k`. Clamped to `[k, ef]`. Wider recovers more of the int8 walk's
+    /// ranking loss but adds Sq16 scores to the tail; recall saturates well
+    /// below `ef` (256 is the knee for k ≤ 100). Ignored when `hnsw_sq8_walk`
+    /// is off or under any other search mode.
+    pub hnsw_refine_k: usize,
     /// For `search_mode = hnsw_ivf`: scale ceiling for the per-row **data**
     /// graph. The resident data HNSW is built at drain and persisted only
     /// when the table's doc count ≤ this; above it, only the centroid graph
@@ -646,14 +688,17 @@ impl Default for VectorSettings {
             serve_near_tie_slack: DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK,
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
             search_mode: VectorSearchMode::Ivf,
-            hnsw_plane: VectorHnswPlane::Sq16,
+            hnsw_plane: VectorHnswPlane::default(),
+            ivf_router: IvfRouter::Stamped,
             global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
             global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
             global_fine_coalesce: false,
+            global_fine_graph_ef: 0,
             hnsw_ef_ceil: DEFAULT_VECTOR_HNSW_EF_CEIL,
             hnsw_ef_construction: DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION,
             hnsw_m0: DEFAULT_VECTOR_HNSW_M0,
             hnsw_recall_slack: DEFAULT_VECTOR_HNSW_RECALL_SLACK,
+            hnsw_refine_k: DEFAULT_VECTOR_HNSW_REFINE_K,
             hnsw_max_docs: DEFAULT_VECTOR_HNSW_MAX_DOCS,
             hnsw_probe_max_docs: DEFAULT_VECTOR_HNSW_PROBE_MAX_DOCS,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,

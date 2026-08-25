@@ -1199,6 +1199,11 @@ impl SupertableWriter {
             )));
         }
 
+        // The vector check `append` runs, at call time rather than in the
+        // commit's append phase — where it would surface as a partial commit
+        // for a mutation that buffered nothing.
+        split_vectors(&new_rows, &self.inner.options).map_err(MutationError::InvalidNewRows)?;
+
         // Resolve the predicate against the latest committed manifest, not a
         // bounded-staleness snapshot: a stale resolve would miss a row
         // committed after the snapshot and leave the old version live beside
@@ -4359,9 +4364,9 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
         // Opt-in gate: only build the resident data graph when queries will
-        // walk it (`search_mode = hnsw_ivf`). Under the default `ivf` (or
-        // `global_fine_centroid`) the drain skips the build — no build tax, no
-        // RAM-pinned graph — and queries serve ivf. Gating here (not inside
+        // walk it (`search_mode = hnsw_ivf`). Under the default `ivf` the drain
+        // skips the build — no build tax, no RAM-pinned graph — and queries
+        // serve ivf. Gating here (not inside
         // `build_hnsw_graph_ref`) keeps that function a pure, directly-testable
         // build step.
         let building_graph =
@@ -7909,7 +7914,8 @@ async fn build_hnsw_graph_ref(
     // Incremental append: extend the prior persisted graph with only the new
     // rows, cloning it (fetch + decode) rather than mutating a serving graph.
     if let Some(prior_ref) = manifest.slow_vector_state_graphs_blob()
-        && let Ok(sections) = slow_vector_state::fetch_graph_sections(storage, prior_ref).await
+        && let Ok(sections) =
+            slow_vector_state::fetch_graph_sections(storage, prior_ref, /* need_sq8 */ false).await
         && let Some(prior_data) = sections.data
     {
         let prior_count = prior_data.doc_ids.len();
@@ -9091,7 +9097,7 @@ mod tests {
         superfile::{
             builder::{FtsConfig, VectorConfig},
             fts::reader::{Bm25Stats, BoolMode},
-            vector::{distance::Metric, hnsw::PlaneScorer, rerank_codec::RerankCodec},
+            vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
             SupertableOptions,
@@ -9141,13 +9147,11 @@ mod tests {
         let nearest = |data: &crate::superfile::vector::hnsw::HnswIndex, axis: usize| -> f32 {
             let mut q = vec![0.0f32; dim];
             q[axis] = 1.0;
-            match &data.scorer {
-                PlaneScorer::Sq16(sc) => data.graph.search(sc, &q, 5, 128),
-                PlaneScorer::Sq4(sc) => data.graph.search(sc, &q, 5, 128),
-            }
-            .into_iter()
-            .map(|(_, d)| d)
-            .fold(f32::INFINITY, f32::min)
+            data.graph
+                .search(&data.scorer, &q, 5, 128)
+                .into_iter()
+                .map(|(_, d)| d)
+                .fold(f32::INFINITY, f32::min)
         };
 
         // Batch 1 on axes [0, half): append + drain (cells only — the default
@@ -9172,11 +9176,15 @@ mod tests {
         let ref1 = build_hnsw_graph_ref(storage.as_ref(), reader1.manifest())
             .await
             .expect("full build registers a graph");
-        let prior = slow_vector_state::fetch_graph_sections(storage.as_ref(), &ref1)
-            .await
-            .expect("fetch built graph")
-            .data
-            .expect("data graph present after full build");
+        let prior = slow_vector_state::fetch_graph_sections(
+            storage.as_ref(),
+            &ref1,
+            /* need_sq8 */ false,
+        )
+        .await
+        .expect("fetch built graph")
+        .data
+        .expect("data graph present after full build");
         assert!(
             nearest(&prior, 1) < 0.05,
             "full-build graph must serve a batch-1 row"

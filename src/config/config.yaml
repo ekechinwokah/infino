@@ -188,28 +188,37 @@ vector:
   #                          different column) serves `ivf` AUTOMATICALLY, so
   #                          correctness never depends on the graph. Best for
   #                          single-box, latency-tier, RAM-provisioned tables.
-  #   global_fine_centroid — EXPERIMENTAL: score every fine centroid globally
-  #                          across all cells and read the top fanout clusters,
-  #                          bypassing the grid. A cold-read win at scale (10M+);
-  #                          opt-in while the per-table fanout stamp is built.
   search_mode: ivf
 
-  # For search_mode = global_fine_centroid: the NUMBER of fine clusters the
+  # For search_mode = ivf: the cluster router.
+  #   stamped        — DEFAULT. Grid routing to cells, then the manifest's
+  #                    stamped per-cell width. The established path.
+  #   centroid_graph — EXPERIMENTAL: score fine centroids via an HNSW over the
+  #                    resident fp32 fine centroids and read the top fanout
+  #                    clusters, bypassing the grid. A cold-read win at scale
+  #                    (10M+); opt-in while the per-table fanout stamp is built.
+  ivf_router: stamped
+
+  # For ivf_router = centroid_graph: the NUMBER of fine clusters the
   # query fans out to (globally scored), clamped to the table's cluster
   # total. Higher reads more clusters — more cold bytes, higher recall.
   # 1024 is the ~0.99 point at 10M; it over-serves smaller tables and
   # under-serves larger ones (the fanout for a recall target grows ~sqrt(N)),
-  # pending a per-table calibrated stamp. Ignored under search_mode = ivf.
+  # pending a per-table calibrated stamp. Ignored under ivf_router = stamped.
   global_fine_fanout: 1024
 
-  # For search_mode = global_fine_centroid: exact-rerank over-fetch multiplier
+  # For ivf_router = centroid_graph: exact-rerank over-fetch multiplier
   # for this path only (a caller-set rerank_mult still wins). Scoped here so
   # tuning it never touches the ivf / filtered / user-table defaults.
   global_fine_rerank_mult: 128
 
-  # For search_mode = global_fine_centroid: coalesce the selected clusters
-  # within each cell into contiguous reads. Ignored under search_mode = ivf.
+  # For ivf_router = centroid_graph: coalesce the selected clusters within
+  # each cell into contiguous reads. Ignored under ivf_router = stamped.
   global_fine_coalesce: false
+
+  # For ivf_router = centroid_graph: the centroid-HNSW walk's ef (candidate
+  # breadth). 0 = auto (fanout * 2). Ignored under ivf_router = stamped.
+  global_fine_graph_ef: 0
 
   # For search_mode = hnsw_ivf: upper bound on the calibration ef grid. The drain
   # sweeps the ef candidates up to this ceiling and stamps the winning per-table
@@ -239,17 +248,33 @@ vector:
   # demand near-target recall from the graph or step aside to ivf.
   hnsw_recall_slack: 0.01
 
-  # For search_mode = hnsw_ivf: codec of the resident code plane the graph
-  # walks. sq16 (default, 2 bytes/dim) is the shipped fixed-grid plane;
-  # sq4 re-quantizes it to fitted 4-bit nibbles (0.5 bytes/dim — ~4x
-  # smaller resident plane); sq4_residual adds a sub-step residual nibble
-  # plane (1 byte/dim — ~2x smaller). Calibration measures recall WITH the
-  # gated plane, so a plane too coarse for target_recall de-registers
-  # itself and the table serves ivf: this knob can shrink the graph's
-  # memory or disable the graph, never lower served recall below the
-  # floor. Applies at the next full drain rebuild; incremental drains
-  # inherit the prior bundle's plane codec like they inherit (m0, ef).
-  hnsw_plane: sq16
+  # For search_mode = hnsw_ivf: which resident plane the graph walk scores
+  # candidates on. Every option re-ranks its final beam on the full Sq16 plane
+  # (always resident), so this decides which candidates reach the beam and what
+  # each candidate costs — never the returned order.
+  #
+  #   sq16         walk the Sq16 codes directly. Adds no plane (smallest
+  #                resident footprint), slowest walk.
+  #   sq8          DEFAULT. Int8 plane from the Sq16 high byte (+1 byte/dim),
+  #                scored with an int8-VNNI kernel. Roughly halves warm walk
+  #                latency at unchanged recall. Derived from Sq16 on read when
+  #                absent, so selecting it never needs a rebuild.
+  #   sq4          Fitted 4-bit nibbles in rotated space (+0.5 bytes/dim),
+  #                scored with the AVX-512 / VNNI nibble kernel: half sq8's
+  #                plane bytes and fewer bytes touched per candidate. Cannot be
+  #                derived on read (the fit needs a rotation and a moment pass),
+  #                so it is written at drain and applies at the next full
+  #                rebuild. Incremental drains inherit the prior plane + ruler.
+  #   sq4_residual sq4 plus a residual nibble plane (+1 byte/dim total), which
+  #                recovers most of the 4-bit reconstruction error. Same
+  #                rebuild caveat.
+  hnsw_plane: sq8
+
+  # For search_mode = hnsw_ivf on a coarse walk plane: how many of the walk's
+  # nearest candidates to re-rank on full Sq16 before returning the top k.
+  # Clamped to [k, ef]. Recall saturates well below ef (256 is the knee for
+  # k <= 100); wider only adds tail cost. Ignored when hnsw_plane is sq16.
+  hnsw_refine_k: 256
 
   # For search_mode = hnsw_ivf: scale ceiling for the per-row DATA graph. The
   # resident data HNSW is built at drain and persisted only when the table's
