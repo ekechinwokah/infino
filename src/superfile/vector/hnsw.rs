@@ -45,11 +45,13 @@ use std::{
 
 use rayon::prelude::*;
 
-use crate::superfile::vector::distance::{
-    Metric, SQ4_CODE_MAX, SQ4_RESIDUAL_CENTER, SQ4_RESIDUAL_DIVISOR, Sq4Kernel, Sq16Kernel,
-    dequantize_sq16_into, dot, encode_sq16_row,
+use crate::superfile::vector::{
+    distance::{
+        Metric, SQ4_CODE_MAX, SQ4_RESIDUAL_CENTER, SQ4_RESIDUAL_DIVISOR, Sq4Kernel, Sq16Kernel,
+        dequantize_sq16_into, dot, encode_sq16_row,
+    },
+    rotation::RandomRotation,
 };
-use crate::superfile::vector::rotation::RandomRotation;
 
 /// Per-node distance the graph is generic over. Lower = nearer.
 ///
@@ -337,7 +339,7 @@ impl Sq4Scorer {
     ) -> Self {
         debug_assert_eq!(sq16_codes.len(), len * dim * 2);
         let rot = RandomRotation::new(dim, rot_seed);
-        let padded = rot.padded_dim();
+        let padded = rot.dim;
         let mut raw = vec![0.0f32; dim];
         let mut row = vec![0.0f32; padded];
         // Fit pass (skipped when inheriting a prior ruler), then encode
@@ -350,7 +352,7 @@ impl Sq4Scorer {
                 let mut hi = vec![f32::NEG_INFINITY; padded];
                 for i in 0..len {
                     dequantize_sq16_into(&sq16_codes[i * dim * 2..(i + 1) * dim * 2], &mut raw);
-                    rot.apply_padded(&raw, &mut row);
+                    rot.apply_blocked(&raw, &mut row);
                     for (d, &x) in row.iter().enumerate() {
                         lo[d] = lo[d].min(x);
                         hi[d] = hi[d].max(x);
@@ -380,7 +382,7 @@ impl Sq4Scorer {
         let mut residual = with_residual.then(|| vec![0u8; len * stride]);
         for i in 0..len {
             dequantize_sq16_into(&sq16_codes[i * dim * 2..(i + 1) * dim * 2], &mut raw);
-            rot.apply_padded(&raw, &mut row);
+            rot.apply_blocked(&raw, &mut row);
             for (d, &x) in row.iter().enumerate() {
                 let c = ((x - offset[d]) / step[d]).round().clamp(0.0, SQ4_CODE_MAX);
                 pack_nibble(&mut codes[i * stride..(i + 1) * stride], d, c as u8);
@@ -419,7 +421,7 @@ impl Sq4Scorer {
         len: usize,
     ) -> Option<Self> {
         let rot = RandomRotation::new(dim, rot_seed);
-        let padded = rot.padded_dim();
+        let padded = rot.dim;
         let plane = len.checked_mul(Self::stride(padded))?;
         if offset.len() != padded
             || step.len() != padded
@@ -530,7 +532,7 @@ impl NodeScorer for Sq4Scorer {
     /// next to the walk), then hand the ruler fold to the kernel.
     fn prepare(&self, query: &[f32]) -> Sq4Kernel {
         let mut rq = vec![0.0f32; self.padded];
-        self.rot.apply_padded(query, &mut rq);
+        self.rot.apply_blocked(query, &mut rq);
         Sq4Kernel::new(&rq, &self.offset, &self.step, self.residual.is_some())
     }
 
@@ -559,7 +561,7 @@ impl NodeScorer for Sq4Scorer {
     fn decode_node(&self, node: u32, out: &mut [f32]) {
         let mut rotated = vec![0.0f32; self.padded];
         self.decode_rotated_into(node, &mut rotated);
-        self.rot.apply_inverse_padded(&rotated, out);
+        self.rot.apply_inverse_blocked(&rotated, out);
     }
 }
 
@@ -1656,9 +1658,12 @@ pub(crate) fn decode_hnsw(bytes: &[u8]) -> Option<HnswIndex> {
             return None;
         }
         let rot_seed = c.u64()?;
-        // The ruler spans the ROTATED space (`dim` rounded up to a power
-        // of two). Bound each read (f32-le per coordinate) before taking.
-        let padded = dim.next_power_of_two();
+        // The ruler spans the ROTATED space, which the blocked transform
+        // keeps at exactly `dim` (no power-of-two padding — that padding
+        // is stored bytes, and a flat scan pays stored bytes twice, in
+        // residency and in latency). Bound each read (f32-le per
+        // coordinate) before taking.
+        let padded = dim;
         if padded.checked_mul(8)? > c.remaining() {
             return None;
         }
@@ -1680,7 +1685,7 @@ pub(crate) fn decode_hnsw(bytes: &[u8]) -> Option<HnswIndex> {
         doc_ids.push(c.i128()?);
     }
     let scorer = if v3 {
-        let stride = dim.next_power_of_two().div_ceil(2);
+        let stride = dim.div_ceil(2);
         let plane = c.take(n.checked_mul(stride)?)?.to_vec();
         let residual = if plane_codec == HNSW_PLANE_SQ4_RESIDUAL {
             Some(c.take(n.checked_mul(stride)?)?.to_vec())

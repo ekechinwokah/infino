@@ -1000,6 +1000,18 @@ const VECTOR_COLD_GET_CEILINGS_SECOND: &[(&str, u64, u64)] = &[
 /// bounds). At and above [`COLD_GET_MID_MAX_DOCS`] the grid shape is
 /// still being calibrated, so no ceiling applies yet.
 const COLD_GET_SMALL_MAX_DOCS: usize = 5_000_000;
+/// Multiple of the stamped law width the #515 near-tie serve window may
+/// reach on a real corpus before its fan counts as a regression. See the
+/// derivation at the `law_extra` computation in
+/// [`assert_cold_data_gets`]; synthetic runs keep the 1x model.
+///
+/// Measured on Cohere-9.4M with the laws serving both the unfiltered and
+/// the filtered path: post-drain 53 GETs on the warmup query and 65
+/// steady at law width 23 (2.3x / 2.8x), post-compact 103 at law width 22
+/// (4.7x — compaction reshapes the cells, so the near-tie run is longer
+/// there). 6x covers the widest of those with headroom while still
+/// tripping on a whole-grid 256-cell read.
+const SERVE_WINDOW_WIDTH_MULTIPLE: u64 = 6;
 /// Upper doc bound for the mid-scale ceilings (exclusive).
 const COLD_GET_MID_MAX_DOCS: usize = 20_000_000;
 /// Ceiling for `label` + `n_docs` out of one of the two gate tables,
@@ -1534,7 +1546,29 @@ fn assert_expected_cold_reads(
     // The ceiling tables assume a width-1 probe (one coalesced cell-GET);
     // a stamped law width w reads w cells by design, adding w-1 GETs to
     // both cold windows.
-    let law_extra = steady_law_width.saturating_sub(1) * width_scale;
+    //
+    // The law floor is not the whole story on a real corpus: the #515
+    // near-tie serve window keeps following the exact-fine ranking past
+    // the stamped width while scores stay inside
+    // `vector.serve_near_tie_slack`, and the engine deliberately puts no
+    // cap on that extension. Decisive geometry cliffs at the floor and
+    // never extends — which is why the synthetic planted-cluster corpus
+    // has always fit a width-1-plus-law model — while diffuse real
+    // embeddings follow a flat run of near-ties. Measured on Cohere-9.4M
+    // at law width 23: 50 GETs on the first (warmup) query and 66 on the
+    // steady one, i.e. 2.2x and 2.9x the floor, at recall@10 0.995.
+    // Budget that extension for real corpora only, so this gate keeps
+    // catching fan-out regressions (a whole-grid 256-cell read still
+    // trips it) without failing legitimate geometry, and every synthetic
+    // ceiling stays exactly where it was calibrated.
+    let serve_window_multiple = match crate::corpus::corpus_source() {
+        crate::corpus::CorpusSource::Synthetic => 1,
+        _ => SERVE_WINDOW_WIDTH_MULTIPLE,
+    };
+    let law_extra = steady_law_width
+        .saturating_mul(serve_window_multiple)
+        .saturating_sub(1)
+        .saturating_mul(width_scale);
     let user_data = split
         .first_query
         .class_io(storage_meter::UriClass::UserData)
@@ -1543,14 +1577,26 @@ fn assert_expected_cold_reads(
         .first_query
         .class_io(storage_meter::UriClass::HiddenData)
         .get_count;
+    let hidden_manifest = split
+        .first_query
+        .class_io(storage_meter::UriClass::HiddenManifest)
+        .get_count;
     let valid = match expected {
         ExpectedTiers::UserOnly => user_data > 0 && hidden_data == 0,
-        ExpectedTiers::HiddenOnly => user_data == 0 && hidden_data > 0,
-        ExpectedTiers::Both => user_data > 0 && hidden_data > 0,
+        // The registered graph tier hydrates its resident sections from
+        // the content-addressed graph blob on the first query, and that
+        // blob lives under the hidden table's slow-vector-state
+        // (manifest-classed) namespace — so hidden-tier serving is proven
+        // by EITHER hidden data GETs (routed cells) or hidden manifest
+        // GETs (graph hydration). The check this assert exists for —
+        // silent fallback to the user path — still trips on user_data.
+        ExpectedTiers::HiddenOnly => user_data == 0 && (hidden_data > 0 || hidden_manifest > 0),
+        ExpectedTiers::Both => user_data > 0 && (hidden_data > 0 || hidden_manifest > 0),
     };
     assert!(
         valid,
-        "{label}: unexpected cold data reads (user data GET={user_data}, hidden data GET={hidden_data})"
+        "{label}: unexpected cold data reads (user data GET={user_data}, \
+         hidden data GET={hidden_data}, hidden manifest GET={hidden_manifest})"
     );
     // Lock in the cold-probe gains, per window: the first query's
     // one-time warmup fan and the second query's steady per-query fetch
@@ -2431,6 +2477,16 @@ pub mod vector {
     /// [`WIDTH_SWEEP_MONOTONICITY_SLACK`]; recall gates stay on the
     /// engine default.
     const UNFILTERED_SWEEP_WIDTHS: &[usize] = &[2, 8, 32];
+    /// `k` knots the codec-rung curve is reported at. A coarse rerank
+    /// codec loses the tail of the neighbourhood long before it loses the
+    /// top-1, so recall at a single `k` cannot say whether a rung is
+    /// usable; these are three of the four knots the drain already stamps
+    /// per-`k` laws for. Diagnostic only — the gated floor stays at
+    /// [`TOP_K`].
+    const CURVE_KS: &[usize] = &[1, 10, 100];
+    /// Deepest knot in [`CURVE_KS`]: one exact oracle is computed at this
+    /// depth and every shallower `k` reads its sorted prefix.
+    const CURVE_KS_DEEPEST: usize = 100;
     /// Recall a wider sweep point may lose vs the previous one before the
     /// width-sweep assert trips. The floored core cannot lose recall by
     /// construction; the slack absorbs the residual eviction band above
@@ -2527,14 +2583,19 @@ pub mod vector {
                 None,
             )
             .expect("routing-state vector hits");
+        // The registered graph tier walks the resident plane over the
+        // hidden index and resolves nodes straight to stable ids — no
+        // per-superfile fetch — so its hits carry the nil marker URI
+        // rather than a hidden cell superfile's. Every scan-path hit
+        // (user or hidden) carries the real URI it was scored in, so nil
+        // is unambiguously hidden-tier serving. A silent fallback to the
+        // user path still trips both this assert (real user URIs) and
+        // the per-class cold-GET assert beside it (user-class bytes).
         let user_hits = hits
             .iter()
-            .filter(|hit| !hidden_uris.contains(&hit.superfile))
+            .filter(|hit| !hidden_uris.contains(&hit.superfile) && !hit.superfile.0.is_nil())
             .count();
-        let hidden_hits = hits
-            .iter()
-            .filter(|hit| hidden_uris.contains(&hit.superfile))
-            .count();
+        let hidden_hits = hits.len() - user_hits;
         HitTierStats {
             user_hits,
             hidden_hits,
@@ -3953,7 +4014,7 @@ pub mod vector {
                     &gt_correct,
                     &q_cal,
                     &gt_cal,
-                    exec_vec::RecallFloors::SUPERTABLE,
+                    exec_vec::RecallFloors::supertable_pre_drain(),
                     phases.warm,
                     phases.cold,
                     COLD_ITERS,
@@ -4048,6 +4109,58 @@ pub mod vector {
                         &gt_correct,
                         rerank,
                     );
+                    // Codec-rung curve: recall at every knot in
+                    // [`CURVE_KS`] for whatever rung this run configured,
+                    // so the rungs can be compared at the `k` a workload
+                    // actually reads. `recall_at_k` divides by the truth
+                    // row's length, so each knot needs the oracle
+                    // truncated to exactly `k`; one exact oracle at the
+                    // deepest knot supplies them all by prefix. Search
+                    // runs at the same engine defaults the gated row
+                    // above used, so the @10 line reproduces it.
+                    // The deepest knot needs an oracle deeper than the
+                    // gated one, so it is computed here from the still-
+                    // mmapped corpus. A run that reopened a cached oracle
+                    // has no vectors resident: the knots at or under
+                    // [`TOP_K`] still read the gated oracle's prefix, and
+                    // the deeper knot is skipped rather than guessed.
+                    let gt_deep = corpus.as_ref().map(|prepared| {
+                        let vslice = prepared
+                            .vectors()
+                            .expect("vector modality prepared a vector corpus")
+                            .as_slice();
+                        corpus::ground_truth(
+                            &vslice[..n_docs * dim()],
+                            n_docs,
+                            &q_correct,
+                            CURVE_KS_DEEPEST,
+                        )
+                    });
+                    for &k in CURVE_KS {
+                        let source = match (gt_deep.as_ref(), k <= TOP_K) {
+                            (Some(deep), _) => deep,
+                            (None, true) => &gt_correct,
+                            (None, false) => continue,
+                        };
+                        let truths: Vec<Vec<u32>> = source
+                            .iter()
+                            .map(|t| t[..k.min(t.len())].to_vec())
+                            .collect();
+                        let (recall, p50) = exec_vec::mean_recall_timed(
+                            &warm_reader,
+                            supertable::VEC_COLUMN,
+                            &q_correct,
+                            &truths,
+                            k,
+                            nprobe,
+                            rerank,
+                        );
+                        eprintln!(
+                            "[078-curve] infino/post-drain recall@{k} = {recall:.3} \
+                             p50 = {:.3} ms",
+                            p50.as_secs_f64() * 1e3,
+                        );
+                    }
                 }
                 routing_states.push(measure_routing_state(
                     "post-drain",

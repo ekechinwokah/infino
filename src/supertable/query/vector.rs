@@ -2243,7 +2243,10 @@ pub(crate) async fn assemble_hnsw_incremental(
                         // so its recall measures the served codec.
                         let (codes, res, offset, ruler_step) = full.parts();
                         // Packed rows span the ROTATED (padded) space.
-                        let stride_bytes = dim.next_power_of_two().div_ceil(2);
+                        // Blocked rotation keeps the rotated space at
+                        // exactly `dim`, so the packed stride carries no
+                        // power-of-two padding.
+                        let stride_bytes = dim.div_ceil(2);
                         let mut sc: Vec<u8> = Vec::with_capacity(probe_cap * stride_bytes);
                         let mut sr: Option<Vec<u8>> = res.map(|_| Vec::new());
                         for i in 0..total {

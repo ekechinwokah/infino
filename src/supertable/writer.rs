@@ -9073,8 +9073,6 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use crate::superfile::vector::hnsw::PlaneScorer;
-
     use arrow_array::{
         Array, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch,
     };
@@ -9093,7 +9091,7 @@ mod tests {
         superfile::{
             builder::{FtsConfig, VectorConfig},
             fts::reader::{Bm25Stats, BoolMode},
-            vector::{distance::Metric, rerank_codec::RerankCodec},
+            vector::{distance::Metric, hnsw::PlaneScorer, rerank_codec::RerankCodec},
         },
         supertable::{
             SupertableOptions,

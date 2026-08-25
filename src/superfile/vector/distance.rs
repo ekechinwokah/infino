@@ -1550,13 +1550,82 @@ impl Sq4Kernel {
 pub(crate) fn sq4_dot(q_prime: &[f32], packed: &[u8], padded: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if avx512_enabled() || avx2_enabled() {
-            // SAFETY: gated on the runtime CPUID checks; `avx512f`
-            // implies `avx2`, so either gate suffices for the AVX2 arm.
+        if avx512_enabled() {
+            // SAFETY: gated on the runtime CPUID check for
+            // `avx512f` + `avx512bw`, both of which this arm uses.
+            return unsafe { sq4_dot_avx512(q_prime, packed, padded) };
+        }
+        if avx2_enabled() {
+            // SAFETY: gated on the runtime CPUID check.
             return unsafe { sq4_dot_avx2(q_prime, packed, padded) };
         }
     }
     sq4_dot_wide(q_prime, packed, padded)
+}
+
+/// 512-bit nibble dot: 32 coordinates per iteration against the AVX2
+/// arm's 16.
+///
+/// A terminal flat scan over this plane is bandwidth- and
+/// throughput-bound on exactly this loop — measured at ~0.7 GB/s per core
+/// on the 256-bit arm, against the ~30 GB/s a tuned 512-bit integer
+/// competitor sustains — so the width is worth taking even before the
+/// larger change (quantizing the query to `u8` so `vpdpbusd` can retire
+/// 64 integer MACs per register instead of 16 float ones).
+///
+/// The nibble split and the low/high interleave are the AVX2 arm's,
+/// widened: 16 packed bytes carry 32 codes, `unpacklo`/`unpackhi` restore
+/// coordinate order across both halves, and each half widens `u8 → i32 →
+/// f32` for a 16-lane FMA.
+///
+/// Callers must ensure the target supports `avx512f` and `avx512bw`; the
+/// [`sq4_dot`] dispatch gates on the runtime CPUID check.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn sq4_dot_avx512(q_prime: &[f32], packed: &[u8], padded: usize) -> f32 {
+    debug_assert_eq!(q_prime.len(), padded);
+    debug_assert_eq!(packed.len(), padded.div_ceil(2));
+    // SAFETY: each iteration reads 16 packed bytes (32 coordinates) and
+    // two 16-f32 windows of `q_prime`. The `d + 32 <= padded` predicate
+    // bounds both: bytes `d/2 .. d/2 + 16` and f32s `d .. d + 32`.
+    // `_mm_loadu_si128` reads exactly 16 bytes, `_mm512_loadu_ps` exactly
+    // 16 f32s. All loads unaligned.
+    unsafe {
+        let nibble_mask = _mm_set1_epi8(SQ4_NIBBLE_MASK as i8);
+        let mut acc = _mm512_setzero_ps();
+        let mut d = 0;
+        while d + 2 * AVX512_F32_LANES <= padded {
+            let bytes = _mm_loadu_si128(packed.as_ptr().add(d / 2) as *const __m128i);
+            let lo = _mm_and_si128(bytes, nibble_mask);
+            let hi = _mm_and_si128(_mm_srli_epi16::<4>(bytes), nibble_mask);
+            // Even coordinates live in the low nibbles, odd in the high;
+            // interleaving restores order 0,1,2,… — `unpacklo` covers
+            // coordinates d..d+16, `unpackhi` covers d+16..d+32.
+            let inter_lo = _mm_unpacklo_epi8(lo, hi);
+            let inter_hi = _mm_unpackhi_epi8(lo, hi);
+            let c0 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(inter_lo));
+            let c1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(inter_hi));
+            let q0 = _mm512_loadu_ps(q_prime.as_ptr().add(d));
+            let q1 = _mm512_loadu_ps(q_prime.as_ptr().add(d + AVX512_F32_LANES));
+            acc = _mm512_fmadd_ps(q0, c0, acc);
+            acc = _mm512_fmadd_ps(q1, c1, acc);
+            d += 2 * AVX512_F32_LANES;
+        }
+        let mut dot = _mm512_reduce_add_ps(acc);
+        // Tail: `padded` is a power of two, so this runs only when the
+        // whole plane is narrower than 32 coordinates.
+        while d < padded {
+            let byte = packed[d / 2];
+            let code = if d.is_multiple_of(2) {
+                byte & SQ4_NIBBLE_MASK
+            } else {
+                byte >> 4
+            };
+            dot += q_prime[d] * code as f32;
+            d += 1;
+        }
+        dot
+    }
 }
 
 /// Portable `wide::f32x8` nibble dot. Per-lane scalar nibble extract +
@@ -3932,6 +4001,40 @@ mod tests {
     /// power of two), including the 8-coordinate tail. This is the test
     /// that catches a wrong unpack ORDER (low/high nibble interleave),
     /// which no aggregate recall number reliably would.
+    /// The 512-bit arm must agree with the portable tier on every length
+    /// class, including the narrow planes where only the tail runs. Same
+    /// role as the AVX2 test below: the `unpacklo`/`unpackhi` pair is
+    /// where a coordinate-order bug hides, and it would show up as a
+    /// small diffuse recall loss rather than an obvious failure.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn sq4_dot_avx512_matches_wide_across_padded_lengths() {
+        if !avx512_enabled() {
+            eprintln!("skipping: host lacks AVX-512F/BW");
+            return;
+        }
+        let mut state = 0x51D4_D07Bu64;
+        let mut next_u64 = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            state
+        };
+        for padded in [8usize, 16, 32, 64, 128, 1024, 2048] {
+            let q: Vec<f32> = (0..padded)
+                .map(|_| ((next_u64() >> 33) as f32 / (1u64 << 30) as f32) - 1.0)
+                .collect();
+            let packed: Vec<u8> = (0..padded.div_ceil(2))
+                .map(|_| (next_u64() >> 24) as u8)
+                .collect();
+            let wide = sq4_dot_wide(&q, &packed, padded);
+            // SAFETY: gated on the runtime AVX-512 check above.
+            let simd = unsafe { sq4_dot_avx512(&q, &packed, padded) };
+            assert!(
+                (wide - simd).abs() <= 1e-3 * wide.abs().max(1.0),
+                "padded {padded}: avx512 {simd} != wide {wide}"
+            );
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn sq4_dot_avx2_matches_wide_across_padded_lengths() {

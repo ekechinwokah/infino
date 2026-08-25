@@ -42,7 +42,7 @@
 
 use std::cell::RefCell;
 
-use rand::{SeedableRng, rngs::StdRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, Normal};
 use wide::f32x8;
 
@@ -69,6 +69,30 @@ pub struct RandomRotation {
     padded_dim: usize,
     /// One `±1` sign-flip diagonal per stage, each length `padded_dim`.
     signs: Vec<Vec<f32>>,
+    /// Power-of-two block sizes summing to `dim`, largest first — the
+    /// unpadded transform's block-diagonal structure. Empty when `dim`
+    /// is itself a power of two and the blocked form is just the padded
+    /// one.
+    blocks: Vec<usize>,
+    /// One seeded permutation of `0..dim` per stage, so the blocked
+    /// transform mixes ACROSS blocks and not only within them.
+    block_perms: Vec<Vec<u32>>,
+}
+
+/// Decompose `dim` into descending power-of-two blocks: the greedy
+/// binary decomposition, so `1536 → [1024, 512]` and `200 → [128, 64,
+/// 8]`. Every block is a valid Walsh–Hadamard length, and the blocks sum
+/// to exactly `dim` — that is what removes the padding.
+fn power_of_two_blocks(dim: usize) -> Vec<usize> {
+    let mut blocks = Vec::new();
+    let mut rest = dim;
+    while rest > 0 {
+        // Largest power of two not exceeding `rest`.
+        let block = 1usize << (usize::BITS - 1 - rest.leading_zeros()) as usize;
+        blocks.push(block);
+        rest -= block;
+    }
+    blocks
 }
 
 impl RandomRotation {
@@ -96,10 +120,26 @@ impl RandomRotation {
                     .collect()
             })
             .collect();
+        let dim = dim.max(1);
+        let blocks = power_of_two_blocks(dim);
+        // Fisher–Yates from the same seeded stream, so the permutations
+        // are as reproducible as the sign diagonals.
+        let block_perms = (0..ROTATION_STAGES)
+            .map(|_| {
+                let mut perm: Vec<u32> = (0..dim as u32).collect();
+                for i in (1..dim).rev() {
+                    let j = (rng.next_u64() % (i as u64 + 1)) as usize;
+                    perm.swap(i, j);
+                }
+                perm
+            })
+            .collect();
         RandomRotation {
             dim,
             padded_dim,
             signs,
+            blocks,
+            block_perms,
         }
     }
 
@@ -153,6 +193,81 @@ impl RandomRotation {
                 apply_signs(&mut buf, stage_signs);
             }
             out.copy_from_slice(&buf[..self.dim]);
+        });
+    }
+
+    /// [`Self::apply_padded`] with no padding: `out` has length `dim`
+    /// exactly, and the transform is still an exact isometry.
+    ///
+    /// Padding to a power of two is what makes `apply_padded` exact, but
+    /// a codec that scores in rotated space then STORES the padding: at
+    /// `dim = 1536` the working size is 2048, so a third of every stored
+    /// plane encodes zeros. Since a flat scan's per-query cost is
+    /// bytes-read ÷ bandwidth, that third is paid twice — once in
+    /// residency and once in latency — for no recall.
+    ///
+    /// This form decomposes `dim` into power-of-two blocks
+    /// (`1536 → 1024 + 512`, `200 → 128 + 64 + 8`) and runs the
+    /// sign-flip + Walsh–Hadamard within each block. A block-diagonal
+    /// orthogonal matrix is orthogonal, so `⟨R x, R q⟩ = ⟨x, q⟩` holds
+    /// exactly with zero padding. Blocks alone would only mix
+    /// coordinates among their own block, so each stage first applies a
+    /// seeded permutation: over [`ROTATION_STAGES`] stages every
+    /// coordinate visits different blocks and mixing is global.
+    pub fn apply_blocked(&self, x: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(x.len(), self.dim);
+        debug_assert_eq!(out.len(), self.dim);
+        out.copy_from_slice(x);
+        SCRATCH.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            buf.resize(self.dim, 0.0);
+            for (stage_signs, perm) in self.signs.iter().zip(&self.block_perms) {
+                // Permute into scratch, then transform back into `out`,
+                // so neither buffer is read and written at once.
+                for (dst, &src) in buf.iter_mut().zip(perm) {
+                    *dst = out[src as usize];
+                }
+                apply_signs(&mut buf, &stage_signs[..self.dim]);
+                let mut start = 0;
+                for &block in &self.blocks {
+                    let seg = &mut buf[start..start + block];
+                    walsh_hadamard(seg);
+                    scale_in_place(seg, 1.0 / (block as f32).sqrt());
+                    start += block;
+                }
+                out.copy_from_slice(&buf);
+            }
+        });
+    }
+
+    /// Inverse of [`Self::apply_blocked`]. Each stage is self-inverse in
+    /// its sign flip and its normalized WHT, so the stages run in reverse
+    /// with the permutation undone last.
+    pub fn apply_inverse_blocked(&self, x: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(x.len(), self.dim);
+        debug_assert_eq!(out.len(), self.dim);
+        out.copy_from_slice(x);
+        SCRATCH.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            buf.resize(self.dim, 0.0);
+            for (stage_signs, perm) in self.signs.iter().zip(&self.block_perms).rev() {
+                buf.copy_from_slice(out);
+                let mut start = 0;
+                for &block in &self.blocks {
+                    let seg = &mut buf[start..start + block];
+                    walsh_hadamard(seg);
+                    scale_in_place(seg, 1.0 / (block as f32).sqrt());
+                    start += block;
+                }
+                apply_signs(&mut buf, &stage_signs[..self.dim]);
+                // Undo the permutation: `apply_blocked` wrote
+                // `buf[i] = out[perm[i]]`, so scatter back.
+                for (i, &src) in perm.iter().enumerate() {
+                    out[src as usize] = buf[i];
+                }
+            }
         });
     }
 
@@ -433,6 +548,47 @@ mod tests {
                 "linearity broken at i={i}: got {} expected {expected}",
                 r_combined[i]
             );
+        }
+    }
+
+    /// The blocked form must preserve inner products EXACTLY while
+    /// producing only `dim` components — that pairing is the whole point
+    /// (an unpadded transform that merely approximated the dot product
+    /// would trade recall for the bytes it saves, which is not a trade
+    /// worth making). Also pins the round-trip, since the plane decodes
+    /// nodes through the inverse.
+    #[test]
+    fn blocked_apply_is_an_exact_isometry_and_inverts() {
+        // Include the non-power-of-two dims that actually pay padding:
+        // 1536 (OpenAI) → 1024+512, 200 (GloVe) → 128+64+8, 768 → 512+256.
+        for &dim in &[8usize, 24, 96, 200, 768, 1536] {
+            let rot = RandomRotation::new(dim, 0xA11CE);
+            let mut state = 0x1234_5678_9ABC_DEF0u64;
+            let mut next = || {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((state >> 33) as f32 / (1u64 << 30) as f32) - 1.0
+            };
+            let x: Vec<f32> = (0..dim).map(|_| next()).collect();
+            let q: Vec<f32> = (0..dim).map(|_| next()).collect();
+            let mut rx = vec![0.0f32; dim];
+            let mut rq = vec![0.0f32; dim];
+            rot.apply_blocked(&x, &mut rx);
+            rot.apply_blocked(&q, &mut rq);
+            let plain: f32 = x.iter().zip(&q).map(|(a, b)| a * b).sum();
+            let rotated: f32 = rx.iter().zip(&rq).map(|(a, b)| a * b).sum();
+            assert!(
+                (plain - rotated).abs() <= 1e-3 * plain.abs().max(1.0),
+                "dim {dim}: blocked rotation is not an isometry \
+                 (plain {plain}, rotated {rotated})"
+            );
+            let mut back = vec![0.0f32; dim];
+            rot.apply_inverse_blocked(&rx, &mut back);
+            for (i, (a, b)) in x.iter().zip(&back).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-3,
+                    "dim {dim} coord {i}: round-trip {b} != {a}"
+                );
+            }
         }
     }
 
