@@ -74,6 +74,32 @@ pub struct Hit {
     pub score: f32,
 }
 
+/// How an engine implements a vector mutation, which is a different
+/// question from whether it implements one at all.
+///
+/// A plain `bool` here would be a reporting hazard. Two engines can both
+/// answer "yes, I can add a vector to a built index" while doing utterly
+/// incomparable amounts of work: one appends to a live mutable structure,
+/// the other re-seals an immutable artifact from scratch. Collapsed to a
+/// boolean, both numbers land in one column headed "insert latency" and
+/// the table silently compares an O(1) append against an O(corpus)
+/// rebuild. Keeping the distinction in the type means the reporting layer
+/// has to decide, explicitly, which column a number belongs in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MutationSupport {
+    /// No such operation; the cell does not run for this engine.
+    #[default]
+    Unsupported,
+    /// Mutates an already-built, already-served index in place. Numbers
+    /// from engines in this class are comparable with each other.
+    InPlace,
+    /// Reaches the same end state by rebuilding the artifact, because the
+    /// engine has no in-place path. A real and publishable number, but it
+    /// answers "what does changing the corpus by n rows cost", not "what
+    /// does one insert cost" — never render it in an `InPlace` column.
+    Rebuild,
+}
+
 /// Which modalities an engine supports, so the comparison driver never
 /// asks an engine for a capability it lacks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -82,17 +108,16 @@ pub struct Capabilities {
     pub vector: bool,
     pub sql: bool,
     pub hybrid: bool,
-    /// Engine can add vectors to an existing index without a full rebuild.
-    /// See [`VectorEngine::insert`] — an immutable-artifact engine may
-    /// still advertise this if it implements `insert` as an honest, if
-    /// heavier, incremental build; the capability flag alone does not
-    /// promise a cheap in-place add.
-    pub vector_insert: bool,
-    /// Engine can remove vectors from an existing index by id, without a
-    /// full rebuild. See [`VectorEngine::remove`].
-    pub vector_remove: bool,
+    /// Whether — and, critically, *how* — the engine can add vectors to
+    /// an already-built index. See [`VectorEngine::insert`].
+    pub vector_insert: MutationSupport,
+    /// Whether and how the engine can remove rows by id from an
+    /// already-built index. See [`VectorEngine::remove`].
+    pub vector_remove: MutationSupport,
     /// Engine can serialize its index to bytes and reopen it — i.e. has a
     /// real save/load boundary distinct from "keep the in-process handle".
+    /// Unlike insert/remove this needs no in-place-vs-rebuild split: the
+    /// operation means the same thing for every engine.
     /// See [`VectorEngine::save`] / [`VectorEngine::load`].
     pub vector_save_load: bool,
 }
@@ -203,16 +228,19 @@ pub trait VectorEngine {
     /// callers must check [`Capabilities::vector_insert`] before calling
     /// and treat a `false` return as a harness bug, not a normal outcome.
     ///
-    /// Deliberately vague about *how* the engine achieves "add to a
-    /// queryable index": an immutable-artifact engine may implement this
-    /// as an incremental rebuild rather than a true append-to-served
-    /// -index. Implementors must document which they do.
+    /// The post-condition is only "the new rows are queryable"; the cost
+    /// of getting there varies by orders of magnitude between engines.
+    /// Implementors must declare which class they are in via
+    /// [`Capabilities::vector_insert`] — [`MutationSupport::InPlace`] or
+    /// [`MutationSupport::Rebuild`] — because that flag, not this method,
+    /// is what keeps the two out of the same reported column.
     fn insert(_index: &mut Self::Index, _vectors: &[f32], _next_id: u64) -> bool {
         false
     }
 
     /// Remove the rows named by `ids` from the index. Returns `false` if
-    /// unsupported (see [`VectorEngine::insert`]'s return-value contract).
+    /// unsupported (see [`VectorEngine::insert`]'s return-value contract,
+    /// and declare in-place vs rebuild the same way).
     fn remove(_index: &mut Self::Index, _ids: &[u64]) -> bool {
         false
     }

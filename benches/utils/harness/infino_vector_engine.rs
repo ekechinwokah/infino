@@ -8,6 +8,7 @@
 //! bytes and the reader. In-tree benches use those retained bytes for
 //! cold upload and the retained reader for correctness/warm search.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::{Decimal128Array, RecordBatch};
@@ -21,7 +22,7 @@ use infino::superfile::{
 };
 use rayon::prelude::*;
 
-use super::{Capabilities, VectorEngine, VectorHit, VectorMetric, VectorSearch};
+use super::{Capabilities, MutationSupport, VectorEngine, VectorHit, VectorMetric, VectorSearch};
 use crate::corpus::{self, block_on_inmem};
 
 const ID_COLUMN: &str = "doc_id";
@@ -123,11 +124,15 @@ impl VectorEngine for InfinoVectorEngine {
             vector: true,
             sql: true,
             hybrid: true,
-            // Honest but heavy: infino has no in-place insert/remove at
-            // the superfile tier, so both are implemented as a full
-            // incremental rebuild — see `insert`/`remove` below.
-            vector_insert: true,
-            vector_remove: true,
+            // A superfile is sealed by `finish()` and never mutated
+            // afterwards, so there is no in-place path at this tier and
+            // both operations re-seal the artifact. Declared as
+            // `Rebuild` so these numbers cannot be rendered next to a
+            // mutable index's in-place appends. Infino's actual
+            // insert/delete path is `Supertable::append`/`delete` at the
+            // table tier, which is a separate cell family, not this one.
+            vector_insert: MutationSupport::Rebuild,
+            vector_remove: MutationSupport::Rebuild,
             // Genuinely cheap and native: `finish()` already returns
             // final bytes, `SuperfileReader::open` already reopens them.
             vector_save_load: true,
@@ -224,7 +229,17 @@ impl VectorEngine for InfinoVectorEngine {
     /// fresh superfile. This is the honest number for "how much does
     /// growing an infino superfile by n rows cost", which is a different
     /// (and for infino, much heavier) question than "insert latency"
-    /// implies for a mutable-index engine.
+    /// implies for a mutable-index engine — hence
+    /// [`MutationSupport::Rebuild`].
+    ///
+    /// This is not how infino ingests new rows in practice. The real path
+    /// is `Supertable::append`, which seals the new rows into their *own*
+    /// superfile and adds it to the manifest, leaving existing superfiles
+    /// untouched — cost proportional to the batch, not the corpus. That
+    /// belongs to a table-tier mutation cell; measuring it through this
+    /// single-superfile trait is not possible, and a reader shown only
+    /// this number would conclude infino's ingest is O(corpus) when it
+    /// isn't.
     fn insert(index: &mut Self::Index, vectors: &[f32], next_id: u64) -> bool {
         let existing = index
             .source_vectors
@@ -261,7 +276,7 @@ impl VectorEngine for InfinoVectorEngine {
             .as_ref()
             .expect("remove requires InfinoVectorIndex::source_vectors retained from write()");
         let dim = index.dim;
-        let drop_set: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        let drop_set: HashSet<u64> = ids.iter().copied().collect();
         let n_docs = existing.len() / dim;
         let mut kept = Vec::with_capacity(existing.len());
         for doc in 0..n_docs {
