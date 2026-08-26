@@ -78,6 +78,10 @@ pub(crate) fn avx512_enabled() -> bool {
 ///
 /// Also implies [`avx512_enabled`] — a specialized kernel is never
 /// enabled without the foundation — so callers check this gate alone.
+// The only dispatch site that calls this is the 4-bit plane's integer
+// query, which is itself x86-gated, so on other targets the function is
+// unused in the library build.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[inline]
 pub(crate) fn has_avx512vnni() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();

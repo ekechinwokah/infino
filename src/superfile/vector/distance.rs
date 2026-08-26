@@ -1600,11 +1600,17 @@ pub(crate) struct Sq4Kernel {
     ///
     /// `None` when the host lacks VNNI or the plane is too short to
     /// block, in which case the float legs above are used.
+    ///
+    /// The whole integer leg is compiled only where a `vpdpbusd` kernel
+    /// exists; elsewhere it would be a permanently-`None` field feeding
+    /// code that cannot be reached.
+    #[cfg(target_arch = "x86_64")]
     q_int: Option<Sq4IntQuery>,
 }
 
 /// Coordinates one `vpdpbusd` block covers: 64 `u8` code lanes per
 /// 512-bit register, fed from 32 packed bytes.
+#[cfg(target_arch = "x86_64")]
 const VNNI_BLOCK_COORDS: usize = 64;
 
 /// Rows scored per pass of the blocked scan.
@@ -1623,6 +1629,7 @@ pub(crate) const SQ4_ROW_BLOCK: usize = 8;
 
 /// `i8`-quantized query legs plus the scale that converts an integer
 /// accumulator back to a dot product.
+#[cfg(target_arch = "x86_64")]
 struct Sq4IntQuery {
     /// Coarse leg, `i8`, in even-then-odd block order.
     coarse: Vec<i8>,
@@ -1637,8 +1644,10 @@ struct Sq4IntQuery {
 /// Largest magnitude an `i8` query lane may take. 127, not 128: the
 /// symmetric range keeps the quantizer unbiased, and `vpdpbusd`'s signed
 /// operand is `i8`.
+#[cfg(target_arch = "x86_64")]
 const I8_MAX: f32 = 127.0;
 
+#[cfg(target_arch = "x86_64")]
 impl Sq4IntQuery {
     /// Quantize the float query legs to `i8` in VNNI block order, or
     /// `None` when the integer path cannot serve this shape.
@@ -1732,12 +1741,14 @@ impl Sq4Kernel {
         if let Some(qr) = &q_residual {
             q_dot_offset -= SQ4_RESIDUAL_CENTER * qr.iter().sum::<f32>();
         }
+        #[cfg(target_arch = "x86_64")]
         let q_int = Sq4IntQuery::build(padded, &q_code, q_residual.as_deref());
         Self {
             padded,
             q_code,
             q_residual,
             q_dot_offset,
+            #[cfg(target_arch = "x86_64")]
             q_int,
         }
     }
