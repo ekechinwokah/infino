@@ -205,7 +205,6 @@ enum EntryAccounting {
     /// Store-reserved entry; removal releases `size_bytes`.
     Eager,
     /// Block-source-reserved entry; source drop releases bytes.
-    #[cfg(test)]
     SourceOwned,
 }
 
@@ -1341,7 +1340,8 @@ impl DiskCacheStore {
         let result = cell
             .get_or_init(|| async {
                 let fetch_storage = self.resolve_storage(storage);
-                self.cold_fetch_lazy(uri, offsets, fetch_storage).await
+                self.cold_fetch_lazy(uri, offsets, fetch_storage, allow_background_fill)
+                    .await
             })
             .await;
         let fetch_storage = self.resolve_storage(storage);
@@ -1354,7 +1354,10 @@ impl DiskCacheStore {
             }
             Err(_e) => {
                 self.coordinators.remove(uri);
-                match self.cold_fetch_lazy(uri, offsets, fetch_storage).await {
+                match self
+                    .cold_fetch_lazy(uri, offsets, fetch_storage, allow_background_fill)
+                    .await
+                {
                     Ok(entry) => {
                         if allow_background_fill {
                             self.maybe_spawn_background_fill(uri, &entry, storage);
@@ -1386,7 +1389,17 @@ impl DiskCacheStore {
         {
             return;
         }
-        let size = entry.size_bytes.load(Ordering::Acquire);
+        // A source-owned (vector-opened) entry accounts its live filled bytes,
+        // so `size_bytes` is NOT the object size. Take the full size from the
+        // block source, and reserve it here — the vector open never did, so the
+        // promotion's mmap needs budget reserved before it downloads.
+        let size = entry
+            .block_source
+            .as_ref()
+            .map(|bs| bs.size())
+            .filter(|&s| s > 0)
+            .unwrap_or_else(|| entry.size_bytes.load(Ordering::Acquire));
+        let needs_reserve = matches!(entry.accounting, EntryAccounting::SourceOwned);
         let skip_vec = vector_blob_range(&entry.reader);
         let store = Arc::downgrade(self);
         let reader = Arc::downgrade(&entry.reader);
@@ -1394,6 +1407,14 @@ impl DiskCacheStore {
         let storage_uri_owned = Self::storage_path(uri);
         let fetch_storage = self.resolve_storage(storage);
         tokio::spawn(async move {
+            if needs_reserve {
+                let Some(s) = store.upgrade() else {
+                    return;
+                };
+                if s.reserve_manual(size).await.is_err() {
+                    return;
+                }
+            }
             let _ = lazy_background_fill(
                 store,
                 reader,
@@ -1428,6 +1449,7 @@ impl DiskCacheStore {
         uri: &SuperfileUri,
         offsets: Option<&SubsectionOffsets>,
         fetch_storage: Arc<dyn StorageProvider>,
+        allow_background_fill: bool,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = Self::storage_path(uri);
         let block_source_arc: Arc<BlockCachedSource>;
@@ -1471,11 +1493,12 @@ impl DiskCacheStore {
                 storage_uri.clone(),
                 total_size,
             ));
-            let block_source = BlockCachedSource::new_pre_reserved(
+            let block_source = BlockCachedSource::new_with_accounting(
                 inner,
                 Arc::downgrade(self),
                 *uri,
                 self.blocks_path(uri),
+                !allow_background_fill,
                 // FTS subsection reads bypass block rounding (exact ranges);
                 // see the `passthrough` field docs.
                 offsets.fts,
@@ -1554,11 +1577,12 @@ impl DiskCacheStore {
                     Arc::clone(&fetch_storage),
                     storage_uri.clone(),
                 ));
-            let block_source = BlockCachedSource::new_pre_reserved(
+            let block_source = BlockCachedSource::new_with_accounting(
                 range_src,
                 Arc::downgrade(self),
                 *uri,
                 self.blocks_path(uri),
+                !allow_background_fill,
                 // No manifest hints here, so the FTS subsection is unknown.
                 None,
             );
@@ -1573,15 +1597,30 @@ impl DiskCacheStore {
             (lazy_reader, size)
         };
 
-        self.reserve_manual(size).await?;
+        // Vector opens keep their blob sparse and never mmap-promote, so they
+        // account their live filled bytes (source-owned) instead of reserving
+        // the whole superfile up front. Otherwise a fanout touching many
+        // superfiles over-reserves and evicts live peers. FTS/SQL opens promote
+        // to a full mmap, so they keep the eager full-size reservation.
+        if allow_background_fill {
+            self.reserve_manual(size).await?;
+        }
 
         let lazy_reader = Arc::new(lazy_reader);
         let block_token = block_source_arc.entry_token();
+        let (size_bytes, accounting) = if allow_background_fill {
+            (Arc::new(AtomicU64::new(size)), EntryAccounting::Eager)
+        } else {
+            (
+                block_source_arc.filled_bytes_handle(),
+                EntryAccounting::SourceOwned,
+            )
+        };
         let entry = Arc::new(CachedEntry {
             reader: Arc::clone(&lazy_reader),
             mmap: None,
-            size_bytes: Arc::new(AtomicU64::new(size)),
-            accounting: EntryAccounting::Eager,
+            size_bytes,
+            accounting,
             block_token: Some(block_token),
             block_source: Some(block_source_arc),
             // Fill is modality-gated via [`Self::maybe_spawn_background_fill`]
@@ -2997,31 +3036,40 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn erase_superfile_local_copy_concurrent_with_a_fill_keeps_accounting_consistent() {
-        // GC can drop a URI while a fill for it is in flight. Either outcome is
-        // fine (the fill lands and leaves a dead entry a later eviction
-        // reclaims, or the drop wins), but accounting must match the outcome:
-        // bytes present exactly when the entry is.
+        // A fill and an erase race on one URI, 200 interleavings. Whichever wins, the
+        // byte count must equal what is actually cached, and a fill that lost its file
+        // to the erase must release what it reserved. Drift either way corrupts the
+        // budget: phantom bytes starve the cache, missing ones let it overrun.
         let (_dir, store) = test_store();
         let size = tiny_superfile_bytes().len() as u64;
 
         for _ in 0..RACE_ITERATIONS {
             let uri = SuperfileUri::new_v4();
             let filler = Arc::clone(&store);
-            let dropper = Arc::clone(&store);
+            let eraser = Arc::clone(&store);
             let fill =
                 tokio::spawn(async move { filler.insert_warm(&uri, tiny_superfile_bytes()).await });
-            let drop_task = tokio::spawn(async move { dropper.erase_superfile_local_copy(&uri) });
-            let (fill_res, drop_res) = tokio::join!(fill, drop_task);
-            fill_res.expect("fill task").expect("insert_warm");
-            drop_res.expect("drop task");
+            let erase = tokio::spawn(async move { eraser.erase_superfile_local_copy(&uri) });
+            let (fill_res, erase_res) = tokio::join!(fill, erase);
+            let filled = fill_res.expect("fill task").is_ok();
+            erase_res.expect("erase task");
 
             let s = store.stats();
             let expected = if s.n_entries == 1 { size } else { 0 };
             assert_eq!(
                 s.current_bytes, expected,
-                "bytes must match entry presence (entries={})",
+                "bytes must match entry presence (entries={}, filled={filled})",
                 s.n_entries
             );
+
+            if !filled {
+                assert_eq!(s.n_entries, 0, "a failed fill leaves no entry behind");
+                assert_eq!(
+                    s.current_bytes, 0,
+                    "a failed fill rolls its reservation back"
+                );
+            }
+
             // Leave a clean slate for the next iteration.
             store.erase_superfile_local_copy(&uri);
             assert_eq!(store.stats().current_bytes, 0);

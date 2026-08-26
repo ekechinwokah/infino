@@ -353,6 +353,13 @@ pub(crate) struct TermCursor {
     /// PACKED block it already holds while probing membership across a
     /// run of ascending target docs.
     pub(super) decoded_block: usize,
+    /// Which block index has its tf array decoded into `block_tfs`
+    /// (`usize::MAX` = none). Set whenever `block_tfs` is filled — by a full
+    /// [`Self::decode_current_block`] (non-count) or by a tf-only decode in
+    /// [`Self::bitset_probe_tf`], which reads a single doc's tf by rank
+    /// without expanding the block's doc ids. Lets the probe reuse the
+    /// decoded tfs across a run of candidates landing in the same block.
+    pub(super) tf_decoded_block: usize,
 }
 
 impl TermCursor {
@@ -432,6 +439,7 @@ impl TermCursor {
             header_probed,
             count_only,
             decoded_block: usize::MAX,
+            tf_decoded_block: usize::MAX,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -489,6 +497,7 @@ impl TermCursor {
             // never call `decode_current_block`, so the flag is inert.
             count_only: false,
             decoded_block: 0,
+            tf_decoded_block: 0,
         }
     }
 
@@ -505,6 +514,11 @@ impl TermCursor {
         };
         self.pos = 0;
         self.decoded_block = self.current_block;
+        // A non-count decode also fills `block_tfs` for this block, so the
+        // tf-only probe can reuse it without re-decoding.
+        if !self.count_only {
+            self.tf_decoded_block = self.current_block;
+        }
     }
 
     /// Membership probe: does this term contain `doc`? Advances the block
@@ -576,6 +590,83 @@ impl TermCursor {
         while self.pos < self.block_n && self.block_doc_ids[self.pos] < doc {
             self.pos += 1;
         }
+    }
+
+    /// Ranked-OR non-essential membership probe returning the doc's tf
+    /// **without expanding the block's doc ids**. On a dense (bitset) block it
+    /// bit-tests presence and, on a hit, reads the one tf by popcount-rank into
+    /// the tf array (decoded once per block) — never materializing the 128 doc
+    /// ids, which is the dominant cost of the ranked-OR non-essential
+    /// completion on common terms. On a PACKED block there is no rank shortcut
+    /// (the doc ids must be decoded to locate the doc), so it falls back to
+    /// `skip_to` + `current_tf`. Like [`Self::contains`] it advances
+    /// `current_block`, so a cursor probed this way must not also be iterated.
+    pub(super) fn bitset_probe_tf(&mut self, doc: u32) -> Option<u32> {
+        while self.current_block < self.blocks.len()
+            && self.blocks[self.current_block].last_doc_id < doc
+        {
+            self.current_block += 1;
+        }
+        if self.current_block >= self.blocks.len() {
+            return None;
+        }
+        // Inline (df=1) cursor: single pre-decoded posting, no postings bytes.
+        if self.bytes.is_empty() {
+            if self.block_n > 0 && self.block_doc_ids[0] == doc {
+                return Some(self.block_tfs[0]);
+            }
+            return None;
+        }
+        let block = self.blocks[self.current_block];
+        let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+        if raw[posting::ENCODING_OFF] != posting::ENCODING_BITSET {
+            // PACKED: no rank shortcut — decode + locate like the old path.
+            self.skip_to(doc);
+            return if self.current_doc_id() == doc {
+                Some(self.current_tf())
+            } else {
+                None
+            };
+        }
+        let base = read_u32_le(&raw[4..8]);
+        if doc < base {
+            return None;
+        }
+        let bit = (doc - base) as usize;
+        let tf_bits = raw[2] as usize;
+        let tfs_size = BLOCK_LEN * tf_bits / 8;
+        let bitset_end = raw.len() - tfs_size;
+        let word_idx = bit / 64;
+        let word_at = posting::HEADER_SIZE + word_idx * 8;
+        if word_at + 8 > bitset_end {
+            return None; // past this block's presence bits ⇒ absent
+        }
+        let word = u64::from_le_bytes(raw[word_at..word_at + 8].try_into().expect("8 bytes"));
+        if (word >> (bit % 64)) & 1 == 0 {
+            return None; // doc not present in this block
+        }
+        // Present. `rank` = number of set bits before `bit` = popcount of the
+        // whole presence words ahead of this one + popcount of this word below
+        // `bit`. The r-th set bit (doc) maps to the r-th tf in doc order.
+        let presence = &raw[posting::HEADER_SIZE..bitset_end];
+        let mut rank: u32 = 0;
+        for w in presence[..word_idx * 8].chunks_exact(8) {
+            rank += u64::from_le_bytes(w.try_into().expect("8 bytes")).count_ones();
+        }
+        let below = if bit.is_multiple_of(64) {
+            0u64
+        } else {
+            (1u64 << (bit % 64)) - 1
+        };
+        rank += (word & below).count_ones();
+        // Decode this block's tf array once (doc order), reused across a run of
+        // candidates in the same block; the doc ids are never expanded.
+        if self.tf_decoded_block != self.current_block {
+            let bytes = &self.bytes[block.block_byte_offset..block.block_byte_end];
+            posting::decode_block_tfs(bytes, &mut self.block_tfs);
+            self.tf_decoded_block = self.current_block;
+        }
+        Some(self.block_tfs[rank as usize])
     }
 
     pub(super) fn is_exhausted(&self) -> bool {
@@ -815,5 +906,113 @@ impl TermCursor {
                 self.decode_current_block();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+
+    use crate::superfile::fts::{
+        bm25, builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
+    };
+
+    /// The per-block BM25 upper bound stored in the skip table must be a
+    /// valid upper bound over the *query-time* score of every document in
+    /// that block. Query-time scoring reads each document's length from the
+    /// byte-quantized norm table, which truncates the length downward — and
+    /// a shorter length yields a *higher* BM25 score. If the stored block
+    /// max is computed from the exact (un-truncated) length, it lands below
+    /// the query score of a doc whose length quantizes down, and the
+    /// block-max skip in the ranked-OR walk drops that doc from the top-k.
+    ///
+    /// This plants a term spanning several 128-doc blocks whose documents
+    /// all have a length in the quantize-down region, then walks the term's
+    /// cursor and asserts `block_max >= query_score` for every posting.
+    /// Without the length-consistent block bound the assertion fires on the
+    /// highest-tf doc in each block; a small-doc corpus (every length in the
+    /// exact-quantization region) never exercises it.
+    #[tokio::test]
+    async fn block_max_bounds_query_time_score() {
+        // A length that truncates under the one-byte length quantizer:
+        // `dequantize_len(quantize_len(200)) == 192`, so a length-200 doc is
+        // scored as if length 192 and scores *higher* than at its true
+        // length.
+        const DOC_LEN: usize = 200;
+        assert!(
+            bm25::dequantize_len(bm25::quantize_len(DOC_LEN as u32)) < DOC_LEN as u32,
+            "corpus doc length must quantize downward to exercise the bound"
+        );
+        // The term under test lives in this many docs — enough to span
+        // multiple 128-doc blocks so the block-max skip engages.
+        const TERM_DOCS: u32 = 260;
+        // Total corpus size. Kept well above `TERM_DOCS` so the term's IDF
+        // is large enough that the quantization-induced score gap clears the
+        // skip table's fixed-point rounding and the assertion is decisive.
+        const N_DOCS: u32 = 1300;
+
+        let tok = Arc::new(AsciiLowerTokenizer);
+        let mut b = FtsBuilder::new(tok);
+        b.register_column("body".into(), false)
+            .expect("register column");
+        for doc_id in 0..N_DOCS {
+            // Every doc is `DOC_LEN` tokens long (so `avgdl == DOC_LEN` and
+            // every length quantizes down identically). The term docs carry
+            // `common` with a term frequency of 1..=3 — a genuine per-block
+            // spread of scores whose maximum is the highest-tf doc — padded
+            // with a filler token; the rest are filler only.
+            let common_tf = if doc_id < TERM_DOCS {
+                1 + (doc_id % 3) as usize
+            } else {
+                0
+            };
+            let mut text = String::with_capacity(DOC_LEN * 5);
+            for _ in 0..common_tf {
+                text.push_str("common ");
+            }
+            for _ in 0..(DOC_LEN - common_tf) {
+                text.push_str("pad ");
+            }
+            b.add_doc(0, doc_id, text.trim_end()).expect("add doc");
+        }
+        let bytes = Bytes::from(b.finish().expect("finish builder"));
+        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let reader = FtsReader::open(bytes, json).expect("open FtsReader");
+
+        let mut cursors = reader
+            .build_term_cursors(0, &["common"], None, false)
+            .await
+            .expect("build term cursors");
+        let cursor = cursors.first_mut().expect("`common` present in dictionary");
+        assert!(
+            cursor.blocks.len() >= 2,
+            "term must span multiple blocks so the block-max skip engages \
+             (got {} block(s))",
+            cursor.blocks.len()
+        );
+        let col_meta = &reader.columns[0];
+
+        let mut checked = 0u32;
+        while !cursor.is_exhausted() {
+            let doc = cursor.current_doc_id();
+            let tf = cursor.current_tf();
+            let query_score =
+                bm25::score_with_dl_norm_k1(cursor.idf_x_k1p1, tf, col_meta.dl_norm_k1.get(doc));
+            let block_max = cursor.current_block_max_bm25();
+            assert!(
+                block_max >= query_score,
+                "stored block max {block_max} < query-time score {query_score} for \
+                 doc {doc} (tf={tf}): the per-block BM25 bound under-estimates a \
+                 document in its own block, so the ranked-OR block-max skip can drop it",
+            );
+            checked += 1;
+            cursor.next();
+        }
+        assert_eq!(
+            checked, TERM_DOCS,
+            "every posting for the term must be visited"
+        );
     }
 }

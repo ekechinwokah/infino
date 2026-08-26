@@ -7,7 +7,9 @@
 //! BlockMaxWAND fast path, and the atom (phrase-aware) scored walk.
 //! Its own `impl FtsReader` block, split from the reader `core`.
 
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
+
+use rustc_hash::FxHashMap;
 
 use super::{
     core::*,
@@ -110,10 +112,14 @@ impl FtsReader {
             return Ok(drain_top_k_desc(heap));
         }
 
-        // Must-driven walk: leapfrog the musts to each common doc,
-        // score musts + landing shoulds there.
+        // Must-driven walk, two-phase per candidate: (1) align every must by its
+        // cheap approximation (a phrase advances only to a member co-occurrence,
+        // no positions); (2) bar-skip on block-max UBs; (3) verify phrase
+        // adjacency and score only on the survivors. The old single-phase walk
+        // verified phrases *during* alignment, so a phrase of common words cost
+        // the same with or without a selective co-clause; verifying only on the
+        // aligned intersection lets that clause prune the position work.
         let should_ub: f32 = shoulds.iter().map(AnyCursor::term_max_bm25).sum();
-        let must_others_ub = atom_slack(&musts, should_ub);
         let should_others_ub: Vec<f32> = {
             let must_ub_total: f32 = musts.iter().map(AnyCursor::term_max_bm25).sum();
             atom_slack(&shoulds, must_ub_total)
@@ -124,15 +130,17 @@ impl FtsReader {
                 true => heap.peek().expect("heap len == k").0.max(floor_eff),
                 false => floor_eff,
             };
+            // Phase 1 — approximate alignment (phrase = member co-occurrence,
+            // no positions).
             let mut aligned = target;
             let mut i = 0usize;
             while i < musts.len() {
                 let a = &mut musts[i];
-                a.skip_to_pruned(aligned, bar - must_others_ub[i], dl_norm_k1)?;
+                a.approx_skip_to(aligned);
                 if a.is_exhausted() {
                     break 'docs;
                 }
-                let here = a.current_doc_id();
+                let here = a.approx_current_doc();
                 if here > aligned {
                     aligned = here;
                     i = 0;
@@ -140,13 +148,10 @@ impl FtsReader {
                 }
                 i += 1;
             }
-            // Bar skip: the kth-best (or the seeded floor) minus the
-            // most the shoulds could add bounds what the musts must
-            // reach; a candidate whose must-side block bounds can't
-            // get there is dead without scoring (and, for phrase
-            // shoulds, without any position work). `>=`, not `>`: a
-            // doc exactly at the bar can still displace the incumbent
-            // kth-best on the ascending-doc-id tie-break.
+            // Bar skip on block-max UBs, before any position work: a candidate
+            // whose musts + shoulds can't reach the kth-best is dead without a
+            // verify. `>=`, not `>`: a doc exactly at the bar can still displace
+            // the incumbent kth-best on the ascending-doc-id tie-break.
             let scoring_needed = match bar > f32::NEG_INFINITY {
                 true => {
                     let must_ub: f32 = musts
@@ -157,22 +162,34 @@ impl FtsReader {
                 }
                 false => true,
             };
-            let admitted = scoring_needed
-                && match filter.as_mut() {
-                    Some(f) => f.admits(aligned)?,
-                    None => true,
-                };
-            if admitted {
-                let norm = dl_norm_k1.get(aligned);
-                let mut score: f32 = musts.iter().map(|a| a.score_current(norm)).sum();
-                for (sh, &others) in shoulds.iter_mut().zip(&should_others_ub) {
-                    sh.skip_to_pruned(aligned, bar - others, dl_norm_k1)?;
-                    if !sh.is_exhausted() && sh.current_doc_id() == aligned {
-                        score += sh.score_current(norm);
+            if scoring_needed {
+                // Phase 2 — verify phrase adjacency at the aligned candidate;
+                // terms match trivially. Only survivors reach the position
+                // decode and scoring.
+                let mut matched = true;
+                for a in musts.iter_mut() {
+                    if !a.verify_at(aligned)? {
+                        matched = false;
+                        break;
                     }
                 }
-                if score > floor_eff {
-                    and_heap_push(&mut heap, k, None, score, aligned);
+                let admitted = matched
+                    && match filter.as_mut() {
+                        Some(f) => f.admits(aligned)?,
+                        None => true,
+                    };
+                if admitted {
+                    let norm = dl_norm_k1.get(aligned);
+                    let mut score: f32 = musts.iter().map(|a| a.score_current(norm)).sum();
+                    for (sh, &others) in shoulds.iter_mut().zip(&should_others_ub) {
+                        sh.skip_to_pruned(aligned, bar - others, dl_norm_k1)?;
+                        if !sh.is_exhausted() && sh.current_doc_id() == aligned {
+                            score += sh.score_current(norm);
+                        }
+                    }
+                    if score > floor_eff {
+                        and_heap_push(&mut heap, k, None, score, aligned);
+                    }
                 }
             }
             let Some(next) = aligned.checked_add(1) else {
@@ -662,15 +679,10 @@ impl FtsReader {
     /// [`Self::search_or_range_pretokenized_with_floor`] delegates here.
     /// The ranged path carries no negation in v1.
     ///
-    /// Kernel choice mirrors `dispatch_or_algo` instead of
-    /// hardcoding MaxScore+BMM: on a broad OR over uniform-upper-bound
-    /// terms BMM cannot prune (every block max ties), so it degrades to
-    /// per-doc min-scan bookkeeping over ~the whole union — the exact
-    /// shape `run_windowed_union` exists for, and it is natively ranged.
-    /// Hardcoding BMM here made the SAME query run a different kernel
-    /// depending on whether the fan-out sliced (few large superfiles,
-    /// i.e. post-compaction) or not (many small ones, pre-compaction) —
-    /// measured at 1M as the 11-24x post-compact broad-OR regression.
+    /// Kernel choice goes through the same `route_or_to_windowed` seam as the
+    /// single-shot path, so a query runs the same kernel whether or not the
+    /// fan-out sliced it — hardcoding BMM here once caused an 11-24x
+    /// post-compact broad-OR regression.
     pub(crate) fn search_or_range_prebuilt(
         &self,
         set: &OrCursorSet,
@@ -683,7 +695,7 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let cursors = set.cursors.clone();
-        if prefer_windowed_union(&cursors) {
+        if route_or_to_windowed(&cursors, k) {
             self.run_windowed_union(
                 set.column_id,
                 cursors,
@@ -719,7 +731,9 @@ impl FtsReader {
         // Tokenize the query with each column's configured tokenizer so
         // per-column analyzers are honored — a table may index different
         // columns with different analyzers.
-        let mut combined: HashMap<u32, f32> = HashMap::new();
+        // FxHashMap: the combine does a per-doc insert across columns; the
+        // default SipHash is needless work for small integer (doc-id) keys.
+        let mut combined: FxHashMap<u32, f32> = FxHashMap::default();
         for (col_name, weight) in columns {
             let col_id = self.resolve_column_id(col_name)?;
             let tok = &self.columns[col_id as usize].tokenizer;
@@ -1360,31 +1374,34 @@ mod tests {
         let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
-        // Uniform 4-term OR routes to the windowed union; the
-        // rare+common mix keeps a dominant term UB and stays on BMM.
-        // Assert the routing rather than assume it — a corpus tweak that
-        // silently stopped exercising one branch would otherwise turn
-        // this into a test of the other branch twice.
+        // k-gated routing exercises both ranged kernels: the uniform OR takes
+        // the windowed scan at K_ALL (deep k) but MaxScore at the small top-k;
+        // the dominant-UB OR stays on MaxScore throughout. Assert it rather
+        // than assume it, so a corpus tweak can't silently test one branch twice.
         let shapes: [&[&str]; 2] = [
             &["alpha", "beta", "gamma", "delta"],
             &["rareterm", "alpha", "beta"],
         ];
         let column_id = r.resolve_column_id("body").expect("column");
-        let uniform_cursors = r
+        let uniform = r
             .build_term_cursors(column_id, shapes[0], None, false)
             .await
             .expect("cursors");
         assert!(
-            prefer_windowed_union(&uniform_cursors),
-            "uniform shape must route to the windowed ranged branch"
+            route_or_to_windowed(&uniform, K_ALL),
+            "uniform OR at K_ALL (deep k) must route to the windowed ranged branch"
         );
-        let dominant_cursors = r
+        assert!(
+            !route_or_to_windowed(&uniform, K_TOP),
+            "uniform OR at small k must route to the MaxScore ranged branch"
+        );
+        let dominant = r
             .build_term_cursors(column_id, shapes[1], None, false)
             .await
             .expect("cursors");
         assert!(
-            !prefer_windowed_union(&dominant_cursors),
-            "dominant-UB shape must route to the BMM ranged branch"
+            !route_or_to_windowed(&dominant, K_ALL) && !route_or_to_windowed(&dominant, K_TOP),
+            "dominant-UB OR must route to MaxScore at every k (not uniform, no ≥100k list)"
         );
         // Uneven partitions, including window-boundary-crossing cuts.
         let partitions: [&[(u32, u32)]; 3] = [

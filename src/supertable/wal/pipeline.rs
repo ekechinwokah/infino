@@ -66,6 +66,7 @@ use uuid::Uuid;
 
 use crate::{
     runtime_bridge::{bridge_sync_to_async, run_on_pool},
+    runtime_metrics::op_stats::{OpStatsCollector, timed_kernel},
     storage::StorageError,
     superfile::{ReadError, SuperfileReader, builder::SuperfileBuilder},
     supertable::{
@@ -208,6 +209,16 @@ impl AppendPhaseError {
             _ => false,
         }
     }
+
+    /// True when the backend refused the credentials in use.
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        match self {
+            AppendPhaseError::ManifestCommit(e) => e.is_permission_denied(),
+            AppendPhaseError::Storage(e) => e.is_permission_denied(),
+            AppendPhaseError::WalStore(e) => e.is_permission_denied(),
+            _ => false,
+        }
+    }
 }
 
 /// Drive one UPDATE WAL from `Intent` to `Appended`.
@@ -233,11 +244,16 @@ impl AppendPhaseError {
 /// end state because every step is idempotent on replay (steps
 /// 1-4) or content-addressed (step 5's manifest writes go
 /// through the normal CAS).
-pub async fn run_append_phase(
+pub(crate) async fn run_append_phase(
     supertable: &Supertable,
     wal_store: &WalStore,
     wal_doc: &WalStateDoc,
     wal_etag: &Etag,
+    // The mutation's per-op collector, passed explicitly: this runs on the
+    // runtime's thread, so the caller's thread-local scope cannot reach it.
+    // The recovery sweep passes None — a recovered WAL is maintenance, not
+    // any live op's work.
+    op_stats: Option<Arc<OpStatsCollector>>,
 ) -> Result<(AppendPhaseOutcome, WalStateDoc, Etag), AppendPhaseError> {
     // Pre-condition: only UPDATE has an append phase.
     if wal_doc.op_kind != OpKind::Update {
@@ -277,6 +293,7 @@ pub async fn run_append_phase(
         wal_doc,
         wal_etag,
         preallocated_superfile_id,
+        op_stats,
     )
     .await?;
     Ok((AppendPhaseOutcome::Applied, new_wal, new_etag))
@@ -320,6 +337,7 @@ async fn do_apply(
     wal_doc: &WalStateDoc,
     wal_etag: &Etag,
     preallocated_superfile_id: Uuid,
+    op_stats: Option<Arc<OpStatsCollector>>,
 ) -> Result<(WalStateDoc, Etag), AppendPhaseError> {
     let inner = supertable.inner();
     let storage = inner
@@ -399,23 +417,35 @@ async fn do_apply(
     // the replacement rows. The pack is a CPU wave, so it rides the writer
     // pool behind a oneshot per the standing rayon/tokio bridge contract.
     // Tables without vector columns keep the plain build.
+    //
+    // Either way the build is the update's own CPU and is bracketed as
+    // such — but on the thread that does the work, not the one that waits
+    // for it. The plain build is synchronous here (`update` reaches this
+    // future through `bridge_on_runtime`, so "here" is the caller's own
+    // thread inside `block_on`), so it brackets here. The packed build
+    // carries the collector into `fanout_shards_metered`, which already
+    // brackets each shard on its own pool worker — bracketing the pool
+    // closure as well would count that CPU twice.
     let bytes = if inner.options.vector_columns.is_empty() {
-        let mut builder = SuperfileBuilder::new(inner.options.builder_options()).map_err(|e| {
-            AppendPhaseError::SuperfileBuild {
-                message: format!("builder construction: {e}"),
-            }
-        })?;
-        builder
-            .add_batch(&scalar_with_id, &vector_slices)
-            .map_err(|e| AppendPhaseError::SuperfileBuild {
-                message: format!("add_batch: {e}"),
-            })?;
-        let raw = builder
-            .finish()
-            .map_err(|e| AppendPhaseError::SuperfileBuild {
-                message: format!("finish: {e}"),
-            })?;
-        Bytes::from(raw)
+        timed_kernel(&op_stats, || {
+            let mut builder =
+                SuperfileBuilder::new(inner.options.builder_options()).map_err(|e| {
+                    AppendPhaseError::SuperfileBuild {
+                        message: format!("builder construction: {e}"),
+                    }
+                })?;
+            builder
+                .add_batch(&scalar_with_id, &vector_slices)
+                .map_err(|e| AppendPhaseError::SuperfileBuild {
+                    message: format!("add_batch: {e}"),
+                })?;
+            let raw = builder
+                .finish()
+                .map_err(|e| AppendPhaseError::SuperfileBuild {
+                    message: format!("finish: {e}"),
+                })?;
+            Ok::<_, AppendPhaseError>(Bytes::from(raw))
+        })?
     } else {
         let vectors = owned_vector_arrays(&user_batch, &inner.options).map_err(|e| {
             AppendPhaseError::SuperfileBuild {
@@ -424,10 +454,11 @@ async fn do_apply(
         })?;
         let pool_inner = Arc::clone(inner);
         let pool_batch = scalar_with_id.clone();
+        let pool_stats = op_stats.clone();
         run_on_pool(
             Some(&inner.options.writer_pool),
             "update packed superfile build",
-            move || build_packed_update_superfile(&pool_inner, pool_batch, vectors),
+            move || build_packed_update_superfile(&pool_inner, pool_batch, vectors, &pool_stats),
         )
         .await
         .map_err(|e| AppendPhaseError::SuperfileBuild {
@@ -812,6 +843,16 @@ impl TombstonePhaseError {
             TombstonePhaseError::ManifestStamp(e) => e.is_conflict(),
             TombstonePhaseError::Storage(e) => e.is_conflict(),
             TombstonePhaseError::WalStore(e) => e.is_conflict(),
+            _ => false,
+        }
+    }
+
+    /// True when the backend refused the credentials in use.
+    pub(crate) fn is_permission_denied(&self) -> bool {
+        match self {
+            TombstonePhaseError::ManifestStamp(e) => e.is_permission_denied(),
+            TombstonePhaseError::Storage(e) => e.is_permission_denied(),
+            TombstonePhaseError::WalStore(e) => e.is_permission_denied(),
             _ => false,
         }
     }
@@ -1405,7 +1446,7 @@ mod tests {
     async fn rejects_delete_wal_with_typed_error() {
         let (_dir, st, ws, mut wal, etag) = fixture().await;
         wal.op_kind = OpKind::Delete;
-        let err = run_append_phase(&st, &ws, &wal, &etag)
+        let err = run_append_phase(&st, &ws, &wal, &etag, None)
             .await
             .expect_err("must error");
         assert!(matches!(err, AppendPhaseError::NotAnUpdateWal), "{err:?}");
@@ -1415,7 +1456,7 @@ mod tests {
     async fn rejects_wal_missing_preallocated_superfile_id() {
         let (_dir, st, ws, mut wal, etag) = fixture().await;
         wal.preallocated_superfile_id = None;
-        let err = run_append_phase(&st, &ws, &wal, &etag)
+        let err = run_append_phase(&st, &ws, &wal, &etag, None)
             .await
             .expect_err("must error");
         assert!(
@@ -1549,7 +1590,7 @@ mod tests {
             fixture_with_ipc_payload(&["alpha bravo", "charlie delta"], 7, 5_000).await;
         let pre_uuid = wal.preallocated_superfile_id.expect("set in fixture");
 
-        let (outcome, new_wal, new_etag) = run_append_phase(&st, &ws, &wal, &etag)
+        let (outcome, new_wal, new_etag) = run_append_phase(&st, &ws, &wal, &etag, None)
             .await
             .expect("append phase");
 
@@ -1582,14 +1623,14 @@ mod tests {
             fixture_with_ipc_payload(&["alpha", "beta"], 11, 6_000).await;
 
         let (first_outcome, after_first, etag_after_first) =
-            run_append_phase(&st, &ws, &wal, &etag)
+            run_append_phase(&st, &ws, &wal, &etag, None)
                 .await
                 .expect("first");
         assert_eq!(first_outcome, AppendPhaseOutcome::Applied);
         assert_eq!(after_first.state, WalState::Appended);
 
         let (second_outcome, after_second, etag_after_second) =
-            run_append_phase(&st, &ws, &after_first, &etag_after_first)
+            run_append_phase(&st, &ws, &after_first, &etag_after_first, None)
                 .await
                 .expect("second");
         // The second run is a no-op on the state doc (WAL was
@@ -1616,8 +1657,9 @@ mod tests {
         // injecting a fault in persist_commit; using a
         // successful run + a manually-reset WAL is equivalent
         // and easier to reason about.)
-        let (_outcome, _new_wal, _new_etag) =
-            run_append_phase(&st, &ws, &wal, &etag).await.expect("seed");
+        let (_outcome, _new_wal, _new_etag) = run_append_phase(&st, &ws, &wal, &etag, None)
+            .await
+            .expect("seed");
 
         // Manually reset the WAL state to Intent — simulating
         // a crash that landed the manifest swap but lost the
@@ -1639,7 +1681,7 @@ mod tests {
         // superfile, takes the AlreadyApplied path, advances
         // the WAL state to Appended.
         let (outcome, recovered, recovered_etag) =
-            run_append_phase(&st, &ws, &intent_wal, &intent_etag)
+            run_append_phase(&st, &ws, &intent_wal, &intent_etag, None)
                 .await
                 .expect("recovered");
         assert_eq!(outcome, AppendPhaseOutcome::AlreadyApplied);
@@ -1662,7 +1704,7 @@ mod tests {
 
         // First run: drive through the orchestrator, capture
         // the superfile's bytes from storage.
-        let (_o, _new_wal, _new_etag) = run_append_phase(&st1, &ws1, &wal, &etag1)
+        let (_o, _new_wal, _new_etag) = run_append_phase(&st1, &ws1, &wal, &etag1, None)
             .await
             .expect("first run");
         let manifest1 = st1.inner().manifest.load_full();
@@ -1684,7 +1726,7 @@ mod tests {
         // helper, so the entire WAL state doc matches.
         let (_dir2, st2, ws2, wal2, etag2) =
             fixture_with_ipc_payload(&["determinism check"], 17, 8_000).await;
-        run_append_phase(&st2, &ws2, &wal2, &etag2)
+        run_append_phase(&st2, &ws2, &wal2, &etag2, None)
             .await
             .expect("second run");
         let storage2 = st2.inner().options.storage.as_ref().expect("storage");
@@ -1721,7 +1763,7 @@ mod tests {
             .await
             .expect("re-cas with bad hash");
 
-        let err = run_append_phase(&st, &ws, &wal, &bad_etag)
+        let err = run_append_phase(&st, &ws, &wal, &bad_etag, None)
             .await
             .expect_err("must error on hash mismatch");
         assert!(
@@ -1772,7 +1814,7 @@ mod tests {
             }],
         };
         let etag = ws.create(&wal_doc).await.expect("create");
-        let err = run_append_phase(&st, &ws, &wal_doc, &etag)
+        let err = run_append_phase(&st, &ws, &wal_doc, &etag, None)
             .await
             .expect_err("must error without storage");
         assert!(
@@ -1789,7 +1831,7 @@ mod tests {
             .update_with_etag(wal.wal_id, &etag, &wal)
             .await
             .expect("re-cas");
-        let err = run_append_phase(&st, &ws, &wal, &bad_etag)
+        let err = run_append_phase(&st, &ws, &wal, &bad_etag, None)
             .await
             .expect_err("must error");
         assert!(
@@ -1817,7 +1859,7 @@ mod tests {
             .update_with_etag(wal.wal_id, &etag, &wal)
             .await
             .expect("re-cas");
-        let err = run_append_phase(&st, &ws, &wal, &bad_etag)
+        let err = run_append_phase(&st, &ws, &wal, &bad_etag, None)
             .await
             .expect_err("must error");
         assert!(
@@ -1872,7 +1914,7 @@ mod tests {
             }],
         };
         let etag = ws.create(&wal_doc).await.expect("create");
-        let err = run_append_phase(&st, &ws, &wal_doc, &etag)
+        let err = run_append_phase(&st, &ws, &wal_doc, &etag, None)
             .await
             .expect_err("must error on bad ipc");
         assert!(matches!(err, AppendPhaseError::IpcDecode { .. }), "{err:?}");
@@ -2111,7 +2153,7 @@ mod tests {
     ) -> (TempDir, Supertable, WalStore, Uuid, i128, i128) {
         let (dir, st, ws, wal, etag) = fixture_with_ipc_payload(titles, 101, minted_first).await;
         let pre_uuid = wal.preallocated_superfile_id.expect("set");
-        run_append_phase(&st, &ws, &wal, &etag)
+        run_append_phase(&st, &ws, &wal, &etag, None)
             .await
             .expect("append phase");
         let n = titles.len() as i128;

@@ -73,7 +73,7 @@ use crate::{
         manifest::{
             SuperfileUri, UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy,
         },
-        slow_vector_state::CentroidSection,
+        slow_vector_state::{CentroidSection, ResidentGraphSections},
     },
 };
 
@@ -402,6 +402,27 @@ pub struct SupertableOptions {
     /// it). Serves the stripped-summary admit rescore from a local
     /// temp-file spill instead of per-cell object-store reads.
     pub(crate) centroid_section_cache: Arc<TokioMutex<Option<Arc<CentroidSection>>>>,
+    /// Single-slot cache for the slow-CAS graph sections (the persisted
+    /// `hnsw` data + centroid HNSW graphs), shared by every manifest
+    /// snapshot of this handle and keyed by the section's content-addressed
+    /// URI. Serves the resident graph walk without rebuilding at query time;
+    /// a new drain generation publishes a new URI and replaces it.
+    pub(crate) graph_sections_cache: Arc<TokioMutex<Option<Arc<ResidentGraphSections>>>>,
+    /// Single-flight gate for [`graph_sections_cache`] hydration. The graph
+    /// bundle is multi-GiB, so a first-touch miss holds THIS gate (never the
+    /// cache mutex) across the download: exactly one query fetches while
+    /// concurrent misses park here and then find the cache already published.
+    /// Warm queries never touch it — they resolve on the cache mutex's fast
+    /// path — so the download never serializes steady-state serving.
+    pub(crate) graph_hydration_lock: Arc<TokioMutex<()>>,
+    /// Build-once cache for the in-memory centroid-router HNSW (an HNSW over
+    /// the resident fp32 fine centroids, used by `ivf_router = centroid_graph`
+    /// to select clusters). Built from the resident centroid section at the
+    /// first such query, so testing it needs no re-drain; the persisted
+    /// centroid graph is a follow-on. Only populated when the centroid-graph
+    /// router is enabled.
+    pub(crate) centroid_router_cache:
+        Arc<tokio::sync::OnceCell<Arc<crate::supertable::query::vector::CentroidRouterGraph>>>,
     /// Read-time reverse (`stable_id -> local`) lookup backing scalar
     /// projection over gapped user superfiles, so a hit resolves in O(k) after
     /// a one-time per-superfile build instead of the per-query O(corpus) `_id`
@@ -727,6 +748,9 @@ impl SupertableOptions {
             // `apply_config` replaces it from `config.yaml`.
             connection_memory_budget: ConnectionMemoryBudget::measured(),
             centroid_section_cache: Arc::new(TokioMutex::new(None)),
+            graph_sections_cache: Arc::new(TokioMutex::new(None)),
+            graph_hydration_lock: Arc::new(TokioMutex::new(())),
+            centroid_router_cache: Arc::new(tokio::sync::OnceCell::new()),
             gapped_id_placement_cache: Arc::new(TokioMutex::new(GappedIdPlacementCache::default())),
             user_centroid_cache: Arc::new(TokioMutex::new(None)),
             prepopulate_cache_on_commit: true,
@@ -860,15 +884,25 @@ impl SupertableOptions {
         self
     }
 
-    /// Tokenizer configured for `column`, for tokenizing query text so
-    /// it matches how the column was indexed. Falls back to the ASCII
-    /// default when `column` is not a registered FTS column (the query
-    /// then fails downstream on the unknown column).
-    pub fn fts_tokenizer_for(&self, column: &str) -> Arc<dyn Tokenizer> {
+    /// Tokenizer configured for `column`, or `None` when `column` carries
+    /// no full-text index. `fts_tokenizers` is aligned to `fts_columns` (one
+    /// per column), so a hit on the column always yields its tokenizer — a
+    /// `None` return is exactly the "column is not full-text-indexed" signal,
+    /// which lets a search path reject up front instead of failing deep in
+    /// the scan. The lookup is a single pass over `fts_columns`.
+    pub fn try_fts_tokenizer_for(&self, column: &str) -> Option<Arc<dyn Tokenizer>> {
         self.fts_columns
             .iter()
             .position(|c| c.column == column)
             .and_then(|i| self.fts_tokenizers.get(i).cloned())
+    }
+
+    /// Tokenizer configured for `column`, for tokenizing query text so
+    /// it matches how the column was indexed. Falls back to the ASCII
+    /// default when `column` is not a registered FTS column; a caller that
+    /// must distinguish that case uses [`Self::try_fts_tokenizer_for`].
+    pub fn fts_tokenizer_for(&self, column: &str) -> Arc<dyn Tokenizer> {
+        self.try_fts_tokenizer_for(column)
             .unwrap_or_else(|| Arc::new(AsciiLowerTokenizer))
     }
 
