@@ -1760,9 +1760,11 @@ impl Sq4Kernel {
     pub(crate) fn distance_negdot(&self, coarse: &[u8], residual: Option<&[u8]>) -> f32 {
         #[cfg(target_arch = "x86_64")]
         if let Some(qi) = &self.q_int {
-            // SAFETY: `q_int` is only Some when `has_avx512vnni()` held
-            // and `padded` is a whole number of VNNI blocks — the two
-            // preconditions the arm documents.
+            // SAFETY: `q_int` is `Some` only when `has_avx512vnni()` held,
+            // which is the arm's single precondition. `padded` is
+            // unconstrained — the kernel masks its final block — and the
+            // query leg was built by `blocked_i8`, which rounds up to whole
+            // blocks, so both sides of every load are in bounds.
             let mut dot = self.q_dot_offset
                 + qi.coarse_scale * unsafe { sq4_dot_vnni(&qi.coarse, coarse, self.padded) } as f32;
             if let (Some(qr), Some(res)) = (&qi.residual, residual) {
@@ -1871,8 +1873,15 @@ pub(crate) fn sq4_dot(q_prime: &[f32], packed: &[u8], padded: usize) -> f32 {
 ///
 /// Callers must ensure the VNNI feature set and that `first + SQ4_ROW_BLOCK`
 /// rows exist in `plane`.
+///
+/// `avx512vl` is declared because the partial-block path uses a 256-bit masked
+/// load, which is a VL instruction. Leaving it out does not make the kernel
+/// unsound — `has_avx512vnni` implies `avx512_enabled`, which checks VL — but
+/// it puts the intrinsic outside the declared envelope, so it cannot inline and
+/// is emitted as an out-of-line call wrapping a single masked move. That lands
+/// on the tail of every row: at dim 200 one block in four.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
 unsafe fn sq4_dot_vnni_rows(
     q_i8: &[i8],
     plane: &[u8],
@@ -1924,11 +1933,14 @@ unsafe fn sq4_dot_vnni_rows(
 /// the high-nibble half are simply concatenated into one register, and
 /// the query was laid out to match.
 ///
-/// Callers must ensure `avx512f` + `avx512bw` + `avx512vnni`, which
-/// [`Sq4IntQuery::build`] establishes. Any `padded` is accepted: whole
-/// blocks go through `vpdpbusd` and the remainder through a scalar tail.
+/// Callers must ensure the feature set below, which [`Sq4IntQuery::build`]
+/// establishes via `has_avx512vnni`. Any `padded` is accepted — a `dim` that is
+/// not a whole number of blocks keeps its remainder in a MASKED final block,
+/// not a scalar tail; `avx512vl` is declared because that masked load is
+/// 256-bit and therefore a VL instruction (see [`sq4_dot_vnni_rows`] for why
+/// omitting it costs an out-of-line call rather than soundness).
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
 unsafe fn sq4_dot_vnni(q_i8: &[i8], packed: &[u8], padded: usize) -> i32 {
     debug_assert_eq!(
         q_i8.len(),
@@ -1937,9 +1949,15 @@ unsafe fn sq4_dot_vnni(q_i8: &[i8], packed: &[u8], padded: usize) -> i32 {
     );
     debug_assert_eq!(packed.len(), padded.div_ceil(2));
 
-    // SAFETY: each iteration reads 32 packed bytes and 64 query bytes.
-    // The loop bound `d + 64 <= padded` bounds both, since packed holds
-    // `padded/2` bytes and `q_i8` holds `padded`. Loads are unaligned.
+    // SAFETY: a whole block reads exactly 32 packed bytes and 64 query
+    // bytes. The loop runs while `d < padded`, so the FINAL block may be
+    // partial — `avail` is the packed bytes that actually remain and the
+    // masked load touches only those, which is what keeps the read inside
+    // `packed` (an unconditional 32-byte load there could cross the end of
+    // a plane that finishes on a page boundary). The query side needs no
+    // mask because `blocked_i8` rounds `q_i8` UP to whole blocks and zeroes
+    // the slack. Loads are unaligned. Do not "simplify" the masked branch
+    // away without restoring a bound that stops before the final block.
     unsafe {
         let nibble_mask = _mm256_set1_epi8(SQ4_NIBBLE_MASK as i8);
         let mut acc = _mm512_setzero_si512();
@@ -2020,8 +2038,10 @@ unsafe fn sq4_dot_avx512(q_prime: &[f32], packed: &[u8], padded: usize) -> f32 {
             d += 2 * AVX512_F32_LANES;
         }
         let mut dot = _mm512_reduce_add_ps(acc);
-        // Tail: `padded` is a power of two, so this runs only when the
-        // whole plane is narrower than 32 coordinates.
+        // Tail. `padded` equals `dim` (the rotation is unpadded), so this
+        // runs for any dim that is not a multiple of 32 — up to 31
+        // coordinates, not just the narrow-plane case it handled when the
+        // rotation still padded to a power of two.
         while d < padded {
             let byte = packed[d / 2];
             let code = if d.is_multiple_of(2) {
@@ -2114,8 +2134,9 @@ unsafe fn sq4_dot_avx2(q_prime: &[f32], packed: &[u8], padded: usize) -> f32 {
             d += 2 * F32X8_LANES;
         }
         let mut dot = horizontal_sum_avx256(acc);
-        // Tail (padded is a power of two, so this is 0 or 8 coordinates):
-        // same per-lane extract as the portable tier.
+        // Tail: up to 15 coordinates, since `padded` equals `dim` under the
+        // unpadded rotation rather than a multiple of 16. Same per-lane
+        // extract as the portable tier.
         while d < padded {
             let byte = packed[d / 2];
             let code = if d.is_multiple_of(2) {
@@ -4446,14 +4467,15 @@ mod tests {
 
     // --- AVX-512 parity -------------------------------------------------
 
-    /// The AVX2 nibble arm must agree with the portable tier on every
-    /// length class (pow2 planes only — the padded space is always a
-    /// power of two), including the 8-coordinate tail. This is the test
-    /// that catches a wrong unpack ORDER (low/high nibble interleave),
-    /// which no aggregate recall number reliably would.
-    /// The VNNI arm quantizes the query to `i8`, so unlike the float arms
-    /// it is NOT exact — what has to hold is that the error stays inside
-    /// the quantization bound. A wrong nibble/query interleave would blow
+    /// The VNNI nibble arm must agree with the portable tier across every
+    /// length class the unpadded rotation can produce: whole blocks, block
+    /// plus tail, and shorter than one block. This is the test that catches
+    /// a wrong unpack ORDER (low/high nibble interleave), which no
+    /// aggregate recall number reliably would.
+    ///
+    /// Unlike the float arms this one quantizes the query to `i8`, so it is
+    /// NOT exact — what has to hold is that the error stays inside the
+    /// quantization bound. A wrong nibble/query interleave would blow
     /// straight past that bound while still producing plausible-looking
     /// numbers, which is exactly the failure this catches.
     ///
@@ -4484,8 +4506,10 @@ mod tests {
             let exact = sq4_dot_wide(&q, &packed, padded);
             let scale = Sq4IntQuery::scale_of(&q);
             let q_i8 = Sq4IntQuery::blocked_i8(padded, &q, scale);
-            // SAFETY: gated on the runtime VNNI check above, and every
-            // `padded` here is a whole number of VNNI blocks.
+            // SAFETY: gated on the runtime VNNI check above. `padded` need
+            // not be a whole number of blocks — several here are not (8,
+            // 100, 200) — because the kernel masks its final block; that
+            // is the property this sweep is here to exercise.
             let got = scale * unsafe { sq4_dot_vnni(&q_i8, &packed, padded) } as f32;
             let bound =
                 0.5 * scale * SQ4_CODE_MAX * (padded as f32).sqrt() + 1e-3 * exact.abs().max(1.0);
@@ -4498,11 +4522,66 @@ mod tests {
         }
     }
 
+    /// Anchor the nibble CONVENTION to hand-computed values.
+    ///
+    /// Every other arm is graded against `sq4_dot_wide`, and the encoder packs
+    /// to the same convention, so a nibble-order flip applied consistently
+    /// across all of them would leave every parity test green while silently
+    /// changing what the stored bytes mean — a bundle written by one build and
+    /// read by another would then disagree with no test objecting. The numbers
+    /// here come from the packing rule itself (low nibble = even coordinate),
+    /// not from any kernel.
+    ///
+    /// The probe is a one-hot query: with `q = e_d` the dot reduces to exactly
+    /// the code at coordinate `d`, which is readable straight off the packed
+    /// byte. Sweeping `d` across a block boundary and into the tail pins the
+    /// convention at every position, not just the first.
+    #[test]
+    fn sq4_nibble_convention_is_pinned_by_hand_computed_dots() {
+        // 0x21: low nibble (1) is coordinate 0, high nibble (2) coordinate 1.
+        assert_eq!(sq4_dot_wide(&[1.0, 0.0], &[0x21], 2), 1.0);
+        assert_eq!(sq4_dot_wide(&[0.0, 1.0], &[0x21], 2), 2.0);
+        // Asymmetric weights, so a swap cannot cancel out.
+        assert_eq!(sq4_dot_wide(&[1.0, 10.0], &[0x21], 2), 1.0 + 20.0);
+        // An odd `dim` leaves the final HIGH nibble unused: only the low one
+        // may contribute. `padded == dim` under the unpadded rotation, so this
+        // shape is reachable in production, not a synthetic edge.
+        assert_eq!(sq4_dot_wide(&[2.0], &[0xF3], 1), 6.0);
+
+        // One-hot sweep across block and tail boundaries.
+        let padded = 200usize;
+        let packed: Vec<u8> = (0..padded.div_ceil(2))
+            .map(|i| ((i % 15 + 1) | ((i % 13 + 2) << 4)) as u8)
+            .collect();
+        for d in [0usize, 1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 198, 199] {
+            let mut q = vec![0.0f32; padded];
+            q[d] = 1.0;
+            let byte = packed[d / 2];
+            let expected = if d.is_multiple_of(2) {
+                (byte & 0x0F) as f32
+            } else {
+                (byte >> 4) as f32
+            };
+            assert_eq!(
+                sq4_dot_wide(&q, &packed, padded),
+                expected,
+                "coordinate {d} does not read the nibble the packing rule assigns it"
+            );
+        }
+    }
+
     /// The 512-bit arm must agree with the portable tier on every length
     /// class, including the narrow planes where only the tail runs. Same
     /// role as the AVX2 test below: the `unpacklo`/`unpackhi` pair is
     /// where a coordinate-order bug hides, and it would show up as a
     /// small diffuse recall loss rather than an obvious failure.
+    ///
+    /// The sweep deliberately mixes three shapes: whole vector blocks
+    /// (32/64/128/1024/2048), tail-only (8, and 16 on this arm), and — the
+    /// ones that matter most now that the rotation is unpadded — MIXED
+    /// block-plus-tail (40, 100, 200). A broken hand-off from the vector
+    /// loop to the tail is invisible on lane-multiple lengths and invisible
+    /// again on tail-only lengths; it only shows up when both run.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn sq4_dot_avx512_matches_wide_across_padded_lengths() {
@@ -4515,7 +4594,7 @@ mod tests {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
             state
         };
-        for padded in [8usize, 16, 32, 64, 128, 1024, 2048] {
+        for padded in [8usize, 16, 32, 40, 64, 100, 128, 200, 1024, 2048] {
             let q: Vec<f32> = (0..padded)
                 .map(|_| ((next_u64() >> 33) as f32 / (1u64 << 30) as f32) - 1.0)
                 .collect();
@@ -4544,7 +4623,7 @@ mod tests {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
             state
         };
-        for padded in [8usize, 16, 32, 64, 128, 1024] {
+        for padded in [8usize, 16, 32, 40, 64, 100, 128, 200, 1024] {
             let q: Vec<f32> = (0..padded)
                 .map(|_| ((next_u64() >> 33) as f32 / (1u64 << 30) as f32) - 1.0)
                 .collect();

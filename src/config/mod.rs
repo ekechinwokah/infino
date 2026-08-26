@@ -54,6 +54,19 @@ use serde::{
 /// Embedded baseline. Compiled in via `include_str!`.
 const EMBEDDED_DEFAULT: &str = include_str!("config.yaml");
 
+/// Keys that used to exist, paired with what to write instead.
+///
+/// A retired key is REJECTED at load rather than ignored. Unknown keys are
+/// dropped silently (no `deny_unknown_fields`, and figment discards what no
+/// field claims), so a user who set the old key precisely to move off a default
+/// would otherwise be handed that default back with nothing to indicate their
+/// setting had stopped applying — resident memory and per-open cost changing
+/// under them on an upgrade. Failing the load is the loud version.
+const RETIRED_CONFIG_KEYS: &[(&str, &str)] = &[(
+    "vector.hnsw_sq8_walk",
+    "vector.hnsw_plane — `sq8` is the old `true`, `sq16` the old `false`",
+)];
+
 /// Engine default connection budget when none is configured; used by both
 /// [`MemorySettings`] and the connect path. `0` is the deliberate measure-only
 /// (no-ceiling) sentinel that `from_budget_bytes` maps to a measured budget.
@@ -600,12 +613,13 @@ pub struct VectorSettings {
     /// at before the drain gives up and serves ivf (`floor = target - this`).
     pub hnsw_recall_slack: f64,
 
-    /// For `search_mode = hnsw_ivf` with `hnsw_sq8_walk`: how many of the SQ8
-    /// walk's nearest candidates to re-rank on full Sq16 before returning the
-    /// top `k`. Clamped to `[k, ef]`. Wider recovers more of the int8 walk's
-    /// ranking loss but adds Sq16 scores to the tail; recall saturates well
-    /// below `ef` (256 is the knee for k ≤ 100). Ignored when `hnsw_sq8_walk`
-    /// is off or under any other search mode.
+    /// For `search_mode = hnsw_ivf` with a lossy [`Self::hnsw_plane`]: how many
+    /// of the walk's nearest candidates to re-rank on full Sq16 before
+    /// returning the top `k`. Clamped to `[k, ef]`. Wider recovers more of the
+    /// coarse walk's ranking loss but adds Sq16 scores to the tail; recall
+    /// saturates well below `ef` (256 is the knee for k ≤ 100). Ignored when
+    /// `hnsw_plane = sq16` (the walk already scores Sq16) or under any other
+    /// search mode.
     pub hnsw_refine_k: usize,
     /// For `search_mode = hnsw_ivf`: scale ceiling for the per-row **data**
     /// graph. The resident data HNSW is built at drain and persisted only
@@ -1026,9 +1040,27 @@ impl Config {
     /// CLI that adds a `--config-file` source) without duplicating
     /// the embedded-default + extraction machinery.
     pub fn from_figment(fig: Figment) -> Result<Self, ConfigError> {
+        // Before extraction, because extraction is exactly where a retired key
+        // would vanish without trace.
+        Self::reject_retired_keys(&fig)?;
         let cfg: Config = fig.extract()?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Fail the load if any [`RETIRED_CONFIG_KEYS`] entry is present, naming
+    /// its replacement.
+    fn reject_retired_keys(fig: &Figment) -> Result<(), ConfigError> {
+        for (retired, replacement) in RETIRED_CONFIG_KEYS {
+            if fig.find_value(retired).is_ok() {
+                return Err(ConfigError::Invalid(format!(
+                    "`{retired}` was removed — use `{replacement}`. It is rejected \
+                     rather than ignored so an upgrade cannot silently revert the \
+                     behaviour this setting was pinning."
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Semantic checks that deserialization alone cannot express, run at
@@ -1161,6 +1193,39 @@ mod tests {
     fn embedded_default_loads_with_expected_value() {
         let cfg = Config::defaults().expect("embedded default must parse");
         assert_eq!(cfg.supertable.commit_threshold_size_mb, 1024);
+    }
+
+    /// A retired key must FAIL the load, not be quietly dropped.
+    ///
+    /// Nothing in the deserializer objects to an unknown key — no
+    /// `deny_unknown_fields`, and figment discards what no field claims — so
+    /// without this check a config that set `hnsw_sq8_walk: false` to walk Sq16
+    /// would come back as the `sq8` default on upgrade: a different resident
+    /// plane, a different per-open cost, and no diagnostic anywhere. The error
+    /// has to name the replacement, because a bare "unknown key" would leave
+    /// the reader to guess which knob took over.
+    #[test]
+    fn a_retired_config_key_is_rejected_and_names_its_replacement() {
+        for value in [serde_json::json!(true), serde_json::json!(false)] {
+            let fig =
+                Figment::new()
+                    .merge(Yaml::string(EMBEDDED_DEFAULT))
+                    .merge(Serialized::defaults(serde_json::json!({
+                        "vector": { "hnsw_sq8_walk": value }
+                    })));
+            let err = Config::from_figment(fig).expect_err("a retired key must fail the load");
+            let ConfigError::Invalid(message) = &err else {
+                panic!("expected a validation error, got {err:?}");
+            };
+            assert!(
+                message.contains("hnsw_sq8_walk") && message.contains("hnsw_plane"),
+                "the error must name both the retired key and its replacement: {message}"
+            );
+        }
+        // The shipped default must not itself trip the check.
+        Config::defaults().expect("embedded default carries no retired key");
+        Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)))
+            .expect("a clean config still loads");
     }
 
     /// The `hnsw` calibration knobs default to the shipped values, and

@@ -4164,7 +4164,7 @@ pub mod vector {
                             rerank,
                         );
                         eprintln!(
-                            "[078-curve] infino/post-drain recall@{k} = {recall:.3} \
+                            "[codec-curve] infino/post-drain recall@{k} = {recall:.3} \
                              p50 = {:.3} ms",
                             p50.as_secs_f64() * 1e3,
                         );

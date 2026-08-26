@@ -123,7 +123,8 @@ use crate::{
         opann::REPLICA_CLOSURE_DISTANCE_RATIO,
         options::{GappedPlacementCell, GappedPlacementIndex},
         slow_vector_state::{
-            CentroidSection, ResidentGraphSections, fetch_centroid_section, fetch_graph_sections,
+            CentroidSection, GraphWalkRequest, ResidentGraphSections, fetch_centroid_section,
+            fetch_graph_sections,
         },
         tombstones::SidecarCache,
     },
@@ -2197,17 +2198,21 @@ pub(crate) async fn assemble_hnsw_incremental(
     // were built, calibrated and registered on that plane's geometry, so the
     // delta must land on the same one. A change to `vector.hnsw_plane` takes
     // effect at the next FULL rebuild, not mid-extend.
-    let inherited_walk = if prior.sq4.is_some() {
-        if prior.sq4.as_ref().is_some_and(Sq4Scorer::has_residual) {
-            hnsw::WalkCodec::Sq4Residual
-        } else {
-            hnsw::WalkCodec::Sq4
-        }
-    } else if prior.sq8_plane.is_empty() {
-        hnsw::WalkCodec::Sq16
-    } else {
-        hnsw::WalkCodec::Sq8
-    };
+    //
+    // It comes from the bundle HEADER, never from which planes this particular
+    // decode happens to hold. Those are two different questions: a decode is
+    // free to filter a plane out, and an absent plane would then be
+    // indistinguishable from a bundle that never stored one. Guessing from the
+    // decoded state re-encodes the bundle without a section it did store, which
+    // for the fitted 4-bit codecs is unrecoverable — the fit needs a moment
+    // pass over the whole corpus that this path does not have.
+    let inherited_walk = prior.stored_walk;
+    // The plane the codec names must actually be resident, or this path cannot
+    // extend it. Full rebuild instead of writing a bundle that silently drops
+    // it: a rebuild is expensive but correct, and it re-fits the ruler.
+    if inherited_walk.is_sq4() && prior.sq4.is_none() {
+        return Ok(None);
+    }
     let mut doc_ids = prior.doc_ids;
     doc_ids.extend_from_slice(&new_doc_ids);
     let total = doc_ids.len();
@@ -2453,9 +2458,10 @@ impl SupertableReader {
         let manifest = self.manifest();
         let sections_for_walk = Arc::clone(&sections);
         let query_owned = query.to_vec();
-        // SQ8 int8-VNNI walk + Sq16 refine when the SQ8 plane is resident
-        // (built at decode under `vector.hnsw_sq8_walk`); otherwise walk on
-        // Sq16 directly. `hnsw_refine_k` is the re-rank width.
+        // Walk on whichever plane decode made resident for `vector.hnsw_plane`
+        // — the 4-bit plane, the SQ8 int8-VNNI plane, or Sq16 directly when the
+        // config asks for no extra plane — then refine the beam on Sq16.
+        // `hnsw_refine_k` is the re-rank width.
         let refine_k = config::global().vector.hnsw_refine_k;
         let hits: Vec<SuperfileHit> = run_on_pool(
             Some(&manifest.options.reader_pool),
@@ -2549,7 +2555,9 @@ impl SupertableReader {
             }
         }
         let sections =
-            match fetch_graph_sections(storage.as_ref(), &reference, /* need_sq8 */ true).await {
+            match fetch_graph_sections(storage.as_ref(), &reference, GraphWalkRequest::Configured)
+                .await
+            {
                 Ok(sections) => Arc::new(sections),
                 Err(error) => {
                     tracing::warn!(
@@ -8214,7 +8222,7 @@ mod tests {
                 .expect("sq16 rows must assemble into a graph");
             let decoded = crate::superfile::vector::hnsw::decode_hnsw(
                 &bytes::Bytes::from(bundle),
-                crate::superfile::vector::hnsw::WalkCodec::Sq8,
+                Some(crate::superfile::vector::hnsw::WalkCodec::Sq8),
             )
             .expect("decode data bundle");
             assert_eq!(
