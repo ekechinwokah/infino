@@ -40,7 +40,7 @@
 //! about the rotation is persisted — swapping the construction is not an
 //! on-disk format change.
 
-use std::cell::RefCell;
+use std::{cell::RefCell, sync::OnceLock};
 
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, Normal};
@@ -83,19 +83,79 @@ pub struct RandomRotation {
     padded_dim: usize,
     /// One `±1` sign-flip diagonal per stage, each length `padded_dim`.
     signs: Vec<Vec<f32>>,
+    /// Seed the blocked state derives from, so it can be rebuilt on
+    /// demand without keeping the RNG alive.
+    seed: u64,
+    /// State for the BLOCKED transform, built on first use.
+    ///
+    /// Only the 4-bit plane walks the blocked form, but this type is on the
+    /// default path — every 1-bit RaBitQ column constructs one — and the
+    /// block permutations plus sign diagonals run ~74 KB per rotation at
+    /// dim 1536. Building them eagerly charges that to callers that never
+    /// read them. The state is a pure function of `(dim, seed)`, so
+    /// deferring it changes nothing observable.
+    blocked: OnceLock<BlockedState>,
+}
+
+/// Lazily-built state for the blocked (unpadded) transform.
+#[derive(Debug)]
+struct BlockedState {
     /// Power-of-two block sizes summing to `dim`, largest first — the
-    /// unpadded transform's block-diagonal structure. Empty when `dim`
-    /// is itself a power of two and the blocked form is just the padded
-    /// one.
+    /// block-diagonal structure that removes the padding.
     blocks: Vec<usize>,
-    /// One seeded permutation of `0..dim` per blocked stage, so the
-    /// blocked transform mixes ACROSS blocks and not only within them.
-    block_perms: Vec<Vec<u32>>,
-    /// `±1` diagonals for the blocked stages, each length `dim`. Separate
-    /// from [`Self::signs`] because the blocked path runs
-    /// [`BLOCKED_STAGES`] stages at width `dim`, not [`ROTATION_STAGES`]
-    /// at width `padded_dim`.
-    blocked_signs: Vec<Vec<f32>>,
+    /// One seeded permutation of `0..dim` per stage, so the transform mixes
+    /// ACROSS blocks and not only within them.
+    perms: Vec<Vec<u32>>,
+    /// `±1` diagonals per stage, each length `dim`. Separate from the padded
+    /// path's diagonals because this runs [`BLOCKED_STAGES`] stages at width
+    /// `dim`, not [`ROTATION_STAGES`] at width `padded_dim`.
+    signs: Vec<Vec<f32>>,
+}
+
+impl BlockedState {
+    /// Derive the state from `(dim, seed)`.
+    ///
+    /// The RNG is re-seeded and advanced past the padded path's draws first,
+    /// so the diagonals this produces are exactly the ones the eager
+    /// construction produced — the stream position is part of the value.
+    fn build(dim: usize, padded_dim: usize, seed: u64) -> Self {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let normal = Normal::new(0.0f32, 1.0).expect("valid stddev");
+        // Replay the padded path's draws so the blocked draws land at the
+        // same stream offset they would have eagerly.
+        for _ in 0..ROTATION_STAGES * padded_dim {
+            let _ = normal.sample(&mut rng);
+        }
+        let blocks = power_of_two_blocks(dim);
+        let perms = (0..BLOCKED_STAGES)
+            .map(|_| {
+                let mut perm: Vec<u32> = (0..dim as u32).collect();
+                for i in (1..dim).rev() {
+                    let j = (rng.next_u64() % (i as u64 + 1)) as usize;
+                    perm.swap(i, j);
+                }
+                perm
+            })
+            .collect();
+        let signs = (0..BLOCKED_STAGES)
+            .map(|_| {
+                (0..dim)
+                    .map(|_| {
+                        if normal.sample(&mut rng) >= 0.0 {
+                            1.0f32
+                        } else {
+                            -1.0f32
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        BlockedState {
+            blocks,
+            perms,
+            signs,
+        }
+    }
 }
 
 /// Decompose `dim` into descending power-of-two blocks: the greedy
@@ -140,39 +200,12 @@ impl RandomRotation {
             })
             .collect();
         let dim = dim.max(1);
-        let blocks = power_of_two_blocks(dim);
-        // Fisher–Yates from the same seeded stream, so the permutations
-        // are as reproducible as the sign diagonals.
-        let block_perms = (0..BLOCKED_STAGES)
-            .map(|_| {
-                let mut perm: Vec<u32> = (0..dim as u32).collect();
-                for i in (1..dim).rev() {
-                    let j = (rng.next_u64() % (i as u64 + 1)) as usize;
-                    perm.swap(i, j);
-                }
-                perm
-            })
-            .collect();
-        let blocked_signs = (0..BLOCKED_STAGES)
-            .map(|_| {
-                (0..dim)
-                    .map(|_| {
-                        if normal.sample(&mut rng) >= 0.0 {
-                            1.0f32
-                        } else {
-                            -1.0f32
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
         RandomRotation {
             dim,
             padded_dim,
             signs,
-            blocks,
-            block_perms,
-            blocked_signs,
+            seed,
+            blocked: OnceLock::new(),
         }
     }
 
@@ -255,7 +288,8 @@ impl RandomRotation {
             let mut buf = cell.borrow_mut();
             buf.clear();
             buf.resize(self.dim, 0.0);
-            for (stage_signs, perm) in self.blocked_signs.iter().zip(&self.block_perms) {
+            let st = self.blocked();
+            for (stage_signs, perm) in st.signs.iter().zip(&st.perms) {
                 // Permute into scratch, then transform back into `out`,
                 // so neither buffer is read and written at once.
                 for (dst, &src) in buf.iter_mut().zip(perm) {
@@ -263,7 +297,7 @@ impl RandomRotation {
                 }
                 apply_signs(&mut buf, stage_signs);
                 let mut start = 0;
-                for &block in &self.blocks {
+                for &block in &st.blocks {
                     let seg = &mut buf[start..start + block];
                     walsh_hadamard(seg);
                     scale_in_place(seg, 1.0 / (block as f32).sqrt());
@@ -285,10 +319,11 @@ impl RandomRotation {
             let mut buf = cell.borrow_mut();
             buf.clear();
             buf.resize(self.dim, 0.0);
-            for (stage_signs, perm) in self.blocked_signs.iter().zip(&self.block_perms).rev() {
+            let st = self.blocked();
+            for (stage_signs, perm) in st.signs.iter().zip(&st.perms).rev() {
                 buf.copy_from_slice(out);
                 let mut start = 0;
-                for &block in &self.blocks {
+                for &block in &st.blocks {
                     let seg = &mut buf[start..start + block];
                     walsh_hadamard(seg);
                     scale_in_place(seg, 1.0 / (block as f32).sqrt());
@@ -302,6 +337,12 @@ impl RandomRotation {
                 }
             }
         });
+    }
+
+    /// The blocked transform's state, built on first use.
+    fn blocked(&self) -> &BlockedState {
+        self.blocked
+            .get_or_init(|| BlockedState::build(self.dim, self.padded_dim, self.seed))
     }
 
     /// Transform working size: `dim` rounded up to a power of two — the
@@ -580,6 +621,33 @@ mod tests {
                 approx(r_combined[i], expected, 1e-3),
                 "linearity broken at i={i}: got {} expected {expected}",
                 r_combined[i]
+            );
+        }
+    }
+
+    /// Two rotations built from the same `(dim, seed)` must agree on the
+    /// blocked transform, whether or not either has already forced its
+    /// lazily-built state.
+    ///
+    /// The state is derived by advancing a re-seeded RNG past the padded
+    /// path's draws, so the stream POSITION is part of the value: a wrong
+    /// replay count yields a different-but-still-orthogonal rotation, which
+    /// every isometry and round-trip assertion would happily accept while
+    /// silently invalidating any plane encoded before the change.
+    #[test]
+    fn blocked_state_is_deterministic_for_a_seed() {
+        for &dim in &[200usize, 768, 1536] {
+            let warmed = RandomRotation::new(dim, 0xB10C);
+            let x: Vec<f32> = (0..dim).map(|i| ((i % 17) as f32 - 8.0) / 8.0).collect();
+            let mut a = vec![0.0f32; dim];
+            warmed.apply_blocked(&x, &mut a);
+            // A second instance that has never forced its state.
+            let fresh = RandomRotation::new(dim, 0xB10C);
+            let mut b = vec![0.0f32; dim];
+            fresh.apply_blocked(&x, &mut b);
+            assert_eq!(
+                a, b,
+                "dim {dim}: blocked transform differs across instances"
             );
         }
     }
