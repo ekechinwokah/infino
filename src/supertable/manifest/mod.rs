@@ -61,6 +61,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use super::options::SupertableOptions;
 use crate::{
+    runtime_bridge::carry_span,
     storage::{StorageError, StorageProvider},
     superfile::{
         builder::VectorConfig,
@@ -101,6 +102,10 @@ use crate::{
 /// bytes live (`<data>/seg-<id>.sf.parquet`). Shared by [`SuperfileUri::storage_path`]
 /// and the GC live-set sweep so both agree on the superfile namespace.
 pub(crate) const SUPERFILE_DATA_DIR: &str = "data";
+
+/// Extra extension an in-flight cold-fetch tempfile carries on top of [`SuperfileUri::cache_filename`];
+/// the file is atomically renamed to the bare name once complete.
+pub(crate) const CACHE_TMP_EXTENSION: &str = ".tmp";
 
 /// Legacy storage-subtree prefix for the hidden vector-index sibling
 /// supertable — the commit-time default stamped when a vector table's
@@ -913,7 +918,7 @@ impl ManifestSnapshot {
                 prewarm_summary_admit_slabs(&entries, &vector_columns, &pool);
                 entries
             };
-            all_superfiles = match spawn_blocking(prewarm).await {
+            all_superfiles = match spawn_blocking(carry_span(prewarm)).await {
                 Ok(entries) => entries,
                 Err(join_error) => {
                     return Err(ManifestLoadError::SlowStateHydration(format!(
@@ -2252,7 +2257,7 @@ impl UserCentroidCache {
 /// `spawn_blocking` keeps the runtime free to drive the remaining
 /// fetches while decodes run in parallel on the blocking pool.
 async fn decode_part_off_thread(bytes: Bytes) -> Result<ManifestPart, ManifestLoadError> {
-    match spawn_blocking(move || part::decode(&bytes)).await {
+    match spawn_blocking(carry_span(move || part::decode(&bytes))).await {
         Ok(result) => Ok(result?),
         Err(join_error) => Err(ManifestLoadError::Parse(part::PartParseError::Avro(
             format!("part decode task failed: {join_error}"),
@@ -2277,7 +2282,7 @@ async fn verify_and_decode_part_off_thread(
         }
         part::decode(&bytes).map_err(ManifestLoadError::from)
     };
-    match spawn_blocking(verify_then_decode).await {
+    match spawn_blocking(carry_span(verify_then_decode)).await {
         Ok(result) => result,
         Err(join_error) => Err(ManifestLoadError::Parse(part::PartParseError::Avro(
             format!("part verify/decode task failed: {join_error}"),
@@ -2518,7 +2523,7 @@ impl SuperfileUri {
 
     /// Disk-cache tempfile while a cold fetch is in flight.
     pub fn cache_tmp_filename(self) -> String {
-        format!("seg-{}.sf.parquet.tmp", self.0)
+        format!("{}{CACHE_TMP_EXTENSION}", self.cache_filename())
     }
 
     /// Inverse of [`Self::cache_filename`]: recover the URI from an on-disk
@@ -2531,6 +2536,12 @@ impl SuperfileUri {
     pub fn from_cache_filename(name: &str) -> Option<Self> {
         let body = name.strip_prefix("seg-")?.strip_suffix(".sf.parquet")?;
         Uuid::parse_str(body).ok().map(SuperfileUri)
+    }
+
+    /// Inverse of [`Self::cache_tmp_filename`]: recover the URI from an in-flight tempfile's name.
+    /// A crash can leave one behind; the disk cache uses this to recognize and delete it.
+    pub fn from_cache_tmp_filename(name: &str) -> Option<Self> {
+        Self::from_cache_filename(name.strip_suffix(CACHE_TMP_EXTENSION)?)
     }
 
     /// Inverse of [`Self::storage_path`]. Fetches the superfile name from the path.
