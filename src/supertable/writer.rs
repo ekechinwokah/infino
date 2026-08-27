@@ -111,8 +111,6 @@ use super::{
         },
     },
 };
-use crate::superfile::vector::hnsw::PayloadKind;
-use crate::supertable::query::vector::IndexOutcome;
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
 use crate::{
@@ -148,6 +146,7 @@ use crate::{
             },
             cell_posting::{EncodedCellRow, MaterializedIvfRow, transcode_clamped_components},
             distance::Metric,
+            hnsw::PayloadKind,
             ivf_merge::{
                 MergedIvfSubsection, merge_fragment_subsections, route_clusters_into_cells,
             },
@@ -176,7 +175,7 @@ use crate::{
         },
         query::{
             dispatch::{open_compaction_input, open_reader},
-            vector::stable_ids_by_local_for_routing,
+            vector::{IndexOutcome, stable_ids_by_local_for_routing},
         },
         reader_cache::{DiskCacheStore, disk::mmap_readonly_bytes},
         slow_vector_state::{self, CentroidSection, fetch_centroid_section},

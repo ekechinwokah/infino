@@ -6217,7 +6217,6 @@ impl Supertable {
 
 #[cfg(test)]
 mod tests {
-    use super::IndexOutcome;
     use std::{
         borrow::Cow,
         collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -6225,6 +6224,8 @@ mod tests {
     };
 
     use arrow::array::Array;
+
+    use super::IndexOutcome;
 
     /// Cosine columns normalize the query; every other metric passes the
     /// caller's slice through untouched, by reference (no copy, no scale).
