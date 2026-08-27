@@ -1414,7 +1414,7 @@ fn calibrate_ef_curve<S: NodeScorer>(
 /// and returns the **fastest** clearing pair (min `ef`, then min `m0` — latency
 /// is the graph's whole point). If none clears within the candidates, returns
 /// the best achieved with `registered` gated by the `target_recall −
-/// recall_slack` graceful floor. Queries are held-out, perturbed (off-node) so
+/// `register_floor` graceful bar. Queries are held-out, perturbed (off-node) so
 /// recall is realistic.
 ///
 /// `want_curve` gates the per-`k` calibration: callers that only need the
@@ -1428,14 +1428,14 @@ pub(crate) fn calibrate_graph<S: NodeScorer + Sync>(
     m0_candidates: &[usize],
     ef_candidates: &[usize],
     target_recall: f64,
-    recall_slack: f64,
+    register_floor: f64,
     ef_construction: usize,
     n_queries: usize,
     k: usize,
     seed: u64,
     want_curve: bool,
 ) -> (CalibChoice, Vec<(u32, u32)>, Option<Hnsw>) {
-    let register_floor = (target_recall - recall_slack).max(0.0);
+    let register_floor = register_floor.clamp(0.0, 1.0);
     let n = serving.len();
     let fallback = CalibChoice {
         m0: *m0_candidates.iter().min().unwrap_or(&32),

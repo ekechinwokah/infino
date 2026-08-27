@@ -242,11 +242,18 @@ vector:
   # Memory scales with docs x m0 (base layer only), bounded by hnsw_max_docs.
   hnsw_m0: 0
 
-  # For search_mode = hnsw_ivf: how far below target_recall the graph is still
-  # accepted before the drain gives up and serves ivf (floor = target - this).
-  # Widen to keep more hard high-dim tables on the fast graph; tighten to
-  # demand near-target recall from the graph or step aside to ivf.
-  hnsw_recall_slack: 0.01
+  # Register floor for the GRAPH index: the recall its calibrated (m0, ef) must
+  # reach before the drain publishes it. Below this, queries serve ivf.
+  hnsw_register_floor: 0.98
+
+  # Register floor for the FLAT index, same contract, its own number. Separate
+  # because the floors answer different questions: the graph is a latency
+  # optimization over a correct scan, so its floor is a quality bar, while a
+  # flat plane is a memory trade the operator chose. flat_plane = sq4 at 0.5
+  # bytes/dim measures ~0.93 on dbpedia-1536, so lower THIS to accept it --
+  # lowering target_recall instead would also detune the ivf width laws that
+  # answer filtered queries.
+  flat_register_floor: 0.98
 
   # For search_mode = hnsw_ivf: which resident plane the graph walk scores
   # candidates on. Every option re-ranks its final beam on the full Sq16 plane

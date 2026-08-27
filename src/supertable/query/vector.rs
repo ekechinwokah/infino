@@ -1817,7 +1817,7 @@ pub(crate) enum IndexUnavailable {
         ceiling: u64,
         knob: &'static str,
     },
-    /// The built index did not clear `target_recall - recall_slack`.
+    /// The built index did not clear its per-index-type register floor.
     BelowRegisterFloor { recall: f64, floor: f64 },
     /// The row gather returned nothing despite a non-zero pre-count.
     GatherEmpty { column: String, pre_count: usize },
@@ -2111,7 +2111,7 @@ pub(crate) async fn assemble_flat_sections(
         }));
     };
     let with_residual = vcfg.flat_plane == config::VectorFlatPlane::Sq4Residual;
-    let floor = (vcfg.target_recall - vcfg.hnsw_recall_slack).max(0.0);
+    let floor = vcfg.flat_register_floor;
     let column_owned = column.to_string();
     // Fitting the plane is a moment pass plus a rotation per row, and the gate
     // scans the whole corpus once per probe query. Both are pure CPU and belong
@@ -2253,9 +2253,9 @@ pub(crate) async fn assemble_hnsw_sections(
         // global rayon pool, and not inline on the tokio worker) per the
         // concurrency contract. The candidate grids are tiny, so clone them
         // into the closure; the full-corpus pass below still owns the originals.
-        let (target_recall, recall_slack, ef_construction) = (
+        let (target_recall, register_floor, ef_construction) = (
             vcfg.target_recall,
-            vcfg.hnsw_recall_slack,
+            vcfg.hnsw_register_floor,
             vcfg.hnsw_ef_construction,
         );
         let (pm0, pef) = (m0_cands.clone(), ef_cands.clone());
@@ -2271,7 +2271,7 @@ pub(crate) async fn assemble_hnsw_sections(
                     &pm0,
                     &pef,
                     target_recall,
-                    recall_slack,
+                    register_floor,
                     ef_construction,
                     HNSW_CALIB_QUERIES,
                     HNSW_CALIB_RECALL_K,
@@ -2297,7 +2297,7 @@ pub(crate) async fn assemble_hnsw_sections(
             return Ok(IndexOutcome::Unavailable(
                 IndexUnavailable::BelowRegisterFloor {
                     recall: pchoice.recall,
-                    floor: (vcfg.target_recall - vcfg.hnsw_recall_slack).max(0.0),
+                    floor: vcfg.hnsw_register_floor,
                 },
             ));
         }
@@ -2368,9 +2368,9 @@ pub(crate) async fn assemble_hnsw_sections(
     // the existing None→fallback, with no separate safety mechanism. Grading
     // against the walk plane itself could not do that: the ground truth would
     // carry the same error it is meant to detect.
-    let (target_recall, recall_slack, ef_construction) = (
+    let (target_recall, register_floor, ef_construction) = (
         vcfg.target_recall,
-        vcfg.hnsw_recall_slack,
+        vcfg.hnsw_register_floor,
         vcfg.hnsw_ef_construction,
     );
     let walk = hnsw::WalkCodec::from_config(vcfg.hnsw_plane);
@@ -2404,7 +2404,7 @@ pub(crate) async fn assemble_hnsw_sections(
                     &m0_cands,
                     &ef_cands,
                     target_recall,
-                    recall_slack,
+                    register_floor,
                     ef_construction,
                     HNSW_CALIB_QUERIES,
                     HNSW_CALIB_RECALL_K,
@@ -2420,7 +2420,7 @@ pub(crate) async fn assemble_hnsw_sections(
                     &m0_cands,
                     &ef_cands,
                     target_recall,
-                    recall_slack,
+                    register_floor,
                     ef_construction,
                     HNSW_CALIB_QUERIES,
                     HNSW_CALIB_RECALL_K,
@@ -2445,7 +2445,7 @@ pub(crate) async fn assemble_hnsw_sections(
         return Ok(IndexOutcome::Unavailable(
             IndexUnavailable::BelowRegisterFloor {
                 recall: choice.recall,
-                floor: (vcfg.target_recall - vcfg.hnsw_recall_slack).max(0.0),
+                floor: vcfg.hnsw_register_floor,
             },
         ));
     }
@@ -2696,13 +2696,16 @@ pub(crate) async fn assemble_hnsw_incremental(
         }
     };
     let vcfg = &config::global().vector;
-    let (target_recall, recall_slack, ef_construction, probe_cap) = (
+    let (target_recall, register_floor, ef_construction, probe_cap) = (
         vcfg.target_recall,
-        vcfg.hnsw_recall_slack,
+        vcfg.hnsw_register_floor,
         vcfg.hnsw_ef_construction,
         vcfg.hnsw_probe_max_docs as usize,
     );
-    let floor = (target_recall - recall_slack).max(0.0);
+    // The incremental extend re-checks the grown graph against the GRAPH's own
+    // floor -- the same bar the full build had to clear, so an append cannot
+    // quietly lower the standard the resident graph was registered at.
+    let floor = register_floor;
     let prior_graph = prior.graph;
     // The extend fans the new-node inserts across rayon, and the recall
     // recheck is pure CPU; both belong on the reader pool, not inline on the
@@ -2755,7 +2758,7 @@ pub(crate) async fn assemble_hnsw_incremental(
                     &[inherited_m0],
                     &[inherited_ef],
                     target_recall,
-                    recall_slack,
+                    register_floor,
                     ef_construction,
                     HNSW_CALIB_QUERIES,
                     HNSW_CALIB_RECALL_K,
