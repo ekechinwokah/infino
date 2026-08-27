@@ -106,6 +106,7 @@ use crate::{
         fts::reader::BoolMode,
         vector::{
             distance::{Metric, distance, normalize, relative_score_window},
+            flat::Sq4FlatIndex,
             hnsw::{self, HnswParams, Plane, Sq4Scorer, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
             reader::{ProbeTally, ScanCandidate, ScanOutcome},
@@ -1789,6 +1790,212 @@ async fn count_hnsw_rows(manifest: &ManifestSnapshot, column: &str) -> Result<us
     Ok(n)
 }
 
+/// Read every superfile's materialized Sq16 rows for `column` ONCE and return
+/// the node-ordered `(stable doc ids, carried code plane)`.
+///
+/// `None` when the column yields no rows at all (absent, not Sq16, or empty).
+///
+/// `probe_step` selects what the second return value carries, because the two
+/// callers want different amounts of the plane and neither can afford a second
+/// decode pass:
+///
+/// - `Some(step)` keeps every `step`-th row — a bounded strided sample. The
+///   graph's calibrator probes on that before deciding whether the full plane
+///   is worth materializing, which on a large drain is the difference between
+///   fitting in RAM and OOM.
+/// - `None` carries the FULL plane, for a caller that will build from it
+///   directly.
+///
+/// The doc-ids are always complete regardless: they are 16 B/row, and both
+/// callers need the whole map to answer a hit.
+///
+/// Shared rather than copied. The iteration order, the superseded-cell
+/// exclusion, and the local→stable id resolution together define what node
+/// index N *means*; two callers computing that separately would eventually
+/// disagree, and the failure would be silently wrong ids rather than an error.
+async fn gather_sq16_rows(
+    manifest: &ManifestSnapshot,
+    column: &str,
+    dim: usize,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+    n: usize,
+    probe_step: Option<usize>,
+) -> Result<Option<(Vec<i128>, Vec<u8>)>, QueryError> {
+    let stride = dim * 2;
+    let store = Arc::clone(&manifest.options.store);
+    let disk_cache = manifest.options.disk_cache.clone();
+    let storage = manifest.options.storage.clone();
+    let empty_superseded = BTreeMap::new();
+    let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
+
+    let mut doc_ids: Vec<i128> = Vec::with_capacity(n);
+    let mut carried_codes: Vec<u8> = Vec::new();
+    let mut gi: usize = 0;
+    for entry in manifest.get_all_superfiles() {
+        let reader =
+            dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
+                .await?;
+        let Some(vr) = reader.vec() else { continue };
+        let Some(rows) = vr
+            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
+            .await
+        else {
+            continue;
+        };
+        let ids =
+            stable_ids_by_local_for_routing(manifest, entry, reader.as_ref(), op_stats).await?;
+        for row in rows {
+            if row.encoded.codes.len() != stride {
+                return Err(QueryError::Execute(format!(
+                    "vector index: Sq16 row length {} != dim*2 ({stride}) on column `{column}`",
+                    row.encoded.codes.len()
+                )));
+            }
+            let local = row.local_doc_id as usize;
+            let stable_id = *ids.get(local).ok_or_else(|| {
+                QueryError::Execute(format!(
+                    "vector index: local_doc_id {local} out of range ({} ids) on `{column}`",
+                    ids.len()
+                ))
+            })?;
+            doc_ids.push(stable_id);
+            match probe_step {
+                Some(step) if gi.is_multiple_of(step) => {
+                    carried_codes.extend_from_slice(&row.encoded.codes);
+                }
+                Some(_) => {}
+                None => carried_codes.extend_from_slice(&row.encoded.codes),
+            }
+            gi += 1;
+        }
+    }
+    // The cheap pre-count must equal the decoded row count, or a strided step
+    // was sized against the wrong total and the sample would not be the one
+    // the caller asked for.
+    debug_assert_eq!(
+        doc_ids.len(),
+        n,
+        "vector index pre-count vs decoded row count mismatch"
+    );
+    if doc_ids.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((doc_ids, carried_codes)))
+}
+
+/// Build and encode the flat 4-bit index for `column` — the drain path for
+/// `search_mode = flat`.
+///
+/// `Ok(None)` means "do not register one", and every reason is a legitimate
+/// fall-through to `ivf` rather than an error: the column is absent or not
+/// Sq16, the table has no rows, it exceeds `flat_max_docs`, or the fitted plane
+/// does not clear the register floor.
+///
+/// Mirrors [`assemble_hnsw_sections`] and shares its row gather, so both
+/// indexes agree on what node index N means. What it does NOT share is the
+/// calibration: there is no `(m0, ef)` to sweep for a scan that visits every
+/// row, so this fits the plane once and then GATES on it. The gate is the part
+/// that matters — a plane too coarse for its corpus would otherwise serve
+/// silently below the table's bar at exactly the right latency.
+pub(crate) async fn assemble_flat_sections(
+    manifest: &ManifestSnapshot,
+    column: &str,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) -> Result<Option<Vec<u8>>, QueryError> {
+    let Some(vc) = manifest
+        .options
+        .vector_columns
+        .iter()
+        .find(|vc| vc.column == column)
+    else {
+        return Ok(None);
+    };
+    // The plane is a re-quantization of the stored Sq16 reconstruction, so a
+    // column stored under another rerank codec has nothing to fit from.
+    if !vc.rerank_codec.is_sq16() {
+        return Ok(None);
+    }
+    let dim = vc.dim;
+    let vcfg = &config::global().vector;
+    let n = count_hnsw_rows(manifest, column).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    let max_docs = vcfg.flat_max_docs as usize;
+    if n > max_docs {
+        tracing::info!(
+            total_docs = n,
+            max_docs,
+            "flat: build skipped - docs exceed flat_max_docs (a linear scan \
+             stops being the right trade); serving ivf"
+        );
+        return Ok(None);
+    }
+    // `None`: a flat build wants the WHOLE plane, not a strided sample. There
+    // is no cheap-probe stage to skip a build with, because the expensive part
+    // of a graph build - the calibration sweep - does not exist here; the fit
+    // is one pass, and the gate below runs against the real plane rather than
+    // a subsample whose recall would be optimistic.
+    let Some((doc_ids, sq16_codes)) =
+        gather_sq16_rows(manifest, column, dim, op_stats, n, None).await?
+    else {
+        return Ok(None);
+    };
+    let with_residual = vcfg.hnsw_plane == config::VectorHnswPlane::Sq4Residual;
+    let floor = (vcfg.target_recall - vcfg.hnsw_recall_slack).max(0.0);
+    let column_owned = column.to_string();
+    // Fitting the plane is a moment pass plus a rotation per row, and the gate
+    // scans the whole corpus once per probe query. Both are pure CPU and belong
+    // on the reader pool, not inline on a tokio worker.
+    let (index, recall) = run_on_pool(
+        Some(&manifest.options.reader_pool),
+        "flat build + gate: reader pool dropped result",
+        move || {
+            let index = Sq4FlatIndex::from_sq16_plane(
+                &sq16_codes,
+                doc_ids,
+                &column_owned,
+                dim,
+                with_residual,
+                HNSW_PLANE_ROT_SEED,
+            );
+            // Graded against the Sq16 plane the codes were fitted from - the
+            // reference, never the plane itself.
+            let reference = Sq16Scorer::from_codes(sq16_codes, dim, n);
+            let recall = index.probe_recall(
+                &reference,
+                HNSW_CALIB_RECALL_K,
+                HNSW_CALIB_QUERIES,
+                HNSW_CALIB_SEED,
+            );
+            (index, recall)
+        },
+    )
+    .await
+    .map_err(|e| QueryError::Execute(e.to_string()))?;
+    if recall < floor {
+        tracing::info!(
+            column,
+            recall,
+            floor,
+            rows = n,
+            residual = with_residual,
+            "flat: NOT registered - the fitted 4-bit plane does not clear the \
+             register floor; serving ivf"
+        );
+        return Ok(None);
+    }
+    tracing::debug!(
+        column,
+        recall,
+        rows = n,
+        residual = with_residual,
+        resident_mib = index.resident_bytes() / (1024 * 1024),
+        "flat: registered"
+    );
+    Ok(Some(index.encode()))
+}
+
 pub(crate) async fn assemble_hnsw_sections(
     manifest: &ManifestSnapshot,
     column: &str,
@@ -1807,9 +2014,6 @@ pub(crate) async fn assemble_hnsw_sections(
     }
     let dim = vc.dim;
     let stride = dim * 2;
-    let store = Arc::clone(&manifest.options.store);
-    let disk_cache = manifest.options.disk_cache.clone();
-    let storage = manifest.options.storage.clone();
 
     // Gather the stable doc-ids (cheap: 16 B/row) and the row count first. The
     // Sq16 code plane itself (dim*2 B/row — GBs at scale) is gathered LATER: a
@@ -1817,8 +2021,7 @@ pub(crate) async fn assemble_hnsw_sections(
     // passes. A graph-hostile corpus therefore never materializes the whole
     // plane just to decline (which, on a large drain, is the difference between
     // fitting in RAM and OOM).
-    let empty_superseded = BTreeMap::new();
-    let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
+    //
     // Cheap metadata pre-count (NO code decode): the row total lets us size the
     // probe's strided step before touching any code plane, so the stable
     // doc-ids and the strided probe sample can both come out of ONE decode pass
@@ -1854,71 +2057,11 @@ pub(crate) async fn assemble_hnsw_sections(
     // the sample is ~probe_cap rows. `None` = small corpus, no probe.
     let probe_step: Option<usize> = (n > probe_cap).then(|| (n / probe_cap).max(1));
 
-    // Single decode pass over every superfile: read/decode each superfile's
-    // rows ONCE and, in that same loop, (a) push the stable doc-id (same
-    // superfile iteration order, same superseded-cell exclusion, so `doc_ids`
-    // is identical to before) and (b) on the probe path, append the row's codes
-    // to the strided sample when its global index is on the step (byte-identical
-    // to the old `collect_hnsw_codes(.., Some(step))`). The full plane is still
-    // read (below) only when the probe registers.
-    let mut doc_ids: Vec<i128> = Vec::with_capacity(n);
-    // On the probe path this carries only the strided probe sample; on the
-    // small-corpus path (no probe) it carries the FULL decoded plane so the
-    // full build below reuses it instead of re-reading + re-decoding every
-    // superfile a second time. The two modes are mutually exclusive, so one
-    // buffer serves both and peak memory is unchanged.
-    let mut carried_codes: Vec<u8> = Vec::new();
-    let mut gi: usize = 0;
-    for entry in manifest.get_all_superfiles() {
-        let reader =
-            dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
-                .await?;
-        let Some(vr) = reader.vec() else { continue };
-        let Some(rows) = vr
-            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
-            .await
-        else {
-            continue;
-        };
-        let ids =
-            stable_ids_by_local_for_routing(manifest, entry, reader.as_ref(), op_stats).await?;
-        for row in rows {
-            if row.encoded.codes.len() != stride {
-                return Err(QueryError::Execute(format!(
-                    "hnsw: Sq16 row length {} != dim*2 ({stride}) on column `{column}`",
-                    row.encoded.codes.len()
-                )));
-            }
-            let local = row.local_doc_id as usize;
-            let stable_id = *ids.get(local).ok_or_else(|| {
-                QueryError::Execute(format!(
-                    "hnsw: local_doc_id {local} out of range ({} ids) on `{column}`",
-                    ids.len()
-                ))
-            })?;
-            doc_ids.push(stable_id);
-            match probe_step {
-                // Probe path: keep only every `step`-th row for the sample.
-                Some(step) if gi.is_multiple_of(step) => {
-                    carried_codes.extend_from_slice(&row.encoded.codes);
-                }
-                Some(_) => {}
-                // Small corpus (no probe): carry the whole plane for the build.
-                None => carried_codes.extend_from_slice(&row.encoded.codes),
-            }
-            gi += 1;
-        }
-    }
-    // The cheap pre-count must equal the decoded row count, or the strided step
-    // was sized wrong and the probe sample would diverge from the old code.
-    debug_assert_eq!(
-        doc_ids.len(),
-        n,
-        "hnsw pre-count vs decoded row count mismatch"
-    );
-    if doc_ids.is_empty() {
+    let Some((doc_ids, mut carried_codes)) =
+        gather_sq16_rows(manifest, column, dim, op_stats, n, probe_step).await?
+    else {
         return Ok(None);
-    }
+    };
 
     if probe_step.is_some() {
         // Reuse the strided sample gathered in the merged pass above — no second

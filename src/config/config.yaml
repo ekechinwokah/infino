@@ -283,6 +283,17 @@ vector:
   # rows of Sq16 codes is the practical single-host resident ceiling.
   hnsw_max_docs: 10000000
 
+  # For search_mode = flat: scale ceiling for the resident 4-bit plane. Built
+  # at drain and persisted only when the table's doc count is at or below
+  # this; above it queries fall back to ivf.
+  #
+  # This is a LATENCY bound, not a memory one -- the plane is 0.5 bytes/dim,
+  # so 10M x 1536 would still fit one host at ~7.7 GiB. An exhaustive scan is
+  # linear in the corpus (~1.5 ms measured at 100K x 1536), so 1M lands near
+  # 15 ms and 10M near 150 ms. One million is where a linear scan is still
+  # competitive with a routed read.
+  flat_max_docs: 1000000
+
   # For search_mode = hnsw_ivf: row cap for the cheap calibration probe. On a
   # larger corpus, calibrate on a subsample of this many rows first. Subsample
   # recall is optimistic (the m0 requirement grows with N), so a probe that

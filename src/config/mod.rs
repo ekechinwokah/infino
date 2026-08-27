@@ -351,6 +351,16 @@ pub const HNSW_EF_CANDIDATES: &[usize] = &[128, 256, 512, 1024, 2048];
 /// falls back to the scan path. 10M rows of Sq16 codes at 768d is ~15 GiB
 /// resident — the practical single-host ceiling.
 const DEFAULT_VECTOR_HNSW_MAX_DOCS: u64 = 10_000_000;
+
+/// Default for `flat_max_docs`: the corpus size past which an exhaustive
+/// 4-bit scan stops being the right trade.
+///
+/// Not a memory bound — the plane is 0.5 B/dim, so 10M x 1536 would still fit
+/// a single host at ~7.7 GiB. It is a LATENCY bound: measured p50 at 100K x
+/// 1536 is ~1.5 ms, and the scan is linear, so 1M lands near 15 ms and 10M
+/// near 150 ms. One million is where a linear scan is still competitive with
+/// a routed read; past it the grid or the graph wins on the same hardware.
+const DEFAULT_VECTOR_FLAT_MAX_DOCS: u64 = 1_000_000;
 /// Row cap for the cheap calibration *probe*. On a corpus larger than this,
 /// the calibrator first builds + calibrates on a bounded subsample of this
 /// many rows before committing to the expensive full-corpus build. Subsample
@@ -493,6 +503,17 @@ pub enum VectorSearchMode {
     /// or a different column) always serves `ivf`. Search walks the graph at
     /// the `k`-scaled `ef` law.
     HnswIvf,
+    /// OPT-IN (`flat`): scan a resident 4-bit plane exhaustively and return
+    /// the codes' own ranking. No grid, no cells, no graph — and no resident
+    /// Sq16 plane, which is the point: 0.5 bytes/dim bare or 1.0 with the
+    /// residual leg, against 2.0 for every other mode.
+    ///
+    /// Per-query work is linear in the corpus, so this is the embedded-scale
+    /// trade: lowest resident footprint at a declared recall, bounded by
+    /// `flat_max_docs`. Above that ceiling — or pre-drain, or on a filtered
+    /// query, or for a column the plane was not built for — queries serve
+    /// `ivf`, exactly as they do when a graph is absent.
+    Flat,
 }
 
 /// Cluster router for `search_mode = ivf`: how a query selects which cells or
@@ -638,6 +659,16 @@ pub struct VectorSettings {
     /// is built and `hnsw` queries fall back to the scan path. The
     /// centroid graph itself is built at any scale.
     pub hnsw_max_docs: u64,
+    /// For `search_mode = flat`: scale ceiling for the resident 4-bit plane.
+    /// Built at drain and persisted only when the table's doc count ≤ this;
+    /// above it queries fall back to `ivf`.
+    ///
+    /// Deliberately far below [`Self::hnsw_max_docs`], and for a different
+    /// reason. The graph's ceiling is a RAM bound — the graph fits or it does
+    /// not. A flat scan's cost is linear in the corpus, so its ceiling is a
+    /// LATENCY bound: it is the point past which touching every row stops
+    /// being the right trade, regardless of whether the plane still fits.
+    pub flat_max_docs: u64,
     /// For `search_mode = hnsw_ivf`: row cap for the cheap calibration *probe*. On
     /// a larger corpus, calibrate on a subsample of this many rows first; a
     /// probe that cannot register (optimistic subsample recall) skips the
@@ -726,6 +757,7 @@ impl Default for VectorSettings {
             hnsw_recall_slack: DEFAULT_VECTOR_HNSW_RECALL_SLACK,
             hnsw_refine_k: DEFAULT_VECTOR_HNSW_REFINE_K,
             hnsw_max_docs: DEFAULT_VECTOR_HNSW_MAX_DOCS,
+            flat_max_docs: DEFAULT_VECTOR_FLAT_MAX_DOCS,
             hnsw_probe_max_docs: DEFAULT_VECTOR_HNSW_PROBE_MAX_DOCS,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,
             cell_split_modality_d: DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D,

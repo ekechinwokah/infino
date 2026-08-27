@@ -38,7 +38,10 @@ use rayon::prelude::*;
 
 use crate::superfile::vector::{
     distance::{SQ4_ROW_BLOCK, encode_sq16_row},
-    hnsw::{Cursor, NodeScorer, Plane, Sq4Scorer, WalkCodec, read_f32_le},
+    hnsw::{
+        Cursor, NodeScorer, Plane, Sq4Scorer, Sq16Scorer, WalkCodec, calibration_queries,
+        exhaustive_topk, read_f32_le,
+    },
 };
 
 /// Magic for the flat index's persisted form.
@@ -146,7 +149,8 @@ impl Sq4FlatIndex {
     ) -> Self {
         let len = doc_ids.len();
         debug_assert_eq!(sq16_codes.len(), len * dim * 2);
-        let scorer = Sq4Scorer::from_sq16_plane(sq16_codes, dim, len, with_residual, rot_seed, None);
+        let scorer =
+            Sq4Scorer::from_sq16_plane(sq16_codes, dim, len, with_residual, rot_seed, None);
         Self {
             scorer,
             doc_ids,
@@ -261,7 +265,11 @@ impl Sq4FlatIndex {
         let stride = self.dim.div_ceil(COORDS_PER_BYTE);
         assert_eq!(offset.len(), self.dim, "ruler offset length vs header dim");
         assert_eq!(step.len(), self.dim, "ruler step length vs header dim");
-        assert_eq!(codes.len(), self.len * stride, "code plane length vs header");
+        assert_eq!(
+            codes.len(),
+            self.len * stride,
+            "code plane length vs header"
+        );
         assert_eq!(
             residual.map(<[u8]>::len),
             self.has_residual().then_some(self.len * stride),
@@ -456,6 +464,45 @@ impl Sq4FlatIndex {
         let mut out: Vec<(u32, f32)> = heap.into_iter().map(|c| (c.node, c.score)).collect();
         out.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         out
+    }
+
+    /// Recall@`k` of this index's scan against an exhaustive Sq16 scan of the
+    /// same rows, over `n_queries` held-out perturbed queries.
+    ///
+    /// The drain calls this to decide whether to register the index at all.
+    /// There is nothing here to tune — no `(m0, ef)` to sweep, since a scan
+    /// visits every row — so this is not a calibration. It is a gate: a plane
+    /// too coarse for the corpus it was fitted on would otherwise serve
+    /// silently below the table's bar, returning wrong neighbours at the right
+    /// latency, which nothing downstream could detect.
+    ///
+    /// `reference` must be the Sq16 plane these codes were fitted from. Grading
+    /// against an exhaustive scan of the 4-bit plane itself would measure
+    /// nothing: if the codes misrank, the ground truth misranks identically.
+    pub(crate) fn probe_recall(
+        &self,
+        reference: &Sq16Scorer,
+        k: usize,
+        n_queries: usize,
+        seed: u64,
+    ) -> f64 {
+        if self.len == 0 || k == 0 {
+            return 0.0;
+        }
+        let queries = calibration_queries(reference, n_queries, seed);
+        let mut hit = 0usize;
+        let mut total = 0usize;
+        for q in &queries {
+            let truth = exhaustive_topk(reference, q, k);
+            let got: Vec<u32> = self.search(q, k).into_iter().map(|(n, _)| n).collect();
+            hit += truth.iter().filter(|t| got.contains(t)).count();
+            total += truth.len();
+        }
+        if total == 0 {
+            0.0
+        } else {
+            hit as f64 / total as f64
+        }
     }
 }
 

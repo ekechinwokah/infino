@@ -1197,7 +1197,7 @@ pub(crate) struct CalibChoice {
 /// Exhaustive top-`k` node ids under `scorer` for one query — the calibration
 /// ground truth. Sq16-exhaustive matches served fp32 recall to within the
 /// codec's own exhaustive ceiling, so it needs no fp32 plane.
-fn exhaustive_topk<S: NodeScorer>(scorer: &S, query: &[f32], k: usize) -> Vec<u32> {
+pub(crate) fn exhaustive_topk<S: NodeScorer>(scorer: &S, query: &[f32], k: usize) -> Vec<u32> {
     let prepared = scorer.prepare(query);
     let mut all: Vec<Scored> = (0..scorer.len() as u32)
         .map(|node| Scored {
@@ -1227,7 +1227,11 @@ const HNSW_CALIB_K_ANCHORS: [usize; 4] = [1, 10, 50, 100];
 /// Held-out, perturbed (off-node) calibration queries drawn from the plane —
 /// evenly spread source nodes, each jittered off its exact position and
 /// renormalized. Shared by the calibrator and the incremental recall re-check.
-fn calibration_queries(scorer: &Sq16Scorer, n_queries: usize, seed: u64) -> Vec<Vec<f32>> {
+pub(crate) fn calibration_queries(
+    scorer: &Sq16Scorer,
+    n_queries: usize,
+    seed: u64,
+) -> Vec<Vec<f32>> {
     let n = scorer.len();
     let dim = scorer.dim();
     let stride = dim * 2;
