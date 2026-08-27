@@ -1568,16 +1568,16 @@ const HNSW_GRAPH_MAGIC: &[u8; 8] = b"INFHNSW1";
 // A little cursor over a byte slice: every read is bounds-checked and
 // returns `None` on underrun, so a truncated or corrupt section decodes to
 // `None` and the caller falls back rather than panicking.
-struct Cursor<'a> {
+pub(crate) struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Cursor<'a> {
-    fn new(buf: &'a [u8]) -> Self {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+    pub(crate) fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         let end = self.pos.checked_add(n)?;
         let s = self.buf.get(self.pos..end)?;
         self.pos = end;
@@ -1585,22 +1585,22 @@ impl<'a> Cursor<'a> {
     }
     /// Bytes left unread — used to bound wire-driven allocations before
     /// reserving, so a corrupt length word can't request a huge `Vec`.
-    fn remaining(&self) -> usize {
+    pub(crate) fn remaining(&self) -> usize {
         self.buf.len().saturating_sub(self.pos)
     }
-    fn u8(&mut self) -> Option<u8> {
+    pub(crate) fn u8(&mut self) -> Option<u8> {
         Some(self.take(1)?[0])
     }
     fn u16(&mut self) -> Option<u16> {
         Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
     }
-    fn u32(&mut self) -> Option<u32> {
+    pub(crate) fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
-    fn u64(&mut self) -> Option<u64> {
+    pub(crate) fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
-    fn i128(&mut self) -> Option<i128> {
+    pub(crate) fn i128(&mut self) -> Option<i128> {
         Some(i128::from_le_bytes(self.take(16)?.try_into().ok()?))
     }
 }
@@ -1839,7 +1839,7 @@ impl WalkCodec {
     }
 
     /// Wire tag stored in the `v04` header.
-    fn tag(self) -> u8 {
+    pub(crate) fn tag(self) -> u8 {
         match self {
             WalkCodec::Sq16 => 0,
             WalkCodec::Sq8 => 1,
@@ -1850,7 +1850,7 @@ impl WalkCodec {
 
     /// Inverse of [`Self::tag`]; `None` for a tag written by a newer build,
     /// which decodes to `None` and serves ivf rather than misreading a plane.
-    fn from_tag(tag: u8) -> Option<Self> {
+    pub(crate) fn from_tag(tag: u8) -> Option<Self> {
         match tag {
             0 => Some(WalkCodec::Sq16),
             1 => Some(WalkCodec::Sq8),
@@ -2274,7 +2274,7 @@ pub(crate) fn decode_hnsw(bundle: &Bytes, want: Option<WalkCodec>) -> Option<Hns
 /// Parse a little-endian `f32` vector from raw bytes. The caller bounds the
 /// read first, so a short slice is a caller bug rather than a corrupt-input
 /// path.
-fn read_f32_le(bytes: &[u8]) -> Vec<f32> {
+pub(crate) fn read_f32_le(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
