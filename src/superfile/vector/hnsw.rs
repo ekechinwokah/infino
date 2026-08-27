@@ -98,7 +98,7 @@ pub(crate) trait NodeScorer {
 ///
 /// The mapped variant keeps its backing `Bytes` alive: when the bundle is
 /// served via `mmap` (the default for local backends, see
-/// `slow_vector_state::fetch_graph_section`), the Sq16 and SQ8 planes are
+/// `slow_vector_state::fetch_resident_index_blob`), the Sq16 and SQ8 planes are
 /// `slice_ref` views of that one mapping — one physical page-cache copy shared
 /// across every process, and no per-open heap copy of the multi-GiB planes.
 pub(crate) enum Plane {
@@ -2458,7 +2458,7 @@ pub(crate) const GRAPH_BUNDLE_HEADER_BYTES: usize = GRAPH_BUNDLE_MAGIC.len() + 8
 /// resolve each hit's stable id to its live `(superfile, local)` through
 /// the engine's existing id→placement resolver, so no per-node physical
 /// provenance is baked in (which would go stale on a compaction repack).
-pub(crate) struct GraphBundle {
+pub(crate) struct ResidentIndexEnvelope {
     /// One `u64` digest of the covered doc-id population (opaque here; the
     /// supertable layer defines it).
     pub population_key: u64,
@@ -2477,7 +2477,7 @@ pub(crate) struct GraphBundle {
 /// [`GRAPH_BUNDLE_HEADER_BYTES`] bytes. `None` on a bad magic or a short
 /// read. Lets the settle path key on the covered population — and find the
 /// append boundary — via a tiny range GET instead of the whole object.
-pub(crate) fn graph_bundle_header(header: &[u8]) -> Option<(u64, i128)> {
+pub(crate) fn resident_envelope_header(header: &[u8]) -> Option<(u64, i128)> {
     if header.len() < GRAPH_BUNDLE_HEADER_BYTES
         || &header[..GRAPH_BUNDLE_MAGIC.len()] != GRAPH_BUNDLE_MAGIC
     {
@@ -2512,7 +2512,7 @@ fn put_opt_section(out: &mut Vec<u8>, section: Option<&[u8]>) {
 /// `(high_water_id, count)` watermark into the fixed-offset header. The
 /// data bundle and its provenance are omitted (a `0` flag) above the
 /// data-graph scale ceiling.
-pub(crate) fn encode_graph_bundle(
+pub(crate) fn encode_resident_envelope(
     population_key: u64,
     high_water_id: i128,
     centroid_graph: &[u8],
@@ -2528,7 +2528,7 @@ pub(crate) fn encode_graph_bundle(
     out
 }
 
-/// Parse an [`encode_graph_bundle`] blob into its raw sections + header.
+/// Parse an [`encode_resident_envelope`] blob into its raw sections + header.
 /// `None` on a bad magic or truncation, so a corrupt bundle degrades to a
 /// fallback.
 ///
@@ -2543,7 +2543,10 @@ pub(crate) fn encode_graph_bundle(
 ///
 /// The small `centroid_graph` (present at every scale, modest size) is always
 /// copied out into owned heap.
-pub(crate) fn decode_graph_bundle(raw: &Bytes, mmap_backed: bool) -> Option<GraphBundle> {
+pub(crate) fn decode_resident_envelope(
+    raw: &Bytes,
+    mmap_backed: bool,
+) -> Option<ResidentIndexEnvelope> {
     let bytes: &[u8] = raw.as_ref();
     let mut c = Cursor::new(bytes);
     if c.take(GRAPH_BUNDLE_MAGIC.len())? != GRAPH_BUNDLE_MAGIC {
@@ -2568,7 +2571,7 @@ pub(crate) fn decode_graph_bundle(raw: &Bytes, mmap_backed: bool) -> Option<Grap
             Bytes::copy_from_slice(section)
         })
     };
-    Some(GraphBundle {
+    Some(ResidentIndexEnvelope {
         population_key,
         high_water_id,
         centroid_graph,
@@ -4340,12 +4343,12 @@ mod tests {
         // Full bundle: centroid graph + data bundle + population key + high water.
         let centroid = vec![1u8, 2, 3, 4, 5];
         let data = vec![9u8; 300];
-        let blob = encode_graph_bundle(0xDEAD_BEEF_1234, 987_654_321, &centroid, Some(&data));
+        let blob = encode_resident_envelope(0xDEAD_BEEF_1234, 987_654_321, &centroid, Some(&data));
         // Both modes recover identical sections; only the data-section backing
         // differs (zero-copy slice of `raw` vs an owned copy).
         for mmap_backed in [true, false] {
             let raw = Bytes::from(blob.clone());
-            let got = decode_graph_bundle(&raw, mmap_backed).expect("decode full");
+            let got = decode_resident_envelope(&raw, mmap_backed).expect("decode full");
             assert_eq!(got.population_key, 0xDEAD_BEEF_1234);
             assert_eq!(got.high_water_id, 987_654_321);
             assert_eq!(got.centroid_graph, centroid);
@@ -4363,18 +4366,18 @@ mod tests {
         // The header reads from the fixed-offset prefix alone (a tiny range
         // GET at settle time — no need for the multi-GiB body).
         assert_eq!(
-            graph_bundle_header(&blob[..GRAPH_BUNDLE_HEADER_BYTES]),
+            resident_envelope_header(&blob[..GRAPH_BUNDLE_HEADER_BYTES]),
             Some((0xDEAD_BEEF_1234, 987_654_321))
         );
 
         // Data-less bundle (above the scale ceiling): empty centroid, no data.
-        let blob = encode_graph_bundle(0, 0, &[], None);
-        let got = decode_graph_bundle(&Bytes::from(blob), true).expect("decode empty");
+        let blob = encode_resident_envelope(0, 0, &[], None);
+        let got = decode_resident_envelope(&Bytes::from(blob), true).expect("decode empty");
         assert!(got.centroid_graph.is_empty());
         assert!(got.data_bundle.is_none());
 
-        assert!(decode_graph_bundle(&Bytes::from_static(b"bad"), true).is_none());
-        assert!(graph_bundle_header(b"short").is_none());
+        assert!(decode_resident_envelope(&Bytes::from_static(b"bad"), true).is_none());
+        assert!(resident_envelope_header(b"short").is_none());
     }
 
     /// Empty and singleton graphs don't panic and answer sanely.

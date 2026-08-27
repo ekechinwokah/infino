@@ -124,8 +124,8 @@ use crate::{
         opann::REPLICA_CLOSURE_DISTANCE_RATIO,
         options::{GappedPlacementCell, GappedPlacementIndex},
         slow_vector_state::{
-            CentroidSection, GraphWalkRequest, ResidentGraphSections, fetch_centroid_section,
-            fetch_graph_sections,
+            CentroidSection, ResidentVectorIndex, WalkPlaneRequest, fetch_centroid_section,
+            hydrate_resident_index,
         },
         tombstones::SidecarCache,
     },
@@ -2608,7 +2608,7 @@ impl SupertableReader {
         if k == 0 {
             return Ok(Some(Vec::new()));
         }
-        let Some(sections) = self.persisted_graph_sections().await else {
+        let Some(sections) = self.resident_vector_index().await else {
             return Ok(None);
         };
         let Some(data) = sections.data.as_ref() else {
@@ -2713,10 +2713,10 @@ impl SupertableReader {
     /// ref (older generation / above the scale ceiling) or the fetch failed
     /// — `hnsw_search` then returns `None` and the caller falls through to
     /// the ivf scan.
-    async fn persisted_graph_sections(&self) -> Option<Arc<ResidentGraphSections>> {
+    async fn resident_vector_index(&self) -> Option<Arc<ResidentVectorIndex>> {
         let manifest = self.manifest();
-        let slot = Arc::clone(&manifest.options.graph_sections_cache);
-        let Some(reference) = manifest.slow_vector_state_graphs_blob().cloned() else {
+        let slot = Arc::clone(&manifest.options.resident_index_cache);
+        let Some(reference) = manifest.resident_vector_index_blob().cloned() else {
             // No graph ref for this generation (a drain declined the graph, or
             // the corpus crossed the scale ceiling). Drop any previously
             // hydrated sections so their multi-GiB plane is not pinned for the
@@ -2737,7 +2737,7 @@ impl SupertableReader {
                 return Some(Arc::clone(sections));
             }
         }
-        // Single-flight hydration. `fetch_graph_sections` blake3-hashes and
+        // Single-flight hydration. `hydrate_resident_index` blake3-hashes and
         // copies a multi-GiB bundle; without a gate every racing first-touch
         // query would run its own download (N duplicate fetches and a transient
         // N×-plane RSS spike that can OOM). The first miss takes THIS gate and
@@ -2754,20 +2754,23 @@ impl SupertableReader {
                 return Some(Arc::clone(sections));
             }
         }
-        let sections =
-            match fetch_graph_sections(storage.as_ref(), &reference, GraphWalkRequest::Configured)
-                .await
-            {
-                Ok(sections) => Arc::new(sections),
-                Err(error) => {
-                    tracing::warn!(
-                        "hnsw graph sections {} unavailable ({error}); falling back to \
+        let sections = match hydrate_resident_index(
+            storage.as_ref(),
+            &reference,
+            WalkPlaneRequest::Configured,
+        )
+        .await
+        {
+            Ok(sections) => Arc::new(sections),
+            Err(error) => {
+                tracing::warn!(
+                    "hnsw graph sections {} unavailable ({error}); falling back to \
                      the ivf scan",
-                        reference.uri
-                    );
-                    return None;
-                }
-            };
+                    reference.uri
+                );
+                return None;
+            }
+        };
         // Publish under the cache lock. The gate makes this the only in-flight
         // hydration, so it installs the uri it just fetched.
         {
@@ -3202,7 +3205,7 @@ impl SupertableReader {
             if let Some(hits) = self.hnsw_search(column, query, k).await? {
                 return Ok(hits);
             }
-            warn_hnsw_no_resident_graph(column, manifest.slow_vector_state_graphs_blob().is_some());
+            warn_hnsw_no_resident_graph(column, manifest.resident_vector_index_blob().is_some());
             // fall through to the ivf scan below
         }
         // The centroid router ranks by cosine (unit-normalized centroids, a

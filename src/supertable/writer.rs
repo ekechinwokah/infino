@@ -8180,7 +8180,7 @@ async fn previous_centroid_section(
 /// deletes. A hash collision only ever costs a spurious reuse/rebuild, not
 /// correctness — the copy-flip and query-time doc-id dedup are the
 /// correctness guards.
-fn graph_population_key(manifest: &ManifestSnapshot) -> u64 {
+fn resident_index_population_key(manifest: &ManifestSnapshot) -> u64 {
     let entries = manifest.get_all_superfiles();
     let count: u64 = entries.iter().map(|e| e.n_docs).sum();
     let min_id = entries.iter().map(|e| e.id_min).min().unwrap_or(0);
@@ -8204,20 +8204,20 @@ fn graph_population_key(manifest: &ManifestSnapshot) -> u64 {
 }
 
 /// Encode + PUT a data bundle as a graph section, logging the outcome.
-async fn publish_hnsw_blob(
+async fn publish_resident_index(
     storage: &dyn StorageProvider,
     population_key: u64,
     high_water: i128,
     data_bundle: &[u8],
 ) -> Option<crate::supertable::manifest::list::RoutingRef> {
-    let blob = crate::superfile::vector::hnsw::encode_graph_bundle(
+    let blob = crate::superfile::vector::hnsw::encode_resident_envelope(
         population_key,
         high_water,
         &[],
         Some(data_bundle),
     );
     let blob_mib = blob.len() / (1024 * 1024);
-    match slow_vector_state::write_graph_section(storage, blob).await {
+    match slow_vector_state::write_resident_index_blob(storage, blob).await {
         Ok(reference) => {
             tracing::debug!(uri = %reference.uri, blob_mib, "hnsw: published graph section");
             Some(reference)
@@ -8282,7 +8282,7 @@ async fn build_hnsw_graph_ref(
         );
         return None;
     }
-    let population_key = graph_population_key(manifest);
+    let population_key = resident_index_population_key(manifest);
     let high_water_now = manifest
         .get_all_superfiles()
         .iter()
@@ -8293,11 +8293,11 @@ async fn build_hnsw_graph_ref(
 
     // Incremental append: extend the prior persisted graph with only the new
     // rows, cloning it (fetch + decode) rather than mutating a serving graph.
-    if let Some(prior_ref) = manifest.slow_vector_state_graphs_blob()
-        && let Ok(sections) = slow_vector_state::fetch_graph_sections(
+    if let Some(prior_ref) = manifest.resident_vector_index_blob()
+        && let Ok(sections) = slow_vector_state::hydrate_resident_index(
             storage,
             prior_ref,
-            slow_vector_state::GraphWalkRequest::AsStored,
+            slow_vector_state::WalkPlaneRequest::AsStored,
         )
         .await
         && let Some(prior_data) = sections.data
@@ -8320,8 +8320,13 @@ async fn build_hnsw_graph_ref(
                     wall_s = t0.elapsed().as_secs_f64(),
                     "hnsw: incremental insert into prior graph"
                 );
-                return publish_hnsw_blob(storage, population_key, new_high_water, &data_bundle)
-                    .await;
+                return publish_resident_index(
+                    storage,
+                    population_key,
+                    new_high_water,
+                    &data_bundle,
+                )
+                .await;
             }
             Ok(None) => {
                 tracing::debug!(
@@ -8359,7 +8364,7 @@ async fn build_hnsw_graph_ref(
         wall_s = t0.elapsed().as_secs_f64(),
         "hnsw: built graph (full)"
     );
-    publish_hnsw_blob(storage, population_key, high_water_now, &data_bundle).await
+    publish_resident_index(storage, population_key, high_water_now, &data_bundle).await
 }
 
 /// Publish/refresh the slow-CAS serving state (Commit B, "settle").
@@ -8435,14 +8440,14 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
         // commit — a lag between the watermark and the graph is a window where a
         // just-drained row is invisible to both arms, the exact visibility gap
         // the atomic-drain stamp closes.
-        let graphs_ref = old.slow_vector_state_graphs_blob().cloned();
+        let graphs_ref = old.resident_vector_index_blob().cloned();
         // No-op only when NOTHING changed — routing blob, centroid section,
         // and the resolved graph ref all already stamped.
         if let Some((cur_uri, cur_hash)) = old.slow_vector_state_blob()
             && cur_uri == published.uri
             && cur_hash == published.content_hash
             && old.slow_vector_state_centroids_blob() == Some(&published.centroids)
-            && old.slow_vector_state_graphs_blob() == graphs_ref.as_ref()
+            && old.resident_vector_index_blob() == graphs_ref.as_ref()
         {
             return Ok(());
         }
@@ -9508,7 +9513,7 @@ mod tests {
     /// default `ivf` mode no longer exercises (the caller now gates the build).
     /// Drives the caller-gated build step directly on the drained cells
     /// (`build_hnsw_graph_ref` → the full `assemble_hnsw_sections` build +
-    /// `publish_hnsw_blob` internally), fetches the published graph back, and
+    /// `publish_resident_index` internally), fetches the published graph back, and
     /// asserts it actually SERVES — a query on the batch's axis finds its exact
     /// row through the fetched graph. Behavioral coverage, not a
     /// build-and-forget stub: it would catch a wrong node→id map or a build
@@ -9560,10 +9565,10 @@ mod tests {
         let ref1 = build_hnsw_graph_ref(storage.as_ref(), reader1.manifest())
             .await
             .expect("full build registers a graph");
-        let prior = slow_vector_state::fetch_graph_sections(
+        let prior = slow_vector_state::hydrate_resident_index(
             storage.as_ref(),
             &ref1,
-            slow_vector_state::GraphWalkRequest::AsStored,
+            slow_vector_state::WalkPlaneRequest::AsStored,
         )
         .await
         .expect("fetch built graph")
