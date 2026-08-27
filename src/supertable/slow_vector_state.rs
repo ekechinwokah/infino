@@ -35,7 +35,7 @@ use crate::{
     config,
     runtime_bridge::carry_span,
     storage::{StorageError, StorageProvider},
-    superfile::vector::hnsw,
+    superfile::vector::{flat, hnsw},
     supertable::{
         manifest::{
             SuperfileEntry, VectorSummary,
@@ -647,20 +647,57 @@ async fn fetch_graph_bytes(
     Ok((bytes, false))
 }
 
-/// The graph sections of one published generation, decoded resident. Held
-/// on the table handle behind a single-slot cache keyed by `uri` (a new
-/// drain generation publishes a new URI and replaces it), mirroring
+/// Which resident index one published generation carries.
+///
+/// A drain builds whichever `vector.search_mode` names, so the kinds are
+/// mutually exclusive by construction — an enum rather than a struct of
+/// `Option`s, so "both present" and "neither present" are not states the
+/// serving path has to consider.
+pub(crate) enum ResidentIndexKind {
+    /// The self-contained per-row `hnsw` index: graph + Sq16 plane +
+    /// node→doc-id map, plus whichever walk plane the bundle stored.
+    Graph(hnsw::HnswIndex),
+    /// The flat 4-bit index: a nibble plane + ruler + node→doc-id map, and
+    /// deliberately no Sq16 plane.
+    Flat(flat::Sq4FlatIndex),
+}
+
+impl ResidentIndexKind {
+    /// The graph, or `None` when this generation published a flat index.
+    ///
+    /// Present so the graph's own paths — the walk, and the incremental drain
+    /// that extends it — read as narrowly as they did before there was a
+    /// second kind, instead of matching an enum they only have one arm for.
+    pub(crate) fn graph(&self) -> Option<&hnsw::HnswIndex> {
+        match self {
+            ResidentIndexKind::Graph(g) => Some(g),
+            ResidentIndexKind::Flat(_) => None,
+        }
+    }
+
+    /// The flat index, or `None` when this generation published a graph.
+    pub(crate) fn flat(&self) -> Option<&flat::Sq4FlatIndex> {
+        match self {
+            ResidentIndexKind::Flat(f) => Some(f),
+            ResidentIndexKind::Graph(_) => None,
+        }
+    }
+}
+
+/// The resident vector index of one published generation, decoded. Held on the
+/// table handle behind a single-slot cache keyed by `uri` (a new drain
+/// generation publishes a new URI and replaces it), mirroring
 /// [`CentroidSection`].
 ///
-/// `data` is the self-contained per-row `hnsw` index (graph + Sq16
-/// plane + node→doc-id map), present only when the table was within the
-/// data-graph scale ceiling at drain.
+/// `data` is absent when the drain declined to build one at all — above the
+/// scale ceiling, below the register floor, or under `search_mode = ivf` —
+/// and the query serves the ivf scan.
 pub(crate) struct ResidentVectorIndex {
     pub uri: String,
-    /// Largest stable doc id the graph covers (the append-delta boundary an
+    /// Largest stable doc id the index covers (the append-delta boundary an
     /// incremental drain inserts past).
     pub high_water_id: i128,
-    pub data: Option<hnsw::HnswIndex>,
+    pub data: Option<ResidentIndexKind>,
 }
 
 /// Why a caller is hydrating the graph — which decides what the walk section
@@ -711,26 +748,42 @@ pub(crate) async fn hydrate_resident_index(
     let (high_water_id, data) = spawn_blocking(move || {
         let bundle = hnsw::decode_resident_envelope(&raw, mmap_backed)
             .ok_or_else(|| SlowVectorStateError::Parse("graph bundle frame".into()))?;
-        let data = bundle
-            .data_bundle
-            .as_ref()
-            .and_then(|b| hnsw::decode_hnsw(b, want));
+        // The envelope states which index its payload holds, so this is a
+        // dispatch rather than a guess. A payload that fails to decode leaves
+        // `data` absent and the query serves the ivf scan — the same fallback
+        // an absent payload gets.
+        let data = match bundle.data_bundle.as_ref() {
+            None => None,
+            Some((hnsw::PayloadKind::Graph, b)) => {
+                hnsw::decode_hnsw(b, want).map(ResidentIndexKind::Graph)
+            }
+            Some((hnsw::PayloadKind::Flat, b)) => {
+                flat::Sq4FlatIndex::decode(b).map(ResidentIndexKind::Flat)
+            }
+        };
         Ok::<_, SlowVectorStateError>((bundle.high_water_id, data))
     })
     .await
     .map_err(|join_error| {
         SlowVectorStateError::Parse(format!("graph bundle decode task failed: {join_error}"))
     })??;
-    if let Some(idx) = &data {
-        // Surface the stamped params every time the resident graph hydrates,
-        // so serving always shows what a table's graph is actually running.
-        tracing::debug!(
+    // Surface what a table is actually running, every time it hydrates.
+    match &data {
+        Some(ResidentIndexKind::Graph(idx)) => tracing::debug!(
             nodes = idx.graph.len(),
             dim = idx.dim,
             base_degree = idx.graph.base_degree(),
             ef = idx.ef_search,
             "hnsw: resident graph hydrated (stamped)"
-        );
+        ),
+        Some(ResidentIndexKind::Flat(idx)) => tracing::debug!(
+            rows = idx.len(),
+            dim = idx.dim(),
+            residual = idx.has_residual(),
+            resident_mib = idx.resident_bytes() / (1024 * 1024),
+            "flat: resident index hydrated"
+        ),
+        None => {}
     }
     Ok(ResidentVectorIndex {
         uri: reference.uri.clone(),

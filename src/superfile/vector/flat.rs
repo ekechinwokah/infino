@@ -583,7 +583,7 @@ mod tests {
         for &dim in TEST_DIMS {
             for with_residual in [false, true] {
                 let rows = 3 * Sq4Scorer::row_block() + 5;
-                let vectors = planted(dim, rows, 0x0FF1_CE);
+                let vectors = planted(dim, rows, 0x000F_F1CE);
                 let doc_ids: Vec<i128> = (0..rows as i128).map(|i| 7_000_000 + i * 3).collect();
                 let mut sq16 = vec![0u8; rows * dim * 2];
                 for (row, codes) in vectors
@@ -622,7 +622,7 @@ mod tests {
                 // anything else means a section was dropped or reordered.
                 assert_eq!(decoded.encode(), bytes, "dim {dim}: re-encode diverged");
 
-                let query = planted(dim, 1, 0xD15E_A5E);
+                let query = planted(dim, 1, 0x0D15_EA5E);
                 assert_eq!(
                     built.search(&query, 10),
                     decoded.search(&query, 10),

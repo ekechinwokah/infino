@@ -111,6 +111,7 @@ use super::{
         },
     },
 };
+use crate::superfile::vector::hnsw::PayloadKind;
 use crate::{
     InfinoError,
     config::{self, CentroidAlignment, DrainConsolidate, ThreadCount},
@@ -4680,8 +4681,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // serve ivf. Gating here (not inside
         // `build_hnsw_graph_ref`) keeps that function a pure, directly-testable
         // build step.
-        let building_graph =
-            crate::config::global().vector.search_mode == crate::config::VectorSearchMode::HnswIvf;
+        // Which resident index this drain builds, if any. One manifest slot
+        // carries whichever it is, and the envelope states its kind, so adding
+        // a kind here does not widen the manifest.
+        let index_mode = crate::config::global().vector.search_mode;
+        let building_graph = index_mode == crate::config::VectorSearchMode::HnswIvf;
+        let building_flat = index_mode == crate::config::VectorSearchMode::Flat;
         // Warm the DISK CACHE with the just-drained cell bytes — already
         // resident in `pending_cache_inserts` — BEFORE the build, so the graph's
         // full re-read of these same cells is served from the local cache
@@ -4704,6 +4709,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         }
         let graph_ref = if building_graph {
             build_hnsw_graph_ref(storage.as_ref(), &prospective).await
+        } else if building_flat {
+            build_flat_index_ref(storage.as_ref(), &prospective).await
         } else {
             None
         };
@@ -8208,13 +8215,14 @@ async fn publish_resident_index(
     storage: &dyn StorageProvider,
     population_key: u64,
     high_water: i128,
+    kind: PayloadKind,
     data_bundle: &[u8],
 ) -> Option<crate::supertable::manifest::list::RoutingRef> {
     let blob = crate::superfile::vector::hnsw::encode_resident_envelope(
         population_key,
         high_water,
         &[],
-        Some(data_bundle),
+        Some((kind, data_bundle)),
     );
     let blob_mib = blob.len() / (1024 * 1024);
     match slow_vector_state::write_resident_index_blob(storage, blob).await {
@@ -8252,6 +8260,67 @@ async fn publish_resident_index(
 /// build step — directly callable in tests without touching global config. The
 /// scale-free **centroid** graph is not yet built here — the bundle carries an
 /// empty centroid section.
+/// Build and publish the resident flat 4-bit index, returning the routing ref
+/// the manifest stamps. `None` means no index — the query serves `ivf`.
+///
+/// Peer of [`build_hnsw_graph_ref`], and shorter for two reasons that are worth
+/// stating rather than inferring from the absence of code.
+///
+/// There is no incremental arm. Extending a flat index would mean appending
+/// rows to a plane whose ruler was fitted over the previous population, which
+/// is exactly the first-input-ruler rule the graph's walk plane follows — but
+/// there it buys consistency with neighbour lists that already exist, and a
+/// scan has no neighbour lists. A rebuild is simply the correct answer, and it
+/// costs one pass over the corpus.
+///
+/// There is no calibration arm either: [`assemble_flat_sections`] owns the doc
+/// ceiling and the register gate, because both are decisions about the fitted
+/// plane rather than about publication.
+async fn build_flat_index_ref(
+    storage: &dyn StorageProvider,
+    manifest: &ManifestSnapshot,
+) -> Option<crate::supertable::manifest::list::RoutingRef> {
+    let column = manifest
+        .options
+        .vector_columns
+        .first()
+        .map(|vc| vc.column.clone())?;
+    let population_key = resident_index_population_key(manifest);
+    let high_water_now = manifest
+        .get_all_superfiles()
+        .iter()
+        .map(|e| e.id_max)
+        .max()
+        .unwrap_or(0);
+    let t0 = std::time::Instant::now();
+    let data_bundle =
+        match crate::supertable::query::vector::assemble_flat_sections(manifest, &column, &None)
+            .await
+        {
+            Ok(Some(bundle)) => bundle,
+            // Every decline is a legitimate fall-through to ivf and has already
+            // logged its own reason (no rows, over the ceiling, below the floor).
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!("flat: build skipped — assemble error: {error}");
+                return None;
+            }
+        };
+    tracing::debug!(
+        data_bundle_mib = data_bundle.len() / (1024 * 1024),
+        wall_s = t0.elapsed().as_secs_f64(),
+        "flat: built index"
+    );
+    publish_resident_index(
+        storage,
+        population_key,
+        high_water_now,
+        PayloadKind::Flat,
+        &data_bundle,
+    )
+    .await
+}
+
 async fn build_hnsw_graph_ref(
     storage: &dyn StorageProvider,
     manifest: &ManifestSnapshot,
@@ -8300,7 +8369,10 @@ async fn build_hnsw_graph_ref(
             slow_vector_state::WalkPlaneRequest::AsStored,
         )
         .await
-        && let Some(prior_data) = sections.data
+        && let Some(prior_data) = sections.data.and_then(|kind| match kind {
+            slow_vector_state::ResidentIndexKind::Graph(g) => Some(g),
+            slow_vector_state::ResidentIndexKind::Flat(_) => None,
+        })
     {
         let prior_count = prior_data.doc_ids.len();
         match crate::supertable::query::vector::assemble_hnsw_incremental(
@@ -8324,6 +8396,7 @@ async fn build_hnsw_graph_ref(
                     storage,
                     population_key,
                     new_high_water,
+                    PayloadKind::Graph,
                     &data_bundle,
                 )
                 .await;
@@ -8364,7 +8437,14 @@ async fn build_hnsw_graph_ref(
         wall_s = t0.elapsed().as_secs_f64(),
         "hnsw: built graph (full)"
     );
-    publish_resident_index(storage, population_key, high_water_now, &data_bundle).await
+    publish_resident_index(
+        storage,
+        population_key,
+        high_water_now,
+        PayloadKind::Graph,
+        &data_bundle,
+    )
+    .await
 }
 
 /// Publish/refresh the slow-CAS serving state (Commit B, "settle").
@@ -9573,6 +9653,10 @@ mod tests {
         .await
         .expect("fetch built graph")
         .data
+        .and_then(|kind| match kind {
+            slow_vector_state::ResidentIndexKind::Graph(g) => Some(g),
+            slow_vector_state::ResidentIndexKind::Flat(_) => None,
+        })
         .expect("data graph present after full build");
         assert!(
             nearest(&prior, 1) < 0.05,

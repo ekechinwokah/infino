@@ -124,8 +124,8 @@ use crate::{
         opann::REPLICA_CLOSURE_DISTANCE_RATIO,
         options::{GappedPlacementCell, GappedPlacementIndex},
         slow_vector_state::{
-            CentroidSection, ResidentVectorIndex, WalkPlaneRequest, fetch_centroid_section,
-            hydrate_resident_index,
+            CentroidSection, ResidentIndexKind, ResidentVectorIndex, WalkPlaneRequest,
+            fetch_centroid_section, hydrate_resident_index,
         },
         tombstones::SidecarCache,
     },
@@ -1652,6 +1652,45 @@ fn score_cell_fp32(
 /// The `_id` results are still correct; only the fast path is off. Deduped
 /// per `(diagnosis, column)` so a miss on one column never suppresses the
 /// warning another column would legitimately raise.
+/// Warn that `search_mode = flat` is set but this query fell through to the
+/// ivf scan, with the diagnosis the situation warrants:
+///   - `has_index_ref = false`: the table carries no resident index at all —
+///     pre-drain, or the drain declined (over `flat_max_docs`, or the fitted
+///     plane missed the register floor).
+///   - `has_index_ref = true`: an index exists but not one this arm can serve —
+///     a graph from a previous `search_mode`, another column, or a dim
+///     mismatch.
+///
+/// The `_id` results are still correct; only the fast path is off. Deduped per
+/// `(diagnosis, column)` so a miss on one column never suppresses another's.
+fn warn_flat_no_resident_index(column: &str, has_index_ref: bool) {
+    static WARNED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(bool, String)>>,
+    > = std::sync::OnceLock::new();
+    let warned = WARNED.get_or_init(Default::default);
+    {
+        let mut set = warned.lock().expect("flat warn dedup set");
+        if !set.insert((has_index_ref, column.to_string())) {
+            return;
+        }
+    }
+    if has_index_ref {
+        tracing::warn!(
+            column,
+            "search_mode=flat but the resident index is not a flat index for this \
+             column (a graph from a previous search_mode, another column, or a dim \
+             mismatch); serving via ivf scan"
+        );
+    } else {
+        tracing::warn!(
+            column,
+            "search_mode=flat but no resident flat index (pre-drain, over \
+             flat_max_docs, or the fitted plane missed the register floor); \
+             serving via ivf scan"
+        );
+    }
+}
+
 fn warn_hnsw_no_resident_graph(column: &str, has_graph_ref: bool) {
     static WARNED: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashSet<(bool, String)>>,
@@ -2599,6 +2638,79 @@ impl SupertableReader {
     /// match the cosine distance the ivf/scan arm emits — the two arms merge on
     /// raw score, so they MUST share one scale (an undrained user-arm hit and a
     /// drained graph hit are compared directly).
+    /// Serve top-`k` from the resident flat 4-bit index. `None` when there is
+    /// no such index for this column, so the caller falls through to the ivf
+    /// scan.
+    ///
+    /// Peer of [`Self::hnsw_search`]. It has no beam, no `ef`, and no refine
+    /// width: the scan visits every row and the codes' own ranking IS the
+    /// answer. That is also why there is no over-fetch for boundary replicas —
+    /// a replicated row appears once per hidden cell in the graph's node
+    /// space, but this index is built from the same gathered rows and
+    /// `top_k_ascending` collapses duplicate stable ids either way, so the
+    /// fetch width is `k`.
+    async fn flat_search(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Option<Vec<SuperfileHit>>, QueryError> {
+        if k == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let Some(sections) = self.resident_vector_index().await else {
+            return Ok(None);
+        };
+        // This arm serves the flat index only; a generation that published a
+        // graph is a different index, not a broken one.
+        let Some(index) = sections.data.as_ref().and_then(ResidentIndexKind::flat) else {
+            return Ok(None);
+        };
+        // Built for exactly one column. A table can carry several same-dim
+        // vector columns, so a dim match alone is not enough — a query on a
+        // DIFFERENT column must fall back to ivf rather than be answered from
+        // this column's rows.
+        if index.column() != column || index.dim() != query.len() || index.is_empty() {
+            return Ok(None);
+        }
+        let manifest = self.manifest();
+        let sections_for_scan = Arc::clone(&sections);
+        let query_owned = query.to_vec();
+        // The scan is a pure CPU wave over the whole resident plane: it belongs
+        // on the reader pool, not inline on a tokio worker, which would block
+        // that worker's I/O for the scan's full duration.
+        let hits: Vec<SuperfileHit> = run_on_pool(
+            Some(&manifest.options.reader_pool),
+            "flat serving scan: reader pool dropped result",
+            move || {
+                let index = sections_for_scan
+                    .data
+                    .as_ref()
+                    .and_then(ResidentIndexKind::flat)
+                    .expect("flat index present: checked before dispatch");
+                index
+                    .search(&query_owned, k)
+                    .into_iter()
+                    .filter_map(|(node, dist)| {
+                        // Shift the scan's `−dot` onto the ivf arm's `1 − dot`
+                        // cosine scale so a cross-arm merge compares like with
+                        // like. Monotonic in `dist`, so intra-arm order is
+                        // unchanged and the public `score` stays non-negative.
+                        Some(SuperfileHit {
+                            superfile: SuperfileUri(Uuid::nil()),
+                            local_doc_id: 0,
+                            score: 1.0 + dist,
+                            stable_id: Some(index.doc_id(node)?),
+                        })
+                    })
+                    .collect()
+            },
+        )
+        .await
+        .map_err(|e| QueryError::Execute(e.to_string()))?;
+        Ok(Some(top_k_ascending(vec![hits], k)))
+    }
+
     async fn hnsw_search(
         &self,
         column: &str,
@@ -2611,7 +2723,11 @@ impl SupertableReader {
         let Some(sections) = self.resident_vector_index().await else {
             return Ok(None);
         };
-        let Some(data) = sections.data.as_ref() else {
+        // This arm serves the graph only. A generation that published a flat
+        // index instead is not a failure — it is a different index, and the
+        // flat arm reaches it — so fall through rather than treating the
+        // absent graph as a missing one.
+        let Some(data) = sections.data.as_ref().and_then(ResidentIndexKind::graph) else {
             return Ok(None);
         };
         // The persisted graph is built for exactly one column. A table can
@@ -2670,7 +2786,8 @@ impl SupertableReader {
                 let data = sections_for_walk
                     .data
                     .as_ref()
-                    .expect("data present: checked before dispatch");
+                    .and_then(ResidentIndexKind::graph)
+                    .expect("graph present: checked before dispatch");
                 // One dispatch per query, not per candidate: pick the walk
                 // plane the bundle carries and hand the concrete scorer to the
                 // monomorphized walk. A coarse plane re-ranks its beam on Sq16
@@ -3206,6 +3323,19 @@ impl SupertableReader {
                 return Ok(hits);
             }
             warn_hnsw_no_resident_graph(column, manifest.resident_vector_index_blob().is_some());
+            // fall through to the ivf scan below
+        }
+        // Flat search mode (`vector.search_mode = flat`): scan the resident
+        // 4-bit plane exhaustively. Same shape of gate as the graph arm above,
+        // and for the same reasons — the hidden (drained) arm only, unfiltered
+        // only, and only when a valid index for THIS column is resident. The
+        // drain declines to build one above `flat_max_docs` or below the
+        // register floor, and either way the query serves ivf.
+        if !filtered && hidden_vector_index && vcfg.search_mode == config::VectorSearchMode::Flat {
+            if let Some(hits) = self.flat_search(column, query, k).await? {
+                return Ok(hits);
+            }
+            warn_flat_no_resident_index(column, manifest.resident_vector_index_blob().is_some());
             // fall through to the ivf scan below
         }
         // The centroid router ranks by cosine (unit-normalized centroids, a

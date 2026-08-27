@@ -2470,7 +2470,7 @@ pub(crate) struct ResidentIndexEnvelope {
     /// multi-GiB data section with no heap copy — the open-time transient the
     /// mmap serving path removes; [`decode_hnsw`] then slices the Sq16 and SQ8
     /// planes straight out of it.
-    pub data_bundle: Option<Bytes>,
+    pub data_bundle: Option<(PayloadKind, Bytes)>,
 }
 
 /// Read the `(population_key, high_water_id)` header from a bundle's first
@@ -2497,10 +2497,41 @@ pub(crate) fn resident_envelope_header(header: &[u8]) -> Option<(u64, i128)> {
 }
 
 /// Length-prefixed opaque section (`0` len flag when absent).
-fn put_opt_section(out: &mut Vec<u8>, section: Option<&[u8]>) {
+/// Which index the envelope's payload section holds.
+///
+/// The envelope STATES this rather than leaving a reader to sniff the payload's
+/// magic. Sniffing works but inverts the responsibility: every reader would
+/// have to try each format in turn and treat "none matched" as corruption,
+/// which gets worse with each kind and is silent when it guesses wrong.
+///
+/// The tag lives in the section's existing presence byte — `0` was already
+/// "absent" and `1` "present", and `1` has only ever meant a graph — so an
+/// envelope written before this tag existed reads back as [`Self::Graph`],
+/// which is what it is. A binary that predates a kind sees a present section,
+/// fails to decode it as a graph, and serves the ivf scan: a downgrade, not a
+/// mis-parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PayloadKind {
+    /// An `encode_hnsw` payload: graph + Sq16 plane + walk plane.
+    Graph = 1,
+    /// A flat 4-bit index payload: nibble plane + ruler, no graph, no Sq16.
+    Flat = 2,
+}
+
+impl PayloadKind {
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(PayloadKind::Graph),
+            2 => Some(PayloadKind::Flat),
+            _ => None,
+        }
+    }
+}
+
+fn put_opt_section(out: &mut Vec<u8>, section: Option<(PayloadKind, &[u8])>) {
     match section {
-        Some(bytes) => {
-            out.push(1);
+        Some((kind, bytes)) => {
+            out.push(kind as u8);
             out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
             out.extend_from_slice(bytes);
         }
@@ -2516,7 +2547,7 @@ pub(crate) fn encode_resident_envelope(
     population_key: u64,
     high_water_id: i128,
     centroid_graph: &[u8],
-    data_bundle: Option<&[u8]>,
+    payload: Option<(PayloadKind, &[u8])>,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(GRAPH_BUNDLE_HEADER_BYTES + 16 + centroid_graph.len());
     out.extend_from_slice(GRAPH_BUNDLE_MAGIC);
@@ -2524,7 +2555,7 @@ pub(crate) fn encode_resident_envelope(
     out.extend_from_slice(&high_water_id.to_le_bytes());
     out.extend_from_slice(&(centroid_graph.len() as u64).to_le_bytes());
     out.extend_from_slice(centroid_graph);
-    put_opt_section(&mut out, data_bundle);
+    put_opt_section(&mut out, payload);
     out
 }
 
@@ -2560,15 +2591,23 @@ pub(crate) fn decode_resident_envelope(
     // yields a subslice of `bytes` (= `raw`): on the mmap path `slice_ref`
     // shares that mapping zero-copy; on the heap path we copy it out so `raw`
     // (the full striped blob) frees.
-    let data_bundle = if c.take(1)?[0] == 0 {
+    let tag = c.take(1)?[0];
+    let data_bundle = if tag == 0 {
         None
     } else {
+        // An unknown kind is a payload written by a newer build. Decline the
+        // SECTION rather than the whole envelope: the centroid graph above it
+        // is still valid and still worth serving.
+        let kind = PayloadKind::from_tag(tag);
         let len = c.u64()? as usize;
         let section = c.take(len)?;
-        Some(if mmap_backed {
-            raw.slice_ref(section)
-        } else {
-            Bytes::copy_from_slice(section)
+        kind.map(|kind| {
+            let bytes = if mmap_backed {
+                raw.slice_ref(section)
+            } else {
+                Bytes::copy_from_slice(section)
+            };
+            (kind, bytes)
         })
     };
     Some(ResidentIndexEnvelope {
@@ -4343,7 +4382,12 @@ mod tests {
         // Full bundle: centroid graph + data bundle + population key + high water.
         let centroid = vec![1u8, 2, 3, 4, 5];
         let data = vec![9u8; 300];
-        let blob = encode_resident_envelope(0xDEAD_BEEF_1234, 987_654_321, &centroid, Some(&data));
+        let blob = encode_resident_envelope(
+            0xDEAD_BEEF_1234,
+            987_654_321,
+            &centroid,
+            Some((PayloadKind::Graph, &data)),
+        );
         // Both modes recover identical sections; only the data-section backing
         // differs (zero-copy slice of `raw` vs an owned copy).
         for mmap_backed in [true, false] {
@@ -4352,14 +4396,19 @@ mod tests {
             assert_eq!(got.population_key, 0xDEAD_BEEF_1234);
             assert_eq!(got.high_water_id, 987_654_321);
             assert_eq!(got.centroid_graph, centroid);
-            assert_eq!(got.data_bundle.as_deref(), Some(&data[..]));
+            let (kind, bytes) = got.data_bundle.as_ref().expect("data present");
+            assert_eq!(
+                *kind,
+                PayloadKind::Graph,
+                "the envelope must report the kind it was written with"
+            );
+            assert_eq!(&bytes[..], &data[..]);
             // On the heap path the data section must be an independent copy, not
             // a view into `raw`, so `raw` can be freed.
             if !mmap_backed {
-                let db = got.data_bundle.as_ref().expect("data present");
                 assert!(
-                    !raw.as_ref().as_ptr_range().contains(&db.as_ptr()),
-                    "heap-path data_bundle must not alias raw"
+                    !raw.as_ref().as_ptr_range().contains(&bytes.as_ptr()),
+                    "heap-path payload must not alias raw"
                 );
             }
         }
