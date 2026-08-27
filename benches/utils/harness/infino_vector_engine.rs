@@ -8,7 +8,6 @@
 //! bytes and the reader. In-tree benches use those retained bytes for
 //! cold upload and the retained reader for correctness/warm search.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::{Decimal128Array, RecordBatch};
@@ -91,14 +90,6 @@ pub struct InfinoVectorIndex {
     metric: VectorMetric,
     bytes: Option<Vec<u8>>,
     reader: Option<SuperfileReader>,
-    /// Retained fp32 source vectors, kept ONLY so `insert`/`remove` can
-    /// rebuild the superfile from an updated corpus — infino superfiles
-    /// are immutable once `finish()` is called (see
-    /// `src/superfile/builder.rs`), so there is no in-place add/remove at
-    /// this tier. Retaining the full fp32 source is a bench-only cost no
-    /// shipping caller would pay; `load` deliberately leaves this `None`
-    /// since a loaded index has no fp32 source to reconstruct from.
-    source_vectors: Option<Vec<f32>>,
 }
 
 impl InfinoVectorIndex {
@@ -124,15 +115,12 @@ impl VectorEngine for InfinoVectorEngine {
             vector: true,
             sql: true,
             hybrid: true,
-            // A superfile is sealed by `finish()` and never mutated
-            // afterwards, so there is no in-place path at this tier and
-            // both operations re-seal the artifact. Declared as
-            // `Rebuild` so these numbers cannot be rendered next to a
-            // mutable index's in-place appends. Infino's actual
-            // insert/delete path is `Supertable::append`/`delete` at the
-            // table tier, which is a separate cell family, not this one.
-            vector_insert: MutationSupport::Rebuild,
-            vector_remove: MutationSupport::Rebuild,
+            // This engine is one sealed superfile (the codec/search cell
+            // next to turbovec). append/delete are table operations —
+            // `Supertable::append`/`delete` — already timed with RSS in
+            // write-diag. They are not advertised here.
+            vector_insert: MutationSupport::Unsupported,
+            vector_remove: MutationSupport::Unsupported,
             // Genuinely cheap and native: `finish()` already returns
             // final bytes, `SuperfileReader::open` already reopens them.
             vector_save_load: true,
@@ -146,7 +134,6 @@ impl VectorEngine for InfinoVectorEngine {
             metric,
             bytes: None,
             reader: None,
-            source_vectors: None,
         }
     }
 
@@ -155,7 +142,6 @@ impl VectorEngine for InfinoVectorEngine {
         index.reader =
             Some(SuperfileReader::open(Bytes::from(bytes.clone())).expect("open SuperfileReader"));
         index.bytes = Some(bytes);
-        index.source_vectors = Some(vectors.to_vec());
     }
 
     fn parallel_write(
@@ -220,89 +206,12 @@ impl VectorEngine for InfinoVectorEngine {
         // Dropping the in-memory bytes/reader releases the artifact.
     }
 
-    /// NOT a true append-to-served-index. Infino superfiles are
-    /// immutable once `finish()` is called — there is no insert-after
-    /// -seal operation anywhere in the crate. What this measures instead
-    /// is the cost of growing the corpus by `vectors.len() / dim` rows and
-    /// re-sealing from scratch: it appends to the retained fp32 source
-    /// (see [`InfinoVectorIndex::source_vectors`]) and re-`finish()`s a
-    /// fresh superfile. This is the honest number for "how much does
-    /// growing an infino superfile by n rows cost", which is a different
-    /// (and for infino, much heavier) question than "insert latency"
-    /// implies for a mutable-index engine — hence
-    /// [`MutationSupport::Rebuild`].
-    ///
-    /// This is not how infino ingests new rows in practice. The real path
-    /// is `Supertable::append`, which seals the new rows into their *own*
-    /// superfile and adds it to the manifest, leaving existing superfiles
-    /// untouched — cost proportional to the batch, not the corpus. That
-    /// belongs to a table-tier mutation cell; measuring it through this
-    /// single-superfile trait is not possible, and a reader shown only
-    /// this number would conclude infino's ingest is O(corpus) when it
-    /// isn't.
-    fn insert(index: &mut Self::Index, vectors: &[f32], next_id: u64) -> bool {
-        let existing = index
-            .source_vectors
-            .as_ref()
-            .expect("insert requires InfinoVectorIndex::source_vectors retained from write()");
-        // Ids are always 0..n_docs by construction (see `build_superfile`'s
-        // `id_base`), so `next_id` is validated rather than threaded
-        // through — this reference impl does not support inserting at an
-        // arbitrary sparse id.
-        let expected_next_id = (existing.len() / index.dim) as u64;
-        assert_eq!(
-            next_id, expected_next_id,
-            "InfinoVectorEngine::insert only supports appending at the current doc count"
-        );
-        let mut combined = existing.clone();
-        combined.extend_from_slice(vectors);
-        let rebuilt = build_superfile(&index.column, &combined, index.dim, index.metric, 0);
-        index.reader = Some(
-            SuperfileReader::open(Bytes::from(rebuilt.clone())).expect("open SuperfileReader"),
-        );
-        index.bytes = Some(rebuilt);
-        index.source_vectors = Some(combined);
-        true
-    }
-
-    /// Same honesty caveat as `insert`: no remove-by-id exists at the
-    /// superfile tier. This filters the retained source vectors by id and
-    /// rebuilds — a full rebuild minus the removed rows, not an in-place
-    /// tombstone. `ids` are the `0..n_docs` positional ids `write`/`insert`
-    /// assign, so this filters by index position directly.
-    fn remove(index: &mut Self::Index, ids: &[u64]) -> bool {
-        let existing = index
-            .source_vectors
-            .as_ref()
-            .expect("remove requires InfinoVectorIndex::source_vectors retained from write()");
-        let dim = index.dim;
-        let drop_set: HashSet<u64> = ids.iter().copied().collect();
-        let n_docs = existing.len() / dim;
-        let mut kept = Vec::with_capacity(existing.len());
-        for doc in 0..n_docs {
-            if !drop_set.contains(&(doc as u64)) {
-                kept.extend_from_slice(&existing[doc * dim..(doc + 1) * dim]);
-            }
-        }
-        let rebuilt = build_superfile(&index.column, &kept, dim, index.metric, 0);
-        index.reader = Some(
-            SuperfileReader::open(Bytes::from(rebuilt.clone())).expect("open SuperfileReader"),
-        );
-        index.bytes = Some(rebuilt);
-        index.source_vectors = Some(kept);
-        true
-    }
-
-    /// This one is real: `finish()` already returns final bytes.
+    /// `finish()` already returns final bytes.
     fn save(index: &Self::Index) -> Option<Vec<u8>> {
         Some(index.bytes().to_vec())
     }
 
-    /// This one is real: `SuperfileReader::open` already reopens from
-    /// bytes. `source_vectors` is deliberately left `None` — a loaded
-    /// index has no fp32 source to reconstruct, so `insert`/`remove`
-    /// after `load` will panic until the source is re-supplied by a
-    /// caller that tracks it independently.
+    /// `SuperfileReader::open` already reopens from bytes.
     fn load(column: &str, dim: usize, metric: VectorMetric, bytes: &[u8]) -> Option<Self::Index> {
         let owned = Bytes::from(bytes.to_vec());
         let reader = SuperfileReader::open(owned.clone()).expect("open SuperfileReader");
@@ -312,7 +221,6 @@ impl VectorEngine for InfinoVectorEngine {
             metric,
             bytes: Some(owned.to_vec()),
             reader: Some(reader),
-            source_vectors: None,
         })
     }
 }

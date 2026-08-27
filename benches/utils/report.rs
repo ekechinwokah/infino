@@ -17,6 +17,7 @@
 //! (CPU / cores / RAM / OS) so a committed table says what machine
 //! produced it.
 
+use std::process::Command;
 use std::{collections::HashMap, path::PathBuf};
 
 use serde_json::Value;
@@ -36,6 +37,15 @@ const CORPUS_FINGERPRINT_KEY: &str = "__corpus";
 /// distribution.
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// `/proc/cpuinfo` keys that carry a human-readable processor name, in
+/// preference order. x86 exposes `model name`; arm64 has no such field
+/// and reports the board or SoC under `Model` / `Hardware` instead.
+const CPUINFO_MODEL_KEYS: [&str; 3] = ["model name", "Model", "Hardware"];
+/// 2^10 × 2^10: `/proc/meminfo` `MemTotal` is kibibytes.
+const KIB_PER_GIB: f64 = 1024.0 * 1024.0;
+/// 2^30: `hw.memsize` is bytes.
+const BYTES_PER_GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 /// Bits of a `u64` that survive a round trip through `f64` (and therefore
 /// through JSON) exactly. The fingerprint is masked to this width so the
@@ -191,13 +201,29 @@ impl Report {
     fn render_block(&mut self, section: &Section, block: &Block) -> Vec<Vec<Rendered>> {
         let mut grid = Vec::with_capacity(block.rows.len());
         for row in &block.rows {
-            let label = row
+            // First text cell is the row name. A `k` column is a
+            // discriminator (`@1` / `@10` / `@100`): fold it into the
+            // label so three knots of one engine do not share one JSON key.
+            let first = row
                 .first()
                 .and_then(|c| match c {
                     Cell::Text(s) => Some(s.as_str()),
                     _ => None,
                 })
                 .unwrap_or("");
+            let label_owned = if block.headers.get(1).map(String::as_str) == Some("k") {
+                let knot = row
+                    .get(1)
+                    .and_then(|c| match c {
+                        Cell::Text(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+                format!("{first} {knot}")
+            } else {
+                first.to_string()
+            };
+            let label = label_owned.as_str();
             let mut rrow = Vec::with_capacity(row.len());
             for (ci, cell) in row.iter().enumerate() {
                 match cell {
@@ -256,6 +282,18 @@ impl Report {
         merged.insert(CORPUS_FINGERPRINT_KEY.to_string(), corpus);
         if let Err(e) = write_map(&path, &merged) {
             eprintln!("[report] failed to persist metrics for {}: {e}", self.bench);
+        }
+        // Sidecar so a published cell can name the box without stuffing a
+        // string into the f64 metric map.
+        let host_path = path
+            .parent()
+            .map(|p| p.join("host.txt"))
+            .unwrap_or_else(|| PathBuf::from("host.txt"));
+        if let Err(e) = std::fs::write(&host_path, format!("{}\n", self.host)) {
+            eprintln!(
+                "[report] failed to persist host stamp {}: {e}",
+                host_path.display()
+            );
         }
     }
 }
@@ -371,24 +409,66 @@ fn machine_info() -> String {
 }
 
 fn read_cpu_model() -> Option<String> {
+    read_cpu_model_linux().or_else(read_cpu_model_macos)
+}
+
+fn read_cpu_model_linux() -> Option<String> {
     let s = std::fs::read_to_string("/proc/cpuinfo").ok()?;
     for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("model name") {
-            return rest.split_once(':').map(|(_, v)| v.trim().to_string());
+        for key in CPUINFO_MODEL_KEYS {
+            if let Some(rest) = line.strip_prefix(key) {
+                let value = rest.split_once(':').map(|(_, v)| v.trim().to_string());
+                if let Some(value) = value.filter(|v| !v.is_empty()) {
+                    return Some(value);
+                }
+            }
         }
     }
     None
 }
 
+fn read_cpu_model_macos() -> Option<String> {
+    let out = Command::new("sysctl")
+        .args(["-n", "machdep.cpu.brand_string"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let s = s.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
 fn read_mem_total_gib() -> Option<f64> {
+    read_mem_total_gib_linux().or_else(read_mem_total_gib_macos)
+}
+
+fn read_mem_total_gib_linux() -> Option<f64> {
     let s = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
             let kb: f64 = rest.split_whitespace().next()?.parse().ok()?;
-            return Some(kb / (1024.0 * 1024.0));
+            return Some(kb / KIB_PER_GIB);
         }
     }
     None
+}
+
+fn read_mem_total_gib_macos() -> Option<f64> {
+    let out = Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let bytes: f64 = String::from_utf8(out.stdout).ok()?.trim().parse().ok()?;
+    Some(bytes / BYTES_PER_GIB)
 }
 
 fn store_path(bench: &str) -> PathBuf {
@@ -419,9 +499,28 @@ fn write_map(path: &PathBuf, map: &HashMap<String, f64>) -> std::io::Result<()> 
 
 #[cfg(test)]
 mod tests {
+    use std::env::consts::ARCH;
+
     use tempfile::tempdir;
 
     use super::*;
+
+    /// A published table has to say which box produced it, so the stamp
+    /// always carries core counts and os/arch. The CPU *name* is only
+    /// asserted where a source is guaranteed to exist: x86 Linux has
+    /// `model name` in `/proc/cpuinfo` and macOS has the `sysctl` brand
+    /// string, while arm64 Linux frequently exposes neither.
+    #[test]
+    fn machine_info_names_this_host() {
+        let s = machine_info();
+        assert!(s.starts_with("Host: "), "{s}");
+        assert!(s.contains(ARCH), "{s}");
+        let cpu_name_guaranteed =
+            cfg!(target_os = "macos") || cfg!(all(target_os = "linux", target_arch = "x86_64"));
+        if cpu_name_guaranteed {
+            assert!(!s.contains("unknown CPU"), "{s}");
+        }
+    }
 
     /// The metrics file is a merge accumulator, which is only sound within
     /// one corpus: a run that measures a subset of the keys must not leave
