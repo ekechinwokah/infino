@@ -450,6 +450,34 @@ pub enum DrainConsolidate {
     Splice,
 }
 
+/// Resident plane the `flat` scan ranks on. Selected by `vector.flat_plane`.
+///
+/// Separate from [`VectorHnswPlane`] on purpose. They answer questions that
+/// only look alike: the graph's knob picks what its WALK scores while an Sq16
+/// plane stays resident to re-rank the beam, so a coarse choice there costs
+/// nothing but navigation quality. The flat scan has no beam and no Sq16 plane,
+/// so its choice sets both the resident footprint and the returned order. An
+/// earlier revision keyed the scan off `hnsw_plane`, which meant selecting
+/// `search_mode = flat` silently got whatever the graph's knob happened to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorFlatPlane {
+    /// Bare 4-bit nibbles, 0.5 bytes/dim — the smallest resident footprint of
+    /// any mode. Measured recall@10 on dbpedia-1536 at 100K is ~0.93, so it
+    /// does NOT clear a 0.99 `target_recall` and such a table serves ivf.
+    /// Choose it when the recall target is set to match.
+    Sq4,
+    /// DEFAULT. 4-bit nibbles plus a residual nibble, 1.0 bytes/dim — still
+    /// half of every other mode. Measured recall@10 ~0.99 on the same cell,
+    /// which is what clears the shipped `target_recall`.
+    ///
+    /// The default is the variant that can actually register at the shipped
+    /// target: a mode whose default can never pass its own gate is a footgun,
+    /// however small its footprint.
+    #[default]
+    Sq4Residual,
+}
+
 /// Resident plane the `hnsw_ivf` graph walk scores candidates on. Selected by
 /// `vector.hnsw_plane`.
 ///
@@ -659,6 +687,11 @@ pub struct VectorSettings {
     /// is built and `hnsw` queries fall back to the scan path. The
     /// centroid graph itself is built at any scale.
     pub hnsw_max_docs: u64,
+    /// For `search_mode = flat`: which 4-bit construction the scan ranks on.
+    /// Sets both the resident footprint and the returned order, since a flat
+    /// scan keeps no Sq16 plane to re-rank against. Ignored under any other
+    /// search mode.
+    pub flat_plane: VectorFlatPlane,
     /// For `search_mode = flat`: scale ceiling for the resident 4-bit plane.
     /// Built at drain and persisted only when the table's doc count ≤ this;
     /// above it queries fall back to `ivf`.
@@ -757,6 +790,7 @@ impl Default for VectorSettings {
             hnsw_recall_slack: DEFAULT_VECTOR_HNSW_RECALL_SLACK,
             hnsw_refine_k: DEFAULT_VECTOR_HNSW_REFINE_K,
             hnsw_max_docs: DEFAULT_VECTOR_HNSW_MAX_DOCS,
+            flat_plane: VectorFlatPlane::default(),
             flat_max_docs: DEFAULT_VECTOR_FLAT_MAX_DOCS,
             hnsw_probe_max_docs: DEFAULT_VECTOR_HNSW_PROBE_MAX_DOCS,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,

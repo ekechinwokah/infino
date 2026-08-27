@@ -292,6 +292,17 @@ vector:
   # linear in the corpus (~1.5 ms measured at 100K x 1536), so 1M lands near
   # 15 ms and 10M near 150 ms. One million is where a linear scan is still
   # competitive with a routed read.
+  # For search_mode = flat: which 4-bit construction the scan ranks on.
+  # sq4          = 0.5 bytes/dim, the smallest resident footprint of any mode;
+  #                measured recall@10 ~0.93 on dbpedia-1536 at 100K, so it does
+  #                NOT clear a 0.99 target_recall and such a table serves ivf.
+  # sq4_residual = 1.0 bytes/dim (default), still half of every other mode;
+  #                measured recall@10 ~0.99 on the same cell.
+  # Separate from hnsw_plane: the graph keeps an Sq16 plane to re-rank its beam,
+  # so its choice affects navigation only. A flat scan has no beam and no Sq16
+  # plane, so this sets both footprint and returned order.
+  flat_plane: sq4_residual
+
   flat_max_docs: 1000000
 
   # For search_mode = hnsw_ivf: row cap for the cheap calibration probe. On a

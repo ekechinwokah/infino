@@ -112,6 +112,7 @@ use super::{
     },
 };
 use crate::superfile::vector::hnsw::PayloadKind;
+use crate::supertable::query::vector::IndexOutcome;
 use crate::{
     InfinoError,
     config::{self, CentroidAlignment, DrainConsolidate, ThreadCount},
@@ -8297,12 +8298,14 @@ async fn build_flat_index_ref(
         match crate::supertable::query::vector::assemble_flat_sections(manifest, &column, &None)
             .await
         {
-            Ok(Some(bundle)) => bundle,
-            // Every decline is a legitimate fall-through to ivf and has already
-            // logged its own reason (no rows, over the ceiling, below the floor).
-            Ok(None) => return None,
+            // A decline carries its reason; `or_warn` is the single place that
+            // reports one, so no path can fall back quietly by forgetting to.
+            Ok(outcome) => match outcome.or_warn("flat build") {
+                Some(bundle) => bundle,
+                None => return None,
+            },
             Err(error) => {
-                tracing::warn!("flat: build skipped — assemble error: {error}");
+                tracing::warn!("flat build: assemble failed: {error}");
                 return None;
             }
         };
@@ -8384,7 +8387,7 @@ async fn build_hnsw_graph_ref(
         )
         .await
         {
-            Ok(Some((data_bundle, new_high_water, inserted))) => {
+            Ok(IndexOutcome::Ready((data_bundle, new_high_water, inserted))) => {
                 tracing::debug!(
                     inserted,
                     nodes = prior_count + inserted,
@@ -8401,10 +8404,8 @@ async fn build_hnsw_graph_ref(
                 )
                 .await;
             }
-            Ok(None) => {
-                tracing::debug!(
-                    "hnsw: incremental not applicable (not a pure append); full rebuild"
-                );
+            Ok(IndexOutcome::Unavailable(reason)) => {
+                tracing::debug!("hnsw incremental: not applicable ({reason}); full rebuild");
             }
             Err(error) => {
                 tracing::debug!("hnsw: incremental error ({error}); full rebuild");
@@ -8413,24 +8414,21 @@ async fn build_hnsw_graph_ref(
     }
 
     // Full rebuild.
-    let data_bundle = match crate::supertable::query::vector::assemble_hnsw_sections(
-        manifest, &column, &None,
-    )
-    .await
-    {
-        Ok(Some(bundle)) => bundle,
-        Ok(None) => {
-            tracing::debug!(
-                column,
-                "hnsw: build skipped — no Sq16 rows assembled (column absent, not sq16, or empty)"
-            );
-            return None;
-        }
-        Err(error) => {
-            tracing::warn!("hnsw: build skipped — assemble error: {error}");
-            return None;
-        }
-    };
+    let data_bundle =
+        match crate::supertable::query::vector::assemble_hnsw_sections(manifest, &column, &None)
+            .await
+        {
+            // A decline carries its reason; `or_warn` is the single place that
+            // reports one, so no path can fall back quietly by forgetting to.
+            Ok(outcome) => match outcome.or_warn("hnsw build") {
+                Some(bundle) => bundle,
+                None => return None,
+            },
+            Err(error) => {
+                tracing::warn!("hnsw build: assemble failed: {error}");
+                return None;
+            }
+        };
     tracing::debug!(
         total_docs,
         data_bundle_mib = data_bundle.len() / (1024 * 1024),

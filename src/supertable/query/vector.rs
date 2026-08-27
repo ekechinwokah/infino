@@ -1652,45 +1652,6 @@ fn score_cell_fp32(
 /// The `_id` results are still correct; only the fast path is off. Deduped
 /// per `(diagnosis, column)` so a miss on one column never suppresses the
 /// warning another column would legitimately raise.
-/// Warn that `search_mode = flat` is set but this query fell through to the
-/// ivf scan, with the diagnosis the situation warrants:
-///   - `has_index_ref = false`: the table carries no resident index at all —
-///     pre-drain, or the drain declined (over `flat_max_docs`, or the fitted
-///     plane missed the register floor).
-///   - `has_index_ref = true`: an index exists but not one this arm can serve —
-///     a graph from a previous `search_mode`, another column, or a dim
-///     mismatch.
-///
-/// The `_id` results are still correct; only the fast path is off. Deduped per
-/// `(diagnosis, column)` so a miss on one column never suppresses another's.
-fn warn_flat_no_resident_index(column: &str, has_index_ref: bool) {
-    static WARNED: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashSet<(bool, String)>>,
-    > = std::sync::OnceLock::new();
-    let warned = WARNED.get_or_init(Default::default);
-    {
-        let mut set = warned.lock().expect("flat warn dedup set");
-        if !set.insert((has_index_ref, column.to_string())) {
-            return;
-        }
-    }
-    if has_index_ref {
-        tracing::warn!(
-            column,
-            "search_mode=flat but the resident index is not a flat index for this \
-             column (a graph from a previous search_mode, another column, or a dim \
-             mismatch); serving via ivf scan"
-        );
-    } else {
-        tracing::warn!(
-            column,
-            "search_mode=flat but no resident flat index (pre-drain, over \
-             flat_max_docs, or the fitted plane missed the register floor); \
-             serving via ivf scan"
-        );
-    }
-}
-
 fn warn_hnsw_no_resident_graph(column: &str, has_graph_ref: bool) {
     static WARNED: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashSet<(bool, String)>>,
@@ -1829,6 +1790,158 @@ async fn count_hnsw_rows(manifest: &ManifestSnapshot, column: &str) -> Result<us
     Ok(n)
 }
 
+/// Why a resident vector index is not available — the graph's or the flat
+/// plane's, at build time or at serve time.
+///
+/// Returned rather than logged, and returned rather than collapsed into `None`.
+/// A sentinel `None` makes the CALLER decide what to say, which in practice
+/// means it says nothing: a table configured for one index quietly serves
+/// another, and the only way to tell is that the numbers look like the mode you
+/// did not ask for. Carrying the reason means the fallback is still automatic
+/// but never silent, and the reason survives whether or not a subscriber is
+/// installed to print it.
+#[derive(Debug)]
+pub(crate) enum IndexUnavailable {
+    /// The manifest declares no such vector column.
+    NoSuchColumn {
+        queried: String,
+        declared: Vec<String>,
+    },
+    /// The column stores a rerank codec the index cannot be fitted from.
+    CodecUnsupported { column: String, codec: &'static str },
+    /// No rows materialized for the column.
+    NoRows { column: String },
+    /// The corpus is past the index's document ceiling.
+    OverDocCeiling {
+        rows: usize,
+        ceiling: u64,
+        knob: &'static str,
+    },
+    /// The built index did not clear `target_recall - recall_slack`.
+    BelowRegisterFloor { recall: f64, floor: f64 },
+    /// The row gather returned nothing despite a non-zero pre-count.
+    GatherEmpty { column: String, pre_count: usize },
+    /// The decoded plane's row count disagrees with the doc-id count.
+    PlaneRowMismatch { doc_ids: usize, decoded: usize },
+    /// No index is hydrated for this generation.
+    NotHydrated,
+    /// An index is hydrated, but of the other kind.
+    WrongKind { wanted: &'static str },
+    /// The hydrated index was built for a different column.
+    ColumnMismatch { queried: String, index: String },
+    /// The hydrated index was built at a different dimensionality.
+    DimMismatch { queried: usize, index: usize },
+    /// The hydrated index holds no rows.
+    IndexEmpty,
+    /// An incremental extend does not apply: the delta is not a pure append.
+    NotPureAppend {
+        prior: usize,
+        delta: usize,
+        current: usize,
+    },
+    /// An incremental extend does not apply: there are no new rows.
+    NoNewRows,
+    /// The codec names a plane that is not resident, so an extend would drop it.
+    PlaneNotResident { codec: &'static str },
+}
+
+impl std::fmt::Display for IndexUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IndexUnavailable::NoSuchColumn { queried, declared } => write!(
+                f,
+                "no vector column `{queried}` on this manifest (declared: {declared:?})"
+            ),
+            IndexUnavailable::CodecUnsupported { column, codec } => write!(
+                f,
+                "column `{column}` stores rerank codec {codec}, which this index \
+                 cannot be fitted from"
+            ),
+            IndexUnavailable::NoRows { column } => {
+                write!(f, "no rows materialized for column `{column}`")
+            }
+            IndexUnavailable::OverDocCeiling {
+                rows,
+                ceiling,
+                knob,
+            } => write!(f, "{rows} rows exceeds {knob} = {ceiling}"),
+            IndexUnavailable::BelowRegisterFloor { recall, floor } => write!(
+                f,
+                "measured recall {recall:.4} is below the register floor {floor:.4}"
+            ),
+            IndexUnavailable::GatherEmpty { column, pre_count } => write!(
+                f,
+                "the row gather for `{column}` returned nothing despite a pre-count \
+                 of {pre_count}"
+            ),
+            IndexUnavailable::PlaneRowMismatch { doc_ids, decoded } => write!(
+                f,
+                "decoded plane has {decoded} rows against {doc_ids} doc-ids \
+                 (transient read fault?)"
+            ),
+            IndexUnavailable::NotHydrated => {
+                write!(f, "no resident index for this generation")
+            }
+            IndexUnavailable::WrongKind { wanted } => write!(
+                f,
+                "the resident index is not a {wanted} index (built under a different \
+                 search_mode)"
+            ),
+            IndexUnavailable::ColumnMismatch { queried, index } => write!(
+                f,
+                "the resident index was built for column `{index}`, not `{queried}`"
+            ),
+            IndexUnavailable::DimMismatch { queried, index } => write!(
+                f,
+                "the resident index has dim {index}, the query has dim {queried}"
+            ),
+            IndexUnavailable::IndexEmpty => write!(f, "the resident index holds no rows"),
+            IndexUnavailable::NotPureAppend {
+                prior,
+                delta,
+                current,
+            } => write!(
+                f,
+                "not a pure append: {prior} prior + {delta} new != {current} current rows"
+            ),
+            IndexUnavailable::NoNewRows => write!(f, "no rows past the prior high water"),
+            IndexUnavailable::PlaneNotResident { codec } => write!(
+                f,
+                "the stored codec names a {codec} plane that is not resident, so an \
+                 extend would drop it"
+            ),
+        }
+    }
+}
+
+/// Outcome of building or serving a resident vector index.
+///
+/// [`Self::Unavailable`] is not an error: the caller falls back to the ivf scan.
+/// It is separate from `Err` precisely so the two cannot be confused — a
+/// storage fault and "this table is too big for a linear scan" call for
+/// different reactions, and collapsing both into `None` is how the second one
+/// became invisible.
+pub(crate) enum IndexOutcome<T> {
+    Ready(T),
+    Unavailable(IndexUnavailable),
+}
+
+impl<T> IndexOutcome<T> {
+    /// Log the reason at warn and yield `None`, or yield the value.
+    ///
+    /// One place decides how a decline is reported, so no path can decline
+    /// quietly by forgetting to.
+    pub(crate) fn or_warn(self, what: &str) -> Option<T> {
+        match self {
+            IndexOutcome::Ready(v) => Some(v),
+            IndexOutcome::Unavailable(reason) => {
+                tracing::warn!("{what}: serving ivf — {reason}");
+                None
+            }
+        }
+    }
+}
+
 /// Read every superfile's materialized Sq16 rows for `column` ONCE and return
 /// the node-ordered `(stable doc ids, carried code plane)`.
 ///
@@ -1940,35 +2053,49 @@ pub(crate) async fn assemble_flat_sections(
     manifest: &ManifestSnapshot,
     column: &str,
     op_stats: &Option<Arc<OpStatsCollector>>,
-) -> Result<Option<Vec<u8>>, QueryError> {
+) -> Result<IndexOutcome<Vec<u8>>, QueryError> {
     let Some(vc) = manifest
         .options
         .vector_columns
         .iter()
         .find(|vc| vc.column == column)
     else {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::NoSuchColumn {
+            queried: column.to_string(),
+            declared: manifest
+                .options
+                .vector_columns
+                .iter()
+                .map(|vc| vc.column.clone())
+                .collect(),
+        }));
     };
     // The plane is a re-quantization of the stored Sq16 reconstruction, so a
     // column stored under another rerank codec has nothing to fit from.
     if !vc.rerank_codec.is_sq16() {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::CodecUnsupported {
+                column: column.to_string(),
+                codec: vc.rerank_codec.name(),
+            },
+        ));
     }
     let dim = vc.dim;
     let vcfg = &config::global().vector;
     let n = count_hnsw_rows(manifest, column).await?;
     if n == 0 {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::NoRows {
+            column: column.to_string(),
+        }));
     }
-    let max_docs = vcfg.flat_max_docs as usize;
-    if n > max_docs {
-        tracing::info!(
-            total_docs = n,
-            max_docs,
-            "flat: build skipped - docs exceed flat_max_docs (a linear scan \
-             stops being the right trade); serving ivf"
-        );
-        return Ok(None);
+    if n > vcfg.flat_max_docs as usize {
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::OverDocCeiling {
+                rows: n,
+                ceiling: vcfg.flat_max_docs,
+                knob: "vector.flat_max_docs",
+            },
+        ));
     }
     // `None`: a flat build wants the WHOLE plane, not a strided sample. There
     // is no cheap-probe stage to skip a build with, because the expensive part
@@ -1978,9 +2105,12 @@ pub(crate) async fn assemble_flat_sections(
     let Some((doc_ids, sq16_codes)) =
         gather_sq16_rows(manifest, column, dim, op_stats, n, None).await?
     else {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::GatherEmpty {
+            column: column.to_string(),
+            pre_count: n,
+        }));
     };
-    let with_residual = vcfg.hnsw_plane == config::VectorHnswPlane::Sq4Residual;
+    let with_residual = vcfg.flat_plane == config::VectorFlatPlane::Sq4Residual;
     let floor = (vcfg.target_recall - vcfg.hnsw_recall_slack).max(0.0);
     let column_owned = column.to_string();
     // Fitting the plane is a moment pass plus a rotation per row, and the gate
@@ -2013,16 +2143,9 @@ pub(crate) async fn assemble_flat_sections(
     .await
     .map_err(|e| QueryError::Execute(e.to_string()))?;
     if recall < floor {
-        tracing::info!(
-            column,
-            recall,
-            floor,
-            rows = n,
-            residual = with_residual,
-            "flat: NOT registered - the fitted 4-bit plane does not clear the \
-             register floor; serving ivf"
-        );
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::BelowRegisterFloor { recall, floor },
+        ));
     }
     tracing::debug!(
         column,
@@ -2032,24 +2155,37 @@ pub(crate) async fn assemble_flat_sections(
         resident_mib = index.resident_bytes() / (1024 * 1024),
         "flat: registered"
     );
-    Ok(Some(index.encode()))
+    Ok(IndexOutcome::Ready(index.encode()))
 }
 
 pub(crate) async fn assemble_hnsw_sections(
     manifest: &ManifestSnapshot,
     column: &str,
     op_stats: &Option<Arc<OpStatsCollector>>,
-) -> Result<Option<Vec<u8>>, QueryError> {
+) -> Result<IndexOutcome<Vec<u8>>, QueryError> {
     let Some(vc) = manifest
         .options
         .vector_columns
         .iter()
         .find(|vc| vc.column == column)
     else {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::NoSuchColumn {
+            queried: column.to_string(),
+            declared: manifest
+                .options
+                .vector_columns
+                .iter()
+                .map(|vc| vc.column.clone())
+                .collect(),
+        }));
     };
     if !vc.rerank_codec.is_sq16() {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::CodecUnsupported {
+                column: column.to_string(),
+                codec: vc.rerank_codec.name(),
+            },
+        ));
     }
     let dim = vc.dim;
     let stride = dim * 2;
@@ -2068,7 +2204,9 @@ pub(crate) async fn assemble_hnsw_sections(
     // a strided-sample decode).
     let n = count_hnsw_rows(manifest, column).await?;
     if n == 0 {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::NoRows {
+            column: column.to_string(),
+        }));
     }
     let vcfg = &config::global().vector;
     // (m0, ef) candidate grid for the calibrator. An explicit `hnsw_m0`
@@ -2099,7 +2237,10 @@ pub(crate) async fn assemble_hnsw_sections(
     let Some((doc_ids, mut carried_codes)) =
         gather_sq16_rows(manifest, column, dim, op_stats, n, probe_step).await?
     else {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::GatherEmpty {
+            column: column.to_string(),
+            pre_count: n,
+        }));
     };
 
     if probe_step.is_some() {
@@ -2150,10 +2291,15 @@ pub(crate) async fn assemble_hnsw_sections(
                 sampled = pn,
                 recall = pchoice.recall,
                 target = vcfg.target_recall,
-                "hnsw probe: best recall below floor — graph-hostile, serving ivf \
-                 (full build skipped)"
+                "hnsw probe: best recall below floor — graph-hostile distribution, \
+                 skipping the full build"
             );
-            return Ok(None);
+            return Ok(IndexOutcome::Unavailable(
+                IndexUnavailable::BelowRegisterFloor {
+                    recall: pchoice.recall,
+                    floor: (vcfg.target_recall - vcfg.hnsw_recall_slack).max(0.0),
+                },
+            ));
         }
         tracing::debug!(
             column,
@@ -2194,10 +2340,14 @@ pub(crate) async fn assemble_hnsw_sections(
             column,
             doc_ids = doc_ids.len(),
             decoded_rows,
-            "hnsw: decoded plane row count != doc-id count (transient read fault?); \
-             skipping graph build, serving ivf"
+            "hnsw: decoded plane row count != doc-id count (transient read fault?)"
         );
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::PlaneRowMismatch {
+                doc_ids: doc_ids.len(),
+                decoded: decoded_rows,
+            },
+        ));
     }
     let scorer = Sq16Scorer::from_codes(codes, dim, decoded_rows);
     // Calibrate (m0, ef) to the table's recall bar on the FULL corpus (build
@@ -2290,9 +2440,14 @@ pub(crate) async fn assemble_hnsw_sections(
             n,
             recall = choice.recall,
             target = vcfg.target_recall,
-            "hnsw calibrate: best recall below floor — graph NOT registered, serving ivf"
+            "hnsw calibrate: best recall below floor — graph NOT registered"
         );
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::BelowRegisterFloor {
+                recall: choice.recall,
+                floor: (vcfg.target_recall - vcfg.hnsw_recall_slack).max(0.0),
+            },
+        ));
     }
     tracing::info!(
         column,
@@ -2307,7 +2462,7 @@ pub(crate) async fn assemble_hnsw_sections(
         "hnsw calibrate: graph registered"
     );
     let graph = graph.expect("registered choice carries its pruned graph");
-    Ok(Some(encode_hnsw(
+    Ok(IndexOutcome::Ready(encode_hnsw(
         scorer.codes(),
         &doc_ids,
         &graph,
@@ -2339,18 +2494,37 @@ pub(crate) async fn assemble_hnsw_incremental(
     op_stats: &Option<Arc<OpStatsCollector>>,
     prior: crate::superfile::vector::hnsw::HnswIndex,
     prior_high_water: i128,
-) -> Result<Option<(Vec<u8>, i128, usize)>, QueryError> {
+) -> Result<IndexOutcome<(Vec<u8>, i128, usize)>, QueryError> {
     let Some(vc) = manifest
         .options
         .vector_columns
         .iter()
         .find(|vc| vc.column == column)
     else {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::NoSuchColumn {
+            queried: column.to_string(),
+            declared: manifest
+                .options
+                .vector_columns
+                .iter()
+                .map(|vc| vc.column.clone())
+                .collect(),
+        }));
     };
     let dim = prior.dim;
-    if !vc.rerank_codec.is_sq16() || vc.dim != dim {
-        return Ok(None);
+    if !vc.rerank_codec.is_sq16() {
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::CodecUnsupported {
+                column: column.to_string(),
+                codec: vc.rerank_codec.name(),
+            },
+        ));
+    }
+    if vc.dim != dim {
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::DimMismatch {
+            queried: vc.dim,
+            index: dim,
+        }));
     }
     let stride = dim * 2;
     let store = Arc::clone(&manifest.options.store);
@@ -2396,7 +2570,7 @@ pub(crate) async fn assemble_hnsw_incremental(
         }
     }
     if new_doc_ids.is_empty() {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::NoNewRows));
     }
     // Pure-append guard: prior population + delta must equal the current row
     // count. Otherwise rows were removed (or ids are not a clean monotonic
@@ -2407,7 +2581,11 @@ pub(crate) async fn assemble_hnsw_incremental(
         .map(|e| e.n_docs as usize)
         .sum();
     if prior.doc_ids.len() + new_doc_ids.len() != current_total {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(IndexUnavailable::NotPureAppend {
+            prior: prior.doc_ids.len(),
+            delta: new_doc_ids.len(),
+            current: current_total,
+        }));
     }
 
     let inserted = new_doc_ids.len();
@@ -2433,7 +2611,9 @@ pub(crate) async fn assemble_hnsw_incremental(
     // extend it. Full rebuild instead of writing a bundle that silently drops
     // it: a rebuild is expensive but correct, and it re-fits the ruler.
     if inherited_walk.is_sq4() && prior.sq4.is_none() {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::PlaneNotResident { codec: "4-bit" },
+        ));
     }
     // The k→ef curve is inherited for the same reason and on the same terms: a
     // pure append does not recalibrate, so it carries forward the beam widths
@@ -2483,7 +2663,13 @@ pub(crate) async fn assemble_hnsw_incremental(
                 (None, None) => None,
                 // A prior bundle cannot disagree with a delta it derived:
                 // `from_sq16_plane` was told the prior's residual-ness.
-                _ => return Ok(None),
+                _ => {
+                    return Ok(IndexOutcome::Unavailable(
+                        IndexUnavailable::PlaneNotResident {
+                            codec: "4-bit residual",
+                        },
+                    ));
+                }
             };
             let offset = offset.to_vec();
             let step = step.to_vec();
@@ -2498,7 +2684,14 @@ pub(crate) async fn assemble_hnsw_incremental(
             ) {
                 Some(sc) => Some(sc),
                 // Shape mismatch means a corrupt prior plane: full rebuild.
-                None => return Ok(None),
+                None => {
+                    return Ok(IndexOutcome::Unavailable(
+                        IndexUnavailable::PlaneRowMismatch {
+                            doc_ids: total,
+                            decoded: 0,
+                        },
+                    ));
+                }
             }
         }
     };
@@ -2599,10 +2792,12 @@ pub(crate) async fn assemble_hnsw_incremental(
     .await
     .map_err(|e| QueryError::Execute(e.to_string()))?;
     if recall < floor {
-        return Ok(None);
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::BelowRegisterFloor { recall, floor },
+        ));
     }
     let new_high_water = doc_ids.iter().copied().max().unwrap_or(prior_high_water);
-    Ok(Some((
+    Ok(IndexOutcome::Ready((
         encode_hnsw(
             scorer.codes(),
             &doc_ids,
@@ -2654,24 +2849,40 @@ impl SupertableReader {
         column: &str,
         query: &[f32],
         k: usize,
-    ) -> Result<Option<Vec<SuperfileHit>>, QueryError> {
+    ) -> Result<IndexOutcome<Vec<SuperfileHit>>, QueryError> {
         if k == 0 {
-            return Ok(Some(Vec::new()));
+            return Ok(IndexOutcome::Ready(Vec::new()));
         }
         let Some(sections) = self.resident_vector_index().await else {
-            return Ok(None);
+            return Ok(IndexOutcome::Unavailable(IndexUnavailable::NotHydrated));
         };
         // This arm serves the flat index only; a generation that published a
         // graph is a different index, not a broken one.
         let Some(index) = sections.data.as_ref().and_then(ResidentIndexKind::flat) else {
-            return Ok(None);
+            return Ok(IndexOutcome::Unavailable(IndexUnavailable::WrongKind {
+                wanted: "flat",
+            }));
         };
         // Built for exactly one column. A table can carry several same-dim
         // vector columns, so a dim match alone is not enough — a query on a
         // DIFFERENT column must fall back to ivf rather than be answered from
         // this column's rows.
-        if index.column() != column || index.dim() != query.len() || index.is_empty() {
-            return Ok(None);
+        if index.column() != column {
+            return Ok(IndexOutcome::Unavailable(
+                IndexUnavailable::ColumnMismatch {
+                    queried: column.to_string(),
+                    index: index.column().to_string(),
+                },
+            ));
+        }
+        if index.dim() != query.len() {
+            return Ok(IndexOutcome::Unavailable(IndexUnavailable::DimMismatch {
+                queried: query.len(),
+                index: index.dim(),
+            }));
+        }
+        if index.is_empty() {
+            return Ok(IndexOutcome::Unavailable(IndexUnavailable::IndexEmpty));
         }
         let manifest = self.manifest();
         let sections_for_scan = Arc::clone(&sections);
@@ -2708,7 +2919,7 @@ impl SupertableReader {
         )
         .await
         .map_err(|e| QueryError::Execute(e.to_string()))?;
-        Ok(Some(top_k_ascending(vec![hits], k)))
+        Ok(IndexOutcome::Ready(top_k_ascending(vec![hits], k)))
     }
 
     async fn hnsw_search(
@@ -3331,12 +3542,15 @@ impl SupertableReader {
         // only, and only when a valid index for THIS column is resident. The
         // drain declines to build one above `flat_max_docs` or below the
         // register floor, and either way the query serves ivf.
-        if !filtered && hidden_vector_index && vcfg.search_mode == config::VectorSearchMode::Flat {
-            if let Some(hits) = self.flat_search(column, query, k).await? {
-                return Ok(hits);
-            }
-            warn_flat_no_resident_index(column, manifest.resident_vector_index_blob().is_some());
-            // fall through to the ivf scan below
+        if !filtered
+            && hidden_vector_index
+            && vcfg.search_mode == config::VectorSearchMode::Flat
+            && let Some(hits) = self
+                .flat_search(column, query, k)
+                .await?
+                .or_warn("flat search")
+        {
+            return Ok(hits);
         }
         // The centroid router ranks by cosine (unit-normalized centroids, a
         // -dot scorer), so it is only correct for a Cosine column. A NegDot or
@@ -5973,6 +6187,7 @@ impl Supertable {
 
 #[cfg(test)]
 mod tests {
+    use super::IndexOutcome;
     use std::{
         borrow::Cow,
         collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -8574,9 +8789,14 @@ mod tests {
         let assemble_ids = |hidden: &Arc<Supertable>| -> Vec<i128> {
             let reader = hidden.reader().expect("hidden reader");
             let manifest = reader.manifest();
-            let bundle = block_on(super::assemble_hnsw_sections(manifest, "emb", &None))
+            let bundle = match block_on(super::assemble_hnsw_sections(manifest, "emb", &None))
                 .expect("assemble ok")
-                .expect("sq16 rows must assemble into a graph");
+            {
+                IndexOutcome::Ready(bytes) => bytes,
+                IndexOutcome::Unavailable(reason) => {
+                    panic!("sq16 rows must assemble into a graph, got: {reason}")
+                }
+            };
             let decoded = crate::superfile::vector::hnsw::decode_hnsw(
                 &bytes::Bytes::from(bundle),
                 Some(crate::superfile::vector::hnsw::WalkCodec::Sq8),
