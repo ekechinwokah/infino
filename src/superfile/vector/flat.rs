@@ -36,8 +36,10 @@ use std::{cmp::Ordering, collections::BinaryHeap};
 use bytes::Bytes;
 use rayon::prelude::*;
 
+#[cfg(test)]
+use crate::superfile::vector::distance::encode_sq16_row;
 use crate::superfile::vector::{
-    distance::{SQ4_ROW_BLOCK, encode_sq16_row},
+    distance::SQ4_ROW_BLOCK,
     hnsw::{
         Cursor, NodeScorer, Plane, Sq4Scorer, Sq16Scorer, WalkCodec, calibration_queries,
         exhaustive_topk, read_f32_le,
@@ -115,7 +117,7 @@ impl PartialOrd for Candidate {
 
 /// A resident 4-bit plane scanned exhaustively per query, with the
 /// `node -> stable doc id` map the serving path resolves through.
-pub struct Sq4FlatIndex {
+pub(crate) struct Sq4FlatIndex {
     scorer: Sq4Scorer,
     /// `node_index -> stable doc id`, in node order. Present so a hit can
     /// be answered without touching a superfile: the scan's node index is
@@ -163,12 +165,17 @@ impl Sq4FlatIndex {
     /// Encode `vectors` (row-major, `len × dim` fp32) into the plane, with
     /// node-ordered synthetic ids.
     ///
-    /// The measurement entry point: benches hold fp32 corpora, not Sq16
-    /// planes. The rows go through the same [`encode_sq16_row`] the builder
-    /// writes with before being fitted and packed, so this reproduces the
-    /// exact bytes a drain would produce rather than a parallel encode path
-    /// that could drift from it.
-    pub fn build(vectors: &[f32], dim: usize, rot_seed: u64, with_residual: bool) -> Self {
+    /// Test-only. The serving path never has fp32 in hand — superfiles store
+    /// Sq16 and [`Self::from_sq16_plane`] is the real constructor — so this
+    /// exists to spare the unit tests a full drain.
+    ///
+    /// It is NOT a measurement entry point. An earlier revision exposed it to
+    /// benches under the `test-helpers` feature, and the 4-bit numbers that
+    /// came out described a construction path no table could be configured to
+    /// use. A codec comparison sets `vector.search_mode` in the config and
+    /// runs the engine normally; it does not reach in here.
+    #[cfg(test)]
+    fn build(vectors: &[f32], dim: usize, rot_seed: u64, with_residual: bool) -> Self {
         assert!(dim > 0, "dim must be non-zero");
         assert!(
             vectors.len().is_multiple_of(dim),
@@ -193,12 +200,12 @@ impl Sq4FlatIndex {
     }
 
     /// Stored rows.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the index holds no rows.
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
 
@@ -230,7 +237,7 @@ impl Sq4FlatIndex {
     /// The `node -> doc id` map is excluded deliberately: every index has to
     /// carry stable ids somewhere, so counting them here would make the
     /// codec's footprint incomparable to another index's plane.
-    pub fn resident_bytes(&self) -> usize {
+    pub(crate) fn resident_bytes(&self) -> usize {
         let (codes, residual, offset, step) = self.scorer.parts();
         codes.len()
             + residual.map_or(0, <[u8]>::len)
@@ -241,7 +248,11 @@ impl Sq4FlatIndex {
     /// plane count rather than read off the buffers. Equal to
     /// [`Self::resident_bytes`] while the rotation stays unpadded; a
     /// divergence is padding creeping back in.
-    pub fn minimum_bytes(&self) -> usize {
+    ///
+    /// Test-only: it exists to be compared against the real figure, not to be
+    /// reported instead of it.
+    #[cfg(test)]
+    fn minimum_bytes(&self) -> usize {
         let (_, residual, _, _) = self.scorer.parts();
         let planes = if residual.is_some() { 2 } else { 1 };
         let per_row = self.dim.div_ceil(COORDS_PER_BYTE) * planes;
@@ -383,7 +394,7 @@ impl Sq4FlatIndex {
     /// per-query setup and layout reuse across a batch, which is exactly
     /// the accounting that makes a published batch figure incomparable
     /// to a served one.
-    pub fn search(&self, query: &[f32], k: usize) -> Vec<(u32, f32)> {
+    pub(crate) fn search(&self, query: &[f32], k: usize) -> Vec<(u32, f32)> {
         assert_eq!(query.len(), self.dim, "query dimensionality mismatch");
         if k == 0 || self.len == 0 {
             return Vec::new();
