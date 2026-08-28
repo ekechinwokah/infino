@@ -676,6 +676,42 @@ mod tests {
         }
     }
 
+    /// A `k` far smaller than the corpus must return the same `k` nearest an
+    /// unbounded scan would, and in the same order.
+    ///
+    /// This is the path a real query takes and the one the other scan tests
+    /// miss: they ask for every row, so the per-task heaps never fill and the
+    /// EVICTION arms — in the blocked fold, in the trailing per-node fold, and
+    /// in the cross-task reduce — never run. An eviction that dropped the
+    /// wrong end would still return `k` plausible rows.
+    #[test]
+    fn bounded_top_k_matches_an_unbounded_scan() {
+        const K: usize = 5;
+        for &dim in TEST_DIMS {
+            // Deliberately not a whole number of blocks: the trailing rows
+            // take the per-node fold, so both eviction arms are exercised.
+            let rows = 7 * Sq4Scorer::row_block() + 11;
+            let vectors = planted(dim, rows, 0x5EA5_04A1);
+            let index = Sq4FlatIndex::build(&vectors, dim, TEST_ROT_SEED, true);
+            let query = planted(dim, 1, 0x7E57_0001);
+
+            let bounded = index.search(&query, K);
+            let full = index.search(&query, rows);
+            assert_eq!(bounded.len(), K, "dim {dim}: a bounded scan returns k");
+            // Compared on SCORES, not on `(node, score)` pairs: 4-bit codes
+            // are coarse enough to tie, and a tie at the k-th place is a free
+            // choice the heap and the full sort may make differently. The k
+            // smallest scores are the property either way.
+            let bounded_scores: Vec<f32> = bounded.iter().map(|&(_, s)| s).collect();
+            let full_scores: Vec<f32> = full[..K].iter().map(|&(_, s)| s).collect();
+            assert_eq!(
+                bounded_scores, full_scores,
+                "dim {dim}: the bounded heap kept a different k than the full \
+                 ranking's head"
+            );
+        }
+    }
+
     /// Malformed bytes decline rather than panicking or mis-slicing.
     #[test]
     fn decode_declines_malformed_input() {

@@ -71,7 +71,7 @@ use std::{
     future::Future,
     mem,
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc, Mutex, OnceLock, PoisonError,
         atomic::{self, AtomicU64},
     },
     time::Instant,
@@ -1644,42 +1644,6 @@ fn score_cell_fp32(
     true
 }
 
-/// Warn that `search_mode = hnsw_ivf` is set but this query fell through to the
-/// ivf scan, with the diagnosis the situation actually warrants:
-///   - `has_graph_ref = false`: the table carries no resident graph at all —
-///     pre-drain, or the corpus exceeds `hnsw_max_docs`.
-///   - `has_graph_ref = true`: a graph exists but not for THIS column (a
-///     second same-dim vector column carries it, or a dim/emptiness mismatch).
-///
-/// The `_id` results are still correct; only the fast path is off. Deduped
-/// per `(diagnosis, column)` so a miss on one column never suppresses the
-/// warning another column would legitimately raise.
-fn warn_hnsw_no_resident_graph(column: &str, has_graph_ref: bool) {
-    static WARNED: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashSet<(bool, String)>>,
-    > = std::sync::OnceLock::new();
-    let warned = WARNED.get_or_init(Default::default);
-    {
-        let mut set = warned.lock().expect("hnsw warn dedup set");
-        if !set.insert((has_graph_ref, column.to_string())) {
-            return;
-        }
-    }
-    if has_graph_ref {
-        tracing::warn!(
-            column,
-            "search_mode=hnsw_ivf but no resident graph for this column (another column \
-             carries the graph, or a dim/emptiness mismatch); serving via ivf scan"
-        );
-    } else {
-        tracing::warn!(
-            column,
-            "search_mode=hnsw_ivf but no resident graph (pre-drain or corpus > hnsw_max_docs); \
-             serving via ivf scan"
-        );
-    }
-}
-
 /// Assemble the persisted `hnsw` data bundle at drain time: walk
 /// every superfile's materialized Sq16 rows for `column`, pool the
 /// node-ordered code plane and the stable-doc-id map, build the HNSW over
@@ -1933,15 +1897,36 @@ impl<T> IndexOutcome<T> {
     ///
     /// One place decides how a decline is reported, so no path can decline
     /// quietly by forgetting to.
+    ///
+    /// Deduped on the rendered message: a serving decline is per QUERY, and a
+    /// table whose config asks for an index it will never have would otherwise
+    /// warn on every one. The set is keyed by the message rather than by the
+    /// variant so two columns declining for the same reason each get said once
+    /// — and it stays small because a serving decline's reasons carry only
+    /// column names and dimensions. (A build decline can carry a measured
+    /// recall, but that path runs once per drain, not per query.)
     pub(crate) fn or_warn(self, what: &str) -> Option<T> {
         match self {
             IndexOutcome::Ready(v) => Some(v),
             IndexOutcome::Unavailable(reason) => {
-                tracing::warn!("{what}: serving ivf — {reason}");
+                let message = format!("{what}: serving ivf — {reason}");
+                if warn_once(&message) {
+                    tracing::warn!("{message}");
+                }
                 None
             }
         }
     }
+}
+
+/// `true` the first time this exact message is offered, `false` after.
+fn warn_once(message: &str) -> bool {
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .expect("index decline warn-dedup set")
+        .insert(message.to_string())
 }
 
 /// Read every superfile's materialized Sq16 rows for `column` ONCE and return
@@ -2932,26 +2917,47 @@ impl SupertableReader {
         column: &str,
         query: &[f32],
         k: usize,
-    ) -> Result<Option<Vec<SuperfileHit>>, QueryError> {
+    ) -> Result<IndexOutcome<Vec<SuperfileHit>>, QueryError> {
         if k == 0 {
-            return Ok(Some(Vec::new()));
+            return Ok(IndexOutcome::Ready(Vec::new()));
         }
         let Some(sections) = self.resident_vector_index().await else {
-            return Ok(None);
+            return Ok(IndexOutcome::Unavailable(IndexUnavailable::NotHydrated));
         };
         // This arm serves the graph only. A generation that published a flat
         // index instead is not a failure — it is a different index, and the
         // flat arm reaches it — so fall through rather than treating the
         // absent graph as a missing one.
         let Some(data) = sections.data.as_ref().and_then(ResidentIndexKind::graph) else {
-            return Ok(None);
+            return Ok(IndexOutcome::Unavailable(IndexUnavailable::WrongKind {
+                wanted: "hnsw",
+            }));
         };
         // The persisted graph is built for exactly one column. A table can
         // carry several same-dim vector columns, so a dim match alone is not
         // enough — a query on a DIFFERENT column must fall back to ivf rather
         // than be answered from this column's neighbors.
-        if data.column != column || data.dim != query.len() || data.doc_ids.is_empty() {
-            return Ok(None);
+        //
+        // Three separate reasons, not one `||`: they call for different
+        // reactions (fix the query, fix the config, wait for a drain) and
+        // collapsing them left an operator with "no resident graph for this
+        // column" covering all three at once.
+        if data.column != column {
+            return Ok(IndexOutcome::Unavailable(
+                IndexUnavailable::ColumnMismatch {
+                    queried: column.to_string(),
+                    index: data.column.clone(),
+                },
+            ));
+        }
+        if data.dim != query.len() {
+            return Ok(IndexOutcome::Unavailable(IndexUnavailable::DimMismatch {
+                queried: query.len(),
+                index: data.dim,
+            }));
+        }
+        if data.doc_ids.is_empty() {
+            return Ok(IndexOutcome::Unavailable(IndexUnavailable::IndexEmpty));
         }
         // Over-fetch to absorb boundary replicas. When
         // `drain_replica_target_factor > 1`, a user row is replicated across
@@ -3036,7 +3042,7 @@ impl SupertableReader {
         )
         .await
         .map_err(|e| QueryError::Execute(e.to_string()))?;
-        Ok(Some(top_k_ascending(vec![hits], k)))
+        Ok(IndexOutcome::Ready(top_k_ascending(vec![hits], k)))
     }
 
     /// Hydrate (or reuse) the persisted `hnsw` graph sections for
@@ -3532,14 +3538,16 @@ impl SupertableReader {
         // exists (dim-matches, right column, non-empty); if the drain skipped
         // it because the corpus exceeds `hnsw_max_docs`, or the query targets
         // a different column, fall through to the ivf scan (the `_ivf` in the
-        // mode name).
-        if !filtered && hidden_vector_index && vcfg.search_mode == config::VectorSearchMode::HnswIvf
+        // mode name) — with the reason named, not inferred.
+        if !filtered
+            && hidden_vector_index
+            && vcfg.search_mode == config::VectorSearchMode::HnswIvf
+            && let Some(hits) = self
+                .hnsw_search(column, query, k)
+                .await?
+                .or_warn("hnsw search")
         {
-            if let Some(hits) = self.hnsw_search(column, query, k).await? {
-                return Ok(hits);
-            }
-            warn_hnsw_no_resident_graph(column, manifest.resident_vector_index_blob().is_some());
-            // fall through to the ivf scan below
+            return Ok(hits);
         }
         // Flat search mode (`vector.search_mode = flat`): scan the resident
         // 4-bit plane exhaustively. Same shape of gate as the graph arm above,
@@ -6224,6 +6232,7 @@ mod tests {
     };
 
     use arrow::array::Array;
+    use bytes::Bytes;
 
     use super::IndexOutcome;
 
@@ -6245,13 +6254,14 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate, VectorFilter,
-        VectorSearchOptions, admit_extension_round, admit_shortlist_window, apply_width_pin,
-        calibrated_query_for, cells_ranked_by_fine_score, free_column_slot,
-        free_columns_unambiguous, gate_fine_candidates_by_fragment, hidden_hits_user_ids,
-        id_score_projection_indices, is_hidden_vector_manifest, law_floor_serve_selection,
-        postings_by_cell_from_summaries, rerank_mult_from_law, score_fine_candidates,
-        select_global_shortlist, union_cell_selection, vector_read_query_error,
+        IndexUnavailable, RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN, ScanCandidate,
+        VectorFilter, VectorSearchOptions, admit_extension_round, admit_shortlist_window,
+        apply_width_pin, assemble_flat_sections, assemble_hnsw_sections, calibrated_query_for,
+        cells_ranked_by_fine_score, free_column_slot, free_columns_unambiguous,
+        gate_fine_candidates_by_fragment, hidden_hits_user_ids, id_score_projection_indices,
+        is_hidden_vector_manifest, law_floor_serve_selection, postings_by_cell_from_summaries,
+        rerank_mult_from_law, score_fine_candidates, select_global_shortlist, union_cell_selection,
+        vector_read_query_error,
     };
     use crate::{
         BoolMode, InfinoError,
@@ -6260,7 +6270,12 @@ mod tests {
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
             error::{ReadError, VectorError},
             fts::reader::Bm25Stats,
-            vector::{distance::Metric, rerank_codec::RerankCodec},
+            vector::{
+                distance::Metric,
+                flat::Sq4FlatIndex,
+                hnsw::{PayloadKind, encode_resident_envelope},
+                rerank_codec::RerankCodec,
+            },
         },
         supertable::{
             Supertable, SupertableOptions,
@@ -6269,9 +6284,10 @@ mod tests {
                 ClusterCentroids, ManifestSnapshot,
                 list::{CellRoutingParams, PartitionStrategy},
             },
+            slow_vector_state::{ResidentIndexKind, write_resident_index_blob},
             writer::{recalibrate_probe_laws, split_overflow_cell},
         },
-        test_helpers::default_tokenizer as tok,
+        test_helpers::{default_tokenizer as tok, distinct_unit_vectors},
     };
 
     /// Drive an async future to completion on a throwaway current-thread
@@ -9282,6 +9298,630 @@ mod tests {
         assert!(
             format!("{err}").contains("unknown vector column"),
             "expected an unknown-column error, got {err}"
+        );
+    }
+
+    // ---- Flat 4-bit index: build, publish, serve --------------------
+    //
+    // `search_mode` is read from the process-wide config, which a unit test
+    // cannot set, so these drive the flat path the same way the graph tests
+    // drive theirs: the drain's build step and the reader's serve arm are
+    // called directly on a drained table.
+
+    /// Rows in the flat-index fixtures. Enough that the register gate's
+    /// held-out queries rank against a real corpus, small enough that an
+    /// exhaustive scan per probe query stays cheap in a unit test.
+    const FLAT_FIXTURE_ROWS: usize = 512;
+    /// Dimension for the flat-index fixtures.
+    const FLAT_FIXTURE_DIM: usize = 32;
+    /// Seed for the fixture corpus, fixed so a failure reproduces.
+    const FLAT_FIXTURE_SEED: u64 = 0x51A7_1DEA;
+    /// The row whose own vector is replayed as the query. Any row works; a
+    /// fixed one keeps every run comparing the two arms on the same thing.
+    const FLAT_FIXTURE_PROBE_ROW: usize = 17;
+    /// Bytes per dimension the residual rung stores — the rate the shipped
+    /// `flat_plane: sq4_residual` default is chosen for.
+    const FLAT_RESIDUAL_BYTES_PER_DIM: usize = 1;
+    /// Bytes per `f32` ruler entry. The ruler is `O(dim)` (one offset and one
+    /// step per rotated coordinate), so it is subtracted out before the
+    /// per-row rate is compared against the codec's.
+    const FLAT_RULER_ENTRY_BYTES: usize = 4;
+    /// Bytes per dimension an Sq16 plane costs. Named to state what retaining
+    /// one alongside the nibble plane would do to the per-row rate.
+    const SQ16_BYTES_PER_DIM: usize = 2;
+
+    /// A corpus of [`distinct_unit_vectors`], returned alongside the vectors
+    /// themselves so a caller can replay one row as a query.
+    ///
+    /// Deliberately not [`build_vector_batch`]'s one-hot rows: the flat
+    /// index's register gate grades its scan against an exhaustive Sq16 one,
+    /// and one-hot rows put a block of exact ties at the head of every
+    /// ground-truth list, so the tie count rather than the codec would decide
+    /// whether an index is registered at all.
+    fn build_distinct_vector_batch(
+        n: usize,
+        dim: usize,
+        seed: u64,
+        schema: Arc<Schema>,
+    ) -> (RecordBatch, Vec<f32>) {
+        let vectors = distinct_unit_vectors(n, dim, seed);
+        let titles = LargeStringArray::from((0..n).map(|i| format!("doc {i}")).collect::<Vec<_>>());
+        let values = Float32Array::from(vectors.clone());
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+            Arc::new(values) as Arc<dyn Array>,
+            None,
+        )
+        .expect("FSL");
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(titles), Arc::new(fsl)]).expect("batch");
+        (batch, vectors)
+    }
+
+    /// A drained Sq16 table over [`build_distinct_vector_batch`], the temp dir
+    /// backing it, and the probe row's own vector as a query.
+    fn drained_flat_fixture() -> (Supertable, TempDir, Vec<f32>) {
+        let schema = schema_with_vector(FLAT_FIXTURE_DIM);
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(options_one_col_sq16(FLAT_FIXTURE_DIM).with_storage(storage))
+            .expect("create");
+        let (batch, vectors) = build_distinct_vector_batch(
+            FLAT_FIXTURE_ROWS,
+            FLAT_FIXTURE_DIM,
+            FLAT_FIXTURE_SEED,
+            schema,
+        );
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("drain");
+        let lo = FLAT_FIXTURE_PROBE_ROW * FLAT_FIXTURE_DIM;
+        (st, dir, vectors[lo..lo + FLAT_FIXTURE_DIM].to_vec())
+    }
+
+    /// The hidden (drained) index table behind a user table.
+    fn hidden_index_of(st: &Supertable) -> Arc<Supertable> {
+        st.reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden index")
+            .clone()
+    }
+
+    /// The stable `_id` the INDEPENDENT ivf arm ranks first for `query`.
+    ///
+    /// The oracle for the flat arm's answer. Ids are generator-assigned, so
+    /// asserting on a computed id would be asserting on ingest timing; asking
+    /// the other arm the same question is both id-agnostic and a stronger
+    /// claim — two paths that share no scoring code agree on the row.
+    fn ivf_top_id(st: &Supertable, query: &[f32]) -> i128 {
+        let batches = st
+            .vector_search(
+                "emb",
+                query,
+                1,
+                VectorSearchOptions::new(),
+                None,
+                Some(&["_id"]),
+            )
+            .expect("ivf vector_search");
+        let batch = batches.first().expect("the ivf arm must return a batch");
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("_id is Decimal128")
+            .value(0)
+    }
+
+    /// Unwrap a build outcome, reporting the decline reason on failure —
+    /// which is the whole point of carrying one.
+    fn expect_ready<T>(outcome: IndexOutcome<T>, what: &str) -> T {
+        match outcome {
+            IndexOutcome::Ready(value) => value,
+            IndexOutcome::Unavailable(reason) => panic!("{what} must be available: {reason}"),
+        }
+    }
+
+    /// The flat index assembles off the drained cells, clears its register
+    /// floor, and the plane it publishes is the nibble plane and nothing else.
+    ///
+    /// The residency assertion is the load-bearing one: this index exists to
+    /// hold 1 byte/dim where every other rerank codec holds 2, and retaining
+    /// the Sq16 codes it was fitted from would leave the ranking assertions
+    /// green while doubling the footprint the index was chosen for.
+    #[test]
+    fn flat_index_assembles_off_the_drained_cells() {
+        let (st, _dir, query) = drained_flat_fixture();
+        let hidden = hidden_index_of(&st);
+        let reader = hidden.reader().expect("hidden reader");
+        let bundle = expect_ready(
+            block_on(assemble_flat_sections(reader.manifest(), "emb", &None)).expect("assemble ok"),
+            "a drained Sq16 corpus",
+        );
+        let index = Sq4FlatIndex::decode(&Bytes::from(bundle)).expect("decode the published plane");
+
+        assert_eq!(index.len(), FLAT_FIXTURE_ROWS, "one node per drained row");
+        assert!(!index.is_empty());
+        assert_eq!(index.dim(), FLAT_FIXTURE_DIM);
+        assert_eq!(
+            index.column(),
+            "emb",
+            "the plane names the column it serves"
+        );
+        assert!(
+            index.has_residual(),
+            "the shipped `flat_plane` default is the residual rung"
+        );
+        let ruler = FLAT_FIXTURE_DIM * 2 * FLAT_RULER_ENTRY_BYTES;
+        let per_row = (index.resident_bytes() - ruler) / FLAT_FIXTURE_ROWS;
+        assert_eq!(
+            per_row,
+            FLAT_FIXTURE_DIM * FLAT_RESIDUAL_BYTES_PER_DIM,
+            "residency must be the nibble planes alone — retaining the Sq16 plane \
+             these codes were fitted from would show as {} bytes/row",
+            FLAT_FIXTURE_DIM * (FLAT_RESIDUAL_BYTES_PER_DIM + SQ16_BYTES_PER_DIM)
+        );
+
+        // The scan answers the query the ivf arm answers, through a node map
+        // built by a different pass over the same cells.
+        let top = index.search(&query, 1);
+        let node = top.first().expect("an exhaustive scan returns a nearest").0;
+        assert_eq!(
+            index.doc_id(node),
+            Some(ivf_top_id(&st, &query)),
+            "the flat scan and the ivf arm must agree on the nearest row"
+        );
+    }
+
+    /// Every build decline names its reason rather than vanishing as a bare
+    /// `None`. A table configured for one index quietly serving another is
+    /// invisible from the outside — the only symptom is numbers that look
+    /// like the mode you did not ask for.
+    #[test]
+    fn flat_build_declines_name_their_reason() {
+        let (st, _dir, _query) = drained_flat_fixture();
+        let hidden = hidden_index_of(&st);
+        let reader = hidden.reader().expect("hidden reader");
+
+        match block_on(assemble_flat_sections(reader.manifest(), "nope", &None)).expect("ok") {
+            IndexOutcome::Unavailable(IndexUnavailable::NoSuchColumn { queried, declared }) => {
+                assert_eq!(queried, "nope");
+                assert!(
+                    declared.iter().any(|c| c == "emb"),
+                    "the reason must name what IS declared, got {declared:?}"
+                );
+            }
+            other => panic!("expected NoSuchColumn, got {}", describe(other)),
+        }
+
+        // A column stored under another rerank codec has no Sq16 plane to be
+        // re-quantized from, so there is nothing to fit. Declined before any
+        // row is read, hence no drain here.
+        let fp32_dir = TempDir::new().expect("tempdir");
+        let fp32_storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(fp32_dir.path()).expect("storage"));
+        let fp32 = Supertable::create(
+            options_one_superfile_per_commit(FLAT_FIXTURE_DIM).with_storage(fp32_storage),
+        )
+        .expect("create fp32 table");
+        let fp32_reader = fp32.reader().expect("reader");
+        match block_on(assemble_flat_sections(fp32_reader.manifest(), "emb", &None)).expect("ok") {
+            IndexOutcome::Unavailable(IndexUnavailable::CodecUnsupported { column, codec }) => {
+                assert_eq!(column, "emb");
+                assert_eq!(codec, RerankCodec::Fp32.name());
+            }
+            other => panic!("expected CodecUnsupported, got {}", describe(other)),
+        }
+
+        // An Sq16 table with nothing drained into it yet.
+        let empty_dir = TempDir::new().expect("tempdir");
+        let empty_storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(empty_dir.path()).expect("storage"));
+        let empty =
+            Supertable::create(options_one_col_sq16(FLAT_FIXTURE_DIM).with_storage(empty_storage))
+                .expect("create empty table");
+        let empty_reader = empty.reader().expect("reader");
+        match block_on(assemble_flat_sections(
+            empty_reader.manifest(),
+            "emb",
+            &None,
+        ))
+        .expect("ok")
+        {
+            IndexOutcome::Unavailable(IndexUnavailable::NoRows { column }) => {
+                assert_eq!(column, "emb");
+            }
+            other => panic!("expected NoRows, got {}", describe(other)),
+        }
+    }
+
+    /// Render a build outcome for a failure message.
+    fn describe<T>(outcome: IndexOutcome<T>) -> String {
+        match outcome {
+            IndexOutcome::Ready(_) => "Ready".to_string(),
+            IndexOutcome::Unavailable(reason) => reason.to_string(),
+        }
+    }
+
+    /// Publish a flat index for the hidden table's current generation and
+    /// stamp it, exactly as the drain's membership commit does — the blob
+    /// through the resident envelope, the ref onto the manifest.
+    fn publish_flat_index(hidden: &Arc<Supertable>) {
+        let reader = hidden.reader().expect("hidden reader");
+        let manifest = reader.manifest();
+        let bundle = expect_ready(
+            block_on(assemble_flat_sections(manifest, "emb", &None)).expect("assemble ok"),
+            "a drained Sq16 corpus",
+        );
+        let storage = manifest
+            .options
+            .storage
+            .clone()
+            .expect("the fixture attaches storage");
+        let high_water = manifest
+            .get_all_superfiles()
+            .iter()
+            .map(|e| e.id_max)
+            .max()
+            .unwrap_or(0);
+        let blob = encode_resident_envelope(0, high_water, &[], Some((PayloadKind::Flat, &bundle)));
+        let reference =
+            block_on(write_resident_index_blob(storage.as_ref(), blob)).expect("publish the blob");
+        let stamped = manifest.with_slow_vector_state_graphs(Some(reference));
+        drop(reader);
+        hidden.inner().manifest.store(Arc::new(stamped));
+    }
+
+    /// The serve arm answers from the hydrated plane, on the ivf arm's score
+    /// scale, and every refusal to serve names itself.
+    ///
+    /// The score scale matters because the two arms merge on raw score: the
+    /// scan ranks on `-dot` internally, and leaking that would rank a drained
+    /// non-match above an exact match and surface a negative public distance.
+    #[test]
+    fn flat_search_serves_the_resident_plane_and_names_its_declines() {
+        let (st, _dir, query) = drained_flat_fixture();
+        let hidden = hidden_index_of(&st);
+
+        // Nothing published yet: both arms say so rather than erroring.
+        let bare = hidden.reader().expect("hidden reader");
+        assert!(
+            matches!(
+                block_on(bare.flat_search("emb", &query, 5)).expect("flat search"),
+                IndexOutcome::Unavailable(IndexUnavailable::NotHydrated)
+            ),
+            "an unpublished generation must decline as NotHydrated"
+        );
+        assert!(
+            matches!(
+                block_on(bare.hnsw_search("emb", &query, 5)).expect("hnsw search"),
+                IndexOutcome::Unavailable(IndexUnavailable::NotHydrated)
+            ),
+            "the graph arm must decline an unpublished generation the same way"
+        );
+        drop(bare);
+
+        publish_flat_index(&hidden);
+        let served = hidden.reader().expect("hidden reader after publish");
+        let hits = expect_ready(
+            block_on(served.flat_search("emb", &query, 5)).expect("flat search"),
+            "the published flat index",
+        );
+        assert_eq!(hits.len(), 5, "an exhaustive scan fills k");
+        assert_eq!(
+            hits[0].stable_id,
+            Some(ivf_top_id(&st, &query)),
+            "the served flat hit must be the row the ivf arm ranks first"
+        );
+        assert!(
+            hits[0].score >= 0.0,
+            "cosine distance is non-negative; a negative score means the scan's \
+             internal -dot leaked into the public scale: {}",
+            hits[0].score
+        );
+        assert!(
+            hits[0].score < 0.05,
+            "a row queried with its own vector is distance ~0, got {}",
+            hits[0].score
+        );
+        assert!(
+            hits.windows(2).all(|w| w[0].score <= w[1].score),
+            "hits must be ascending by distance"
+        );
+
+        assert!(
+            matches!(
+                block_on(served.flat_search("emb", &query, 0)).expect("k=0"),
+                IndexOutcome::Ready(ref hits) if hits.is_empty()
+            ),
+            "k=0 is an empty answer, not a decline"
+        );
+        // A same-dim sibling column must not be answered from this column's
+        // rows: a dim match alone is not identity.
+        match block_on(served.flat_search("sibling", &query, 5)).expect("column mismatch") {
+            IndexOutcome::Unavailable(IndexUnavailable::ColumnMismatch { queried, index }) => {
+                assert_eq!(queried, "sibling");
+                assert_eq!(index, "emb");
+            }
+            other => panic!("expected ColumnMismatch, got {}", describe(other)),
+        }
+        match block_on(served.flat_search("emb", &query[..FLAT_FIXTURE_DIM - 1], 5))
+            .expect("dim mismatch")
+        {
+            IndexOutcome::Unavailable(IndexUnavailable::DimMismatch { queried, index }) => {
+                assert_eq!(queried, FLAT_FIXTURE_DIM - 1);
+                assert_eq!(index, FLAT_FIXTURE_DIM);
+            }
+            other => panic!("expected DimMismatch, got {}", describe(other)),
+        }
+        // The mirror of `flat_search_declines_a_generation_that_published_a
+        // _graph`: neither arm may answer from the other's index.
+        match block_on(served.hnsw_search("emb", &query, 5)).expect("hnsw search") {
+            IndexOutcome::Unavailable(IndexUnavailable::WrongKind { wanted }) => {
+                assert_eq!(wanted, "hnsw");
+            }
+            other => panic!("expected WrongKind, got {}", describe(other)),
+        }
+    }
+
+    /// Dimension for the graph fixtures — the shape the other graph-assembly
+    /// tests in this module already register at.
+    const GRAPH_FIXTURE_DIM: usize = 16;
+    /// Rows for the graph fixtures.
+    const GRAPH_FIXTURE_ROWS: usize = 256;
+
+    /// A drained Sq16 table with a GRAPH published and stamped, plus a query
+    /// on one of its planted directions.
+    ///
+    /// One-hot rows here, unlike the flat fixtures: this corpus only has to
+    /// assemble into a registered graph, which it does at this shape (the
+    /// other graph tests in this module rely on the same), and the assertions
+    /// are about which arm answers rather than about recall.
+    fn drained_graph_fixture() -> (Supertable, TempDir, Arc<Supertable>, Vec<f32>) {
+        let schema = schema_with_vector(GRAPH_FIXTURE_DIM);
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(options_one_col_sq16(GRAPH_FIXTURE_DIM).with_storage(storage))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(
+            0,
+            GRAPH_FIXTURE_ROWS,
+            GRAPH_FIXTURE_DIM,
+            schema,
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let hidden = hidden_index_of(&st);
+        let reader = hidden.reader().expect("hidden reader");
+        let manifest = reader.manifest();
+        let graph = expect_ready(
+            block_on(assemble_hnsw_sections(manifest, "emb", &None)).expect("assemble ok"),
+            "a drained Sq16 corpus",
+        );
+        let storage = manifest.options.storage.clone().expect("storage");
+        let blob = encode_resident_envelope(0, 0, &[], Some((PayloadKind::Graph, &graph)));
+        let reference =
+            block_on(write_resident_index_blob(storage.as_ref(), blob)).expect("publish");
+        let stamped = manifest.with_slow_vector_state_graphs(Some(reference));
+        drop(reader);
+        hidden.inner().manifest.store(Arc::new(stamped));
+
+        let mut query = vec![0.0f32; GRAPH_FIXTURE_DIM];
+        query[0] = 1.0;
+        (st, dir, hidden, query)
+    }
+
+    /// A generation that published a GRAPH is a different index, not a broken
+    /// one: the flat arm declines and the query serves ivf. Without the
+    /// envelope's kind tag this is where a reader would try to slice a graph
+    /// bundle as a nibble plane.
+    #[test]
+    fn flat_search_declines_a_generation_that_published_a_graph() {
+        let (_st, _dir, hidden, query) = drained_graph_fixture();
+        let served = hidden.reader().expect("hidden reader after publish");
+        let resident = block_on(served.resident_vector_index()).expect("the ref must hydrate");
+        assert!(
+            resident
+                .data
+                .as_ref()
+                .and_then(ResidentIndexKind::graph)
+                .is_some(),
+            "the fixture must publish a decodable graph for the flat arm to decline"
+        );
+        assert!(
+            resident
+                .data
+                .as_ref()
+                .and_then(ResidentIndexKind::flat)
+                .is_none(),
+            "one generation carries one index, not both"
+        );
+        match block_on(served.flat_search("emb", &query, 5)).expect("flat search") {
+            IndexOutcome::Unavailable(IndexUnavailable::WrongKind { wanted }) => {
+                assert_eq!(wanted, "flat");
+            }
+            other => panic!("expected WrongKind, got {}", describe(other)),
+        }
+    }
+
+    /// The graph arm serves its own generation, and every refusal names
+    /// itself — the same contract the flat arm holds to.
+    ///
+    /// The three that used to share one `return` are the point: a wrong
+    /// column, a wrong dimensionality and an empty index call for different
+    /// reactions (fix the query, fix the config, wait for a drain), and one
+    /// message covering all three left an operator guessing which it was.
+    #[test]
+    fn hnsw_search_serves_the_graph_and_names_its_declines() {
+        let (_st, _dir, hidden, query) = drained_graph_fixture();
+        let served = hidden.reader().expect("hidden reader after publish");
+
+        let hits = expect_ready(
+            block_on(served.hnsw_search("emb", &query, 5)).expect("hnsw search"),
+            "the published graph",
+        );
+        assert!(!hits.is_empty(), "the graph must answer its own generation");
+        assert!(
+            hits[0].score >= 0.0,
+            "cosine distance is non-negative; a negative score means the walk's \
+             internal -dot leaked into the public scale: {}",
+            hits[0].score
+        );
+        assert!(
+            hits.windows(2).all(|w| w[0].score <= w[1].score),
+            "hits must be ascending by distance"
+        );
+
+        assert!(
+            matches!(
+                block_on(served.hnsw_search("emb", &query, 0)).expect("k=0"),
+                IndexOutcome::Ready(ref hits) if hits.is_empty()
+            ),
+            "k=0 is an empty answer, not a decline"
+        );
+        match block_on(served.hnsw_search("sibling", &query, 5)).expect("column mismatch") {
+            IndexOutcome::Unavailable(IndexUnavailable::ColumnMismatch { queried, index }) => {
+                assert_eq!(queried, "sibling");
+                assert_eq!(index, "emb");
+            }
+            other => panic!("expected ColumnMismatch, got {}", describe(other)),
+        }
+        match block_on(served.hnsw_search("emb", &query[..GRAPH_FIXTURE_DIM - 1], 5))
+            .expect("dim mismatch")
+        {
+            IndexOutcome::Unavailable(IndexUnavailable::DimMismatch { queried, index }) => {
+                assert_eq!(queried, GRAPH_FIXTURE_DIM - 1);
+                assert_eq!(index, GRAPH_FIXTURE_DIM);
+            }
+            other => panic!("expected DimMismatch, got {}", describe(other)),
+        }
+    }
+
+    /// Every decline reason renders, and `or_warn` is the one place a decline
+    /// turns into a fallback.
+    ///
+    /// A reason that formatted as a bare discriminant would leave an operator
+    /// with "serving ivf" and no way to tell a too-large corpus from a
+    /// misconfigured column, so each message names the value that decided it.
+    #[test]
+    fn every_index_decline_reason_renders_its_cause() {
+        let reasons = [
+            (
+                IndexUnavailable::NoSuchColumn {
+                    queried: "emb".into(),
+                    declared: vec!["other".into()],
+                },
+                vec!["emb", "other"],
+            ),
+            (
+                IndexUnavailable::CodecUnsupported {
+                    column: "emb".into(),
+                    codec: "fp32",
+                },
+                vec!["emb", "fp32"],
+            ),
+            (
+                IndexUnavailable::NoRows {
+                    column: "emb".into(),
+                },
+                vec!["emb"],
+            ),
+            (
+                IndexUnavailable::OverDocCeiling {
+                    rows: 2_000_000,
+                    ceiling: 1_000_000,
+                    knob: "vector.flat_max_docs",
+                },
+                vec!["2000000", "1000000", "vector.flat_max_docs"],
+            ),
+            (
+                IndexUnavailable::BelowRegisterFloor {
+                    recall: 0.9371,
+                    floor: 0.98,
+                },
+                vec!["0.9371", "0.9800"],
+            ),
+            (
+                IndexUnavailable::GatherEmpty {
+                    column: "emb".into(),
+                    pre_count: 7,
+                },
+                vec!["emb", "7"],
+            ),
+            (
+                IndexUnavailable::PlaneRowMismatch {
+                    doc_ids: 9,
+                    decoded: 8,
+                },
+                vec!["9", "8"],
+            ),
+            (IndexUnavailable::NotHydrated, vec!["resident"]),
+            (IndexUnavailable::WrongKind { wanted: "flat" }, vec!["flat"]),
+            (
+                IndexUnavailable::ColumnMismatch {
+                    queried: "emb".into(),
+                    index: "other".into(),
+                },
+                vec!["emb", "other"],
+            ),
+            (
+                IndexUnavailable::DimMismatch {
+                    queried: 16,
+                    index: 32,
+                },
+                vec!["16", "32"],
+            ),
+            (IndexUnavailable::IndexEmpty, vec!["no rows"]),
+            (
+                IndexUnavailable::NotPureAppend {
+                    prior: 10,
+                    delta: 3,
+                    current: 14,
+                },
+                vec!["10", "3", "14"],
+            ),
+            (IndexUnavailable::NoNewRows, vec!["high water"]),
+            (
+                IndexUnavailable::PlaneNotResident { codec: "sq4" },
+                vec!["sq4"],
+            ),
+        ];
+        for (reason, wanted) in reasons {
+            let rendered = reason.to_string();
+            for needle in wanted {
+                assert!(
+                    rendered.contains(needle),
+                    "a decline must name what decided it — `{needle}` missing from `{rendered}`"
+                );
+            }
+            // The two shapes the engine actually declines in: a build (bytes)
+            // and a serve (hits).
+            assert!(
+                IndexOutcome::<Vec<u8>>::Unavailable(reason)
+                    .or_warn("test")
+                    .is_none(),
+                "a decline yields no value"
+            );
+        }
+        let hits: Vec<SuperfileHit> = Vec::new();
+        assert!(
+            IndexOutcome::Ready(hits).or_warn("test").is_some(),
+            "a ready outcome yields its value"
+        );
+        assert!(
+            IndexOutcome::<Vec<SuperfileHit>>::Unavailable(IndexUnavailable::NotHydrated)
+                .or_warn("test")
+                .is_none()
         );
     }
 

@@ -9580,6 +9580,7 @@ mod tests {
         },
         test_helpers::{
             build_title_batch, default_supertable_options, default_tokenizer as tok,
+            distinct_unit_vectors,
             fault_storage::{FaultKind, FaultOp, FaultStorage},
         },
     };
@@ -9665,6 +9666,122 @@ mod tests {
         assert!(
             nearest(&prior, 1) < 0.05,
             "full-build graph must serve a batch-1 row"
+        );
+    }
+
+    /// Rows in the flat drain-build fixture — enough that the register gate's
+    /// held-out queries rank against a real corpus.
+    const FLAT_DRAIN_ROWS: usize = 512;
+    /// Dimension for the flat drain-build fixture.
+    const FLAT_DRAIN_DIM: usize = 32;
+    /// Seed for the fixture corpus, fixed so a failure reproduces.
+    const FLAT_DRAIN_SEED: u64 = 0x51A7_1DEA;
+    /// Separation the probe row must win its own query by, on the scan's
+    /// `-dot` scale. Random unit directions at this dimension sit well below
+    /// it, so a smaller margin would mean the scan found the wrong row.
+    const FLAT_DRAIN_MIN_MARGIN: f32 = 0.2;
+
+    /// A batch of [`distinct_unit_vectors`], returned alongside the vectors
+    /// themselves so one row can be replayed as a query.
+    ///
+    /// Not [`build_axis_vector_batch_range`]: the flat index's register gate
+    /// grades its scan against an exhaustive Sq16 one, and one-hot rows put a
+    /// block of exact ties at the head of every ground-truth list.
+    fn build_distinct_vector_batch(n: usize, dim: usize, seed: u64) -> (RecordBatch, Vec<f32>) {
+        let vectors = distinct_unit_vectors(n, dim, seed);
+        let titles =
+            LargeStringArray::from((0..n).map(|i| format!("doc {i} beta")).collect::<Vec<_>>());
+        let values = Arc::new(Float32Array::from(vectors.clone()));
+        let list = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+            values,
+            None,
+        )
+        .expect("fixed-size list");
+        let batch = RecordBatch::try_new(
+            schema_id_title_emb(dim),
+            vec![Arc::new(titles), Arc::new(list)],
+        )
+        .expect("vector batch");
+        (batch, vectors)
+    }
+
+    /// End-to-end coverage of the opt-in `flat` drain-build path, the peer of
+    /// [`hnsw_drain_full_build_serves_its_rows`]. Drives the caller-gated
+    /// build step on the drained cells (`build_flat_index_ref` → the register
+    /// gate → `publish_resident_index` with [`PayloadKind::Flat`]), hydrates
+    /// the published blob back, and asserts it SERVES: a query replaying a
+    /// corpus row finds that row and wins by a margin.
+    ///
+    /// Behavioral, not build-and-forget. A build that published a plane whose
+    /// node→id map was misaligned, or an envelope whose kind tag said graph,
+    /// would still produce bytes and a plausible top-k.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flat_drain_build_publishes_an_index_that_serves() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let table = Supertable::create(
+            options_title_emb_sq16(FLAT_DRAIN_DIM)
+                .with_storage(Arc::clone(&storage))
+                .with_drain_batch_superfiles(1),
+        )
+        .expect("create");
+        let (batch, vectors) =
+            build_distinct_vector_batch(FLAT_DRAIN_ROWS, FLAT_DRAIN_DIM, FLAT_DRAIN_SEED);
+        {
+            let mut writer = table.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        let (hidden, _epoch) = current_drain_epoch(&table).await;
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("drain");
+
+        let reader = hidden.reader().expect("hidden reader");
+        let reference = build_flat_index_ref(storage.as_ref(), reader.manifest())
+            .await
+            .expect("a drained Sq16 corpus must register a flat index");
+        let index = slow_vector_state::hydrate_resident_index(
+            storage.as_ref(),
+            &reference,
+            slow_vector_state::WalkPlaneRequest::AsStored,
+        )
+        .await
+        .expect("fetch the published index")
+        .data
+        .and_then(|kind| match kind {
+            slow_vector_state::ResidentIndexKind::Flat(f) => Some(f),
+            slow_vector_state::ResidentIndexKind::Graph(_) => None,
+        })
+        .expect("the envelope must state Flat, and the payload decode as one");
+
+        assert_eq!(
+            index.len(),
+            FLAT_DRAIN_ROWS,
+            "the plane holds one node per drained row"
+        );
+        assert_eq!(index.dim(), FLAT_DRAIN_DIM);
+        assert_eq!(index.column(), "emb");
+
+        let probe = &vectors[..FLAT_DRAIN_DIM];
+        let top = index.search(probe, 2);
+        assert_eq!(top.len(), 2, "an exhaustive scan fills k");
+        assert!(
+            index.doc_id(top[0].0).is_some(),
+            "the nearest node must resolve to a stable id"
+        );
+        assert!(
+            top[0].1 + FLAT_DRAIN_MIN_MARGIN < top[1].1,
+            "a row queried with its own vector must win by a clear margin, \
+             got {} against runner-up {}",
+            top[0].1,
+            top[1].1
         );
     }
 
