@@ -470,7 +470,7 @@ pub enum DrainConsolidate {
 /// nothing but navigation quality. The flat scan has no beam and no Sq16 plane,
 /// so its choice sets both the resident footprint and the returned order. An
 /// earlier revision keyed the scan off `hnsw_plane`, which meant selecting
-/// `search_mode = flat` silently got whatever the graph's knob happened to say.
+/// `search_mode = flat_ivf` silently got whatever the graph's knob happened to say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VectorFlatPlane {
@@ -543,17 +543,20 @@ pub enum VectorSearchMode {
     /// or a different column) always serves `ivf`. Search walks the graph at
     /// the `k`-scaled `ef` law.
     HnswIvf,
-    /// OPT-IN (`flat`): scan a resident 4-bit plane exhaustively and return
-    /// the codes' own ranking. No grid, no cells, no graph — and no resident
-    /// Sq16 plane, which is the point: 0.5 bytes/dim bare or 1.0 with the
-    /// residual leg, against 2.0 for every other mode.
+    /// OPT-IN (`flat_ivf`): scan a resident 4-bit plane exhaustively and
+    /// return the codes' own ranking. No grid, no cells, no graph — and no
+    /// resident Sq16 plane, which is the point: 0.5 bytes/dim bare or 1.0 with
+    /// the residual leg, against 2.0 for every other mode.
     ///
     /// Per-query work is linear in the corpus, so this is the embedded-scale
     /// trade: lowest resident footprint at a declared recall, bounded by
     /// `flat_max_docs`. Above that ceiling — or pre-drain, or on a filtered
     /// query, or for a column the plane was not built for — queries serve
-    /// `ivf`, exactly as they do when a graph is absent.
-    Flat,
+    /// `ivf`, exactly as they do when a graph is absent. The `_ivf` suffix
+    /// names that fallback, as it does for [`Self::HnswIvf`]: a mode is
+    /// spelled as the chain it actually serves, so nothing about where a query
+    /// lands is hidden in the name.
+    FlatIvf,
 }
 
 /// Cluster router for `search_mode = ivf`: how a query selects which cells or
@@ -718,12 +721,12 @@ pub struct VectorSettings {
     /// is built and `hnsw` queries fall back to the scan path. The
     /// centroid graph itself is built at any scale.
     pub hnsw_max_docs: u64,
-    /// For `search_mode = flat`: which 4-bit construction the scan ranks on.
+    /// For `search_mode = flat_ivf`: which 4-bit construction the scan ranks on.
     /// Sets both the resident footprint and the returned order, since a flat
     /// scan keeps no Sq16 plane to re-rank against. Ignored under any other
     /// search mode.
     pub flat_plane: VectorFlatPlane,
-    /// For `search_mode = flat`: scale ceiling for the resident 4-bit plane.
+    /// For `search_mode = flat_ivf`: scale ceiling for the resident 4-bit plane.
     /// Built at drain and persisted only when the table's doc count ≤ this;
     /// above it queries fall back to `ivf`.
     ///
@@ -1209,6 +1212,26 @@ impl Config {
                     "{name} must be in [0.0, 1.0], got {floor}"
                 )));
             }
+            // Warn, not reject: a floor above `target_recall` is a legal thing
+            // to want (hold the resident index to a higher bar than the ivf
+            // laws). It is warned because it is also what an unnoticed
+            // MIGRATION looks like. The floors used to be derived as
+            // `target_recall - hnsw_recall_slack`; a config that lowered
+            // `target_recall` and never set the slack key carries nothing
+            // retired, so the load succeeds and the floor silently snaps from
+            // (say) 0.94 to the 0.98 default — after which an index that
+            // calibrates at 0.96 de-registers at the next drain and the table
+            // quietly serves ivf. Said once at load, where both numbers are in
+            // hand, rather than at the drain that acts on it.
+            if floor > v.target_recall {
+                tracing::warn!(
+                    "{name} = {floor} is above vector.target_recall = {}: an index that \
+                     clears the target will still de-register, and the table will serve \
+                     ivf. If you lowered target_recall and expected the floor to follow, \
+                     set {name} explicitly — it is no longer derived from target_recall.",
+                    v.target_recall
+                );
+            }
         }
         // An explicit base degree far above `ef_construction` is pure sentinel
         // padding: a build discovers at most ~`ef_construction` neighbors per
@@ -1324,6 +1347,34 @@ mod tests {
             assert!(
                 message.contains("hnsw_sq8_walk") && message.contains("hnsw_plane"),
                 "the error must name both the retired key and its replacement: {message}"
+            );
+        }
+        // Every entry in the table, not just the first: the generic scan covers
+        // both today, but a refactor of `reject_retired_keys` could break
+        // detection for an untested key with the suite green — handing an
+        // operator's `hnsw_recall_slack: 0.02` a silent 0.98 floor, which is
+        // the exact drift the retirement mechanism exists to prevent.
+        for (retired, replacement) in RETIRED_CONFIG_KEYS {
+            let key = retired
+                .strip_prefix("vector.")
+                .expect("every retired key is under `vector.` today");
+            let fig =
+                Figment::new()
+                    .merge(Yaml::string(EMBEDDED_DEFAULT))
+                    .merge(Serialized::defaults(serde_json::json!({
+                        "vector": { key: 0.02 }
+                    })));
+            let err = Config::from_figment(fig).expect_err("a retired key must fail the load");
+            let ConfigError::Invalid(message) = &err else {
+                panic!("expected a validation error for `{retired}`, got {err:?}");
+            };
+            let named = replacement
+                .split_whitespace()
+                .next()
+                .expect("a replacement names a key");
+            assert!(
+                message.contains(retired) && message.contains(named),
+                "the error must name both `{retired}` and `{named}`: {message}"
             );
         }
         // The shipped default must not itself trip the check.

@@ -2526,6 +2526,15 @@ impl PayloadKind {
             _ => None,
         }
     }
+
+    /// The kind's name for a log line, so a message about a published or
+    /// hydrated section says which index it was.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            PayloadKind::Graph => "hnsw",
+            PayloadKind::Flat => "flat",
+        }
+    }
 }
 
 fn put_opt_section(out: &mut Vec<u8>, section: Option<(PayloadKind, &[u8])>) {
@@ -4427,6 +4436,60 @@ mod tests {
 
         assert!(decode_resident_envelope(&Bytes::from_static(b"bad"), true).is_none());
         assert!(resident_envelope_header(b"short").is_none());
+    }
+
+    /// The kind tag round-trips for BOTH kinds, and an unknown one declines
+    /// the section without taking the envelope down with it.
+    ///
+    /// The compat story was asserted only for `Graph`, which is the arm that
+    /// cannot regress: `1` is what the presence byte has always meant. `Flat`
+    /// is the arm a future edit to `put_opt_section` or the decode cursor
+    /// would break, and it would break silently — every flat table falls back
+    /// to ivf and every test stays green, because nothing else pins it.
+    #[test]
+    fn envelope_kind_tag_round_trips_and_declines_the_unknown() {
+        let centroid = vec![7u8; 40];
+        let data = vec![3u8; 128];
+        for kind in [PayloadKind::Graph, PayloadKind::Flat] {
+            for mmap_backed in [true, false] {
+                let blob = encode_resident_envelope(11, 22, &centroid, Some((kind, &data)));
+                let got = decode_resident_envelope(&Bytes::from(blob), mmap_backed)
+                    .expect("decode a tagged envelope");
+                let (got_kind, bytes) = got.data_bundle.as_ref().expect("payload present");
+                assert_eq!(*got_kind, kind, "the tag must survive the round trip");
+                assert_eq!(&bytes[..], &data[..]);
+                assert_eq!(got.centroid_graph, centroid);
+            }
+        }
+
+        // A payload written by a NEWER build. The section is declined and the
+        // centroid graph — which this reader still understands — survives. The
+        // cursor must consume the payload's length prefix and body even though
+        // the kind is unknown, or everything after it mis-slices.
+        let mut blob =
+            encode_resident_envelope(11, 22, &centroid, Some((PayloadKind::Flat, &data)));
+        // Header (magic + population key + high water), then the centroid
+        // section's own u64 length prefix, then its bytes, then the kind tag.
+        let tag_at = GRAPH_BUNDLE_HEADER_BYTES + size_of::<u64>() + centroid.len();
+        assert_eq!(
+            blob[tag_at],
+            PayloadKind::Flat as u8,
+            "the tag sits directly after the centroid section"
+        );
+        for unknown in [3u8, 9, u8::MAX] {
+            blob[tag_at] = unknown;
+            let got = decode_resident_envelope(&Bytes::from(blob.clone()), true)
+                .expect("an unknown kind must decline the SECTION, not the envelope");
+            assert!(
+                got.data_bundle.is_none(),
+                "tag {unknown} is not a kind this build can serve"
+            );
+            assert_eq!(
+                got.centroid_graph, centroid,
+                "the centroid graph must survive a payload this reader cannot decode"
+            );
+            assert_eq!((got.population_key, got.high_water_id), (11, 22));
+        }
     }
 
     /// Empty and singleton graphs don't panic and answer sanely.

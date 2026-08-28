@@ -4693,7 +4693,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // a kind here does not widen the manifest.
         let index_mode = crate::config::global().vector.search_mode;
         let building_graph = index_mode == crate::config::VectorSearchMode::HnswIvf;
-        let building_flat = index_mode == crate::config::VectorSearchMode::Flat;
+        let building_flat = index_mode == crate::config::VectorSearchMode::FlatIvf;
         // Warm the DISK CACHE with the just-drained cell bytes — already
         // resident in `pending_cache_inserts` — BEFORE the build, so the graph's
         // full re-read of these same cells is served from the local cache
@@ -8217,7 +8217,13 @@ fn resident_index_population_key(manifest: &ManifestSnapshot) -> u64 {
     h
 }
 
-/// Encode + PUT a data bundle as a graph section, logging the outcome.
+/// Encode + PUT a data bundle as the generation's resident index section,
+/// logging the outcome under the kind actually published.
+///
+/// The kind is in the message because this function serves both index types:
+/// a flat publish logging as a graph publish is the same class of confusion
+/// the reasoned declines exist to remove — the log saying the mode you did not
+/// ask for.
 async fn publish_resident_index(
     storage: &dyn StorageProvider,
     population_key: u64,
@@ -8232,13 +8238,14 @@ async fn publish_resident_index(
         Some((kind, data_bundle)),
     );
     let blob_mib = blob.len() / (1024 * 1024);
+    let label = kind.label();
     match slow_vector_state::write_resident_index_blob(storage, blob).await {
         Ok(reference) => {
-            tracing::debug!(uri = %reference.uri, blob_mib, "hnsw: published graph section");
+            tracing::debug!(uri = %reference.uri, blob_mib, "{label}: published resident index");
             Some(reference)
         }
         Err(error) => {
-            tracing::warn!("hnsw: publish failed: {error}");
+            tracing::warn!("{label}: publish failed: {error}");
             None
         }
     }

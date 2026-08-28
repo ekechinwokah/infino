@@ -643,12 +643,42 @@ mod tests {
         }
     }
 
+    /// The index holds the scorer, the id map and its two descriptors — and
+    /// no fourth buffer.
+    ///
+    /// [`Sq4FlatIndex::resident_bytes`] reports what the SCORER exposes
+    /// through `parts()`, so it is blind by construction to anything owned
+    /// beside the scorer — and "retain the Sq16 plane to refine with" is
+    /// exactly a buffer owned beside the scorer. That regression would keep
+    /// [`residency_is_the_nibble_plane_only`] green while residency
+    /// quadrupled.
+    ///
+    /// A retained buffer has to be reachable from the struct, and an owning
+    /// handle to one (`Vec`, `Bytes`, `Box<[u8]>`, `Plane`) costs inline
+    /// bytes. So pinning the struct's own width closes the hole that the
+    /// byte-rate assertion cannot see: adding a field fails here, and the
+    /// failure names the reason.
+    #[test]
+    fn the_index_owns_nothing_beside_the_scorer_and_the_id_map() {
+        assert_eq!(
+            size_of::<Sq4FlatIndex>(),
+            size_of::<Sq4Scorer>()
+                + size_of::<Vec<i128>>()
+                + size_of::<String>()
+                + 2 * size_of::<usize>(),
+            "Sq4FlatIndex has gained a field. If it owns a buffer, \
+             `resident_bytes` does not count it and the residency assertions \
+             are measuring the wrong thing — this index exists to hold the \
+             nibble plane and nothing else."
+        );
+    }
+
     /// The resident footprint must be the nibble plane and its ruler, and
     /// nothing else — in particular no Sq16 plane.
     ///
-    /// This is the index's entire reason for existing, and it is the kind of
-    /// property that regresses silently: retaining the Sq16 codes to refine
-    /// with would leave every test above green while quadrupling residency.
+    /// This is the index's entire reason for existing. Paired with
+    /// [`the_index_owns_nothing_beside_the_scorer_and_the_id_map`], which
+    /// covers the buffer this one cannot see.
     #[test]
     fn residency_is_the_nibble_plane_only() {
         let dim = 1536;

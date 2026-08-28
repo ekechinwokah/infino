@@ -1775,6 +1775,8 @@ pub(crate) enum IndexUnavailable {
     },
     /// The column stores a rerank codec the index cannot be fitted from.
     CodecUnsupported { column: String, codec: &'static str },
+    /// The column's metric is not the one these scorers rank under.
+    MetricUnsupported { column: String, metric: Metric },
     /// No rows materialized for the column.
     NoRows { column: String },
     /// The corpus is past the index's document ceiling.
@@ -1822,6 +1824,11 @@ impl std::fmt::Display for IndexUnavailable {
                 f,
                 "column `{column}` stores rerank codec {codec}, which this index \
                  cannot be fitted from"
+            ),
+            IndexUnavailable::MetricUnsupported { column, metric } => write!(
+                f,
+                "column `{column}` uses metric {metric:?}; the resident scorers rank \
+                 by inner product, which orders neighbours correctly only under Cosine"
             ),
             IndexUnavailable::NoRows { column } => {
                 write!(f, "no rows materialized for column `{column}`")
@@ -1917,6 +1924,56 @@ impl<T> IndexOutcome<T> {
             }
         }
     }
+}
+
+/// Nodes a resident index must fetch to return `k` DISTINCT rows.
+///
+/// When `drain_replica_target_factor > 1` a user row is replicated across
+/// hidden cells and occupies several nodes carrying the SAME `stable_id`;
+/// `top_k_ascending` collapses them by id, so a plain top-`k` fetch would
+/// return fewer than `k` distinct rows on a delete-free table. The ivf arm
+/// over-fetches by the same factor.
+///
+/// Shared by both resident arms because both are built from the same gathered
+/// rows and so carry the same replication. The graph arm had it and the flat
+/// arm did not, which is the kind of divergence that only shows up as "a
+/// query asked for 10 and got 8".
+///
+/// Caveat: this reads the CURRENT config, but replica duplication is a
+/// build-time property baked into the persisted index. Lowering
+/// `drain_replica_target_factor` below the value the resident index was built
+/// at under-counts its replicas and can re-open an under-`k` window until the
+/// next full rebuild restamps it.
+fn replica_fetch_width(k: usize) -> usize {
+    let factor = config::global().vector.drain_replica_target_factor.max(1.0);
+    ((k as f32) * factor).ceil() as usize
+}
+
+/// Decline unless `column`'s metric is one the resident scorers rank under.
+///
+/// Both resident index types score `−dot` and both map the result onto the
+/// `1 − dot` cosine scale. That ordering is the column's own ordering only
+/// under [`Metric::Cosine`]: under `L2Sq` it is a different ranking entirely
+/// (`‖a−b‖² = ‖a‖² + ‖b‖² − 2a·b` agrees with `−dot` only when the norms are
+/// equal), and under `NegDot` the order is right but the published score
+/// carries a meaningless `+1`.
+///
+/// The register gate cannot catch this on its own: `probe_recall` grades a
+/// `−dot` scan against a `−dot` exhaustive scan, so a mis-metriced index
+/// measures perfect recall against a ground truth that is wrong the same way,
+/// clears its floor, registers, and serves wrong neighbours at the right
+/// latency. The centroid-graph router gates on `Cosine` for the same reason.
+fn metric_supported(manifest: &ManifestSnapshot, column: &str) -> Option<IndexUnavailable> {
+    let metric = manifest
+        .options
+        .vector_columns
+        .iter()
+        .find(|vc| vc.column == column)
+        .map(|vc| vc.metric)?;
+    (!matches!(metric, Metric::Cosine)).then(|| IndexUnavailable::MetricUnsupported {
+        column: column.to_string(),
+        metric,
+    })
 }
 
 /// `true` the first time this exact message is offered, `false` after.
@@ -2023,7 +2080,7 @@ async fn gather_sq16_rows(
 }
 
 /// Build and encode the flat 4-bit index for `column` — the drain path for
-/// `search_mode = flat`.
+/// `search_mode = flat_ivf`.
 ///
 /// `Ok(None)` means "do not register one", and every reason is a legitimate
 /// fall-through to `ivf` rather than an error: the column is absent or not
@@ -2066,6 +2123,9 @@ pub(crate) async fn assemble_flat_sections(
                 codec: vc.rerank_codec.name(),
             },
         ));
+    }
+    if let Some(reason) = metric_supported(manifest, column) {
+        return Ok(IndexOutcome::Unavailable(reason));
     }
     let dim = vc.dim;
     let vcfg = &config::global().vector;
@@ -2173,6 +2233,9 @@ pub(crate) async fn assemble_hnsw_sections(
                 codec: vc.rerank_codec.name(),
             },
         ));
+    }
+    if let Some(reason) = metric_supported(manifest, column) {
+        return Ok(IndexOutcome::Unavailable(reason));
     }
     let dim = vc.dim;
     let stride = dim * 2;
@@ -2829,11 +2892,15 @@ impl SupertableReader {
     ///
     /// Peer of [`Self::hnsw_search`]. It has no beam, no `ef`, and no refine
     /// width: the scan visits every row and the codes' own ranking IS the
-    /// answer. That is also why there is no over-fetch for boundary replicas —
-    /// a replicated row appears once per hidden cell in the graph's node
-    /// space, but this index is built from the same gathered rows and
-    /// `top_k_ascending` collapses duplicate stable ids either way, so the
-    /// fetch width is `k`.
+    /// answer.
+    ///
+    /// It does over-fetch for boundary replicas, exactly as the graph arm
+    /// does, and for the same reason. This index is built from the same
+    /// gathered rows, so under `drain_replica_target_factor > 1` one user row
+    /// occupies several NODES carrying one `stable_id`; `top_k_ascending`
+    /// then collapses them, and a scan of width `k` would return fewer than
+    /// `k` distinct rows. The collapse is why the width has to grow, not a
+    /// reason it can stay at `k`.
     async fn flat_search(
         &self,
         column: &str,
@@ -2875,8 +2942,19 @@ impl SupertableReader {
             return Ok(IndexOutcome::Unavailable(IndexUnavailable::IndexEmpty));
         }
         let manifest = self.manifest();
+        // Also checked at build, so a plane published by this binary can never
+        // reach here on a non-cosine column. Re-checked because a plane
+        // published by an EARLIER binary can, and it would rank by inner
+        // product under a metric that does not agree with it.
+        if let Some(reason) = metric_supported(manifest, column) {
+            return Ok(IndexOutcome::Unavailable(reason));
+        }
         let sections_for_scan = Arc::clone(&sections);
         let query_owned = query.to_vec();
+        // Over-fetch to absorb boundary replicas, matching the graph arm's
+        // `k_fetch`. See this method's doc comment: the id-collapse in
+        // `top_k_ascending` is what makes the widening necessary.
+        let k_fetch = replica_fetch_width(k);
         // The scan is a pure CPU wave over the whole resident plane: it belongs
         // on the reader pool, not inline on a tokio worker, which would block
         // that worker's I/O for the scan's full duration.
@@ -2890,7 +2968,7 @@ impl SupertableReader {
                     .and_then(ResidentIndexKind::flat)
                     .expect("flat index present: checked before dispatch");
                 index
-                    .search(&query_owned, k)
+                    .search(&query_owned, k_fetch)
                     .into_iter()
                     .filter_map(|(node, dist)| {
                         // Shift the scan's `−dot` onto the ivf arm's `1 − dot`
@@ -2959,20 +3037,13 @@ impl SupertableReader {
         if data.doc_ids.is_empty() {
             return Ok(IndexOutcome::Unavailable(IndexUnavailable::IndexEmpty));
         }
-        // Over-fetch to absorb boundary replicas. When
-        // `drain_replica_target_factor > 1`, a user row is replicated across
-        // hidden cells and appears as several graph nodes with the SAME stable
-        // id; `top_k_ascending` collapses them by id, so a plain top-`k` walk
-        // would return fewer than `k` distinct rows on a delete-free table. The
-        // ivf arm over-fetches by the same factor (`k_fetch = k + overhead`).
-        //
-        // Caveat: this reads the CURRENT config, but replica duplication is a
-        // build-time property baked into the persisted graph. Lowering
-        // `drain_replica_target_factor` below the value the resident graph was
-        // built at under-counts its replicas and can re-open an under-`k`
-        // window until the next full rebuild restamps the graph.
-        let replica_factor = config::global().vector.drain_replica_target_factor.max(1.0);
-        let k_fetch = ((k as f32) * replica_factor).ceil() as usize;
+        // A graph published before the build-side metric gate existed can still
+        // be resident, and it ranks by inner product regardless of what the
+        // column's metric says.
+        if let Some(reason) = metric_supported(self.manifest(), column) {
+            return Ok(IndexOutcome::Unavailable(reason));
+        }
+        let k_fetch = replica_fetch_width(k);
         // The calibrated per-`k` beam from the stamped k→ef curve drives the
         // walk, never below the (over-)fetch width. Indexed by the ACTUAL
         // requested `k` (not the replica-inflated `k_fetch`), so a large `k`
@@ -3549,7 +3620,7 @@ impl SupertableReader {
         {
             return Ok(hits);
         }
-        // Flat search mode (`vector.search_mode = flat`): scan the resident
+        // Flat search mode (`vector.search_mode = flat_ivf`): scan the resident
         // 4-bit plane exhaustively. Same shape of gate as the graph arm above,
         // and for the same reasons — the hidden (drained) arm only, unfiltered
         // only, and only when a valid index for THIS column is resident. The
@@ -3557,7 +3628,7 @@ impl SupertableReader {
         // register floor, and either way the query serves ivf.
         if !filtered
             && hidden_vector_index
-            && vcfg.search_mode == config::VectorSearchMode::Flat
+            && vcfg.search_mode == config::VectorSearchMode::FlatIvf
             && let Some(hits) = self
                 .flat_search(column, query, k)
                 .await?
@@ -9190,6 +9261,10 @@ mod tests {
     /// Single vector column (`emb`), Sq16 rerank codec — so the drain builds
     /// and persists the resident per-row graph the hnsw serving path walks.
     fn options_one_col_sq16(dim: usize) -> SupertableOptions {
+        options_one_col_sq16_metric(dim, Metric::Cosine)
+    }
+
+    fn options_one_col_sq16_metric(dim: usize, metric: Metric) -> SupertableOptions {
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(1)
@@ -9206,7 +9281,7 @@ mod tests {
                 column: "emb".into(),
                 dim,
                 rot_seed: 7,
-                metric: Metric::Cosine,
+                metric,
                 rerank_codec: RerankCodec::Sq16,
                 provided_centroids: None,
             }],
@@ -9518,6 +9593,46 @@ mod tests {
             other => panic!("expected CodecUnsupported, got {}", describe(other)),
         }
 
+        // A non-cosine column. Both resident index types rank by `-dot`, which
+        // is the column's own ordering only under Cosine — and the register
+        // gate cannot catch it, because `probe_recall` grades a `-dot` scan
+        // against a `-dot` exhaustive scan and so measures a mis-metriced
+        // index as perfect. Declined at build, for BOTH arms.
+        for metric in [Metric::L2Sq, Metric::NegDot] {
+            let metric_dir = TempDir::new().expect("tempdir");
+            let metric_storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(metric_dir.path()).expect("storage"));
+            let table = Supertable::create(
+                options_one_col_sq16_metric(FLAT_FIXTURE_DIM, metric).with_storage(metric_storage),
+            )
+            .expect("create non-cosine table");
+            let reader = table.reader().expect("reader");
+            for (arm, outcome) in [
+                (
+                    "flat",
+                    block_on(assemble_flat_sections(reader.manifest(), "emb", &None)),
+                ),
+                (
+                    "hnsw",
+                    block_on(assemble_hnsw_sections(reader.manifest(), "emb", &None)),
+                ),
+            ] {
+                match outcome.expect("ok") {
+                    IndexOutcome::Unavailable(IndexUnavailable::MetricUnsupported {
+                        column,
+                        metric: named,
+                    }) => {
+                        assert_eq!(column, "emb");
+                        assert_eq!(named, metric);
+                    }
+                    other => panic!(
+                        "the {arm} arm must decline {metric:?} as MetricUnsupported, got {}",
+                        describe(other)
+                    ),
+                }
+            }
+        }
+
         // An Sq16 table with nothing drained into it yet.
         let empty_dir = TempDir::new().expect("tempdir");
         let empty_storage: Arc<dyn StorageProvider> =
@@ -9537,6 +9652,23 @@ mod tests {
                 assert_eq!(column, "emb");
             }
             other => panic!("expected NoRows, got {}", describe(other)),
+        }
+    }
+
+    /// The fetch width both resident arms use. Identity at the shipped
+    /// `drain_replica_target_factor: 1.0`; the widened case is what a
+    /// replicating table needs so `top_k_ascending`'s id-collapse cannot
+    /// return fewer than `k` distinct rows.
+    ///
+    /// The factor is process-global config, so the widened behaviour is not
+    /// reachable from a test — same seam as `search_mode`. What is pinned here
+    /// is that the width is a shared function of `k` rather than two arms each
+    /// deciding for themselves, which is how the flat arm came to use a bare
+    /// `k` while the graph arm widened.
+    #[test]
+    fn replica_fetch_width_is_identity_at_the_shipped_factor() {
+        for k in [1usize, 10, 100] {
+            assert_eq!(super::replica_fetch_width(k), k);
         }
     }
 

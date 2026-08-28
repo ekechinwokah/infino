@@ -188,6 +188,17 @@ vector:
   #                          different column) serves `ivf` AUTOMATICALLY, so
   #                          correctness never depends on the graph. Best for
   #                          single-box, latency-tier, RAM-provisioned tables.
+  #   flat_ivf             — OPT-IN: scan a resident 4-bit plane exhaustively
+  #                          and return the codes' own ranking. No grid, no
+  #                          cells, no graph, and no resident Sq16 plane —
+  #                          0.5 bytes/dim bare or 1.0 with the residual leg,
+  #                          against 2.0 for every other mode. Per-query work
+  #                          is linear in the corpus, so it is bounded by
+  #                          flat_max_docs; past that ceiling (and pre-drain,
+  #                          filtered, or another column) it serves `ivf`, which
+  #                          is what the `_ivf` suffix names. Cosine columns
+  #                          only. Best for embedded tables sized by resident
+  #                          memory rather than by QPS.
   search_mode: ivf
 
   # For search_mode = ivf: the cluster router.
@@ -290,7 +301,7 @@ vector:
   # rows of Sq16 codes is the practical single-host resident ceiling.
   hnsw_max_docs: 10000000
 
-  # For search_mode = flat: scale ceiling for the resident 4-bit plane. Built
+  # For search_mode = flat_ivf: scale ceiling for the resident 4-bit plane. Built
   # at drain and persisted only when the table's doc count is at or below
   # this; above it queries fall back to ivf.
   #
@@ -299,7 +310,7 @@ vector:
   # linear in the corpus (~1.5 ms measured at 100K x 1536), so 1M lands near
   # 15 ms and 10M near 150 ms. One million is where a linear scan is still
   # competitive with a routed read.
-  # For search_mode = flat: which 4-bit construction the scan ranks on.
+  # For search_mode = flat_ivf: which 4-bit construction the scan ranks on.
   # sq4          = 0.5 bytes/dim, the smallest resident footprint of any mode;
   #                measured recall@10 ~0.93 on dbpedia-1536 at 100K, so it does
   #                NOT clear a 0.99 target_recall and such a table serves ivf.
