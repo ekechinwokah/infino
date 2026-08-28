@@ -77,13 +77,16 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use datafusion::prelude::Expr;
 use futures::{
     future::try_join_all,
-    stream::{self, StreamExt},
+    stream::{self, FuturesUnordered, StreamExt},
 };
 use object_store::{MultipartUpload, PutPayload, UploadPart};
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
-use tokio::time::sleep;
+use tokio::{
+    sync::mpsc::{Receiver, Sender, channel},
+    time::sleep,
+};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -1919,23 +1922,117 @@ impl SupertableWriter {
                 .first()
                 .map(|vc| vc.metric)
                 .unwrap_or(Metric::L2Sq);
-            let (outputs, cell_hints) = commit_shards_via_drain(
-                buffer,
-                &self.inner,
-                &pack_grid,
-                metric,
-                packed_cell_shard_count(&self.inner.options),
-                &self.op_stats,
-            )?;
-            let build_elapsed = commit_t0.elapsed();
-            let output_bytes: usize = outputs.iter().map(|output| output.bytes.len()).sum();
-            let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
-            let prepare_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
-            let data_put_bytes: usize = user_batch
-                .pending_storage_writes
-                .iter()
-                .map(|(_, bytes)| bytes.len())
-                .sum();
+            // Pipelined publish on storage-backed tables: shards stream
+            // to the uploader as each finishes packing, so the commit
+            // pays ~max(pack, PUT) instead of pack + PUT. The manifest
+            // CAS below still runs strictly after every byte is durable —
+            // the durability boundary is unmoved. The in-memory path
+            // keeps the collected build: there is no upload to overlap.
+            let piped_storage = self.inner.options.storage.as_ref().cloned();
+            let (
+                user_batch,
+                build_elapsed,
+                upload_drain_elapsed,
+                prepare_elapsed,
+                output_bytes,
+                data_put_bytes,
+            ) = if let Some(storage) = piped_storage {
+                let (tx, rx) =
+                    channel::<(u32, PreparedSuperfile)>(commit_write_concurrency().get());
+                let runtime = self.inner.query_runtime();
+                let uploader = runtime.spawn(upload_prepared_shards(
+                    storage,
+                    self.inner.options.put_multipart_threshold_bytes,
+                    rx,
+                ));
+                let built = commit_shards_via_drain(
+                    buffer,
+                    &self.inner,
+                    &pack_grid,
+                    metric,
+                    packed_cell_shard_count(&self.inner.options),
+                    &self.op_stats,
+                    Some(&tx),
+                );
+                // Stamped where the pack ends, not after the join below:
+                // every shard has been handed off by now, so this is the
+                // pack's own cost. Charging the join to it would bury the
+                // upload time that did NOT fit under the pack inside the
+                // build number — which is the one number that would show
+                // this change failing to overlap anything.
+                let build_elapsed = commit_t0.elapsed();
+                // Close the channel even on a build error so the
+                // uploader terminates; join it BEFORE surfacing the
+                // build result so no upload outlives this commit.
+                drop(tx);
+                let uploaded = bridge_on_runtime(
+                    async move {
+                        uploader.await.map_err(|join| {
+                            BuildError::Store(format!("pipelined uploader: {join}"))
+                        })?
+                    },
+                    &runtime,
+                );
+                // The upload tail: PUTs still in flight when the last
+                // shard finished packing. Zero here means the network kept
+                // up with the pack entirely.
+                let upload_drain_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
+                let (outputs, _hints) = built?;
+                // A real error, not a `debug_assert`: on the piped path
+                // every shard leaves through the channel, so a collected
+                // shard here is one the uploader never saw. Releasing it
+                // would publish a manifest entry whose bytes were never
+                // PUT, so the commit must fail instead.
+                if !outputs.is_empty() {
+                    return Err(BuildError::Store(
+                        "pipelined drain-commit returned collected shards".into(),
+                    ));
+                }
+                let (prepared, uploaded_bytes) = uploaded?;
+                let user_batch = collect_prepared_superfiles(&self.inner, prepared)?;
+                let prepare_elapsed = commit_t0
+                    .elapsed()
+                    .saturating_sub(build_elapsed)
+                    .saturating_sub(upload_drain_elapsed);
+                let bytes = uploaded_bytes as usize;
+                (
+                    user_batch,
+                    build_elapsed,
+                    upload_drain_elapsed,
+                    prepare_elapsed,
+                    bytes,
+                    bytes,
+                )
+            } else {
+                let (outputs, cell_hints) = commit_shards_via_drain(
+                    buffer,
+                    &self.inner,
+                    &pack_grid,
+                    metric,
+                    packed_cell_shard_count(&self.inner.options),
+                    &self.op_stats,
+                    None,
+                )?;
+                let build_elapsed = commit_t0.elapsed();
+                let output_bytes: usize = outputs.iter().map(|output| output.bytes.len()).sum();
+                let user_batch = prepare_user_superfile_batch(&self.inner, outputs, cell_hints)?;
+                let prepare_elapsed = commit_t0.elapsed().saturating_sub(build_elapsed);
+                let data_put_bytes: usize = user_batch
+                    .pending_storage_writes
+                    .iter()
+                    .map(|(_, bytes)| bytes.len())
+                    .sum();
+                (
+                    user_batch,
+                    build_elapsed,
+                    // The unpiped path uploads in the publish wave, so it
+                    // has no tail to drain here.
+                    time::Duration::ZERO,
+                    prepare_elapsed,
+                    output_bytes,
+                    data_put_bytes,
+                )
+            };
             // Computed before the batch moves into the publish future;
             // flushed only after Ok below, so a failed or retried commit
             // never counts.
@@ -1956,10 +2053,11 @@ impl SupertableWriter {
             }
             if crate::storage::io_counters::timeline_enabled() {
                 info!(
-                    "[supertable commit] build {:.1}ms ({:.1} MiB output) + prepare {:.1}ms + \
-                     publish {:.1}ms ({:.1} MiB data PUT)",
+                    "[supertable commit] build {:.1}ms ({:.1} MiB output) + upload drain \
+                     {:.1}ms + prepare {:.1}ms + publish {:.1}ms ({:.1} MiB data PUT)",
                     build_elapsed.as_secs_f64() * 1e3,
                     output_bytes as f64 / (1u64 << 20) as f64,
+                    upload_drain_elapsed.as_secs_f64() * 1e3,
                     prepare_elapsed.as_secs_f64() * 1e3,
                     publish_t0.elapsed().as_secs_f64() * 1e3,
                     data_put_bytes as f64 / (1u64 << 20) as f64,
@@ -4141,7 +4239,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             }
                         },
                     ))
-                    .buffered(commit_write_concurrency())
+                    .buffered(commit_write_concurrency().get())
                     .collect::<Vec<_>>()
                     .await
                     .into_iter()
@@ -4513,7 +4611,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         .map_err(|error| BuildError::Store(error.to_string()))
                 }
             });
-        let mut uploads = stream::iter(put_futures).buffer_unordered(commit_write_concurrency());
+        let mut uploads =
+            stream::iter(put_futures).buffer_unordered(commit_write_concurrency().get());
         while let Some(uploaded) = uploads.next().await {
             let uri = uploaded?;
             let entry = entry_by_uri.get(&uri).cloned().ok_or_else(|| {
@@ -5721,6 +5820,95 @@ fn build_prepared_from_spilled_cells(
 /// Rows are resharded by centroid distance instead of arrival time; drain
 /// never writes superfiles or touches S3 here — the writer publishes through
 /// the normal batch path.
+/// Streaming handoff for the pipelined commit publish: each pool task
+/// sends its shard the moment prepare finishes, so the uploader has the
+/// storage bytes in flight while the remaining shards are still packing.
+///
+/// Bounded, and sent to with `blocking_send` from the pack's pool threads:
+/// an unbounded queue would let a fast pack outrun a slow object store and
+/// hold every sealed shard at once, which is the peak memory the pipeline
+/// exists to avoid. At this depth the bytes in memory are what the uploader
+/// has in flight plus one queued shard per upload slot.
+type PipelinedShardTx = Sender<(u32, PreparedSuperfile)>;
+
+/// Drain `rx`, PUTting each shard's storage bytes as it arrives, at most
+/// [`commit_write_concurrency`] uploads in flight. Returns the prepared
+/// shards in shard-id order (manifest entry order must not depend on
+/// upload completion order) with their storage bytes taken, plus the
+/// uploaded byte total.
+///
+/// The manifest CAS runs strictly after this completes, so the
+/// durability boundary is unmoved. A failure after some PUTs leaves
+/// orphans that gc reaps past its reclaim grace — the same recovery as a
+/// crash between the batch upload wave and the CAS on the unpiped path.
+async fn upload_prepared_shards(
+    storage: Arc<dyn StorageProvider>,
+    multipart_threshold: u64,
+    mut rx: Receiver<(u32, PreparedSuperfile)>,
+) -> Result<(Vec<PreparedSuperfile>, u64), BuildError> {
+    let cap = commit_write_concurrency().get();
+    let mut in_flight = FuturesUnordered::new();
+    let mut done: Vec<(u32, PreparedSuperfile)> = Vec::new();
+    let mut uploaded_bytes: u64 = 0;
+    let mut open = true;
+    // The first upload error, held until every PUT already started has
+    // settled. Returning at the first failure would drop the other futures
+    // mid-request: a cancelled multipart leaves its uploaded parts behind
+    // with no abort, and those parts are not an orphaned superfile that gc
+    // reclaims. Draining also keeps receiving, so a packing thread parked on
+    // a full queue is never left there.
+    let mut failure: Option<BuildError> = None;
+    while open || !in_flight.is_empty() {
+        tokio::select! {
+            received = rx.recv(), if open && in_flight.len() < cap => match received {
+                Some((shard_id, mut prepared)) => {
+                    if failure.is_some() {
+                        // The commit is already lost; take the shard off the
+                        // queue and drop it rather than starting a PUT whose
+                        // bytes nothing will reference.
+                        continue;
+                    }
+                    let Some((uri, bytes)) = prepared.bytes_for_storage.take() else {
+                        // Unreachable as written: `prepare_superfile` fills
+                        // `bytes_for_storage` whenever the table has storage,
+                        // and this path runs only when it does. Fail closed
+                        // regardless — accepting the shard would hand
+                        // `collect_prepared_superfiles` an entry to publish
+                        // for an object nothing ever PUT, which is the same
+                        // hazard the collected-shards guard above refuses.
+                        failure.get_or_insert_with(|| {
+                            BuildError::Store(format!(
+                                "pipelined shard {shard_id} carries no storage bytes"
+                            ))
+                        });
+                        continue;
+                    };
+                    uploaded_bytes += bytes.len() as u64;
+                    let storage = Arc::clone(&storage);
+                    in_flight.push(async move {
+                        put_new_superfile_bytes(&storage, multipart_threshold, uri, bytes)
+                            .await
+                            .map(|()| (shard_id, prepared))
+                            .map_err(|error| BuildError::Store(error.to_string()))
+                    });
+                }
+                None => open = false,
+            },
+            Some(finished) = in_flight.next(), if !in_flight.is_empty() => match finished {
+                Ok(shard) => done.push(shard),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    done.sort_by_key(|(shard_id, _)| *shard_id);
+    Ok((done.into_iter().map(|(_, p)| p).collect(), uploaded_bytes))
+}
+
 fn commit_shards_via_drain(
     buffer: &[BufferedBatch],
     inner: &SupertableInner,
@@ -5728,6 +5916,7 @@ fn commit_shards_via_drain(
     metric: Metric,
     n_packed_shards: usize,
     op_stats: &Option<Arc<OpStatsCollector>>,
+    pipeline: Option<&PipelinedShardTx>,
 ) -> Result<(Vec<ShardOutput>, Vec<Option<u32>>), BuildError> {
     let stage_t0 = time::Instant::now();
     let vc = inner
@@ -5824,17 +6013,51 @@ fn commit_shards_via_drain(
         &inner.options.writer_pool,
         op_stats,
         &packed_shards,
-        |task| {
+        |task| -> Result<Option<(u32, ShardOutput)>, BuildError> {
             let (shard_id, cells) = task;
-            build_one_packed_shard_via_drain(
+            let output = build_one_packed_shard_via_drain(
                 cells,
                 &source_scalar,
                 &vector_views,
                 &local_by_id,
                 options,
                 &vc,
-            )
-            .map(|output| output.map(|output| (*shard_id, output)))
+            )?;
+            let Some(tx) = pipeline else {
+                return Ok(output.map(|output| (*shard_id, output)));
+            };
+            // Pipelined publish: prepare on this pool thread and hand the
+            // shard to the uploader NOW, so its storage bytes go out while
+            // the remaining shards are still packing — sealed bytes never
+            // accumulate across the fan-out.
+            let Some(output) = output else {
+                return Ok(None);
+            };
+            let Some(prepared) = prepare_superfile(inner, output)? else {
+                return Ok(None);
+            };
+            let PreparedSuperfile {
+                entry,
+                bytes_for_store,
+                bytes_for_storage,
+                bytes_for_cache,
+            } = prepared;
+            let entry = finish_superfile_entry(entry, Some(*shard_id))?;
+            // `blocking_send`, not `send`: this runs on a rayon pool thread
+            // (the fan-out is a `pool.install`), never a tokio worker, so
+            // parking here parks the pack — which is the backpressure. The
+            // uploader is a separate runtime task and keeps draining.
+            tx.blocking_send((
+                *shard_id,
+                PreparedSuperfile {
+                    entry,
+                    bytes_for_store,
+                    bytes_for_storage,
+                    bytes_for_cache,
+                },
+            ))
+            .map_err(|_| BuildError::Store("pipelined commit uploader closed mid-build".into()))?;
+            Ok(None)
         },
     )?;
     let fanout_elapsed = stage_t0
@@ -5904,6 +6127,7 @@ pub(in crate::supertable) fn build_packed_update_superfile(
         metric,
         UPDATE_PACKED_SHARDS,
         op_stats,
+        None,
     )?;
     let output = outputs.pop().ok_or(BuildError::NoDocsToBuild)?;
     if !outputs.is_empty() || output.n_docs != expected_rows {
@@ -6834,7 +7058,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
                 .map_err(|error| BuildError::Store(error.to_string()))
         }
     });
-    let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency());
+    let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency().get());
     while let Some(upload) = in_flight.next().await {
         if let Err(error) = upload {
             drop(in_flight);
@@ -7322,7 +7546,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
                 .map_err(|error| BuildError::Store(error.to_string()))
         }
     });
-    let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency());
+    let mut in_flight = stream::iter(uploads).buffer_unordered(commit_write_concurrency().get());
     while let Some(landed) = in_flight.next().await {
         if let Err(error) = landed {
             drop(in_flight);
@@ -8775,11 +8999,14 @@ async fn put_superfile_replace(
 /// maintenance compaction each fan out their PUTs at this width, so keeping
 /// each at ~50% of cores bounds the combined in-flight PUTs to roughly the
 /// core count rather than a multiple of it.
-fn commit_write_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get() / 2)
-        .unwrap_or(1)
-        .max(1)
+///
+/// Returns `NonZeroUsize` because several callers are unsound at zero — a
+/// zero-capacity `channel` panics, and a zero-width `buffered` stalls — and
+/// a single-core host divides to zero before the floor applies. Carrying the
+/// floor in the type means no caller has to restate it.
+fn commit_write_concurrency() -> NonZeroUsize {
+    let half = available_parallelism().map(|n| n.get() / 2).unwrap_or(1);
+    NonZeroUsize::new(half).unwrap_or(NonZeroUsize::MIN)
 }
 
 /// Upper bound on the drain's auto-sized read fan-out — keeps a very large box
@@ -8862,7 +9089,7 @@ async fn write_superfile_list_with_threshold(
     // fanout from each stacks and starves the connection pool until requests
     // hit the per-request timeout. Capping each operation at ~50% of cores
     // leaves headroom for a concurrent maintenance pass without saturation.
-    let write_concurrency = commit_write_concurrency();
+    let write_concurrency = commit_write_concurrency().get();
 
     let replace_futs = pending_storage_replaces
         .iter()
@@ -9353,7 +9580,7 @@ async fn put_superfile_multipart(
 
     let mut upload = storage.put_multipart(path).await?;
     let total = bytes.len();
-    let part_concurrency = commit_write_concurrency().max(1);
+    let part_concurrency = commit_write_concurrency().get();
     let mut parts: Vec<UploadPart> = Vec::with_capacity(part_concurrency);
     let mut offset = 0;
     while offset < total {
@@ -9580,6 +9807,140 @@ mod tests {
             nearest(&prior, 1) < 0.05,
             "full-build graph must serve a batch-1 row"
         );
+    }
+
+    /// Payload size for the pipelined-uploader tests. Small enough to stay
+    /// under any multipart threshold, large enough to be a real object.
+    const UPLOAD_TEST_BYTES: usize = 64;
+    /// Shard ids the uploader tests send, deliberately out of order so the
+    /// returned order cannot accidentally match the arrival order.
+    const UPLOAD_TEST_SHARD_IDS: [u32; 3] = [2, 0, 1];
+    /// Base uuid for the uploader tests' superfiles; the shard id occupies
+    /// the low byte, so a returned entry names the shard that produced it.
+    const UPLOAD_TEST_UUID_BASE: u128 = 0x5D40_0000_0000_0000_0000_0000_0000_0000;
+
+    /// A minimal entry for the uploader tests: the uploader only moves
+    /// `bytes_for_storage` and orders by shard id, so the entry's contents
+    /// are irrelevant beyond identifying the superfile.
+    fn upload_test_prepared(shard_id: u32) -> (SuperfileUri, PreparedSuperfile) {
+        let uuid = Uuid::from_u128(UPLOAD_TEST_UUID_BASE + u128::from(shard_id));
+        let uri = SuperfileUri(uuid);
+        let entry = Arc::new(SuperfileEntry {
+            birth_version: 0,
+            superfile_id: uuid,
+            uri,
+            n_docs: 1,
+            id_min: 0,
+            id_max: 0,
+            scalar_stats: HashMap::new(),
+            fts_summary: HashMap::new(),
+            vector_summary: HashMap::new(),
+            partition_key: Vec::new(),
+            partition_hint: None,
+            vector_layout: VectorLayout::Ivf,
+            subsection_offsets: None,
+        });
+        let bytes = Bytes::from(vec![shard_id as u8; UPLOAD_TEST_BYTES]);
+        (
+            uri,
+            PreparedSuperfile {
+                entry,
+                bytes_for_store: None,
+                bytes_for_storage: Some((uri, bytes)),
+                bytes_for_cache: None,
+            },
+        )
+    }
+
+    /// The uploader returns shards in shard-id order no matter what order
+    /// they finish uploading in — manifest entry order must not depend on
+    /// the network. Fed deliberately out of order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upload_prepared_shards_returns_shard_id_order() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let (tx, rx) = channel::<(u32, PreparedSuperfile)>(UPLOAD_TEST_SHARD_IDS.len());
+        for shard_id in UPLOAD_TEST_SHARD_IDS {
+            let (_, prepared) = upload_test_prepared(shard_id);
+            tx.send((shard_id, prepared)).await.expect("send");
+        }
+        drop(tx);
+
+        let (prepared, uploaded) = upload_prepared_shards(Arc::clone(&storage), u64::MAX, rx)
+            .await
+            .expect("all uploads succeed");
+        let ids: Vec<u32> = prepared
+            .iter()
+            .map(|p| p.entry.superfile_id.as_u128() as u32 & 0xFF)
+            .collect();
+        assert_eq!(
+            ids.len(),
+            UPLOAD_TEST_SHARD_IDS.len(),
+            "every shard comes back"
+        );
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "returned in shard-id order, not arrival order");
+        assert_eq!(
+            uploaded as usize,
+            UPLOAD_TEST_SHARD_IDS.len() * UPLOAD_TEST_BYTES,
+            "uploaded byte total counts every shard"
+        );
+    }
+
+    /// A failed PUT must not cancel the PUTs already in flight. Cancelling a
+    /// multipart upload mid-request leaves its parts stored with no abort,
+    /// and parts are not an orphaned superfile that gc reclaims — so the
+    /// uploader records the first error, lets every started request settle,
+    /// and only then reports the failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upload_prepared_shards_settles_started_puts_before_reporting_failure() {
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+
+        // Fail exactly one shard, named by its own URI so the other two are
+        // untouched whatever order the uploads are dispatched in.
+        let (doomed_uri, doomed) = upload_test_prepared(0);
+        faults.fail(FaultOp::PutAtomic, &doomed_uri.0.to_string(), 1);
+
+        let (tx, rx) = channel::<(u32, PreparedSuperfile)>(UPLOAD_TEST_SHARD_IDS.len());
+        tx.send((0, doomed)).await.expect("send");
+        for shard_id in [1u32, 2] {
+            let (_, prepared) = upload_test_prepared(shard_id);
+            tx.send((shard_id, prepared)).await.expect("send");
+        }
+        drop(tx);
+
+        let err = match upload_prepared_shards(Arc::clone(&storage), u64::MAX, rx).await {
+            Err(error) => error,
+            Ok(_) => panic!("a failed shard PUT must fail the batch"),
+        };
+        assert!(
+            format!("{err:?}").contains("injected"),
+            "the injected fault is what surfaces: {err:?}"
+        );
+        assert_eq!(faults.fired(), 1, "exactly the armed fault fired");
+        // The uploader drained rather than returning at the first error, so
+        // the doomed shard is the only one missing from storage.
+        assert!(
+            !storage
+                .head(&superfile_storage_path(&doomed_uri))
+                .await
+                .is_ok_and(|meta| meta.size > 0),
+            "the faulted shard must not be durable"
+        );
+    }
+
+    /// The commit write fanout is a `NonZeroUsize` because a zero would
+    /// panic the uploader's channel and stall `buffered`; a single-core host
+    /// divides to zero before the floor applies.
+    #[test]
+    fn commit_write_concurrency_is_never_zero() {
+        assert!(commit_write_concurrency().get() >= 1);
     }
 
     /// Default shard target for the fanout unit tests, in bytes — mirrors the shipped
