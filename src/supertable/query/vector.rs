@@ -2157,7 +2157,14 @@ pub(crate) async fn assemble_flat_sections(
             pre_count: n,
         }));
     };
-    let with_residual = vcfg.flat_plane == config::VectorFlatPlane::Sq4Residual;
+    // The bare 4-bit plane, always. The 1.0 B/dim residual rung was carved out
+    // pending a matched-bytes comparison against a single 8-bit plane — the
+    // Sq16-vs-Sq8Residual theorem says a uniform plane beats coarse+residual
+    // at equal bytes, and shipping a default that comparison may retire is a
+    // migration for nothing. The scorer and the persisted form keep the codec
+    // seam (the bundle's codec tag), so a future rung is a config variant, not
+    // a format change.
+    let with_residual = false;
     let floor = vcfg.flat_register_floor;
     let column_owned = column.to_string();
     // Fitting the plane is a moment pass plus a rotation per row, and the gate
@@ -9394,9 +9401,9 @@ mod tests {
     /// The row whose own vector is replayed as the query. Any row works; a
     /// fixed one keeps every run comparing the two arms on the same thing.
     const FLAT_FIXTURE_PROBE_ROW: usize = 17;
-    /// Bytes per dimension the residual rung stores — the rate the shipped
-    /// `flat_plane: sq4_residual` default is chosen for.
-    const FLAT_RESIDUAL_BYTES_PER_DIM: usize = 1;
+    /// Coordinates a bare 4-bit code packs per byte — the plane's rate is
+    /// `dim / 2` bytes per row.
+    const FLAT_COORDS_PER_BYTE: usize = 2;
     /// Bytes per `f32` ruler entry. The ruler is `O(dim)` (one offset and one
     /// step per rotated coordinate), so it is subtracted out before the
     /// per-row rate is compared against the codec's.
@@ -9529,17 +9536,18 @@ mod tests {
             "the plane names the column it serves"
         );
         assert!(
-            index.has_residual(),
-            "the shipped `flat_plane` default is the residual rung"
+            !index.has_residual(),
+            "the drain builds the bare 4-bit plane — the residual rung is \
+             carved out pending the matched-bytes comparison against sq8"
         );
         let ruler = FLAT_FIXTURE_DIM * 2 * FLAT_RULER_ENTRY_BYTES;
         let per_row = (index.resident_bytes() - ruler) / FLAT_FIXTURE_ROWS;
         assert_eq!(
             per_row,
-            FLAT_FIXTURE_DIM * FLAT_RESIDUAL_BYTES_PER_DIM,
-            "residency must be the nibble planes alone — retaining the Sq16 plane \
+            FLAT_FIXTURE_DIM / FLAT_COORDS_PER_BYTE,
+            "residency must be the nibble plane alone — retaining the Sq16 plane \
              these codes were fitted from would show as {} bytes/row",
-            FLAT_FIXTURE_DIM * (FLAT_RESIDUAL_BYTES_PER_DIM + SQ16_BYTES_PER_DIM)
+            FLAT_FIXTURE_DIM / FLAT_COORDS_PER_BYTE + FLAT_FIXTURE_DIM * SQ16_BYTES_PER_DIM
         );
 
         // The scan answers the query the ivf arm answers, through a node map

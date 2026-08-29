@@ -342,11 +342,16 @@ const DEFAULT_VECTOR_TARGET_RECALL: f64 = 0.99;
 /// behaviour is unchanged by stating it directly.
 const DEFAULT_VECTOR_HNSW_REGISTER_FLOOR: f64 = 0.98;
 
-/// Default register floor for the flat index. Same number as the graph's, so a
-/// table that changes nothing behaves as before — and the default `flat_plane`
-/// (`sq4_residual`, ~0.99 measured) clears it. Choosing the bare `sq4` rung is
-/// what calls for lowering this, and only this.
-const DEFAULT_VECTOR_FLAT_REGISTER_FLOOR: f64 = 0.98;
+/// Default register floor for the flat index: a broken-plane tripwire, not a
+/// quality bar.
+///
+/// Deliberately NOT the graph's 0.98. The graph can reach that; a 4-bit plane
+/// structurally cannot — 16 levels per coordinate measures ~0.93 recall@10 on
+/// dbpedia-1536 — so a 0.98 default would leave the mode unable to register
+/// without the operator lowering the floor first, a mode dead on arrival. A
+/// healthy bare plane sits well above 0.80; a broken one (degenerate ruler,
+/// mis-sliced section) collapses toward random and lands far below it.
+const DEFAULT_VECTOR_FLAT_REGISTER_FLOOR: f64 = 0.80;
 /// Default for `hnsw_refine_k`: re-rank the SQ8 walk's top 256 on full Sq16.
 /// The knee for k ≤ 100 — recall matches the Sq16 walk and saturates here, so
 /// a wider refine only adds tail cost.
@@ -368,10 +373,13 @@ const DEFAULT_VECTOR_HNSW_MAX_DOCS: u64 = 10_000_000;
 /// 4-bit scan stops being the right trade.
 ///
 /// Not a memory bound — the plane is 0.5 B/dim, so 10M x 1536 would still fit
-/// a single host at ~7.7 GiB. It is a LATENCY bound: measured p50 at 100K x
-/// 1536 is ~1.5 ms, and the scan is linear, so 1M lands near 15 ms and 10M
-/// near 150 ms. One million is where a linear scan is still competitive with
-/// a routed read; past it the grid or the graph wins on the same hardware.
+/// a single host at ~7.7 GiB. It is a LATENCY bound, and a ceiling rather
+/// than a recommendation: measured on dbpedia-1536, the scan is ~1.6 ms at
+/// 100K and ~20 ms at 1M (linear, as an exhaustive scan must be), while a
+/// warm routed read at 1M serves ~2 ms at higher recall. What the scan keeps
+/// at any scale is a pinned, cache-independent footprint and a
+/// width-invariant worst case; the latency trade favors it up to a few
+/// hundred thousand rows and has clearly turned by this ceiling.
 const DEFAULT_VECTOR_FLAT_MAX_DOCS: u64 = 1_000_000;
 /// Row cap for the cheap calibration *probe*. On a corpus larger than this,
 /// the calibrator first builds + calibrates on a bounded subsample of this
@@ -462,34 +470,6 @@ pub enum DrainConsolidate {
     Splice,
 }
 
-/// Resident plane the `flat` scan ranks on. Selected by `vector.flat_plane`.
-///
-/// Separate from [`VectorHnswPlane`] on purpose. They answer questions that
-/// only look alike: the graph's knob picks what its WALK scores while an Sq16
-/// plane stays resident to re-rank the beam, so a coarse choice there costs
-/// nothing but navigation quality. The flat scan has no beam and no Sq16 plane,
-/// so its choice sets both the resident footprint and the returned order. An
-/// earlier revision keyed the scan off `hnsw_plane`, which meant selecting
-/// `search_mode = flat_ivf` silently got whatever the graph's knob happened to say.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum VectorFlatPlane {
-    /// Bare 4-bit nibbles, 0.5 bytes/dim — the smallest resident footprint of
-    /// any mode. Measured recall@10 on dbpedia-1536 at 100K is ~0.93, so it
-    /// does NOT clear a 0.99 `target_recall` and such a table serves ivf.
-    /// Choose it when the recall target is set to match.
-    Sq4,
-    /// DEFAULT. 4-bit nibbles plus a residual nibble, 1.0 bytes/dim — still
-    /// half of every other mode. Measured recall@10 ~0.99 on the same cell,
-    /// which is what clears the shipped `target_recall`.
-    ///
-    /// The default is the variant that can actually register at the shipped
-    /// target: a mode whose default can never pass its own gate is a footgun,
-    /// however small its footprint.
-    #[default]
-    Sq4Residual,
-}
-
 /// Resident plane the `hnsw_ivf` graph walk scores candidates on. Selected by
 /// `vector.hnsw_plane`.
 ///
@@ -545,8 +525,11 @@ pub enum VectorSearchMode {
     HnswIvf,
     /// OPT-IN (`flat_ivf`): scan a resident 4-bit plane exhaustively and
     /// return the codes' own ranking. No grid, no cells, no graph — and no
-    /// resident Sq16 plane, which is the point: 0.5 bytes/dim bare or 1.0 with
-    /// the residual leg, against 2.0 for every other mode.
+    /// resident Sq16 plane, which is the point: 0.5 bytes/dim, against 2.0 for
+    /// every other mode. The codec sets the recall ceiling: 16 levels per
+    /// coordinate measures ~0.93 recall@10 on dbpedia-1536, a declared trade,
+    /// not a defect. (The persisted form carries a codec tag, so a finer or
+    /// coarser plane is a future variant, not a format change.)
     ///
     /// Per-query work is linear in the corpus, so this is the embedded-scale
     /// trade: lowest resident footprint at a declared recall, bounded by
@@ -701,10 +684,14 @@ pub struct VectorSettings {
     /// Separate because the two floors answer different questions. The graph is
     /// a latency optimization over a correct scan, so its floor is a quality
     /// bar: a graph that cannot match the table's target has no reason to
-    /// exist. A flat plane is a memory trade the operator chose — `flat_plane =
-    /// sq4` at 0.5 bytes/dim measures ~0.93 on dbpedia-1536 — so its floor's
-    /// job is narrower: catch a plane that is BROKEN (degenerate ruler,
-    /// mis-sliced section) rather than one that is merely coarse.
+    /// exist. A flat plane is a memory trade the operator chose, and its
+    /// recall ceiling is set by the codec — 16 levels per coordinate measures
+    /// ~0.93 recall@10 on dbpedia-1536 — so a quality-bar default would leave
+    /// the mode unable to register at all. This floor's job is narrower: catch
+    /// a plane that is BROKEN (degenerate ruler, mis-sliced section, recall
+    /// collapsed toward random) rather than one that is merely coarse. The
+    /// default is a tripwire well below any healthy plane; an operator who
+    /// wants a bar raises it.
     pub flat_register_floor: f64,
 
     /// For `search_mode = hnsw_ivf` with a lossy [`Self::hnsw_plane`]: how many
@@ -721,11 +708,6 @@ pub struct VectorSettings {
     /// is built and `hnsw` queries fall back to the scan path. The
     /// centroid graph itself is built at any scale.
     pub hnsw_max_docs: u64,
-    /// For `search_mode = flat_ivf`: which 4-bit construction the scan ranks on.
-    /// Sets both the resident footprint and the returned order, since a flat
-    /// scan keeps no Sq16 plane to re-rank against. Ignored under any other
-    /// search mode.
-    pub flat_plane: VectorFlatPlane,
     /// For `search_mode = flat_ivf`: scale ceiling for the resident 4-bit plane.
     /// Built at drain and persisted only when the table's doc count ≤ this;
     /// above it queries fall back to `ivf`.
@@ -825,7 +807,6 @@ impl Default for VectorSettings {
             flat_register_floor: DEFAULT_VECTOR_FLAT_REGISTER_FLOOR,
             hnsw_refine_k: DEFAULT_VECTOR_HNSW_REFINE_K,
             hnsw_max_docs: DEFAULT_VECTOR_HNSW_MAX_DOCS,
-            flat_plane: VectorFlatPlane::default(),
             flat_max_docs: DEFAULT_VECTOR_FLAT_MAX_DOCS,
             hnsw_probe_max_docs: DEFAULT_VECTOR_HNSW_PROBE_MAX_DOCS,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,

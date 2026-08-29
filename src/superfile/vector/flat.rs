@@ -12,8 +12,12 @@
 //!   which therefore has to be resident, at 2 bytes/dim.
 //! - This scan visits every row and returns the codes' own ranking.
 //!   Whatever it loses is quantization error alone, and **nothing but the
-//!   nibble plane is resident**: 0.5 bytes/dim bare, 1.0 with the residual
-//!   leg. There is no Sq16 section in the persisted form at all.
+//!   nibble plane is resident**: 0.5 bytes/dim. There is no Sq16 section in
+//!   the persisted form at all. (The type and the format also carry the
+//!   residual construction at 1.0 bytes/dim, but the drain does not build
+//!   it: a single uniform 8-bit plane is expected to dominate coarse+residual
+//!   at equal bytes — the Sq16-vs-Sq8Residual theorem, one rung down — so the
+//!   1.0 B/dim slot stays open until a matched-bytes comparison fills it.)
 //!
 //! That second point is the whole reason this index exists. Holding Sq16
 //! resident to refine a 4-bit scan would cost 2 B/dim on top of 0.5 and

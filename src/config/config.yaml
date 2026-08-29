@@ -191,14 +191,16 @@ vector:
   #   flat_ivf             — OPT-IN: scan a resident 4-bit plane exhaustively
   #                          and return the codes' own ranking. No grid, no
   #                          cells, no graph, and no resident Sq16 plane —
-  #                          0.5 bytes/dim bare or 1.0 with the residual leg,
-  #                          against 2.0 for every other mode. Per-query work
-  #                          is linear in the corpus, so it is bounded by
-  #                          flat_max_docs; past that ceiling (and pre-drain,
-  #                          filtered, or another column) it serves `ivf`, which
-  #                          is what the `_ivf` suffix names. Cosine columns
-  #                          only. Best for embedded tables sized by resident
-  #                          memory rather than by QPS.
+  #                          0.5 bytes/dim against 2.0 for every other mode.
+  #                          The codec sets the recall ceiling (~0.93 recall@10
+  #                          on dbpedia-1536): a declared trade, gated by
+  #                          flat_register_floor. Per-query work is linear in
+  #                          the corpus, so it is bounded by flat_max_docs;
+  #                          past that ceiling (and pre-drain, filtered, or
+  #                          another column) it serves `ivf`, which is what the
+  #                          `_ivf` suffix names. Cosine columns only. Best for
+  #                          embedded tables sized by resident memory rather
+  #                          than by QPS.
   search_mode: ivf
 
   # For search_mode = ivf: the cluster router.
@@ -260,11 +262,12 @@ vector:
   # Register floor for the FLAT index, same contract, its own number. Separate
   # because the floors answer different questions: the graph is a latency
   # optimization over a correct scan, so its floor is a quality bar, while a
-  # flat plane is a memory trade the operator chose. flat_plane = sq4 at 0.5
-  # bytes/dim measures ~0.93 on dbpedia-1536, so lower THIS to accept it --
-  # lowering target_recall instead would also detune the ivf width laws that
-  # answer filtered queries.
-  flat_register_floor: 0.98
+  # flat plane is a memory trade the operator chose whose recall ceiling is
+  # set by the codec (16 levels/coordinate measures ~0.93 on dbpedia-1536).
+  # The default is therefore a broken-plane TRIPWIRE, not a bar: a healthy
+  # plane sits well above it, a degenerate ruler or mis-sliced section
+  # collapses toward random and lands far below. Raise it to impose a bar.
+  flat_register_floor: 0.80
 
   # For search_mode = hnsw_ivf: which resident plane the graph walk scores
   # candidates on. Every option re-ranks its final beam on the full Sq16 plane
@@ -307,20 +310,11 @@ vector:
   #
   # This is a LATENCY bound, not a memory one -- the plane is 0.5 bytes/dim,
   # so 10M x 1536 would still fit one host at ~7.7 GiB. An exhaustive scan is
-  # linear in the corpus (~1.5 ms measured at 100K x 1536), so 1M lands near
-  # 15 ms and 10M near 150 ms. One million is where a linear scan is still
-  # competitive with a routed read.
-  # For search_mode = flat_ivf: which 4-bit construction the scan ranks on.
-  # sq4          = 0.5 bytes/dim, the smallest resident footprint of any mode;
-  #                measured recall@10 ~0.93 on dbpedia-1536 at 100K, so it does
-  #                NOT clear a 0.99 target_recall and such a table serves ivf.
-  # sq4_residual = 1.0 bytes/dim (default), still half of every other mode;
-  #                measured recall@10 ~0.99 on the same cell.
-  # Separate from hnsw_plane: the graph keeps an Sq16 plane to re-rank its beam,
-  # so its choice affects navigation only. A flat scan has no beam and no Sq16
-  # plane, so this sets both footprint and returned order.
-  flat_plane: sq4_residual
-
+  # linear in the corpus: measured ~1.6 ms at 100K x 1536 and ~20 ms at 1M,
+  # where a warm routed read serves ~2 ms at higher recall. A ceiling, not a
+  # recommendation -- the trade favors the scan up to a few hundred thousand
+  # rows; what it keeps at any scale is the pinned, cache-independent
+  # footprint and a width-invariant worst case.
   flat_max_docs: 1000000
 
   # For search_mode = hnsw_ivf: row cap for the cheap calibration probe. On a
