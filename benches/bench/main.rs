@@ -509,7 +509,11 @@ fn main() {
     let debug_flag = std::env::args().any(|a| a == "--debug");
     let env_filter = move || {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new(if debug_flag { "info,infino=debug" } else { "warn" })
+            EnvFilter::new(if debug_flag {
+                "info,infino=debug"
+            } else {
+                "warn"
+            })
         })
     };
     if std::env::var("INFINO_TRACE_SPANS").is_ok() {
