@@ -56,6 +56,9 @@ Warm p50, tables on object storage:
 | BM25 top-10, including row fetch | 125 µs | 2 ms |
 | SQL, metadata → crosstab shapes | 186 µs – 7.6 ms | 260 µs – 75 ms |
 
+Every battery's full recorded tables — per-shape rows, RSS, cold GET counts, the 1M
+run these summaries quote — live in [benches/README.md](benches/README.md).
+
 ![Vector search latency, log scale, 1M and 10M documents](docs/assets/readme/vector.svg)
 
 <details>
