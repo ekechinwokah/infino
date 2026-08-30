@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="308" viewBox="0 0 880 308" role="img">
+<rect width="880" height="308" rx="10" fill="#FBF9F3" stroke="#DCD6C7"/>
+<text x="26" y="32" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#17130F">Vector search vs vector databases</text>
+<text x="854" y="32" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">VectorDBBench · Cohere 1M · 768-d · top-100 · serial p99</text>
+<text x="250" y="66" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#17130F" text-anchor="end">Infino</text>
+<text x="250" y="80" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">16c64g</text>
+<rect x="264" y="60" width="33.7" height="9" rx="1" fill="#D6400F"/>
+<text x="854" y="68" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#17130F" text-anchor="end">1.1ms</text>
+<text x="250" y="100" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">Zilliz Cloud</text>
+<text x="250" y="114" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">8cu-perf</text>
+<rect x="264" y="94" width="61.3" height="9" rx="1" fill="#B7B4AB"/>
+<text x="854" y="102" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#5E5749" text-anchor="end">2.0ms</text>
+<text x="250" y="134" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">Qdrant Cloud</text>
+<text x="250" y="148" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">16c64g</text>
+<rect x="264" y="128" width="196.2" height="9" rx="1" fill="#B7B4AB"/>
+<text x="854" y="136" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#5E5749" text-anchor="end">6.4ms</text>
+<text x="250" y="168" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">OpenSearch</text>
+<text x="250" y="182" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">16c128g force-merge</text>
+<rect x="264" y="162" width="220.7" height="9" rx="1" fill="#B7B4AB"/>
+<text x="854" y="170" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#5E5749" text-anchor="end">7.2ms</text>
+<text x="250" y="202" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">Elastic Cloud</text>
+<text x="250" y="216" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">8c60g force-merge</text>
+<rect x="264" y="196" width="291.2" height="9" rx="1" fill="#B7B4AB"/>
+<text x="854" y="204" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#5E5749" text-anchor="end">9.5ms</text>
+<text x="250" y="236" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">Pinecone</text>
+<text x="250" y="250" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">p2.x8 1node</text>
+<rect x="264" y="230" width="420.0" height="9" rx="1" fill="#B7B4AB"/>
+<text x="854" y="238" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#5E5749" text-anchor="end">13.7ms</text>
+</svg>
