@@ -529,7 +529,7 @@ def main() -> None:
     latency_chart(CROSSOVER, "vector-crossover.svg")
     compare_chart(VDB_META, VDB_ROWS, "compare-vdb.svg")
     compare_chart(EMBED_META, EMBED_ROWS, "compare-embedded.svg")
-    compare_chart(SQL_EXT_META, SQL_EXT_ROWS, "compare-sql.svg", log=True)
+    compare_chart(SQL_EXT_META, SQL_EXT_ROWS, "compare-sql.svg")
     compare_chart(
         CLICKBENCH_SEARCH_META, CLICKBENCH_SEARCH_ROWS, "compare-sql-search.svg", log=True
     )

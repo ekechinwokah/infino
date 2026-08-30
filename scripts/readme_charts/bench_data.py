@@ -251,62 +251,42 @@ SBG_META = {
 }
 
 SQL_EXT_ROWS: list[CompareRow] = [
-    CompareRow("ClickHouse", 6.8, "6.8", ("18.4 s",)),
-    CompareRow("DuckDB", 9.8, "9.8", ("26.3 s",)),
-    CompareRow("Infino", 12.8, "12.8", ("34.0 s",), self_row=True),
-    CompareRow("DataFusion", 17.0, "17.0", ("45.6 s",)),
-    CompareRow("Spark", 123.7, "123.7", ("332.4 s",)),
-    CompareRow("Postgres", 1519.0, "1519", ("4085.5 s",)),
+    CompareRow("ClickHouse", 6.8, "6.8"),
+    CompareRow("DuckDB", 9.8, "9.8"),
+    CompareRow("Infino", 12.7, "12.7", self_row=True),
+    CompareRow("DataFusion", 17.0, "17.0"),
 ]
 
 SQL_EXT_META = {
     "title": "SQL vs analytic engines",
-    "subtitle": "ClickBench 100M rows · vCPU-sec per query · hot · c6a.4xlarge · lower is faster",
-    "value_header": "vCPU-s/query",
-    "columns": ("full suite",),
+    "subtitle": "ClickBench · vCPU-sec per query · hot · c6a.4xlarge · lower is faster",
     "url": (
         "https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino"
-        "%7CDataFusion%20%28Parquet%2C%20single%29%7CSpark%7CPostgreSQL%20%28with%20indexes%29"
+        "%7CDataFusion%20%28Parquet%2C%20single%29"
         "&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot"
     ),
 }
 
 # ── ClickBench, search-engine peer group ────────────────────────────────────
 #
-# Same 43-query suite as the analytic-engines chart, filtered to the
-# search-tagged, untuned, CPU entries — the Elastic-shaped systems. Scores
-# recomputed from ClickBench's own data, reimplementing their combined
-# metric exactly (hot 60%, cold 20%, load time 10%, data size 10%), all
-# rows at c6a.4xlarge so the chart and its deep link agree. Verified
-# 2026-08-30. An earlier "SigLens leads on hot time" caveat was an
-# artifact of counting its FAILED queries as zero seconds and is
-# retracted; it does not lead.
+# Same suite, same metric, same machine as the analytic chart — one
+# number system across both peer groups (Infino prints identically in
+# each). SigLens is omitted (no recognition to anchor a comparison) and
+# Quickwit is omitted (fails roughly half the suite, so any per-query
+# figure over the queries it completes is not comparable); Tantivy's
+# library tier is covered by the SBG chart.
 CLICKBENCH_SEARCH_ROWS: list[CompareRow] = [
-    CompareRow("Infino", 3.00, "3.00", self_row=True),
-    CompareRow("ParadeDB", 4.68, "4.68"),
-    CompareRow("Quickwit", 16.06, "16.06"),
-    CompareRow("Elasticsearch", 17.91, "17.91"),
-    CompareRow("SigLens", 75.83, "75.83"),
+    CompareRow("Infino", 12.7, "12.7", self_row=True),
+    CompareRow("ParadeDB", 20.2, "20.2"),
+    CompareRow("Elasticsearch", 171.1, "171.1"),
+    CompareRow("MongoDB", 7229.8, "7230"),
 ]
 
 CLICKBENCH_SEARCH_META = {
     "title": "SQL vs search engines",
-    "subtitle": "ClickBench · combined score: hot 60 / cold 20 / load 10 / size 10 · c6a.4xlarge · untuned",
-    "value_header": "combined",
+    "subtitle": "ClickBench · vCPU-sec per query · hot · c6a.4xlarge · lower is faster",
 }
 
-
-
-# ── Quantized indexes vs embedded libraries (retrievalbench, in-harness) ────
-#
-# dbpedia-1536 at 100K, box-threads, top-10: same queries and the same exact
-# ground truth for every engine. Infino's row IS the shipped `flat_ivf` mode —
-# a table built through the public lifecycle (append → commit → optimize)
-# with `vector.search_mode: flat_ivf`, one YAML line — and its resident bytes
-# are the engine's own serialized index blob, matching how each comparator
-# reports its own index bytes. Comparators run in-process through their own
-# libraries. Run: retrievalbench `c883ce0` (engine pin `447ff2fc` = main
-# `3aaffb64` + benches-only commits), EPYC 9V74 4C/8T, 2026-08-30.
 EMBED_ROWS: list[CompareRow] = [
     CompareRow("turbovec 2-bit", 0.42, "0.42 ms", ("0.835", "38 MiB")),
     CompareRow("Infino flat_ivf (4-bit)", 1.51, "1.51 ms", ("0.934", "75 MiB"), self_row=True),
