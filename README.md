@@ -6,8 +6,8 @@
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Embedded retrieval library: full-text, vector, hybrid, and SQL over one table, stored as
-ordinary Parquet on local disk or object storage.
+**Adaptive retrieval library: full-text, vector, hybrid, and SQL over one table, stored as
+ordinary Parquet on local disk or object storage. Fast, simple, and scalable.**
 
 ```sh
 pip install infino              # Python
@@ -295,6 +295,8 @@ Every knob, and the measurement behind each default, is documented inline in
 
 ## Vector index modes
 
+You can trade memory for latency, depending on your workload.
+
 A million 1536-dimension vectors are 5.7 GiB of RAM as float32. `flat_ivf` serves them from
 841 MiB, all-in.
 
@@ -349,10 +351,13 @@ Measured serving figures, each row on its own corpus:
 - Every mode falls back to the routed scan when it cannot serve a query; changing the mode
   can cost recall or latency, never correctness.
 
-## SQL
+## SQL and Hybrid Search
 
-SQL planning and execution is Apache DataFusion. When a `WHERE` clause hits a column that
-has a full-text index, Infino looks the value up in that index first and hands DataFusion
+SQL planning and execution is Apache DataFusion. Infino leverages the indexes it maintains for FTS
+so accelerate SQL queries by pruning bytes it does not need to touch. For example, DataFusion
+prunes ordered, numeric columns via min/max limits, but Infino uses Bloomfilters, FSTs, bitmaps,
+and other data structures not usually available in DataFusion. For example, when a `WHERE` clause 
+hits a column that has a full-text index, Infino looks the value up in that index first and hands DataFusion
 the matching row numbers, so the scan decodes only those rows instead of the whole column.
 
 The chart is that lookup switched on and off — same query, same files:
@@ -394,8 +399,8 @@ ORDER BY hits DESC;
 
 ## Limitations
 
-- Commit is the durability boundary. Rows are durable when a commit lands, not when
-  `append()` returns.
+- commit() is the durability boundary, so you need to call commit() to ensure your data persists.
+  Rows are durable when a commit lands, not when `append()` returns.
 - Tables are append-only and time-ordered. Updates are delete plus insert via tombstones, and
   there are no cross-table transactions. This is not an OLTP store.
 - Writes go through a single writer slot, so there is one writer per table at a time. Readers
