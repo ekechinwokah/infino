@@ -15,16 +15,6 @@ npm install @infino-ai/infino   # Node.js
 cargo add infino                # Rust
 ```
 
-
-- One Parquet file per data batch, with the BM25 and vector indexes inside it.
-  DuckDB, pyarrow, and DataFusion open the same file as a normal table
-  ([example](infino-python/examples/parquet_interop.py)).
-- The storage target is determined by a connection string: `memory://`, a local path, or
-  `s3://`, `gs://`, Azure.
-- No daemon, no cluster, no lock service is necessary. Infino writes append-only, immutable
-  files so readers pin a snapshot and never block on writers.
-- Tables much larger than RAM work: queries read byte ranges.
-
 ## Quickstart
 
 ```python
@@ -219,6 +209,15 @@ The corpus downloads once into `corpus-dir`. Add `--features faiss` (after
 ## How it works
 
 ![Your app queries Infino, which caches in RAM and on disk over Parquet on object storage](docs/assets/readme/one-parquet-copy.svg)
+
+- One Parquet file per data batch, with the BM25 and vector indexes inside it.
+  DuckDB, pyarrow, and DataFusion open the same file as a normal table
+  ([example](infino-python/examples/parquet_interop.py)).
+- The storage target is determined by a connection string: `memory://`, a local path, or
+  `s3://`, `gs://`, Azure.
+- No daemon, no cluster, no lock service is necessary. Infino writes append-only, immutable
+  files so readers pin a snapshot and never block on writers.
+- Tables much larger than RAM work: queries read byte ranges.
 
 ### The indexes live inside the Parquet file
 
