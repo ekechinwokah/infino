@@ -386,7 +386,7 @@ The battery emits both arms — the same query through the index lookup and thro
 
 The combination of SQL and search functions makes it simpler to express complex queries.
 `bm25_search`, `vector_search`, `hybrid_search`, `token_match`, and `exact_match` are SQL
-table-valued functions, let search results compose as ordinary SQL tables. 
+table-valued functions that let search results compose as ordinary SQL tables. 
 
 The ranked result sets are relations so operations like retrieval, filters, joins,
 and aggregation compose in one statement against one pinned snapshot. 
