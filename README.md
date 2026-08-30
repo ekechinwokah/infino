@@ -58,11 +58,51 @@ Warm p50, tables on object storage:
 
 ![Vector search latency, log scale, 1M and 10M documents](docs/assets/readme/vector.svg)
 
+<details>
+<summary>Reproduce</summary>
+
+```sh
+cargo bench -- supertable vector warm cold
+```
+
+10M is the default scale; prefix `INFINO_BENCH_SUPERTABLE_DOCS=1000000` for the 1M rows.
+</details>
+
 ![BM25 full-text search latency, log scale, 1M and 10M documents](docs/assets/readme/fts.svg)
+
+<details>
+<summary>Reproduce</summary>
+
+```sh
+cargo bench -- supertable fts warm cold
+```
+
+10M is the default scale; prefix `INFINO_BENCH_SUPERTABLE_DOCS=1000000` for the 1M rows.
+</details>
 
 ![SQL query shape latency, log scale, 1M and 10M rows](docs/assets/readme/sql.svg)
 
+<details>
+<summary>Reproduce</summary>
+
+```sh
+cargo bench -- supertable sql warm
+```
+
+10M is the default scale; prefix `INFINO_BENCH_SUPERTABLE_DOCS=1000000` for the 1M rows.
+</details>
+
 ![Ingest throughput, 1M docs](docs/assets/readme/ingest.svg)
+
+<details>
+<summary>Reproduce</summary>
+
+```sh
+INFINO_BENCH_SUPERTABLE_DOCS=1000000 cargo bench -- supertable build
+```
+
+One command, all three modalities' ingest cells.
+</details>
 
 - Cold first query = file opens + cache fill: 114 ms (1M) and 314 ms (10M) for vector,
   16 ms and 275 ms for BM25. Warm and cold sit ~200× apart; the charts use a log scale.
@@ -72,7 +112,7 @@ Warm p50, tables on object storage:
   Azure Blob, commit `339e621`. Compare each scale against its own baseline.
 
 <details>
-<summary><b>Reproducing the charts</b></summary>
+<summary><b>Methodology: config, real corpora, matching CI</b></summary>
 
 Engine behavior is configured in YAML only; environment variables never override it. The
 shipped defaults are what the charts measure:
@@ -85,14 +125,7 @@ The `vector:` block holds probe depth, rerank codec, and cell counts. The `super
 block holds commit and cache behavior. Leave both alone to reproduce the published charts.
 
 Corpus size is the one bench knob that reads an environment variable, and it takes a plain
-integer (`1000000`, not `1M`). The table tier defaults to 10M:
-
-| Chart | Command |
-|---|---|
-| Vector, 10M | `cargo bench -- supertable vector warm cold` |
-| BM25, 10M | `cargo bench -- supertable fts warm cold` |
-| SQL, 10M | `cargo bench -- supertable sql warm` |
-| Any chart, 1M | prefix with `INFINO_BENCH_SUPERTABLE_DOCS=1000000` |
+integer (`1000000`, not `1M`); each chart's own Reproduce fold carries its exact command.
 
 To run against a real dataset instead of the synthetic corpus, pass a `corpus=` spec.
 It applies to one selected cell, so name a single tier and modality:
@@ -261,9 +294,35 @@ A million 1536-dimension vectors are 5.7 GiB of RAM as float32. `flat_ivf` serve
 
 ![RAM to serve vector search, 100K and 1M vectors, versus the float32 baseline](docs/assets/readme/vector-modes-memory.svg)
 
+<details>
+<summary>Reproduce</summary>
+
+```sh
+printf 'vector:\n  search_mode: flat_ivf\n' > infino.yaml   # or hnsw_ivf; rm for ivf
+INFINO_BENCH_SUPERTABLE_DOCS=1000000 \\
+  cargo bench -- supertable vector build warm \\
+  corpus=hf:KShivendu/dbpedia-entities-openai-1M corpus-dir=./corpora
+```
+
+One run per mode: the config line selects it, `optimize()` builds it, the battery reports serving RSS and latency.
+</details>
+
 ![Vector mode warm p50 at the recall each serves, 100K and 1M vectors](docs/assets/readme/vector-modes-latency.svg)
 
 ![flat_ivf vs ivf warm p50 across table sizes](docs/assets/readme/vector-crossover.svg)
+
+<details>
+<summary>Reproduce</summary>
+
+```sh
+printf 'vector:\n  search_mode: flat_ivf\n' > infino.yaml   # or hnsw_ivf; rm for ivf
+INFINO_BENCH_SUPERTABLE_DOCS=1000000 \\
+  cargo bench -- supertable vector build warm \\
+  corpus=hf:KShivendu/dbpedia-entities-openai-1M corpus-dir=./corpora
+```
+
+One run per mode: the config line selects it, `optimize()` builds it, the battery reports serving RSS and latency.
+</details>
 
 Measured serving figures, each row on its own corpus:
 
@@ -293,6 +352,16 @@ the matching row numbers, so the scan decodes only those rows instead of the who
 The chart is that lookup switched on and off — same query, same files:
 
 ![SQL latency with and without the index lookup, same query, same files](docs/assets/readme/sql-pushdown.svg)
+
+<details>
+<summary>Reproduce</summary>
+
+```sh
+INFINO_BENCH_SUPERTABLE_DOCS=1000000 cargo bench -- supertable sql warm
+```
+
+The battery emits both arms — the same query through the index lookup and through the plain scan.
+</details>
 
 - Equality on an unsorted column, where Parquet min/max stats can't skip anything:
   21.9 ms without the index lookup, 1.44 ms with it. COUNT and AVG over the same
