@@ -433,6 +433,23 @@ ORDER BY hits DESC;
 
 The crate is 0.x and the API can still move. The public surface is pinned by `public-api.txt`.
 
+## Building an agent?
+
+An agent's memory is a retrieval problem: transcripts, embeddings, and metadata in one
+table, recalled by meaning, keyword, or SQL — over object storage, with no service to run.
+Infino is that layer, and three companions cover the rest:
+
+- [infino-mcp](https://github.com/infino-ai/infino-mcp) — give any MCP client (Claude Code,
+  Claude Desktop, Cursor, VS Code) keyword, semantic, hybrid, and SQL retrieval over your
+  tables. Local embedding model, read-only by default, writes behind one flag.
+  `npm i @infino-ai/mcp-server`, or straight from the MCP Registry.
+- [infino-cli](https://github.com/infino-ai/infino-cli) — the same tables from your shell:
+  SQL, full-text, and vector search against a path or bucket. Inspect what the agent
+  stored, script the parts that don't need a model.
+- [infino-analytics](https://github.com/infino-ai/infino-analytics) — a reference kit for
+  building analytics products on Infino: visualization and dashboard API, plus Fino, a
+  conversational layer — a complete worked example of an agent over Infino tables.
+
 ## Documentation
 
 - [Overview](docs/architecture/overview.md) — the mental model, and how this compares
