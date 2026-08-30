@@ -99,6 +99,7 @@ cargo bench -- dataset run datasets/bench-10m fts
 | `supertable fts` | multi-artifact on object storage | FTS |
 | `supertable vector` | | vector |
 | `supertable sql` | | SQL |
+
 Each cell: `build`, `warm`, `cold`. Multi-cell runs isolate each cell in its own process (RSS).
 
 Vector cells report a `default` config row; probe/rerank are not env-tunable.

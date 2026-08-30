@@ -6,19 +6,18 @@
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-# Fast, embedded search and analytics.
+Infino is an embedded retrieval library. It runs full-text, vector, hybrid, and SQL queries
+over the same table, and stores that table as ordinary Parquet. Warm top-10 on a
+1M-document table is 125 µs for BM25 and 591 µs for vector search.
 
-Infino is a drop-in library for searching and analyzing your data. Full-text, vector,
-hybrid, and SQL over the same table, with **125 µs** BM25 and **591 µs** vector top-10 warm.
-
-It starts in memory on your laptop. When the data outgrows RAM, you change the connection
-string and nothing else — the tables are Parquet on object storage, and the engine reads
-them in place.
+The storage target is a connection string. Nothing else in your code changes between them,
+and a table larger than RAM works because the engine reads Parquet in place instead of
+loading an index into memory.
 
 ```python
-db = infino.connect("memory://")            # laptop
-db = infino.connect("./data")               # on-prem disk
-db = infino.connect("s3://bucket/prefix")   # past RAM, same app code
+db = infino.connect("memory://")
+db = infino.connect("./data")
+db = infino.connect("s3://bucket/prefix")
 ```
 
 Built by the team that created OpenSearch.
@@ -48,7 +47,7 @@ docs = db.create_table(
 
 docs.append(rows)   # list of dicts, or an Arrow RecordBatch
 
-# One call, both signals, fused ranking. `query_vec` is your embedding.
+# BM25 and vector in one call, fused ranking. `query_vec` is your embedding.
 hits = docs.hybrid_search("body", "disk full", "embedding", query_vec, k=10)
 ```
 
@@ -58,13 +57,13 @@ Warm p50, tables on object storage:
 
 | | 1M docs | 10M docs |
 |---|---|---|
-| **Vector** top-10, recall@10 0.992 | **591 µs** | **5 ms** |
-| **BM25** top-10, incl. row fetch | **125 µs** | **2 ms** |
-| **SQL** point lookup → crosstab | **186 µs – 7.6 ms** | **260 µs – 75 ms** |
+| Vector top-10, recall@10 0.992 | 591 µs | 5 ms |
+| BM25 top-10, including row fetch | 125 µs | 2 ms |
+| SQL, point lookup through crosstab | 186 µs – 7.6 ms | 260 µs – 75 ms |
 
-Cold, meaning the first query on an idle table while handles open and the cache fills, is
-114 ms and 314 ms for vector, 16 ms and 275 ms for BM25. The charts are log-scale because
-warm and cold sit about 200× apart.
+The first query against an idle table has to open file handles and fill the cache. That
+costs 114 ms at 1M and 314 ms at 10M for vector, 16 ms and 275 ms for BM25. Warm and cold
+are about 200× apart, so the charts use a log scale.
 
 ![Vector search latency, log scale, 1M and 10M documents](docs/assets/readme/vector.svg)
 
@@ -72,16 +71,16 @@ warm and cold sit about 200× apart.
 
 ![SQL query shape latency, log scale, 1M and 10M rows](docs/assets/readme/sql.svg)
 
-Measured on Azure Blob with 4 cores pinned ([CI run 33245831329](https://github.com/infino-ai/infino/actions/runs/33245831329))
-for 1M, and on a separate run at the default 10M scale. The two scales come from different
-commits and different hardware, so read each against its own baseline rather than against
-the other.
+The 1M numbers are from Azure Blob with 4 cores pinned
+([CI run 33245831329](https://github.com/infino-ai/infino/actions/runs/33245831329)). The
+10M numbers are from a separate run at the default scale, on a different commit and
+different hardware, so compare each against its own baseline rather than against the other.
 
 <details>
-<summary><b>Reproduce every chart</b> — config and exact commands</summary>
+<summary><b>Reproducing the charts</b></summary>
 
-Engine behavior is configured in YAML only; environment variables never override it. Start
-from the shipped defaults, which are exactly what the charts measure:
+Engine behavior is configured in YAML only; environment variables never override it. The
+shipped defaults are what the charts measure:
 
 ```sh
 cp src/config/config.yaml infino.yaml    # or $XDG_CONFIG_HOME/infino/config.yaml
@@ -90,7 +89,7 @@ cp src/config/config.yaml infino.yaml    # or $XDG_CONFIG_HOME/infino/config.yam
 The `vector:` block holds probe depth, rerank codec, and cell counts. The `supertable:`
 block holds commit and cache behavior. Leave both alone to reproduce the published charts.
 
-Corpus size is the one bench knob that is an environment variable, and it takes a plain
+Corpus size is the one bench knob that reads an environment variable, and it takes a plain
 integer (`1000000`, not `1M`). The table tier defaults to 10M:
 
 | Chart | Command |
@@ -112,103 +111,143 @@ AZURE_STORAGE_ACCOUNT_KEY=$KEY \
 ```
 
 Reading the output: vector is the post-drain `default` row; BM25 is `single_rare` under
-**Supertable FTS — queries + cost**; the SQL shapes are `agg_max_title` (metadata),
-`WHERE key = ?` (lookup), `AVG(rating) GROUP BY category` (scan), and
-`COUNT(*) GROUP BY bucket, category` (crosstab). Structured results land in
-`target/infino-bench/*.json`. Methodology: [benches/README.md](benches/README.md).
+Supertable FTS; the SQL shapes are `agg_max_title` (metadata), `WHERE key = ?` (lookup),
+`AVG(rating) GROUP BY category` (scan), and `COUNT(*) GROUP BY bucket, category`
+(crosstab). Structured results land in `target/infino-bench/*.json`. Methodology is in
+[benches/README.md](benches/README.md).
 
 </details>
 
-### Where it lands
+### Against the public benchmarks
 
-The goal is one library that stays close to the specialized engine in each category.
-Measured on the public harnesses:
+Infino has the lowest p99 on
+[VectorDBBench](https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch)
+([client](https://github.com/infino-ai/VectorDBBench/tree/main/vectordb_bench/backend/clients/infino)).
 
-- **Vector** — lowest p99 on [VectorDBBench](https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch)
-  ([client](https://github.com/infino-ai/VectorDBBench/tree/main/vectordb_bench/backend/clients/infino))
-- **Full-text** — within 19% of Lucene on search, and faster on count, at
-  [Search Benchmark, the Game](https://tantivy-search.github.io/bench/)
-  ([harness](https://github.com/quickwit-oss/search-benchmark-game))
-- **SQL** — 12.8 vCPU-seconds per query on
-  [ClickBench](https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino%7CDataFusion%20%28Parquet%2C%20single%29%7CSpark%7CPostgreSQL%20%28with%20indexes%29&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot),
-  in the same range as DuckDB at 9.8
-  ([port](https://github.com/infino-ai/clickbench/tree/add-infino/infino))
+On [Search Benchmark, the Game](https://tantivy-search.github.io/bench/) it is within 19% of
+Lucene on search and faster on count
+([harness](https://github.com/quickwit-oss/search-benchmark-game)).
 
-Lucene and DuckDB are excellent, and they are the right yardsticks. The goal is to be in
-that range on each axis while serving all four query types from one file.
+On [ClickBench](https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino%7CDataFusion%20%28Parquet%2C%20single%29%7CSpark%7CPostgreSQL%20%28with%20indexes%29&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot)
+it averages 12.8 vCPU-seconds per query, against 9.8 for DuckDB
+([port](https://github.com/infino-ai/clickbench/tree/add-infino/infino)).
 
-## Why it's fast
+Lucene and DuckDB are the right yardsticks for the last two. Landing in their range while
+serving all four query types from one file is the goal.
+
+## How it works
 
 ![Your app queries Infino, which caches in RAM and on disk over Parquet on object storage](docs/assets/readme/one-parquet-copy.svg)
 
-### The index lives inside the data file
+### The indexes live inside the Parquet file
 
-Infino writes one file per batch, and that file is ordinary Parquet with the search indexes
-stored inside it. DuckDB, pyarrow, and DataFusion open it and see a normal table, with Infino
-nowhere in the read path ([example](infino-python/examples/parquet_interop.py)). Infino opens
-the same bytes and uses the indexes.
+Infino writes one Parquet file per batch, with the BM25 and vector indexes stored inside it.
+DuckDB, pyarrow, and DataFusion open that file and see a normal table, with Infino nowhere in
+the read path ([example](infino-python/examples/parquet_interop.py)). Infino opens the same
+bytes and uses the indexes.
 
-So there is no second artifact to build, ship, load, or keep in sync with the data, and no
-"open the index" step at startup.
+There is no second artifact to build, ship, or keep in sync with the data, and no step that
+loads an index at startup.
 
-### A query reads a few byte ranges, not a file
+### A query reads byte ranges, not files
 
 The indexes are laid out by term and by vector cluster, so a top-10 resolves to a short list
-of byte offsets. On object storage those are HTTP range requests — a handful of them, rather
-than a download. This is the part that makes running search directly on S3 practical, since
-each round trip costs 20–100 ms and the goal is to need very few.
+of byte offsets. On object storage those become HTTP range requests, a handful per query
+rather than a download. Each round trip to object storage costs 20–100 ms, so the number of
+them is what determines whether search on S3 is usable.
 
-Fetched ranges are kept in a local disk cache and memory-mapped, so the next query over the
-same terms is page-cache reads with no network at all. That is where the 125 µs comes from.
-The cache is reclaimable: it shrinks under memory pressure, down to nothing on an idle table,
-and refills on demand.
+Fetched ranges are kept in a local disk cache and memory-mapped. A second query over the same
+terms reads from the page cache and touches the network zero times, which is where the 125 µs
+comes from. The cache is reclaimable: it shrinks under memory pressure, to nothing on an idle
+table, and refills on demand.
 
-### Scoring is SIMD over compressed vectors
+### Scoring is SIMD over quantized vectors
 
-Vectors are stored as 1-bit-per-dimension RaBitQ codes — `dim / 8` bytes per row, so 128
-bytes for a 1024-dimension vector against 4 KB as raw float32. That is 32× less to fetch and
-score, and it is small enough that a whole cluster of candidates stays in cache.
+The routed path scores 1-bit-per-dimension RaBitQ codes, which is `dim / 8` bytes per row —
+128 bytes for a 1024-dimension vector against 4 KB as float32. Finalists are rescored against
+a higher-precision copy, so the quantization costs latency rather than accuracy; measured
+recall@10 is 0.992.
 
-The distance kernels are hand-written intrinsics chosen at runtime: AVX-512 where the CPU
-reports it, AVX2 otherwise, a portable 256-bit path elsewhere, and an int8 VNNI kernel for
-the graph walk. Finalists get rescored against a higher-precision copy, which is how the
-compression stays free — recall@10 is 0.992.
+Distance kernels are hand-written intrinsics selected at runtime: AVX-512 where the CPU
+reports it, AVX2 otherwise, a portable 256-bit path elsewhere, and an int8 VNNI kernel for the
+graph walk.
 
-### Writes append, and readers never block
+### Commits swap a manifest
 
-A table is a set of immutable files plus a small manifest listing them. Appending writes new
-files and then swaps the manifest in one atomic step, so a commit publishes everything or
-nothing. A query pins the manifest it started with and reads that version to completion,
-which means readers never wait on a writer and never see a half-finished commit.
+A table is a set of immutable files plus a manifest listing them. Appending writes new files
+and then replaces the manifest in one atomic operation, so a commit publishes all of its rows
+or none of them. A reader pins the manifest it opened with and reads that version to
+completion, so it never waits on a writer and never sees a partial commit. No lock service or
+leader election participates in this.
 
-Nothing has to coordinate for that to hold — no lock service, no elected leader. That is what
-lets Infino be a library you link in rather than a service you operate.
+## Vector index modes
 
-### Memory
+The index is one config line. Every mode falls back to the routed scan on its own when it
+cannot serve a query, so changing the line can cost recall or latency but not correctness.
 
-Only the codes need to be resident, and they are the compressed copy:
+What a million 1536-dimension vectors cost to keep resident:
 
-| Vector dimensions | RaBitQ codes | Same data as float32 |
-|---|---|---|
-| 384 | 48 B/row | 1.5 KB/row |
-| 768 | 96 B/row | 3 KB/row |
-| 1024 | 128 B/row | 4 KB/row |
+| Mode | Resident | 1M × 1536d | vs float32 | recall@10 | warm p50 |
+|---|---|---|---|---|---|
+| float32, no index | 4 B/dim | 5.7 GiB | — | 1.000 | — |
+| `flat_ivf` | 0.5 B/dim, pinned | 726 MiB | 8× less | 0.938 | 20 ms |
+| `ivf` (default) | 2 B/dim, cached | ~2.9 GiB reclaimable, ~100 MiB pinned | ~2× less | 0.988 | 6.2 ms |
+| `hnsw_ivf` | ~3.2 B/dim, pinned | ~4.6 GiB | ~1.2× less | 0.995 | 0.59 ms |
 
-At 1024 dimensions, 10M vectors is about 1.3 GB of codes. The higher-precision rerank copy is
-2 bytes per dimension and lives in the disk cache rather than in RAM; setting the rerank codec
-to `rabitq_only` drops it entirely. Every bench table in
-[benches/README.md](benches/README.md) reports peak, median, and p90 RSS alongside latency,
-so the memory cost of each shape is recorded next to its speed.
+The `1M × 1536d` column is computed from the same corpus for every row, so the memory is
+comparable across modes. Recall and latency come from each mode's own measurement, and those
+are not the same corpus: `flat_ivf` on dbpedia at 1536 dimensions, `hnsw_ivf` on Cohere at
+768 dimensions, where it pins about 2.4 GiB.
 
-## Retrieval is a relation
+`flat_ivf` scans a 4-bit plane end to end and returns the codes' own ranking. No clusters, no
+graph, no rerank plane. It fetches nothing to serve a query, so cold and warm are the same
+number and the quoted latency is a worst case rather than a cache-dependent average. Cost is
+linear in rows: about 1.6 ms at 100K, 20 ms at 1M. Recall is set by the codec at roughly 0.94
+and does not move with scale. Cosine columns only.
+
+`ivf` is the default and the only mode that scales past memory. The index lives on object
+storage and pages into the reclaimable cache, so pinned memory stays near 100 MiB regardless
+of table size and the resident set drops to nothing when the table goes idle.
+
+`hnsw_ivf` walks a resident graph on an int8 plane and re-ranks the final beam at higher
+precision. It needs the graph in RAM, which bounds it to tables of 10M rows.
+
+At 100K rows, `flat_ivf` holds 77 MiB of plane where float32 needs 586 MiB, answers in
+1.6 ms, and beats the routed path below roughly 130K rows. Serving RSS all-in, including the
+manifest, is 153 MiB at 100K and 841 MiB at 1M. Build peaks are transient and released at
+commit.
+
+### Calibration
+
+You set a recall target and `optimize()` measures the corpus to decide how to reach it. A
+graph or a flat plane is published only if its calibrated recall clears the registration floor
+for that index type; otherwise the routed scan serves and nothing changes for the caller.
+Probe width and depth are re-fitted whenever compaction or a cell split moves the geometry
+they were measured against.
+
+```yaml
+# infino.yaml
+vector:
+  target_recall: 0.99
+  search_mode: ivf         # ivf (default) | hnsw_ivf | flat_ivf
+```
+
+```python
+table.optimize()    # drain, compact, recalibrate, sweep
+```
+
+Every knob, and the measurement behind each default, is documented inline in
+[`src/config/config.yaml`](src/config/config.yaml). The bench tables in
+[benches/README.md](benches/README.md) report peak, median, and p90 RSS next to each latency.
+
+## Search results are SQL tables
 
 `bm25_search`, `vector_search`, `hybrid_search`, `token_match`, and `exact_match` are SQL
-table-valued functions, so a ranked result set is an ordinary table. Retrieval, filters,
-joins, and aggregation compose in one statement against one pinned snapshot. One query
-replaces several, which matters when an agent pays a round trip per call.
+table-valued functions, so a ranked result set is a relation. Retrieval, filters, joins, and
+aggregation compose in one statement against one pinned snapshot, which replaces several
+round trips with one.
 
 ```sql
--- a ranked search is a relation: join it, group it, aggregate it
 SELECT   s.team,
          count(*)      AS hits,
          avg(h.score)  AS relevance
@@ -219,49 +258,30 @@ GROUP BY s.team
 ORDER BY hits DESC;
 ```
 
-## Indexes calibrate themselves
+SQL runs on Apache DataFusion. What Infino adds is the indexes it already wrote: a predicate
+on an indexed text column resolves through the posting list into a Parquet row selection, so
+DataFusion decodes only the matching rows, and file-level min/max and Bloom summaries drop
+whole files before any bytes are read.
 
-You declare a recall target and the engine decides how to reach it. On `optimize()`, Infino
-measures the corpus and picks the vector path: an IVF cell scan over 1-bit RaBitQ codes, or
-a resident HNSW graph when the table fits RAM and the distribution suits a graph. A
-calibrated graph that cannot reach the target is discarded and the scan path serves instead.
-Per-cell probe width and depth are re-measured whenever compaction or a cell split changes
-the geometry they were fitted against.
+## Limitations
 
-```yaml
-# infino.yaml
-vector:
-  target_recall: 0.99      # declare the goal
-  search_mode: hnsw_ivf    # default: ivf. hnsw_ivf falls back to ivf automatically
-```
+- Commit is the durability boundary. Rows are durable when a commit lands, not when
+  `append()` returns.
+- Tables are append-only and time-ordered. Updates are delete plus insert via tombstones, and
+  there are no cross-table transactions. This is not an OLTP store.
+- Writes go through a single writer slot, so there is one writer per table at a time. Readers
+  are unbounded and are never blocked.
+- This is a library with a SQL and Arrow surface. There is no daemon, no REST endpoint, and no
+  cluster to operate.
 
-```python
-table.optimize()    # drain, compact, recalibrate, sweep
-```
-
-Every knob, with the measurement behind each default, is documented inline in
-[`src/config/config.yaml`](src/config/config.yaml).
-
-## When not to use Infino
-
-- **You need per-row durability.** Commit is the durability boundary. Rows are durable when
-  a commit lands, not when `append()` returns.
-- **You need OLTP.** Tables are append-only and time-ordered; updates are delete plus insert
-  via tombstones. There are no transactions across tables.
-- **You need many concurrent writers on one table.** Writes go through a single writer slot.
-  Readers are unbounded and never blocked.
-- **You want a server.** This crate is embedded, with a SQL and Arrow surface. There is no
-  daemon to run, no REST endpoint, and no cluster to operate.
-
-The crate is 0.x and the API can still move. The public surface is pinned by
-`public-api.txt`.
+The crate is 0.x and the API can still move. The public surface is pinned by `public-api.txt`.
 
 ## Documentation
 
-- **[Overview →](docs/architecture/overview.md)** — the mental model, and how this compares
-- **[Superfile format →](docs/architecture/superfile.md)** — how indexes fit inside Parquet
-- **[Supertable layer →](docs/architecture/supertable.md)** — manifest, commit, query fan-out
-- **[infino.ai/docs](https://infino.ai/docs)** — concepts and guides
+- [Overview](docs/architecture/overview.md) — the mental model, and how this compares
+- [Superfile format](docs/architecture/superfile.md) — how indexes fit inside Parquet
+- [Supertable layer](docs/architecture/supertable.md) — manifest, commit, query fan-out
+- [infino.ai/docs](https://infino.ai/docs) — concepts and guides
 
 | Language | Package | Examples |
 |----------|---------|----------|
@@ -279,6 +299,6 @@ make ci                # gates before a PR
 make readme-charts     # regenerate the charts above
 ```
 
-MSRV **1.95**. Python and Node version on their own SemVer lines
+MSRV 1.95. Python and Node version on their own SemVer lines
 ([docs/versioning.md](docs/versioning.md)). See [CONTRIBUTING.md](CONTRIBUTING.md).
 Licensed [Apache-2.0](LICENSE).
