@@ -7,7 +7,8 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 **Embedded retrieval library: full-text, vector, hybrid, and SQL over one table, stored as
-ordinary Parquet on local disk or object storage. Fast, simple, and scalable.**
+ordinary Parquet on local disk or object storage. Fast, simple, scalable, and with far
+less resource usage than traditional engines.**
 
 ```sh
 pip install infino              # Python
