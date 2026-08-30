@@ -110,6 +110,96 @@ Harnesses: [VectorDBBench](https://zilliz.com/vdbbench-leaderboard?dataset=vecto
 [ClickBench](https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino%7CDataFusion%20%28Parquet%2C%20single%29%7CSpark%7CPostgreSQL%20%28with%20indexes%29&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot)
 ([port](https://github.com/infino-ai/clickbench/tree/add-infino/infino)).
 
+## Adaptive vector indexing
+
+Infino serves vector search from one of two index paths, selected by
+`vector.search_mode` in YAML. There is no separate "flat" mode — an exhaustive scan is
+what an IVF cell degenerates to when the probe covers it.
+
+| `search_mode` | Path | When to use |
+|---|---|---|
+| `ivf` *(default)* | Grid-route to cells, then scan each cell at the per-cell width stamped in the manifest. Reads come off NVMe cache and reclaim under memory pressure. | Any scale. The only path for filtered queries, and the automatic fallback everywhere else. |
+| `hnsw_ivf` | Walk a resident in-memory HNSW graph over every row's Sq16 codes, skipping the grid, cell selection, and disk reads entirely. | Single-box, latency-tier tables that fit RAM (≤ `hnsw_max_docs`, default 10M rows). |
+
+The `_ivf` suffix is the contract: `hnsw_ivf` means "graph if one exists, otherwise IVF."
+A missing graph — pre-drain, above the row ceiling, a different column, or a corpus the
+calibrator rejected — silently serves `ivf`. Correctness never depends on the graph.
+
+```yaml
+# infino.yaml
+vector:
+  # Declare the recall you want; the drain calibrates the index to hit it.
+  target_recall: 0.99      # default
+
+  search_mode: hnsw_ivf    # default: ivf
+  hnsw_max_docs: 10000000  # above this, the graph is not built at all
+  hnsw_recall_slack: 0.01  # accept the graph down to target_recall - slack
+  hnsw_m0: 0               # 0 = calibrator picks base-layer degree
+  hnsw_ef_construction: 200
+  hnsw_ef_ceil: 2048       # ceiling on the calibration ef sweep
+
+  # Within search_mode: ivf, choose the cluster router.
+  ivf_router: stamped      # or: centroid_graph (experimental, cold-read win at 10M+)
+```
+
+### What `optimize()` actually does
+
+`optimize()` is the maintenance entry point, and it runs three phases in order:
+
+1. **Drain the hidden vector cells.** Vector search runs over a hidden, cell-ordered index
+   supertable dual-written alongside your time-ordered table. The drain merges pending
+   per-cell delta superfiles, refreshes centroids and radii, splits overflow cells, and —
+   under `hnsw_ivf` — builds and calibrates the resident graph. New superfiles are written
+   to object storage; nothing is edited in place.
+2. **Compact, then re-measure the probe laws.** Merge small or underfilled superfiles
+   toward `compaction.target_superfile_size_mb`, cutting query fan-out. Merging and cell
+   splitting change the geometry the per-cell probe width and fine depth were measured
+   against, so when the pass reshapes the index those laws are re-measured and re-stamped
+   into the manifest. Recalibration is monotonic on fine depth — it never shallows a depth
+   an earlier measurement certified.
+3. **Sweep.** Best-effort garbage collection of orphaned superfiles, manifests, dead
+   tombstone sidecars, and completed WAL state.
+
+Recalibration also fires without a reshape, when a stamped width has outgrown the rerank
+pool that measured it. That case can't self-heal on a table that never splits or merges, so
+without the check a bulk-load-then-optimize flow would leave the default path on a constant
+probe budget indefinitely.
+
+```python
+table.optimize()                    # engine defaults
+```
+
+```rust
+table.optimize(&OptimizeOptions::default())?;
+```
+
+Both require durable storage. `vector.maintenance_threads` (default `auto`, meaning every
+hardware thread, on the assumption that an explicit optimize owns its machine) caps the CPU
+pool for the maintenance compute — cell-split k-means, child builds, and probe-law
+recalibration. Lower it when optimize runs alongside latency-critical foreground work. The
+ingest commit path does not ride this pool.
+
+### What adapts on its own
+
+Every decision below is re-derived on each drain, so a table is never permanently locked
+into a choice made when it was small:
+
+| Decision | Governed by | Default |
+|---|---|---|
+| Is this corpus graph-friendly at all? A cheap probe on a subsample; a probe that can't register is a hard "skip the expensive build, serve `ivf`" signal. | `hnsw_probe_max_docs` | `100000` |
+| Does the graph fit? Above the ceiling only the much smaller centroid graph is built and queries take the scan path. | `hnsw_max_docs` | `10000000` |
+| How dense must the base layer be? Swept until recall reaches the target — high-dimensional vectors need a denser layer-0. | `hnsw_m0` (`0` = auto) | `0` |
+| What query-time beam? The drain sweeps `ef` candidates and stamps the per-table winner into the persisted bundle. | `hnsw_ef_ceil` | `2048` |
+| Keep the graph or fall back? If calibrated recall lands below `target_recall - slack`, the drain gives up and serves `ivf`. | `hnsw_recall_slack` | `0.01` |
+| When does a cell split? On a hard row cap, or when a cell goes genuinely multi-modal (Ashman's D on the axis between a two-means partition). | `cell_split_doc_cap`, `cell_split_modality_d` | `500000`, `8.0` |
+| How wide and how deep does a query probe each cell? Measured per table and stamped in the manifest, then re-measured whenever compaction or a split changes the geometry. | `target_recall`, `fine_nprobe_floor`, `fine_nprobe_pct` | `0.99`, `4`, `0.0` |
+
+Memory follows from these: the resident graph is bounded by rows × `m0` on the base layer,
+capped by `hnsw_max_docs`. `hnsw_sq8_walk` (default `true`) navigates on an int8 plane
+derived from the Sq16 codes and re-ranks the final `hnsw_refine_k` (default `256`)
+candidates on full Sq16 — roughly half the warm latency at unchanged recall, for about one
+extra byte per dimension per row. Set it to `false` to walk on Sq16 only and drop that plane.
+
 ## Hybrid search is SQL
 
 `bm25_search`, `vector_search`, `hybrid_search`, `token_match`, and `exact_match` are SQL
