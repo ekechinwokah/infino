@@ -217,9 +217,7 @@ The corpus downloads once into `corpus-dir`. Add `--features faiss` (after
 ![SQL vs search engines, ClickBench combined score, c6a.4xlarge](docs/assets/readme/compare-sql-search.svg)
 
 [ClickBench, search-tagged systems](https://benchmark.clickhouse.com/#system=-&type=+sac&machine=+c6a.4xlarge&cluster_size=-&opensource=-&hardware=+c&tuned=+n&metric=combined&queries=-)
-— same 43 queries, filtered to the search engines. Combined weights load time and
-footprint; on the hot suite alone SigLens leads (11.3 s vs Infino's 34.0 s) — its rank
-above is set by a 6,279 s load against Infino's 1,139 s.
+(same 43 queries, filtered to the search engines)
 
 ## How it works
 

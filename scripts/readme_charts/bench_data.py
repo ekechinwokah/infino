@@ -278,9 +278,9 @@ SQL_EXT_META = {
 # recomputed from ClickBench's own data, reimplementing their combined
 # metric exactly (hot 60%, cold 20%, load time 10%, data size 10%), all
 # rows at c6a.4xlarge so the chart and its deep link agree. Verified
-# 2026-08-30. CAVEAT the README carries under the chart: on the hot suite
-# alone SigLens leads (11.3 s vs Infino 34.0 s); its combined rank is set
-# by a 6,279 s load vs Infino's 1,139 s.
+# 2026-08-30. An earlier "SigLens leads on hot time" caveat was an
+# artifact of counting its FAILED queries as zero seconds and is
+# retracted; it does not lead.
 CLICKBENCH_SEARCH_ROWS: list[CompareRow] = [
     CompareRow("Infino", 3.00, "3.00", self_row=True),
     CompareRow("ParadeDB", 4.68, "4.68"),
