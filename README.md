@@ -214,6 +214,13 @@ The corpus downloads once into `corpus-dir`. Add `--features faiss` (after
 [ClickBench](https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino%7CDataFusion%20%28Parquet%2C%20single%29%7CSpark%7CPostgreSQL%20%28with%20indexes%29&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot)
 ([our port](https://github.com/infino-ai/clickbench/tree/add-infino/infino))
 
+![SQL vs search engines, ClickBench combined score, c6a.4xlarge](docs/assets/readme/compare-sql-search.svg)
+
+[ClickBench, search-tagged systems](https://benchmark.clickhouse.com/#system=-&type=+sac&machine=+c6a.4xlarge&cluster_size=-&opensource=-&hardware=+c&tuned=+n&metric=combined&queries=-)
+— same 43 queries, filtered to the search engines. Combined weights load time and
+footprint; on the hot suite alone SigLens leads (11.3 s vs Infino's 34.0 s) — its rank
+above is set by a 6,279 s load against Infino's 1,139 s.
+
 ## How it works
 
 ![Your app queries Infino, which caches in RAM and on disk over Parquet on object storage](docs/assets/readme/one-parquet-copy.svg)

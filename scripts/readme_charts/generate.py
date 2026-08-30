@@ -16,6 +16,8 @@ import math
 from pathlib import Path
 
 from bench_data import (
+    CLICKBENCH_SEARCH_META,
+    CLICKBENCH_SEARCH_ROWS,
     EMBED_META,
     EMBED_ROWS,
     SBG_META,
@@ -528,6 +530,9 @@ def main() -> None:
     compare_chart(VDB_META, VDB_ROWS, "compare-vdb.svg")
     compare_chart(EMBED_META, EMBED_ROWS, "compare-embedded.svg")
     compare_chart(SQL_EXT_META, SQL_EXT_ROWS, "compare-sql.svg", log=True)
+    compare_chart(
+        CLICKBENCH_SEARCH_META, CLICKBENCH_SEARCH_ROWS, "compare-sql-search.svg", log=True
+    )
     ratio_chart(SBG_META, SBG_ROWS, "compare-fts.svg")
     print(f"wrote charts to {OUT}")
 
