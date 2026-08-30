@@ -1362,7 +1362,11 @@ pub mod fts {
 }
 
 pub mod vector {
-    use std::{collections::HashMap, hint::black_box};
+    use std::{
+        collections::HashMap,
+        hint::black_box,
+        time::{Duration, Instant},
+    };
 
     use infino::{
         storage::io_counters,
@@ -1568,6 +1572,123 @@ pub mod vector {
             _rerank: usize,
         ) -> Option<f64> {
             None
+        }
+    }
+
+    /// One row of [`per_k_sweep`]: recall and latency at a single `k`.
+    #[derive(Clone, Copy, Debug)]
+    pub struct PerKCell {
+        pub k: usize,
+        pub recall: f32,
+        pub p50_ns: f64,
+        pub p95_ns: f64,
+    }
+
+    /// Median percentile rank for [`per_k_sweep`] latency columns.
+    const SWEEP_P50: usize = 50;
+    /// Tail percentile rank for [`per_k_sweep`] latency columns.
+    const SWEEP_P95: usize = 95;
+
+    /// Per-`k` recall/latency sweep over ONE search surface — the single
+    /// measurement loop every comparison arm shares. `search` is the
+    /// engine's own call (its public API where it has one: a supertable
+    /// arm passes a closure over `vector_search` via
+    /// [`SupertableVectorRead`], a library peer passes its `search`);
+    /// this function owns the timing, the recall division against the
+    /// deep oracle's `k`-prefix, and the percentile math, so no battery
+    /// re-implements any of them. `truth_deep` rows are rank-sorted and
+    /// at least as deep as the largest `k`.
+    pub fn per_k_sweep(
+        queries: &[Vec<f32>],
+        truth_deep: &[Vec<u32>],
+        ks: &[usize],
+        mut search: impl FnMut(&[f32], usize) -> Vec<corpus::Hit>,
+    ) -> Vec<PerKCell> {
+        let percentile = |sorted: &[Duration], pct: usize| -> f64 {
+            // Empty input yields 0 rather than an underflowing index: the
+            // recall side already tolerates an empty query set, and a
+            // helper must not have a narrower domain than its caller.
+            if sorted.is_empty() {
+                return 0.0;
+            }
+            let rank = (pct * sorted.len()).div_ceil(100);
+            sorted[rank.saturating_sub(1).min(sorted.len() - 1)].as_nanos() as f64
+        };
+        // Enforced, not just documented: a measurement helper must fail
+        // fast on malformed inputs rather than publish skewed numbers —
+        // zip would silently drop unmatched rows while the division still
+        // used the full count, and clipping a shallow oracle row would
+        // inflate recall at the deep knots.
+        assert_eq!(
+            queries.len(),
+            truth_deep.len(),
+            "one ground-truth row per query"
+        );
+        let max_k = ks.iter().copied().max().unwrap_or(0);
+        assert!(
+            truth_deep.iter().all(|truth| truth.len() >= max_k),
+            "every ground-truth row must be at least as deep as the largest k ({max_k})"
+        );
+        ks.iter()
+            .map(|&k| {
+                let mut latencies = Vec::with_capacity(queries.len());
+                let mut recall_sum = 0.0_f32;
+                for (query, truth) in queries.iter().zip(truth_deep) {
+                    let started = Instant::now();
+                    let hits = search(query, k);
+                    latencies.push(started.elapsed());
+                    recall_sum += corpus::recall_at_k(&hits, &truth[..k]);
+                }
+                latencies.sort_unstable();
+                PerKCell {
+                    k,
+                    recall: recall_sum / queries.len().max(1) as f32,
+                    p50_ns: percentile(&latencies, SWEEP_P50),
+                    p95_ns: percentile(&latencies, SWEEP_P95),
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    mod per_k_sweep_tests {
+        use super::*;
+
+        /// Queries carry their own index in coordinate 0, so the closure
+        /// can answer each from its matching truth row: an ideal engine,
+        /// which must grade exactly 1.0 at every knot.
+        #[test]
+        fn an_ideal_engine_grades_one_at_every_knot() {
+            let queries: Vec<Vec<f32>> = (0..3).map(|q| vec![q as f32; 4]).collect();
+            let truth: Vec<Vec<u32>> = (0..3u32).map(|q| (q * 10..q * 10 + 10).collect()).collect();
+            let truth_for_closure = truth.clone();
+            let cells = per_k_sweep(&queries, &truth, &[1, 10], |query, k| {
+                let row = &truth_for_closure[query[0] as usize];
+                row[..k].iter().map(|&id| (id, 0.0)).collect()
+            });
+            assert_eq!(cells.len(), 2);
+            for cell in &cells {
+                assert_eq!(cell.recall, 1.0, "ideal engine at k={}", cell.k);
+            }
+        }
+
+        /// The enforced input contract: a ground-truth row shallower than
+        /// the deepest knot must fail fast, never inflate recall.
+        #[test]
+        #[should_panic(expected = "at least as deep")]
+        fn a_shallow_oracle_row_fails_fast() {
+            let queries = vec![vec![0.0f32; 4]];
+            let truth = vec![vec![0u32; 5]];
+            per_k_sweep(&queries, &truth, &[10], |_, _| Vec::new());
+        }
+
+        /// One truth row per query, enforced.
+        #[test]
+        #[should_panic(expected = "one ground-truth row per query")]
+        fn mismatched_lengths_fail_fast() {
+            let queries = vec![vec![0.0f32; 4]; 2];
+            let truth = vec![vec![0u32; 10]];
+            per_k_sweep(&queries, &truth, &[10], |_, _| Vec::new());
         }
     }
 
