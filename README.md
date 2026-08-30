@@ -113,8 +113,10 @@ Harnesses: [VectorDBBench](https://zilliz.com/vdbbench-leaderboard?dataset=vecto
 ## Adaptive vector indexing
 
 Infino serves vector search from one of two index paths, selected by
-`vector.search_mode` in YAML. There is no separate "flat" mode — an exhaustive scan is
-what an IVF cell degenerates to when the probe covers it.
+`vector.search_mode` in YAML. Both search quantized codes — `ivf` scores 1-bit RaBitQ and
+then re-ranks, `hnsw_ivf` walks an int8 plane and refines on Sq16 — so neither is an exact
+full scan. `IndexSpec::vector(column, dim, metric)` takes no index-type argument, which
+makes the path a runtime setting rather than something frozen at table creation.
 
 | `search_mode` | Path | When to use |
 |---|---|---|
