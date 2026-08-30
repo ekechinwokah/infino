@@ -1,6 +1,6 @@
 # Benchmarks
 
-Infino-only measurements from the in-tree harness (`cargo bench`). One binary
+Infino benchmark measurements from the in-tree harness (`cargo bench`). One binary
 builds the corpus, times ingest and queries, samples RSS, and prints the tables.
 
 ## Latest (CI)
@@ -10,13 +10,11 @@ Azure Blob, 1M-doc supertables, warm cache —
 ([run 32825375037](https://github.com/infino-ai/infino/actions/runs/32825375037)),
 Intel Xeon 6973P-C (4C/7T pinned, 31 GiB).
 
-FTS numbers are **search + document fetch** (`+fetch`).
-
 | | Shape | Result |
 |---|---|---:|
-| FTS | `single_rare` top-10, warm `+fetch` | **166 µs** p50 |
+| FTS | single_rare top-10, warm+fetch | **166 µs** p50 |
 | Vector | default top-10 cosine, post-drain, 1024-d | **663 µs** p50 · **0.992** recall@10 |
-| Hybrid | `hybrid_search` via SQL, 10 rows | **3.47 ms** p50 |
+| Hybrid | hybrid_search via SQL, 10 rows | **3.47 ms** p50 |
 | Ingest | FTS / vector / SQL | **62.1 / 7.8 / 17.0** K docs/s |
 
 Raw logs: Actions artifacts on that run.
@@ -96,7 +94,6 @@ cargo bench -- dataset run datasets/bench-10m fts
 | `supertable fts` | multi-artifact on object storage | FTS |
 | `supertable vector` | | vector |
 | `supertable sql` | | SQL |
-
 Each cell: `build`, `warm`, `cold`. Multi-cell runs isolate each cell in its own process (RSS).
 
 Vector cells report a `default` config row; probe/rerank are not env-tunable.
@@ -112,13 +109,6 @@ scale.rs, sql_diag.rs, tombstone_overhead.rs, …
 ```
 
 JSON metrics land in `target/infino-bench/<bench>.json` (local only).
-
-## Archived tables (2026-06-13)
-
-Frozen snapshot from
-[`33fdc59`](https://github.com/infino-ai/infino/commit/33fdc593aba335df9190bd7e3ebb3e3feab316fe)
-(S3, 1M docs, **384-d** vectors). Prefer the CI table above for current
-defaults. Blocks below are rewritten by `INFINO_BENCH_UPDATE_README=1`.
 
 ### Superfile FTS
 

@@ -43,6 +43,7 @@ use std::{
     sync::{Mutex, RwLock},
 };
 
+use bytes::Bytes;
 use rayon::prelude::*;
 
 use crate::superfile::vector::distance::{
@@ -85,6 +86,39 @@ pub(crate) trait NodeScorer {
     fn score(&self, q: &Self::Prepared, node: u32) -> f32;
 }
 
+/// Backing store for a serving byte plane (the Sq16 code plane or the derived
+/// SQ8 walk plane): either owned heap (`Vec`) or a zero-copy slice of the
+/// memory-mapped graph bundle (`Bytes`). [`Plane::bytes`] hands out a
+/// contiguous `&[u8]` either way, so the scoring / VNNI kernels are unchanged.
+///
+/// The mapped variant keeps its backing `Bytes` alive: when the bundle is
+/// served via `mmap` (the default for local backends, see
+/// `slow_vector_state::fetch_graph_section`), the Sq16 and SQ8 planes are
+/// `slice_ref` views of that one mapping — one physical page-cache copy shared
+/// across every process, and no per-open heap copy of the multi-GiB planes.
+pub(crate) enum Plane {
+    Owned(Vec<u8>),
+    Shared(Bytes),
+}
+
+impl Plane {
+    #[inline]
+    pub(crate) fn bytes(&self) -> &[u8] {
+        match self {
+            Plane::Owned(v) => v,
+            Plane::Shared(b) => b,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.bytes().len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bytes().is_empty()
+    }
+}
+
 /// Sq16 node scorer: one `u16` code per dimension on the fixed cosine
 /// grid, scored with the existing fused-dequant [`Sq16Kernel`] under the
 /// [`Metric::NegDot`] convention (`score = −dot`, so smaller is nearer).
@@ -92,8 +126,9 @@ pub(crate) trait NodeScorer {
 /// The codes are stored row-major (`dim × 2` bytes per node) and scored
 /// straight from the code bytes — no per-candidate decode buffer.
 pub(crate) struct Sq16Scorer {
-    /// `len × dim × 2` little-endian `u16` codes, row-major.
-    codes: Vec<u8>,
+    /// `len × dim × 2` little-endian `u16` codes, row-major — owned heap, or a
+    /// zero-copy slice of the mapped graph bundle.
+    codes: Plane,
     dim: usize,
     len: usize,
 }
@@ -110,7 +145,7 @@ impl Sq16Scorer {
             encode_sq16_row(v, &mut codes[i * stride..(i + 1) * stride]);
         }
         Self {
-            codes,
+            codes: Plane::Owned(codes),
             dim,
             len: vectors.len(),
         }
@@ -121,6 +156,19 @@ impl Sq16Scorer {
     /// on-disk `full[]` Sq16 plane. No decode/re-encode round trip.
     pub(crate) fn from_codes(codes: Vec<u8>, dim: usize, len: usize) -> Self {
         debug_assert_eq!(codes.len(), len * dim * 2);
+        Self {
+            codes: Plane::Owned(codes),
+            dim,
+            len,
+        }
+    }
+
+    /// Adopt an already-backed Sq16 code plane verbatim: the plane holds
+    /// exactly the `len × dim × 2` on-disk bytes, whether that is a zero-copy
+    /// slice of the mapped bundle (`Plane::Shared`) or an owned buffer. No
+    /// decode/re-encode round trip and, for the shared variant, no heap copy.
+    pub(crate) fn from_plane(codes: Plane, dim: usize, len: usize) -> Self {
+        debug_assert_eq!(codes.len(), len * dim * 2);
         Self { codes, dim, len }
     }
 
@@ -128,14 +176,14 @@ impl Sq16Scorer {
     /// concatenate the prior codes with a freshly-drained delta into one
     /// combined scorer.
     pub(crate) fn codes(&self) -> &[u8] {
-        &self.codes
+        self.codes.bytes()
     }
 
     #[inline]
     fn row(&self, node: u32) -> &[u8] {
         let stride = self.dim * 2;
         let start = node as usize * stride;
-        &self.codes[start..start + stride]
+        &self.codes.bytes()[start..start + stride]
     }
 }
 
@@ -770,6 +818,13 @@ const CALIB_QUERY_STRIDE_MULT: usize = 2_654_435_761;
 /// renormalized) so measured recall reflects true off-node search rather than
 /// a node's trivial self-hit.
 const CALIB_QUERY_JITTER: f32 = 0.05;
+/// Recall-`k` anchors the calibrator stamps an `ef` for — a compact k→ef curve
+/// so each query's requested `k` gets the minimal `ef` that clears the recall
+/// target at that `k`. A single stamped `ef` cannot serve every `k`: an `ef`
+/// sized for k=10 under-serves recall@100, and the wide `ef` that clears
+/// recall@100 over-serves (needlessly slows) k=10. Ascending; the largest is
+/// the ground-truth depth the calibrator computes exhaustively.
+const HNSW_CALIB_K_ANCHORS: [usize; 4] = [1, 10, 50, 100];
 
 /// Held-out, perturbed (off-node) calibration queries drawn from the plane —
 /// evenly spread source nodes, each jittered off its exact position and
@@ -822,7 +877,10 @@ pub(crate) fn measure_recall(
     graph_recall(graph, scorer, &queries, &gt, k, ef)
 }
 
-/// Recall@k of `graph` walked at `ef` against exhaustive `gt`.
+/// Recall@k of `graph` walked at `ef` against exhaustive `gt`. `gt` truth lists
+/// may be deeper than `k` (the calibrator computes ground truth to the widest
+/// anchor); only the top-`k` prefix of each is scored, so recall@k is measured
+/// against the top-`k` truth regardless of how deep `gt` was computed.
 fn graph_recall(
     graph: &Hnsw,
     scorer: &Sq16Scorer,
@@ -837,6 +895,7 @@ fn graph_recall(
     // searches per drain — a fresh O(n) buffer each would dominate).
     let mut visited = VisitedSet::new(graph.len());
     for (q, truth) in queries.iter().zip(gt) {
+        let truth = &truth[..k.min(truth.len())];
         let got: HashSet<u32> = graph
             .search_scratch(scorer, q, k, ef, &mut visited)
             .into_iter()
@@ -852,6 +911,87 @@ fn graph_recall(
     }
 }
 
+/// For a fixed `graph`/`m0`, stamp the compact k→ef curve: the minimal `ef`
+/// (from ascending `efs`) that clears `target_recall` at each anchor in
+/// `anchors`. One graph search per (query, ef) at the widest anchor depth
+/// yields recall at every anchor as a prefix of the same candidate list — no
+/// extra walks — reusing the exhaustive `gt` (computed to the widest anchor)
+/// the caller already has. An anchor no `ef` clears gets the ceiling `ef`
+/// (`efs.last()`); the curve is forced monotonic non-decreasing in `k` so a
+/// larger `k` never asks for a narrower beam than a smaller one (measurement
+/// noise can otherwise invert two adjacent anchors).
+fn calibrate_ef_curve(
+    graph: &Hnsw,
+    scorer: &Sq16Scorer,
+    queries: &[Vec<f32>],
+    gt: &[Vec<u32>],
+    anchors: &[usize],
+    efs: &[usize],
+    target_recall: f64,
+) -> Vec<(u32, u32)> {
+    let kmax = anchors.iter().copied().max().unwrap_or(0);
+    let ceiling = efs.last().copied().unwrap_or(0);
+    // `search_scratch` walks at `ef.max(k)` with `k = kmax`, so the recall an
+    // anchor is credited with is measured at beam `max(ef, kmax)` while `chosen`
+    // records the un-clamped `ef`. That only agrees when every candidate `ef` is
+    // at least the widest anchor; otherwise a small cleared `ef` would be stamped
+    // yet served at a narrower beam than it was measured at.
+    debug_assert!(
+        efs.first().copied().unwrap_or(usize::MAX) >= kmax,
+        "ef candidates must be >= the widest anchor ({kmax}) so a stamped ef is served \
+         at the beam its recall was measured at"
+    );
+    // Minimal clearing ef per anchor, filled the first time an ascending ef
+    // clears that anchor's target.
+    let mut chosen: Vec<Option<usize>> = vec![None; anchors.len()];
+    let mut visited = VisitedSet::new(graph.len());
+    for &ef in efs {
+        if chosen.iter().all(Option::is_some) {
+            break;
+        }
+        let mut hit = vec![0usize; anchors.len()];
+        let mut total = vec![0usize; anchors.len()];
+        for (q, truth) in queries.iter().zip(gt) {
+            // Top-`kmax` candidates at this beam; recall@anchor is the top-anchor
+            // prefix of this same list intersected with the top-anchor truth.
+            let got: Vec<u32> = graph
+                .search_scratch(scorer, q, kmax, ef, &mut visited)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
+            for (ai, &a) in anchors.iter().enumerate() {
+                let got_a: HashSet<u32> = got.iter().copied().take(a).collect();
+                let truth_a = &truth[..a.min(truth.len())];
+                hit[ai] += truth_a.iter().filter(|t| got_a.contains(t)).count();
+                total[ai] += truth_a.len();
+            }
+        }
+        for (ai, slot) in chosen.iter_mut().enumerate() {
+            if slot.is_none() {
+                let recall = if total[ai] == 0 {
+                    0.0
+                } else {
+                    hit[ai] as f64 / total[ai] as f64
+                };
+                if recall >= target_recall {
+                    *slot = Some(ef);
+                }
+            }
+        }
+    }
+    // Emit (k, ef) pairs, defaulting an uncleared anchor to the ceiling ef and
+    // clamping each ef up to the running max so the curve is non-decreasing.
+    let mut running = 0usize;
+    anchors
+        .iter()
+        .zip(&chosen)
+        .map(|(&a, slot)| {
+            running = slot.unwrap_or(ceiling).max(running);
+            (a as u32, running as u32)
+        })
+        .collect()
+}
+
 /// Calibrate `(m0, ef)` to `target_recall` on `scorer` (the drained Sq16 plane,
 /// or a subsample of it). Builds ONE graph at `max(m0_candidates)`, evaluates
 /// smaller `m0` by pruning the base layer (cheap) and `ef` by re-search (free),
@@ -860,6 +1000,11 @@ fn graph_recall(
 /// the best achieved with `registered` gated by the `target_recall −
 /// recall_slack` graceful floor. Queries are held-out, perturbed (off-node) so
 /// recall is realistic.
+///
+/// `want_curve` gates the per-`k` calibration: callers that only need the
+/// `(m0, ef)` choice (the corpus-size probe, the incremental-append recall
+/// check) pass `false` to skip the extra anchor sweep, whose result they would
+/// discard anyway — the authoritative curve is stamped on the full-corpus build.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn calibrate_graph(
     scorer: &Sq16Scorer,
@@ -871,7 +1016,8 @@ pub(crate) fn calibrate_graph(
     n_queries: usize,
     k: usize,
     seed: u64,
-) -> (CalibChoice, Option<Hnsw>) {
+    want_curve: bool,
+) -> (CalibChoice, Vec<(u32, u32)>, Option<Hnsw>) {
     let register_floor = (target_recall - recall_slack).max(0.0);
     let n = scorer.len();
     let fallback = CalibChoice {
@@ -882,12 +1028,21 @@ pub(crate) fn calibrate_graph(
         at_target: false,
     };
     if n == 0 || m0_candidates.is_empty() || ef_candidates.is_empty() {
-        return (fallback, None);
+        return (fallback, Vec::new(), None);
     }
     let queries = calibration_queries(scorer, n_queries, seed);
+    // Ground truth is computed to the widest anchor (or the primary `k`,
+    // whichever is deeper) so the m0-selection recall@`k` and every curve
+    // anchor's recall are prefixes of the SAME exhaustive lists — no re-derive.
+    let gt_depth = HNSW_CALIB_K_ANCHORS
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(k)
+        .max(k);
     let gt: Vec<Vec<u32>> = queries
         .iter()
-        .map(|q| exhaustive_topk(scorer, q, k))
+        .map(|q| exhaustive_topk(scorer, q, gt_depth))
         .collect();
 
     let mut m0s: Vec<usize> = m0_candidates.to_vec();
@@ -957,7 +1112,29 @@ pub(crate) fn calibrate_graph(
     } else {
         Some(base.pruned_base_layer(scorer, choice.m0))
     };
-    (choice, graph)
+    // Stamp the k→ef curve for the chosen m0's graph (the one that serves).
+    // Per-`k` widening only earns its keep on a graph that clears the target:
+    // uncleared anchors widen to the ceiling to chase recall, which is what a
+    // larger `k` wants. A graceful-band graph (registered but below target at
+    // every ef) has no anchor to clear, so a curve would just serve every `k`
+    // at the ceiling — strictly slower than the single stamped `choice.ef` it
+    // used before this curve existed. Stamp an empty curve there so serving
+    // degrades to `ef_search` (= `choice.ef`) for every `k`, exactly the
+    // pre-curve behavior. Empty too when the caller does not want a curve, or
+    // when nothing registered (no bundle is written in that case).
+    let curve = match graph.as_ref() {
+        Some(g) if want_curve && choice.at_target => calibrate_ef_curve(
+            g,
+            scorer,
+            &queries,
+            &gt,
+            &HNSW_CALIB_K_ANCHORS,
+            &efs,
+            target_recall,
+        ),
+        _ => Vec::new(),
+    };
+    (choice, curve, graph)
 }
 
 /// Sentinel filling unused fixed-stride layer-0 adjacency slots. Node ids
@@ -991,6 +1168,9 @@ impl<'a> Cursor<'a> {
     /// reserving, so a corrupt length word can't request a huge `Vec`.
     fn remaining(&self) -> usize {
         self.buf.len().saturating_sub(self.pos)
+    }
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
     }
     fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
@@ -1152,12 +1332,38 @@ impl Hnsw {
     }
 }
 
-/// On-disk magic for a persisted `hnsw` bundle (graph + node→doc-id
-/// map + node-ordered Sq16 plane), the self-contained payload a resident
-/// data index is rebuilt from at open. `02` carries the stamped column
-/// name; an older `01` bundle (no column) decodes to `None` so the query
-/// falls back to ivf until the next drain rebuilds it.
-const HNSW_DATA_MAGIC: &[u8; 8] = b"INFDDG02";
+/// On-disk magic for a persisted `hnsw` data bundle (graph + node→doc-id map +
+/// node-ordered Sq16 plane), the self-contained payload a resident data index
+/// is rebuilt from at open.
+///
+/// `v03` is the current format: it appends the derived SQ8 walk plane (`n ×
+/// dim` high bytes) as a section right after the Sq16 plane, so a mapped bundle
+/// serves *both* planes as zero-copy slices — no per-open derive of the ~0.77
+/// GiB SQ8 plane. `v02` (pre-existing bundles) carries only the Sq16 plane; it
+/// is still decoded, with the SQ8 plane derived on read as before — the
+/// backward-compatible fallback, so no forced rebuild. `v03` and `v02` share
+/// an identical header/doc-id/Sq16/graph framing; they differ only by the
+/// presence of the SQ8 section (and thus the magic). An older `01` bundle (no
+/// column) is neither, so it decodes to `None` and the query falls back to ivf
+/// until the next drain rebuilds it.
+const HNSW_DATA_MAGIC_V2: &[u8; 8] = b"INFDDG02";
+const HNSW_DATA_MAGIC_V3: &[u8; 8] = b"INFDDG03";
+/// `v04` appends the compact k→ef calibration curve as a trailing section after
+/// the graph — a `u16` pair count then that many `(u32 k, u32 ef)` pairs — so a
+/// query's requested `k` is served at its own calibrated beam (`v03` added the
+/// persisted SQ8 walk plane; `v04` adds the curve). Older bundles carry a
+/// single stamped `ef` and no curve; `decode_hnsw` reads the curve on `v04` and
+/// synthesizes a degenerate 1-point curve (`ef_for_k(k) = ef_search` for every
+/// `k`) on `v03`/`v02` — today's exact behavior, no forced rebuild.
+const HNSW_DATA_MAGIC_V4: &[u8; 8] = b"INFDDG04";
+/// All magics are 8 bytes; the shared byte width of the leading tag.
+const HNSW_DATA_MAGIC_LEN: usize = HNSW_DATA_MAGIC_V4.len();
+/// Byte size of the fixed frame of a data bundle: magic(8) + n(u64) + dim(u32)
+/// + ef(u32) + col_len(u32) + graph_len(u64). The variable-length column name,
+/// doc-id map, Sq16/SQ8 planes, and graph bytes are added on top; naming it
+/// keeps the `encode_hnsw` capacity hint exact so the final `graph_len` extend
+/// after the multi-GiB planes cannot trigger a full-buffer realloc at drain.
+const HNSW_DATA_FIXED_BYTES: usize = HNSW_DATA_MAGIC_LEN + 8 + 4 + 4 + 4 + 8;
 
 /// A `hnsw` resident index rebuilt from a persisted bundle: the Sq16
 /// scorer over the node-ordered code plane, the walkable graph, and the
@@ -1167,44 +1373,68 @@ pub(crate) struct HnswIndex {
     pub graph: Hnsw,
     pub doc_ids: Vec<i128>,
     pub dim: usize,
-    /// Calibrated query beam stamped at drain — the served `ef` (a query knob,
-    /// so it rides in the bundle header, not the graph structure). Always
-    /// non-zero from the drain; a 0 (which cannot occur) degrades to `k`.
+    /// Calibrated query beam stamped at drain — the recall@10 `ef` (a query
+    /// knob, so it rides in the bundle header, not the graph structure). Always
+    /// non-zero from the drain; a 0 (which cannot occur) degrades to `k`. Also
+    /// the value the degenerate 1-point `ef_curve` carries for a pre-`v04`
+    /// bundle (no per-`k` curve stamped).
     pub ef_search: usize,
+    /// Compact k→ef calibration curve: ascending `(k_anchor, ef)` pairs,
+    /// monotonic non-decreasing in `ef`. Stamped on a `v04` bundle so each
+    /// query's requested `k` is served at its own calibrated beam; a pre-`v04`
+    /// bundle decodes to a degenerate 1-point curve `[(u32::MAX, ef_search)]`
+    /// (every `k` maps to the single stamped `ef`). Read via [`Self::ef_for_k`].
+    pub ef_curve: Vec<(u32, u32)>,
     /// Vector column this graph was built for. A table can carry several
     /// same-dim vector columns; the serving path must reject a query on a
     /// different column (→ ivf) rather than silently answer it from this
     /// column's neighbors.
     pub column: String,
     /// Resident contiguous SQ8 walk plane (`n × dim` bytes) — the high byte of
-    /// each Sq16 code, derived here at load, never persisted (no writer/bundle
-    /// change). Used by [`HnswIndex::search_sq8_refine`] for a cheap int8-VNNI
-    /// walk; the exact ranking comes from the Sq16 refine over `scorer`.
-    pub sq8_plane: Vec<u8>,
+    /// each Sq16 code. On a `v03` bundle it is a zero-copy slice of the mapped
+    /// bundle (persisted as a section); on a `v02` bundle it is derived on read
+    /// into owned heap. Empty when SQ8-walk serving is off, so it costs no
+    /// memory when disabled and serving falls back to the Sq16 walk. Used by
+    /// [`HnswIndex::search_sq8_refine`] for a cheap int8-VNNI walk; the exact
+    /// ranking comes from the Sq16 refine over `scorer`.
+    pub sq8_plane: Plane,
 }
 
-/// Serialize a `hnsw` index to a persistable byte bundle: header,
-/// the `node -> stable doc id` map, the node-ordered Sq16 code plane, and
-/// the graph section. The Sq16 plane is carried inline so the bundle is
-/// self-contained — reopening needs nothing but these bytes.
+/// Serialize a `hnsw` index to a persistable byte bundle (`v03`): header,
+/// the `node -> stable doc id` map, the node-ordered Sq16 code plane, the
+/// derived SQ8 walk plane, and the graph section. Both planes are carried
+/// inline so the bundle is self-contained — reopening needs nothing but these
+/// bytes, and a mapped bundle serves both planes zero-copy.
 pub(crate) fn encode_hnsw(
     sq16_codes: &[u8],
     doc_ids: &[i128],
     graph: &Hnsw,
     dim: usize,
     ef_search: usize,
+    ef_curve: &[(u32, u32)],
     column: &str,
 ) -> Vec<u8> {
     let n = doc_ids.len();
     debug_assert_eq!(sq16_codes.len(), n * dim * 2);
     let graph_bytes = graph.to_bytes();
     let col = column.as_bytes();
-    let mut out =
-        Vec::with_capacity(32 + col.len() + n * 16 + sq16_codes.len() + graph_bytes.len());
-    out.extend_from_slice(HNSW_DATA_MAGIC);
+    // The SQ8 section is `n × dim` bytes (the high byte of each u16 Sq16 code).
+    let sq8_len = n * dim;
+    // The trailing k→ef curve: a u16 count then `(u32 k, u32 ef)` per pair.
+    let curve_len = 2 + ef_curve.len() * 8;
+    let mut out = Vec::with_capacity(
+        HNSW_DATA_FIXED_BYTES
+            + col.len()
+            + n * 16
+            + sq16_codes.len()
+            + sq8_len
+            + graph_bytes.len()
+            + curve_len,
+    );
+    out.extend_from_slice(HNSW_DATA_MAGIC_V4);
     out.extend_from_slice(&(n as u64).to_le_bytes());
     out.extend_from_slice(&(dim as u32).to_le_bytes());
-    // Was reserved / alignment; now the stamped query beam (u32).
+    // Was reserved / alignment; now the stamped recall@10 query beam (u32).
     out.extend_from_slice(&(ef_search as u32).to_le_bytes());
     // Stamped column name: length-prefixed UTF-8.
     out.extend_from_slice(&(col.len() as u32).to_le_bytes());
@@ -1213,19 +1443,70 @@ pub(crate) fn encode_hnsw(
         out.extend_from_slice(&id.to_le_bytes());
     }
     out.extend_from_slice(sq16_codes);
+    // SQ8 walk plane, derived from the Sq16 plane just written. Persisting it
+    // (rather than deriving on read) lets a mapped bundle serve it as a
+    // zero-copy slice. Shares the derivation with the v02 read-time fallback so
+    // the two can't drift.
+    extend_sq8_plane(&mut out, sq16_codes);
     out.extend_from_slice(&(graph_bytes.len() as u64).to_le_bytes());
     out.extend_from_slice(&graph_bytes);
+    // k→ef curve, appended AFTER the variable sections so the fixed-header
+    // byte count is unaffected. Bounded to u16 pairs (a handful of anchors).
+    out.extend_from_slice(&(ef_curve.len() as u16).to_le_bytes());
+    for &(k, ef) in ef_curve {
+        out.extend_from_slice(&k.to_le_bytes());
+        out.extend_from_slice(&ef.to_le_bytes());
+    }
+    out
+}
+
+/// Append the derived SQ8 walk plane — the high byte of each little-endian
+/// `u16` Sq16 code — to `out`. The single source of truth for the derivation,
+/// shared by [`encode_hnsw`] (persisting the v03 section) and
+/// [`derive_sq8_plane`] (the v02 read-time fallback) so the two can't drift.
+/// `chunks_exact(2)` elides the per-element bounds check on this hydration loop.
+fn extend_sq8_plane(out: &mut Vec<u8>, sq16_plane: &[u8]) {
+    out.extend(sq16_plane.chunks_exact(2).map(|w| w[1]));
+}
+
+/// The derived SQ8 walk plane as an owned buffer (`n × dim`). A pure function
+/// of the Sq16 plane — used to serve a `v02` bundle that has no persisted SQ8
+/// section.
+fn derive_sq8_plane(sq16_plane: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(sq16_plane.len() / 2);
+    extend_sq8_plane(&mut out, sq16_plane);
     out
 }
 
 /// Rebuild a resident [`HnswIndex`] from [`encode_hnsw`].
 /// Returns `None` on any malformation so the caller falls back to the lazy
 /// build or scan path rather than failing the query.
-pub(crate) fn decode_hnsw(bytes: &[u8], sq8_walk: bool) -> Option<HnswIndex> {
+///
+/// `bundle` owns the encoded bytes. When it is the memory-mapped graph bundle
+/// (the default local serving path), the Sq16 plane — and, on a `v03` bundle,
+/// the SQ8 plane — are served as zero-copy [`Bytes::slice_ref`] slices of it,
+/// with no heap copy, and the returned index keeps the mapping alive. A `v02`
+/// bundle has no SQ8 section, so the SQ8 plane is derived on read into owned
+/// heap when SQ8-walk serving is on.
+pub(crate) fn decode_hnsw(bundle: &Bytes, sq8_walk: bool) -> Option<HnswIndex> {
+    let bytes: &[u8] = bundle.as_ref();
     let mut c = Cursor::new(bytes);
-    if c.take(HNSW_DATA_MAGIC.len())? != HNSW_DATA_MAGIC {
+    let magic = c.take(HNSW_DATA_MAGIC_LEN)?;
+    // `v03`/`v04` carry the SQ8 walk plane as an inline section; `v02`
+    // (pre-existing bundles) does not, so it is derived on read below. `v04`
+    // additionally carries a trailing k→ef curve; `v03`/`v02` synthesize a
+    // degenerate 1-point curve from the single stamped `ef` below. Any other
+    // tag (e.g. a legacy `01`) is unsupported → `None`, and the query falls
+    // back to ivf.
+    let (has_sq8_section, has_curve) = if magic == HNSW_DATA_MAGIC_V4 {
+        (true, true)
+    } else if magic == HNSW_DATA_MAGIC_V3 {
+        (true, false)
+    } else if magic == HNSW_DATA_MAGIC_V2 {
+        (false, false)
+    } else {
         return None;
-    }
+    };
     let n = c.u64()? as usize;
     let dim = c.u32()? as usize;
     let ef_search = c.u32()? as usize; // 0 on older bundles (was reserved)
@@ -1249,33 +1530,71 @@ pub(crate) fn decode_hnsw(bytes: &[u8], sq8_walk: bool) -> Option<HnswIndex> {
     for _ in 0..n {
         doc_ids.push(c.i128()?);
     }
-    let plane = c.take(n.checked_mul(dim)?.checked_mul(2)?)?.to_vec();
+    // Sq16 plane as a zero-copy slice of `bundle`: `c.take` yields a subslice of
+    // `bytes` (= `bundle.as_ref()`), so `slice_ref` recovers the owning `Bytes`
+    // view without copying — a mapped bundle never copies the ~1.5 GiB plane
+    // into this process's heap.
+    let sq16_slice = c.take(n.checked_mul(dim)?.checked_mul(2)?)?;
+    let sq16_plane = bundle.slice_ref(sq16_slice);
+    // SQ8 walk plane. On `v03` it is the next inline section — sliced zero-copy
+    // out of `bundle` exactly like Sq16; the cursor consumes it either way
+    // (the section is always present) so the graph section that follows is
+    // reachable. On `v02` it is derived on read from the Sq16 high byte. Empty
+    // when SQ8-walk serving is off, so it costs no memory when disabled and
+    // serving falls back to the Sq16 walk.
+    let sq8_plane: Plane = if has_sq8_section {
+        let sq8_slice = c.take(n.checked_mul(dim)?)?;
+        if sq8_walk {
+            Plane::Shared(bundle.slice_ref(sq8_slice))
+        } else {
+            Plane::Owned(Vec::new())
+        }
+    } else if sq8_walk {
+        Plane::Owned(derive_sq8_plane(sq16_slice))
+    } else {
+        Plane::Owned(Vec::new())
+    };
     let graph_len = c.u64()? as usize;
     let graph_bytes = c.take(graph_len)?;
     let graph = Hnsw::from_bytes(graph_bytes)?;
     if graph.len() != n {
         return None;
     }
-    // Resident SQ8 walk plane: the high byte of each little-endian u16 code,
-    // laid out contiguously (n × dim). Reader-side only — derived from the
-    // Sq16 plane, never persisted. Built only when SQ8-walk serving is on;
-    // empty otherwise, so the plane costs no memory when disabled and serving
-    // falls back to the Sq16 walk.
-    let sq8_plane: Vec<u8> = if sq8_walk {
-        // High byte of each little-endian u16 code — the second byte of every
-        // 2-byte pair. `chunks_exact(2)` elides the per-element bounds check on
-        // this `n × dim` hydration loop.
-        plane.chunks_exact(2).map(|w| w[1]).collect()
+    // k→ef curve. On `v04` it is the trailing section after the graph; on an
+    // older bundle (no curve) synthesize a degenerate 1-point curve mapping
+    // every `k` to the single stamped `ef_search` — today's exact behavior.
+    let ef_curve = if has_curve {
+        let count = c.u16()? as usize;
+        // Bound the pair read against the bytes present (8 B/pair) before
+        // reserving, so a corrupt count cannot drive a huge allocation.
+        if count.checked_mul(8)? > c.remaining() {
+            return None;
+        }
+        let mut curve = Vec::with_capacity(count);
+        for _ in 0..count {
+            let k = c.u32()?;
+            let ef = c.u32()?;
+            curve.push((k, ef));
+        }
+        curve
     } else {
         Vec::new()
     };
-    let scorer = Sq16Scorer::from_codes(plane, dim, n);
+    // An absent or empty curve degrades to the degenerate 1-point fallback so
+    // `ef_for_k` always has a value to return.
+    let ef_curve = if ef_curve.is_empty() {
+        vec![(u32::MAX, ef_search as u32)]
+    } else {
+        ef_curve
+    };
+    let scorer = Sq16Scorer::from_plane(Plane::Shared(sq16_plane), dim, n);
     Some(HnswIndex {
         scorer,
         graph,
         doc_ids,
         dim,
         ef_search,
+        ef_curve,
         column,
         sq8_plane,
     })
@@ -1346,6 +1665,26 @@ impl NodeScorer for Sq8WalkScorer<'_> {
 }
 
 impl HnswIndex {
+    /// The calibrated query beam for a requested `k`, read from the stamped
+    /// k→ef curve: round `k` UP to the next anchor and return that anchor's
+    /// `ef` (the minimal beam that cleared the recall target there). A `k`
+    /// above the top anchor clamps to the top anchor's `ef` (the widest
+    /// calibrated beam — no measured-recall promise beyond the anchors). A
+    /// degenerate 1-point curve
+    /// (a pre-`v04` bundle) returns its single stamped `ef` for every `k`.
+    pub(crate) fn ef_for_k(&self, k: usize) -> usize {
+        for &(anchor_k, ef) in &self.ef_curve {
+            if anchor_k as usize >= k {
+                return ef as usize;
+            }
+        }
+        // `k` past the widest anchor: clamp to the widest anchor's ef.
+        self.ef_curve
+            .last()
+            .map(|&(_, ef)| ef as usize)
+            .unwrap_or(self.ef_search)
+    }
+
     /// SQ8 walk + Sq16 refine: navigate the graph scoring the cheap int8 plane
     /// (returning the top `refine_k` by SQ8), then re-score those on the exact
     /// Sq16 plane and return the true top-`k`. Reader-side; no bundle change.
@@ -1357,7 +1696,7 @@ impl HnswIndex {
         refine_k: usize,
     ) -> Vec<(u32, f32)> {
         let sq8 = Sq8WalkScorer {
-            plane: &self.sq8_plane,
+            plane: self.sq8_plane.bytes(),
             dim: self.dim,
             len: self.graph.len(),
         };
@@ -1412,7 +1751,12 @@ pub(crate) struct GraphBundle {
     /// Largest stable doc id the graph covers (the append-delta boundary).
     pub high_water_id: i128,
     pub centroid_graph: Vec<u8>,
-    pub data_bundle: Option<Vec<u8>>,
+    /// The [`encode_hnsw`] payload, as a zero-copy slice of the input `Bytes`
+    /// (`raw.slice_ref`). When the input is the mapped bundle this is the
+    /// multi-GiB data section with no heap copy — the open-time transient the
+    /// mmap serving path removes; [`decode_hnsw`] then slices the Sq16 and SQ8
+    /// planes straight out of it.
+    pub data_bundle: Option<Bytes>,
 }
 
 /// Read the `(population_key, high_water_id)` header from a bundle's first
@@ -1450,14 +1794,6 @@ fn put_opt_section(out: &mut Vec<u8>, section: Option<&[u8]>) {
     }
 }
 
-fn take_opt_section(c: &mut Cursor<'_>) -> Option<Option<Vec<u8>>> {
-    if c.take(1)?[0] == 0 {
-        return Some(None);
-    }
-    let len = c.u64()? as usize;
-    Some(Some(c.take(len)?.to_vec()))
-}
-
 /// Frame the graph sections into one slow-state blob, stamping the
 /// `(high_water_id, count)` watermark into the fixed-offset header. The
 /// data bundle and its provenance are omitted (a `0` flag) above the
@@ -1481,7 +1817,20 @@ pub(crate) fn encode_graph_bundle(
 /// Parse an [`encode_graph_bundle`] blob into its raw sections + header.
 /// `None` on a bad magic or truncation, so a corrupt bundle degrades to a
 /// fallback.
-pub(crate) fn decode_graph_bundle(bytes: &[u8]) -> Option<GraphBundle> {
+///
+/// `mmap_backed` picks how the large `data_bundle` section is returned:
+/// - `true` (the local serving path, `raw` is the shared file mmap): a
+///   zero-copy `raw.slice_ref` — the multi-GiB payload never touches heap and
+///   the returned index keeps the one mapping alive.
+/// - `false` (remote/object-store, `raw` is a striped *heap* blob): the data
+///   section is copied out into its own `Bytes`, so `raw` — which also holds
+///   the centroid section and framing — is freed once this returns instead of
+///   being pinned for the index's whole lifetime.
+///
+/// The small `centroid_graph` (present at every scale, modest size) is always
+/// copied out into owned heap.
+pub(crate) fn decode_graph_bundle(raw: &Bytes, mmap_backed: bool) -> Option<GraphBundle> {
+    let bytes: &[u8] = raw.as_ref();
     let mut c = Cursor::new(bytes);
     if c.take(GRAPH_BUNDLE_MAGIC.len())? != GRAPH_BUNDLE_MAGIC {
         return None;
@@ -1490,7 +1839,21 @@ pub(crate) fn decode_graph_bundle(bytes: &[u8]) -> Option<GraphBundle> {
     let high_water_id = c.i128()?;
     let centroid_len = c.u64()? as usize;
     let centroid_graph = c.take(centroid_len)?.to_vec();
-    let data_bundle = take_opt_section(&mut c)?;
+    // Optional length-prefixed data-bundle section (`0` flag ⇒ absent). `c.take`
+    // yields a subslice of `bytes` (= `raw`): on the mmap path `slice_ref`
+    // shares that mapping zero-copy; on the heap path we copy it out so `raw`
+    // (the full striped blob) frees.
+    let data_bundle = if c.take(1)?[0] == 0 {
+        None
+    } else {
+        let len = c.u64()? as usize;
+        let section = c.take(len)?;
+        Some(if mmap_backed {
+            raw.slice_ref(section)
+        } else {
+            Bytes::copy_from_slice(section)
+        })
+    };
     Some(GraphBundle {
         population_key,
         high_water_id,
@@ -2010,7 +2373,7 @@ mod tests {
         let n = 5000;
         let vectors = clustered_unit_vectors(n, 32, dim, 0.3, 0x0CA_11B);
         let scorer = Sq16Scorer::from_unit_vectors(&vectors, dim);
-        let (choice, graph) = calibrate_graph(
+        let (choice, curve, graph) = calibrate_graph(
             &scorer,
             &[32, 64, 128],
             &[128, 256, 512],
@@ -2020,9 +2383,10 @@ mod tests {
             100,
             10,
             0x5EED,
+            /* want_curve */ true,
         );
         eprintln!(
-            "[calib] m0={} ef={} recall={:.3} registered={} at_target={}",
+            "[calib] m0={} ef={} recall={:.3} registered={} at_target={} curve={curve:?}",
             choice.m0, choice.ef, choice.recall, choice.registered, choice.at_target
         );
         assert!(
@@ -2052,6 +2416,42 @@ mod tests {
             choice.at_target,
             "expected to clear 0.90; got {:.3}",
             choice.recall
+        );
+        // A registered graph stamps a k→ef curve: one pair per anchor, its
+        // anchors ARE the calibrator's anchors, ascending in `k`, and its `ef`
+        // is monotonic non-decreasing (a larger `k` never asks for a narrower
+        // beam than a smaller one). In particular k=100's ef ≥ k=10's ef.
+        assert_eq!(
+            curve.len(),
+            HNSW_CALIB_K_ANCHORS.len(),
+            "one curve pair per anchor"
+        );
+        for (i, &(k_anchor, _)) in curve.iter().enumerate() {
+            assert_eq!(
+                k_anchor as usize, HNSW_CALIB_K_ANCHORS[i],
+                "curve anchor matches the calibrator's anchor"
+            );
+        }
+        for w in curve.windows(2) {
+            assert!(w[0].0 < w[1].0, "curve anchors strictly ascending in k");
+            assert!(
+                w[0].1 <= w[1].1,
+                "curve ef monotonic non-decreasing in k: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+        let ef_at = |k: usize| {
+            curve
+                .iter()
+                .find(|&&(a, _)| a as usize == k)
+                .map(|&(_, e)| e)
+        };
+        assert!(
+            ef_at(100) >= ef_at(10),
+            "k=100 ef {:?} must be ≥ k=10 ef {:?}",
+            ef_at(100),
+            ef_at(10)
         );
     }
 
@@ -2391,8 +2791,15 @@ mod tests {
         let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
         let graph = Hnsw::build(&scorer, HnswParams::default());
 
-        let bytes = encode_hnsw(&codes, &doc_ids, &graph, dim, 256, "emb");
-        let idx = decode_hnsw(&bytes, true).expect("decode bundle");
+        // A representative k→ef curve to round-trip through the v04 section.
+        let curve: Vec<(u32, u32)> = vec![(1, 128), (10, 128), (50, 256), (100, 512)];
+        let bytes = encode_hnsw(&codes, &doc_ids, &graph, dim, 256, &curve, "emb");
+        assert_eq!(
+            &bytes[..HNSW_DATA_MAGIC_LEN],
+            HNSW_DATA_MAGIC_V4,
+            "encode_hnsw stamps the v04 data magic"
+        );
+        let idx = decode_hnsw(&Bytes::from(bytes.clone()), true).expect("decode bundle");
         assert_eq!(idx.dim, dim);
         assert_eq!(idx.doc_ids, doc_ids);
         assert_eq!(idx.graph.len(), n);
@@ -2401,6 +2808,18 @@ mod tests {
             "stamped ef round-trips through the bundle"
         );
         assert_eq!(idx.column, "emb", "stamped column round-trips");
+        assert_eq!(idx.ef_curve, curve, "k→ef curve round-trips through v04");
+        // The accessor rounds a requested k UP to the next anchor and clamps
+        // above the top anchor to the ceiling ef.
+        assert_eq!(idx.ef_for_k(1), 128, "k=1 → anchor 1");
+        assert_eq!(idx.ef_for_k(10), 128, "k=10 → anchor 10");
+        assert_eq!(idx.ef_for_k(11), 256, "k=11 rounds up to anchor 50");
+        assert_eq!(idx.ef_for_k(100), 512, "k=100 → anchor 100");
+        assert_eq!(
+            idx.ef_for_k(1000),
+            512,
+            "k above top anchor clamps to ceiling"
+        );
 
         let queries = random_unit_vectors(20, dim, 0xFEED);
         for q in &queries {
@@ -2412,18 +2831,153 @@ mod tests {
                 assert_eq!(idx.doc_ids[*node as usize], doc_ids[*node as usize]);
             }
         }
-        assert!(decode_hnsw(b"short", true).is_none());
+        assert!(decode_hnsw(&Bytes::from_static(b"short"), true).is_none());
 
         // A corrupt node count must degrade to None, not drive a huge
         // `with_capacity` alloc-abort. Overwrite the `n` word (right after the
         // 8-byte magic) with an absurd value and confirm the decode declines.
         let mut poisoned = bytes.clone();
-        poisoned[HNSW_DATA_MAGIC.len()..HNSW_DATA_MAGIC.len() + 8]
+        poisoned[HNSW_DATA_MAGIC_LEN..HNSW_DATA_MAGIC_LEN + 8]
             .copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(
-            decode_hnsw(&poisoned, true).is_none(),
+            decode_hnsw(&Bytes::from(poisoned), true).is_none(),
             "a corrupt node count must decode to None, not attempt a giant alloc"
         );
+    }
+
+    /// A `v03` bundle serves the SQ8 plane as a persisted section that is a
+    /// zero-copy slice of the same backing bytes as the Sq16 plane, and a
+    /// pre-existing `v02` bundle (Sq16 only) still decodes with the SQ8 plane
+    /// derived on read — the backward-compatible fallback. Both paths must
+    /// yield byte-identical planes and identical search results.
+    #[test]
+    fn sq8_section_v03_matches_derived_v02() {
+        use crate::superfile::vector::distance::encode_sq16_row;
+        let dim = 24;
+        let n = 400;
+        let vectors = random_unit_vectors(n, dim, 0x5EC7);
+        let stride = dim * 2;
+        let mut codes = vec![0u8; n * stride];
+        for (i, v) in vectors.iter().enumerate() {
+            encode_sq16_row(v, &mut codes[i * stride..(i + 1) * stride]);
+        }
+        let doc_ids: Vec<i128> = (0..n as i128).collect();
+        let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
+        let graph = Hnsw::build(&scorer, HnswParams::default());
+
+        // Current encoder → v04 (SQ8 section present, plus the trailing curve).
+        let curve: Vec<(u32, u32)> = vec![(1, 128), (10, 128), (50, 256), (100, 512)];
+        let v3 = encode_hnsw(&codes, &doc_ids, &graph, dim, 128, &curve, "emb");
+        assert_eq!(&v3[..HNSW_DATA_MAGIC_LEN], HNSW_DATA_MAGIC_V4);
+
+        // Synthesize a pre-existing v02 bundle: identical framing but no SQ8
+        // section (Sq16 plane runs straight into the graph section) and the v02
+        // magic. Built by re-laying the wire so the fixture matches exactly what
+        // an old drain wrote.
+        let mut v2 = Vec::new();
+        v2.extend_from_slice(HNSW_DATA_MAGIC_V2);
+        v2.extend_from_slice(&(n as u64).to_le_bytes());
+        v2.extend_from_slice(&(dim as u32).to_le_bytes());
+        v2.extend_from_slice(&128u32.to_le_bytes());
+        let col = b"emb";
+        v2.extend_from_slice(&(col.len() as u32).to_le_bytes());
+        v2.extend_from_slice(col);
+        for &id in &doc_ids {
+            v2.extend_from_slice(&id.to_le_bytes());
+        }
+        v2.extend_from_slice(&codes);
+        let graph_bytes = graph.to_bytes();
+        v2.extend_from_slice(&(graph_bytes.len() as u64).to_le_bytes());
+        v2.extend_from_slice(&graph_bytes);
+
+        let idx_v3 = decode_hnsw(&Bytes::from(v3), true).expect("decode v03");
+        let idx_v2 = decode_hnsw(&Bytes::from(v2), true).expect("decode v02");
+
+        // The SQ8 plane the persisted section carries must equal the one derived
+        // from the Sq16 high byte.
+        let derived = derive_sq8_plane(&codes);
+        assert_eq!(idx_v3.sq8_plane.bytes(), derived.as_slice());
+        assert_eq!(idx_v2.sq8_plane.bytes(), derived.as_slice());
+        assert_eq!(idx_v3.sq8_plane.len(), n * dim);
+
+        // Sq16 plane and searches identical across both bundle versions.
+        assert_eq!(idx_v3.scorer.codes(), idx_v2.scorer.codes());
+        let queries = random_unit_vectors(30, dim, 0x1CE);
+        for q in &queries {
+            let a = idx_v3.search_sq8_refine(q, 10, 64, 32);
+            let b = idx_v2.search_sq8_refine(q, 10, 64, 32);
+            assert_eq!(a, b, "v03 section vs v02 derive diverged");
+        }
+
+        // With SQ8-walk off, a v04 bundle still consumes the section (so the
+        // graph is reachable) and serves correctly with an empty SQ8 plane.
+        let v3_again = encode_hnsw(&codes, &doc_ids, &graph, dim, 128, &curve, "emb");
+        let idx_off = decode_hnsw(&Bytes::from(v3_again), false).expect("decode v04 sq8-off");
+        assert!(idx_off.sq8_plane.is_empty());
+        assert_eq!(idx_off.graph.len(), n);
+    }
+
+    /// A pre-`v04` bundle (`v03` with the SQ8 section, or `v02` without) carries
+    /// a single stamped `ef` and no k→ef curve. Decoding must synthesize the
+    /// degenerate 1-point curve so `ef_for_k(k) == ef_search` for EVERY `k` —
+    /// exactly today's single-`ef` behavior, no forced rebuild.
+    #[test]
+    fn pre_v04_bundle_decodes_to_one_point_curve() {
+        use crate::superfile::vector::distance::encode_sq16_row;
+        let dim = 16;
+        let n = 300;
+        let stamped_ef = 200usize;
+        let vectors = random_unit_vectors(n, dim, 0xB0BB1E);
+        let stride = dim * 2;
+        let mut codes = vec![0u8; n * stride];
+        for (i, v) in vectors.iter().enumerate() {
+            encode_sq16_row(v, &mut codes[i * stride..(i + 1) * stride]);
+        }
+        let doc_ids: Vec<i128> = (0..n as i128).collect();
+        let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
+        let graph = Hnsw::build(&scorer, HnswParams::default());
+        let graph_bytes = graph.to_bytes();
+        let col = b"emb";
+
+        // Shared framing writer: magic + header + doc-ids + Sq16 plane, then
+        // (v03 only) the SQ8 section, then the graph section — NO curve section.
+        let frame = |magic: &[u8; 8], with_sq8: bool| -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(magic);
+            b.extend_from_slice(&(n as u64).to_le_bytes());
+            b.extend_from_slice(&(dim as u32).to_le_bytes());
+            b.extend_from_slice(&(stamped_ef as u32).to_le_bytes());
+            b.extend_from_slice(&(col.len() as u32).to_le_bytes());
+            b.extend_from_slice(col);
+            for &id in &doc_ids {
+                b.extend_from_slice(&id.to_le_bytes());
+            }
+            b.extend_from_slice(&codes);
+            if with_sq8 {
+                extend_sq8_plane(&mut b, &codes);
+            }
+            b.extend_from_slice(&(graph_bytes.len() as u64).to_le_bytes());
+            b.extend_from_slice(&graph_bytes);
+            b
+        };
+
+        let v3 = frame(HNSW_DATA_MAGIC_V3, true);
+        let v2 = frame(HNSW_DATA_MAGIC_V2, false);
+
+        for (label, fixture) in [("v03", v3), ("v02", v2)] {
+            let idx = decode_hnsw(&Bytes::from(fixture), true)
+                .unwrap_or_else(|| panic!("{label} fixture must decode"));
+            assert_eq!(idx.ef_search, stamped_ef, "{label} ef round-trips");
+            // Degenerate 1-point curve: constant ef for every k, small and large.
+            assert_eq!(idx.ef_curve.len(), 1, "{label} → degenerate 1-point curve");
+            for k in [1usize, 10, 50, 100, 1000, 100_000] {
+                assert_eq!(
+                    idx.ef_for_k(k),
+                    stamped_ef,
+                    "{label}: ef_for_k({k}) must equal the single stamped ef"
+                );
+            }
+        }
     }
 
     /// SQ8 walk + Sq16 refine returns essentially the same top-k as the Sq16
@@ -2447,8 +3001,8 @@ mod tests {
         let doc_ids: Vec<i128> = (0..n as i128).collect();
         let scorer = Sq16Scorer::from_codes(codes.clone(), dim, n);
         let graph = Hnsw::build(&scorer, HnswParams::default());
-        let bytes = encode_hnsw(&codes, &doc_ids, &graph, dim, ef, "emb");
-        let idx = decode_hnsw(&bytes, true).expect("decode bundle");
+        let bytes = encode_hnsw(&codes, &doc_ids, &graph, dim, ef, &[(10, ef as u32)], "emb");
+        let idx = decode_hnsw(&Bytes::from(bytes), true).expect("decode bundle");
         assert!(
             !idx.sq8_plane.is_empty(),
             "sq8 plane must be built when sq8_walk=true"
@@ -2507,11 +3061,25 @@ mod tests {
         let centroid = vec![1u8, 2, 3, 4, 5];
         let data = vec![9u8; 300];
         let blob = encode_graph_bundle(0xDEAD_BEEF_1234, 987_654_321, &centroid, Some(&data));
-        let got = decode_graph_bundle(&blob).expect("decode full");
-        assert_eq!(got.population_key, 0xDEAD_BEEF_1234);
-        assert_eq!(got.high_water_id, 987_654_321);
-        assert_eq!(got.centroid_graph, centroid);
-        assert_eq!(got.data_bundle.as_deref(), Some(&data[..]));
+        // Both modes recover identical sections; only the data-section backing
+        // differs (zero-copy slice of `raw` vs an owned copy).
+        for mmap_backed in [true, false] {
+            let raw = Bytes::from(blob.clone());
+            let got = decode_graph_bundle(&raw, mmap_backed).expect("decode full");
+            assert_eq!(got.population_key, 0xDEAD_BEEF_1234);
+            assert_eq!(got.high_water_id, 987_654_321);
+            assert_eq!(got.centroid_graph, centroid);
+            assert_eq!(got.data_bundle.as_deref(), Some(&data[..]));
+            // On the heap path the data section must be an independent copy, not
+            // a view into `raw`, so `raw` can be freed.
+            if !mmap_backed {
+                let db = got.data_bundle.as_ref().expect("data present");
+                assert!(
+                    !raw.as_ref().as_ptr_range().contains(&db.as_ptr()),
+                    "heap-path data_bundle must not alias raw"
+                );
+            }
+        }
         // The header reads from the fixed-offset prefix alone (a tiny range
         // GET at settle time — no need for the multi-GiB body).
         assert_eq!(
@@ -2521,11 +3089,11 @@ mod tests {
 
         // Data-less bundle (above the scale ceiling): empty centroid, no data.
         let blob = encode_graph_bundle(0, 0, &[], None);
-        let got = decode_graph_bundle(&blob).expect("decode empty");
+        let got = decode_graph_bundle(&Bytes::from(blob), true).expect("decode empty");
         assert!(got.centroid_graph.is_empty());
         assert!(got.data_bundle.is_none());
 
-        assert!(decode_graph_bundle(b"bad").is_none());
+        assert!(decode_graph_bundle(&Bytes::from_static(b"bad"), true).is_none());
         assert!(graph_bundle_header(b"short").is_none());
     }
 
