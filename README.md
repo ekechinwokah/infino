@@ -6,7 +6,7 @@
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Adaptive retrieval library: full-text, vector, hybrid, and SQL over one table, stored as
+**Embedded retrieval library: full-text, vector, hybrid, and SQL over one table, stored as
 ordinary Parquet on local disk or object storage. Fast, simple, and scalable.**
 
 ```sh
