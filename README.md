@@ -177,7 +177,7 @@ Supertable FTS; the SQL shapes are `agg_max_title` (metadata), `WHERE key = ?` (
 ![Vector search p99 vs vector databases, VectorDBBench Cohere 1M](docs/assets/readme/compare-vdb.svg)
 
 [VectorDBBench](https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch)
-([our client](https://github.com/infino-ai/VectorDBBench/tree/main/vectordb_bench/backend/clients/infino))
+([RetrievalBench](https://github.com/infino-ai/retrievalbench))
 
 ![Quantized vector indexes vs embedded libraries, dbpedia-1536 100K, same queries and ground truth](docs/assets/readme/compare-embedded.svg)
 
@@ -211,12 +211,12 @@ The corpus downloads once into `corpus-dir`. Add `--features faiss` (after
 ![SQL vs analytic engines, ClickBench vCPU-seconds per query](docs/assets/readme/compare-sql.svg)
 
 [ClickBench](https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino%7CDataFusion%20%28Parquet%2C%20single%29&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot)
-([our port](https://github.com/infino-ai/clickbench/tree/add-infino/infino))
+([RetrievalBench](https://github.com/infino-ai/retrievalbench))
 
 ![SQL vs search engines, ClickBench vCPU-seconds per query](docs/assets/readme/compare-sql-search.svg)
 
 [ClickBench](https://benchmark.clickhouse.com/#system=-&type=+sac&machine=+c6a.4xlarge&cluster_size=-&opensource=-&hardware=+c&tuned=+n&metric=hot&queries=-)
-([our port](https://github.com/infino-ai/clickbench/tree/add-infino/infino))
+([RetrievalBench](https://github.com/infino-ai/retrievalbench))
 
 ## How it works
 
