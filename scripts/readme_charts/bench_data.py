@@ -260,7 +260,7 @@ SQL_EXT_ROWS: list[CompareRow] = [
 ]
 
 SQL_EXT_META = {
-    "title": "SQL on Parquet vs analytic engines",
+    "title": "SQL vs analytic engines",
     "subtitle": "ClickBench 100M rows · vCPU-sec per query · hot · c6a.4xlarge · lower is faster",
     "value_header": "vCPU-s/query",
     "columns": ("full suite",),
