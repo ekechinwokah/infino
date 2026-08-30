@@ -435,9 +435,12 @@ The crate is 0.x and the API can still move. The public surface is pinned by `pu
 
 ## Building an agent?
 
-An agent's memory is a retrieval problem: transcripts, embeddings, and metadata in one
-table, recalled by meaning, keyword, or SQL — over object storage, with no service to run.
-Infino is that layer, and three companions cover the rest:
+Infino is a powerful agent data layer. Hybrid search and SQL allow more expressive
+queries in more compact form, with less token spend on LLMs — for example in
+[code-context](https://github.com/infino-ai/code-context), our Claude Code plugin.
+Agent memory is also a retrieval problem: transcripts, embeddings, and metadata can be
+stored in one table, recalled by meaning, keyword, or SQL — over object storage, with no
+service to run:
 
 - [infino-mcp](https://github.com/infino-ai/infino-mcp) — give any MCP client (Claude Code,
   Claude Desktop, Cursor, VS Code) keyword, semantic, hybrid, and SQL retrieval over your
