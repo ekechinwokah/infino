@@ -6,7 +6,7 @@
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Turbovec's byte count, 2 times faster than Datafusion, and ~8x cheaper per core than Elastic.**
+**Turbovec's byte count, 2x faster than Datafusion, and ~10x cheaper than Elastic.**
 
 **Infino is a fast embedded retrieval library: full-text, vector, hybrid, and SQL over one table, stored as
 ordinary Parquet on local disk or object storage. Simple, scalable, and optimized for cost.**
