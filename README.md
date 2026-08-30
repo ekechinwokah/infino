@@ -6,8 +6,10 @@
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Embedded retrieval library: full-text, vector, hybrid, and SQL over one table, stored as
-ordinary Parquet on local disk or object storage. Fast, simple, scalable, and optimized for speed-per-dollar.**
+**Smaller than Turbovec, faster than Datafusion, cheaper than Elasticsearch.**
+
+**Infino is a fast embedded retrieval library: full-text, vector, hybrid, and SQL over one table, stored as
+ordinary Parquet on local disk or object storage. Simple, scalable, and optimized for cost.**
 
 ```sh
 pip install infino              # Python
@@ -15,13 +17,15 @@ npm install @infino-ai/infino   # Node.js
 cargo add infino                # Rust
 ```
 
-- One Parquet file per batch, with the BM25 and vector indexes inside it. DuckDB, pyarrow,
-  and DataFusion open the same file as a normal table
+
+- One Parquet file per data batch, with the BM25 and vector indexes inside it.
+  DuckDB, pyarrow, and DataFusion open the same file as a normal table
   ([example](infino-python/examples/parquet_interop.py)).
-- The storage target is a connection string: `memory://`, a local path, or
-  `s3://` / `gs://` / Azure. Nothing else changes between them.
-- No daemon, no cluster, no lock service. Readers pin a snapshot and never block on writers.
-- Tables larger than RAM work: queries read byte ranges, not files.
+- The storage target is determined by a connection string: `memory://`, a local path, or
+  `s3://`, `gs://`, Azure.
+- No daemon, no cluster, no lock service is necessary. Infino writes append-only, immutable
+  files so readers pin a snapshot and never block on writers.
+- Tables much larger than RAM work: queries read byte ranges.
 
 ## Quickstart
 
