@@ -6,7 +6,7 @@
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Turbovec's byte count, close to DuckDB speeds on SQL, and ~10x more efficient than Elastic on search.**
+**Turbovec's byte count on vectors, DuckDB-class speeds on SQL, and ~10x more efficient than Elastic on search.**
 
 **Infino is a fast embedded retrieval library: full-text, vector, hybrid, and SQL over one table, stored as
 ordinary Parquet on local disk or object storage. Simple, scalable, and optimized for cost.**
@@ -424,8 +424,6 @@ ORDER BY hits DESC;
 
 ## Limitations
 
-- commit() is the durability boundary, so you need to call commit() to ensure your data persists.
-  Rows are durable when a commit lands, not when `append()` returns.
 - Tables are append-only and time-ordered. Updates are delete plus insert via tombstones, and
   there are no cross-table transactions. This is not an OLTP store.
 - Writes go through a single writer slot, so there is one writer per table at a time. Readers
