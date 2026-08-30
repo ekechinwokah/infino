@@ -15,7 +15,24 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-from bench_data import FTS, SQL, VECTOR
+from bench_data import (
+    EMBED_META,
+    EMBED_ROWS,
+    SBG_META,
+    SBG_ROWS,
+    SQL_EXT_META,
+    SQL_EXT_ROWS,
+    VDB_META,
+    VDB_ROWS,
+    CROSSOVER,
+    FTS,
+    INGEST,
+    MODES_LATENCY,
+    MODES_MEMORY,
+    SQL,
+    SQL_PUSHDOWN,
+    VECTOR,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "docs" / "assets" / "readme"
@@ -53,7 +70,7 @@ def esc(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def fmt_value(ms: float) -> str:
+def fmt_ms(ms: float) -> str:
     if ms < 1:
         return f"{ms * 1000:.0f} µs"
     if ms < 10:
@@ -61,6 +78,19 @@ def fmt_value(ms: float) -> str:
     if ms < 1000:
         return f"{ms:.0f} ms"
     return f"{ms / 1000:g} s"
+
+
+def fmt_mib(mib: float) -> str:
+    if mib < 1024:
+        return f"{mib:.0f} MiB"
+    return f"{mib / 1024:.2f} GiB"
+
+
+def fmt_kps(kps: float) -> str:
+    return f"{kps:g} K docs/s"
+
+
+FORMATTERS = {"ms": fmt_ms, "mib": fmt_mib, "kps": fmt_kps}
 
 
 def log_axis(values: list[float]) -> tuple[float, float, list[float]]:
@@ -106,6 +136,7 @@ def latency_chart(spec: dict, filename: str) -> None:
             groups.append((bar.group, []))
         groups[-1][1].append(bar)
 
+    fmt_value = FORMATTERS[spec.get("unit", "ms")]
     lo, hi, ticks = log_axis([b.ms for b in bars])
     span = math.log10(hi / lo)
 
@@ -153,15 +184,141 @@ def latency_chart(spec: dict, filename: str) -> None:
 
     foot_y = height - 12
     if has_cold:
+        legend_warm = spec.get("legend_warm") or "warm cache"
+        legend_cold = spec.get("legend_cold") or "cold · first query on an idle table"
         lines.append(
             f'<rect x="{PAD}" y="{foot_y - 21}" width="9" height="9" rx="1" fill="{WARM}"/>'
         )
-        lines.append(text(PAD + 16, foot_y - 13, "warm cache", size=11))
+        lines.append(text(PAD + 16, foot_y - 13, legend_warm, size=11))
+        cold_x = PAD + 16 + 8 * len(legend_warm) + 24
         lines.append(
-            f'<rect x="130" y="{foot_y - 21}" width="9" height="9" rx="1" fill="{COLD}"/>'
+            f'<rect x="{cold_x}" y="{foot_y - 21}" width="9" height="9" rx="1" fill="{COLD}"/>'
         )
-        lines.append(text(146, foot_y - 13, "cold · first query on an idle table", size=11))
+        lines.append(text(cold_x + 16, foot_y - 13, legend_cold, size=11))
     lines.append(text(VALUE_X, foot_y, spec["footnote"], size=10, anchor="end"))
+    lines.append("</svg>")
+    (OUT / filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def compare_chart(meta: dict, rows: list, filename: str, *, log: bool = False) -> None:
+    label_x, track_x, track_w = 250, 264, 420
+    if log:
+        lo, hi, ticks = log_axis([r.value for r in rows])
+        span = math.log10(hi / lo)
+
+        def bar_w(v: float) -> float:
+            return max((math.log10(v / lo) / span) * track_w, MIN_BAR_W)
+
+    else:
+        hi = max(r.value for r in rows)
+        ticks = []
+
+        def bar_w(v: float) -> float:
+            return max(track_w * (v / hi), MIN_BAR_W)
+
+    plot_h = len(rows) * 34
+    axis_y = PLOT_TOP + plot_h
+    height = int(axis_y + (24 if log else 8) + 14)
+    lines = frame(height, meta["title"], meta["subtitle"])
+
+    for tick in ticks:
+        gx = track_x + (math.log10(tick / lo) / span) * track_w
+        lines.append(
+            f'<line x1="{gx:.1f}" y1="{PLOT_TOP - 6}" x2="{gx:.1f}" y2="{axis_y}" stroke="{GRID}"/>'
+        )
+        lines.append(text(gx, axis_y + 16, f"{tick:g}", size=10, anchor="middle"))
+
+    y = PLOT_TOP
+    for row in rows:
+        color = WARM if row.self_row else COLD
+        lines.append(
+            text(
+                label_x,
+                y + 10,
+                row.name,
+                size=12,
+                fill=INK if row.self_row else MUTED,
+                weight=600 if row.self_row else None,
+                anchor="end",
+            )
+        )
+        if row.config:
+            lines.append(text(label_x, y + 24, row.config, size=10, anchor="end"))
+        lines.append(
+            f'<rect x="{track_x}" y="{y + 4}" width="{bar_w(row.value):.1f}" '
+            f'height="{BAR_H}" rx="1" fill="{color}"/>'
+        )
+        lines.append(
+            text(
+                VALUE_X,
+                y + 12,
+                row.label,
+                size=11,
+                fill=INK if row.self_row else MUTED,
+                anchor="end",
+                weight=600,
+            )
+        )
+        y += 34
+    lines.append("</svg>")
+    (OUT / filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def ratio_chart(meta: dict, rows: list, filename: str) -> None:
+    """Two bars per engine (search, count), as a ratio against a 1.00 baseline."""
+    label_x, track_x, track_w = 250, 264, 420
+    hi = max(max(search, count) for _, _, search, count, _ in rows)
+    height = PLOT_TOP + len(rows) * 44 + 40
+    lines = frame(height, meta["title"], meta["subtitle"])
+
+    base_x = track_x + (1.0 / hi) * track_w
+    lines.append(
+        f'<line x1="{base_x:.1f}" y1="{PLOT_TOP - 6}" x2="{base_x:.1f}" '
+        f'y2="{PLOT_TOP + len(rows) * 44 - 8}" stroke="{GRID}"/>'
+    )
+
+    y = PLOT_TOP
+    for name, version, search, count, is_self in rows:
+        lines.append(
+            text(
+                label_x,
+                y + 10,
+                name,
+                size=12,
+                fill=INK if is_self else MUTED,
+                weight=600 if is_self else None,
+                anchor="end",
+            )
+        )
+        lines.append(text(label_x, y + 24, version, size=10, anchor="end"))
+        for idx, val in enumerate((search, count)):
+            if is_self:
+                fill = WARM if idx == 0 else "#E8A090"
+            else:
+                fill = COLD if idx == 0 else "#CFCBC2"
+            yy = y + idx * 14
+            lines.append(
+                f'<rect x="{track_x}" y="{yy}" width="{max(track_w * (val / hi), MIN_BAR_W):.1f}" '
+                f'height="8" rx="1" fill="{fill}"/>'
+            )
+            lines.append(
+                text(
+                    VALUE_X,
+                    yy + 7,
+                    f"{val:.2f}×",
+                    size=10,
+                    fill=INK if is_self else MUTED,
+                    anchor="end",
+                    weight=600,
+                )
+            )
+        y += 44
+
+    foot_y = height - 14
+    lines.append(f'<rect x="{PAD}" y="{foot_y - 7}" width="9" height="9" rx="1" fill="{COLD}"/>')
+    lines.append(text(PAD + 16, foot_y, "search (top-k)", size=11))
+    lines.append(f'<rect x="150" y="{foot_y - 7}" width="9" height="9" rx="1" fill="#CFCBC2"/>')
+    lines.append(text(166, foot_y, "count", size=11))
     lines.append("</svg>")
     (OUT / filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -171,6 +328,15 @@ def main() -> None:
     latency_chart(VECTOR, "vector.svg")
     latency_chart(FTS, "fts.svg")
     latency_chart(SQL, "sql.svg")
+    latency_chart(MODES_MEMORY, "vector-modes-memory.svg")
+    latency_chart(MODES_LATENCY, "vector-modes-latency.svg")
+    latency_chart(SQL_PUSHDOWN, "sql-pushdown.svg")
+    latency_chart(INGEST, "ingest.svg")
+    latency_chart(CROSSOVER, "vector-crossover.svg")
+    compare_chart(VDB_META, VDB_ROWS, "compare-vdb.svg")
+    compare_chart(EMBED_META, EMBED_ROWS, "compare-embedded.svg", log=True)
+    compare_chart(SQL_EXT_META, SQL_EXT_ROWS, "compare-sql.svg", log=True)
+    ratio_chart(SBG_META, SBG_ROWS, "compare-fts.svg")
     print(f"wrote charts to {OUT}")
 
 

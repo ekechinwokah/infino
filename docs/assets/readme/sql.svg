@@ -36,5 +36,5 @@
 <text x="170.0" y="233.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">crosstab</text>
 <rect x="184" y="224" width="590.7" height="9" rx="1" fill="#D6400F"/>
 <text x="854.0" y="233.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">75 ms</text>
-<text x="854.0" y="288.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">1M: Azure Blob, 4 cores pinned, CI run 33245831329 (3aaffb64) · 10M: supertable default scale, separate run</text>
+<text x="854.0" y="288.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">1M: Azure Blob, 4 cores pinned, CI run 33245831329 (3aaffb64) · 10M: EPYC 9V74 8 vCPU, Azure Blob, 339e621</text>
 </svg>

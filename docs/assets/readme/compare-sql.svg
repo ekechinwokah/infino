@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="298" viewBox="0 0 880 298" role="img">
+<rect width="880" height="298" rx="10" fill="#FBF9F3" stroke="#DCD6C7"/>
+<text x="26.0" y="32.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#17130F" font-weight="600">SQL on Parquet vs analytic engines</text>
+<text x="854.0" y="32.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">ClickBench 100M rows · vCPU-sec per query · hot · c6a.4xlarge · lower is faster</text>
+<line x1="264.0" y1="50" x2="264.0" y2="260" stroke="#DCD6C7"/>
+<text x="264.0" y="276.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">1</text>
+<line x1="393.5" y1="50" x2="393.5" y2="260" stroke="#DCD6C7"/>
+<text x="393.5" y="276.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">10</text>
+<line x1="523.1" y1="50" x2="523.1" y2="260" stroke="#DCD6C7"/>
+<text x="523.1" y="276.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">100</text>
+<line x1="652.6" y1="50" x2="652.6" y2="260" stroke="#DCD6C7"/>
+<text x="652.6" y="276.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">1000</text>
+<text x="250.0" y="66.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">ClickHouse</text>
+<text x="250.0" y="80.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">18.4 s suite</text>
+<rect x="264" y="60" width="107.8" height="9" rx="1" fill="#B7B4AB"/>
+<text x="854.0" y="68.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" font-weight="600" text-anchor="end">6.8</text>
+<text x="250.0" y="100.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">DuckDB</text>
+<text x="250.0" y="114.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">26.3 s suite</text>
+<rect x="264" y="94" width="128.4" height="9" rx="1" fill="#B7B4AB"/>
+<text x="854.0" y="102.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" font-weight="600" text-anchor="end">9.8</text>
+<text x="250.0" y="134.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#17130F" font-weight="600" text-anchor="end">Infino</text>
+<text x="250.0" y="148.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">34.0 s suite</text>
+<rect x="264" y="128" width="143.4" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="136.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">12.8</text>
+<text x="250.0" y="168.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">DataFusion</text>
+<text x="250.0" y="182.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">45.6 s suite</text>
+<rect x="264" y="162" width="159.4" height="9" rx="1" fill="#B7B4AB"/>
+<text x="854.0" y="170.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" font-weight="600" text-anchor="end">17.0</text>
+<text x="250.0" y="202.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">Spark</text>
+<text x="250.0" y="216.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">332.4 s suite</text>
+<rect x="264" y="196" width="271.0" height="9" rx="1" fill="#B7B4AB"/>
+<text x="854.0" y="204.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" font-weight="600" text-anchor="end">123.7</text>
+<text x="250.0" y="236.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">Postgres</text>
+<text x="250.0" y="250.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">4085.5 s suite</text>
+<rect x="264" y="230" width="412.1" height="9" rx="1" fill="#B7B4AB"/>
+<text x="854.0" y="238.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" font-weight="600" text-anchor="end">1519</text>
+</svg>

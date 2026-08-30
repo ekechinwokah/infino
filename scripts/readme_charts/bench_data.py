@@ -8,8 +8,8 @@ comparable — different commits, different hardware:
 
   1M  — CI Benchmark (Azure Blob, 4 cores pinned), run 33245831329 on
         commit 3aaffb64, 2026-08-29.
-  10M — the default supertable scale, measured separately (commit 339e621
-        window). See benches/README.md.
+  10M — the default supertable scale on an 8-vCPU AMD EPYC 9V74 (AVX-512,
+        62 GiB) against Azure Blob, commit 339e621. See benches/README.md.
 
 Every chart therefore labels its scale groups and carries both provenances in
 the footnote. Footnote text is drawn straight into SVG, so it must stay plain:
@@ -34,6 +34,15 @@ class Bar:
     cold: bool = False
 
 
+@dataclass(frozen=True)
+class CompareRow:
+    name: str
+    value: float
+    label: str
+    config: str = ""
+    self_row: bool = False
+
+
 CI_RUN = "33245831329"
 CI_RUN_URL = f"https://github.com/infino-ai/infino/actions/runs/{CI_RUN}"
 CI_COMMIT = "3aaffb64"
@@ -41,7 +50,7 @@ CI_COMMIT = "3aaffb64"
 # Both windows in one line, plain text, for the chart footnotes.
 PROVENANCE = (
     f"1M: Azure Blob, 4 cores pinned, CI run {CI_RUN} ({CI_COMMIT}) "
-    "· 10M: supertable default scale, separate run"
+    "· 10M: EPYC 9V74 8 vCPU, Azure Blob, 339e621"
 )
 
 # ── Internal latency ────────────────────────────────────────────────────────
@@ -88,4 +97,182 @@ SQL = {
         Bar("10M", "scan", 41.14),
         Bar("10M", "crosstab", 75.14),
     ],
+}
+
+
+# ── Vector modes: memory and latency (dbpedia-1536 over Azure Blob) ────────
+#
+# Measured on main (3aaffb64) on an 8-vCPU AMD EPYC 9V74 (AVX-512, 62 GiB):
+# the flat/ivf serving figures are the bench's own RSS decomposition
+# (pinned index + manifest, plus the ivf working set). The float32 bars are
+# arithmetic — rows x dims x 4 bytes — the size of the raw vectors before
+# any engine touches them, drawn muted as the baseline.
+MODES_PROVENANCE = (
+    "dbpedia-1536, Azure Blob, EPYC 9V74 8 vCPU, 3aaffb64 "
+    "· float32 = rows x 1536 x 4B"
+)
+
+MODES_MEMORY = {
+    "title": "RAM to serve vector search",
+    "subtitle": "all-in: index + manifest + working set · dbpedia-1536",
+    "footnote": MODES_PROVENANCE,
+    "unit": "mib",
+    "legend_warm": "measured, serving",
+    "legend_cold": "float32 vectors, for scale",
+    "bars": [
+        Bar("100K", "float32 vectors", 586, cold=True),
+        Bar("100K", "ivf (default)", 423),
+        Bar("100K", "flat_ivf", 153),
+        Bar("1M", "float32 vectors", 5860, cold=True),
+        Bar("1M", "ivf (default)", 3160),
+        Bar("1M", "flat_ivf", 841),
+    ],
+}
+
+MODES_LATENCY = {
+    "title": "Vector modes: warm p50 at the recall each serves",
+    "subtitle": "top-10 · post-compact · dbpedia-1536",
+    "footnote": MODES_PROVENANCE,
+    "unit": "ms",
+    "bars": [
+        Bar("100K", "flat_ivf · recall 0.944", 1.63),
+        Bar("100K", "ivf · recall 0.998", 2.28),
+        Bar("1M", "flat_ivf · recall 0.938", 20.1),
+        Bar("1M", "ivf · recall 0.988", 6.2),
+    ],
+}
+
+
+# ── SQL: the same query with and without the search indexes ────────────────
+#
+# Pairs from the recorded 1M warm battery in benches/README.md ("Plain Scan
+# (DataFusion only)" vs "FTS-pushdown"): identical SQL over identical files,
+# the only difference being whether the text index turns the predicate into a
+# row selection before the scan. The last pair is the honest one: a predicate
+# that selects every row gains nothing from an index and pays for it.
+SQL_PUSHDOWN = {
+    "title": "SQL: the same query, with and without the search indexes",
+    "subtitle": "1M rows · warm · identical files · benches/README battery",
+    "footnote": "recorded 1M battery, benches/README.md · unsorted key column, min/max defeated",
+    "unit": "ms",
+    "legend_warm": "with FTS pushdown",
+    "legend_cold": "DataFusion scan, same files",
+    "bars": [
+        Bar("WHERE key = ?", "DataFusion scan", 21.90, cold=True),
+        Bar("WHERE key = ?", "FTS pushdown", 1.44),
+        Bar("COUNT(*) WHERE key = ?", "DataFusion scan", 22.55, cold=True),
+        Bar("COUNT(*) WHERE key = ?", "FTS pushdown", 1.69),
+        Bar("AVG(rating) WHERE key = ?", "DataFusion scan", 22.56, cold=True),
+        Bar("AVG(rating) WHERE key = ?", "FTS pushdown", 1.84),
+        Bar("SUM over every row", "DataFusion scan", 30.54, cold=True),
+        Bar("SUM over every row", "FTS pushdown", 66.05),
+    ],
+}
+
+
+# ── Ingest throughput (recorded Latest-CI table, benches/README.md) ────────
+INGEST = {
+    "title": "Ingest throughput",
+    "subtitle": "1M docs · 16 commits · object storage",
+    "footnote": "recorded CI battery, benches/README.md (run 32825375037)",
+    "unit": "kps",
+    "bars": [
+        Bar("1M docs", "FTS", 62.1),
+        Bar("1M docs", "SQL", 17.0),
+        Bar("1M docs", "vector", 7.8),
+    ],
+}
+
+# ── flat_ivf vs ivf warm p50 across scales (five-point sweep) ───────────────
+CROSSOVER = {
+    "title": "flat_ivf vs ivf: warm p50 by table size",
+    "subtitle": "top-10 · post-compact · dbpedia-1536",
+    "footnote": MODES_PROVENANCE,
+    "unit": "ms",
+    "legend_warm": "flat_ivf (exhaustive 4-bit scan)",
+    "legend_cold": "ivf (routed)",
+    "bars": [
+        Bar("106K rows", "flat_ivf", 1.63),
+        Bar("106K rows", "ivf", 2.28, cold=True),
+        Bar("141K rows", "flat_ivf", 2.41),
+        Bar("141K rows", "ivf", 1.39, cold=True),
+        Bar("189K rows", "flat_ivf", 3.47),
+        Bar("189K rows", "ivf", 1.59, cold=True),
+        Bar("336K rows", "flat_ivf", 6.90),
+        Bar("336K rows", "ivf", 2.51, cold=True),
+        Bar("992K rows", "flat_ivf", 20.1),
+        Bar("992K rows", "ivf", 6.2, cold=True),
+    ],
+}
+
+
+# ── External comparisons ────────────────────────────────────────────────────
+
+VDB_ROWS: list[CompareRow] = [
+    CompareRow("Infino", 1.1, "1.1 ms", "16c64g", self_row=True),
+    CompareRow("Zilliz Cloud", 2.0, "2.0 ms", "8cu-perf"),
+    CompareRow("Qdrant Cloud", 6.4, "6.4 ms", "16c64g"),
+    CompareRow("OpenSearch", 7.2, "7.2 ms", "16c128g force-merge"),
+    CompareRow("Elastic Cloud", 9.5, "9.5 ms", "8c60g force-merge"),
+    CompareRow("Pinecone", 13.7, "13.7 ms", "p2.x8 1node"),
+]
+
+VDB_META = {
+    "title": "Vector search vs vector databases",
+    "subtitle": "VectorDBBench · Cohere 1M · 768-d · top-100 · serial p99 · lower is faster",
+    "url": "https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch",
+}
+
+# (name, version, search ratio, count ratio, is_infino)
+SBG_ROWS: list[tuple[str, str, float, float, bool]] = [
+    ("Infino", "0.1", 1.19, 0.74, True),
+    ("Lucene", "10.5.0", 1.0, 1.0, False),
+    ("Tantivy", "0.26", 1.15, 0.80, False),
+]
+
+SBG_META = {
+    "title": "Full-text vs search libraries",
+    "subtitle": "Search Benchmark, the Game · latency vs Lucene = 1.00 · lower is faster",
+    "url": "https://tantivy-search.github.io/bench/",
+}
+
+SQL_EXT_ROWS: list[CompareRow] = [
+    CompareRow("ClickHouse", 6.8, "6.8", "18.4 s suite"),
+    CompareRow("DuckDB", 9.8, "9.8", "26.3 s suite"),
+    CompareRow("Infino", 12.8, "12.8", "34.0 s suite", self_row=True),
+    CompareRow("DataFusion", 17.0, "17.0", "45.6 s suite"),
+    CompareRow("Spark", 123.7, "123.7", "332.4 s suite"),
+    CompareRow("Postgres", 1519.0, "1519", "4085.5 s suite"),
+]
+
+SQL_EXT_META = {
+    "title": "SQL on Parquet vs analytic engines",
+    "subtitle": "ClickBench 100M rows · vCPU-sec per query · hot · c6a.4xlarge · lower is faster",
+    "url": (
+        "https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino"
+        "%7CDataFusion%20%28Parquet%2C%20single%29%7CSpark%7CPostgreSQL%20%28with%20indexes%29"
+        "&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot"
+    ),
+}
+
+
+# ── Quantized indexes vs embedded libraries (retrievalbench, in-harness) ────
+#
+# dbpedia-1536 at 100K, box-threads, top-10: same queries and the same exact
+# ground truth for every engine. Infino's row is the shipped `flat_ivf` mode;
+# the comparators run in-process through their own libraries.
+EMBED_ROWS: list[CompareRow] = [
+    CompareRow("turbovec 2-bit", 0.41, "0.41 ms", "recall 0.835 · 38 MiB"),
+    CompareRow(
+        "Infino flat_ivf (4-bit)", 1.45, "1.45 ms", "recall 0.934 · 73 MiB", self_row=True
+    ),
+    CompareRow("turbovec 4-bit", 1.55, "1.55 ms", "recall 0.945 · 75 MiB"),
+    CompareRow("FAISS PQ fastscan", 4.36, "4.36 ms", "recall 0.673 · 74 MiB"),
+    CompareRow("FAISS PQ 8-bit", 45.1, "45.1 ms", "recall 0.944 · 76 MiB"),
+]
+
+EMBED_META = {
+    "title": "Quantized vector indexes vs embedded libraries",
+    "subtitle": "dbpedia-1536 · 100K · top-10 · warm p50 · same queries, same ground truth",
+    "url": "",
 }

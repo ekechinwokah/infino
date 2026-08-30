@@ -6,27 +6,22 @@
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Infino is an embedded retrieval library. It runs full-text, vector, hybrid, and SQL queries
-over the same table, and stores that table as ordinary Parquet. Warm top-10 on a
-1M-document table is 125 µs for BM25 and 591 µs for vector search.
-
-The storage target is a connection string. Nothing else in your code changes between them,
-and a table larger than RAM works because the engine reads Parquet in place instead of
-loading an index into memory.
-
-```python
-db = infino.connect("memory://")
-db = infino.connect("./data")
-db = infino.connect("s3://bucket/prefix")
-```
-
-Built by the team that created OpenSearch.
+Embedded retrieval library: full-text, vector, hybrid, and SQL over one table, stored as
+ordinary Parquet on local disk or object storage.
 
 ```sh
 pip install infino              # Python
 npm install @infino-ai/infino   # Node.js
 cargo add infino                # Rust
 ```
+
+- One Parquet file per batch, with the BM25 and vector indexes inside it. DuckDB, pyarrow,
+  and DataFusion open the same file as a normal table
+  ([example](infino-python/examples/parquet_interop.py)).
+- The storage target is a connection string: `memory://`, a local path, or
+  `s3://` / `gs://` / Azure. Nothing else changes between them.
+- No daemon, no cluster, no lock service. Readers pin a snapshot and never block on writers.
+- Tables larger than RAM work: queries read byte ranges, not files.
 
 ## Quickstart
 
@@ -57,13 +52,9 @@ Warm p50, tables on object storage:
 
 | | 1M docs | 10M docs |
 |---|---|---|
-| Vector top-10, recall@10 0.992 | 591 µs | 5 ms |
+| Vector top-10 (recall@10 0.992 at 1M) | 591 µs | 5 ms |
 | BM25 top-10, including row fetch | 125 µs | 2 ms |
-| SQL, point lookup through crosstab | 186 µs – 7.6 ms | 260 µs – 75 ms |
-
-The first query against an idle table has to open file handles and fill the cache. That
-costs 114 ms at 1M and 314 ms at 10M for vector, 16 ms and 275 ms for BM25. Warm and cold
-are about 200× apart, so the charts use a log scale.
+| SQL, metadata → crosstab shapes | 186 µs – 7.6 ms | 260 µs – 75 ms |
 
 ![Vector search latency, log scale, 1M and 10M documents](docs/assets/readme/vector.svg)
 
@@ -71,10 +62,14 @@ are about 200× apart, so the charts use a log scale.
 
 ![SQL query shape latency, log scale, 1M and 10M rows](docs/assets/readme/sql.svg)
 
-The 1M numbers are from Azure Blob with 4 cores pinned
-([CI run 33245831329](https://github.com/infino-ai/infino/actions/runs/33245831329)). The
-10M numbers are from a separate run at the default scale, on a different commit and
-different hardware, so compare each against its own baseline rather than against the other.
+![Ingest throughput, 1M docs](docs/assets/readme/ingest.svg)
+
+- Cold first query = file opens + cache fill: 114 ms (1M) and 314 ms (10M) for vector,
+  16 ms and 275 ms for BM25. Warm and cold sit ~200× apart; the charts use a log scale.
+- 1M: CI — Azure Blob, 4 pinned cores, commit `3aaffb64`
+  ([run 33245831329](https://github.com/infino-ai/infino/actions/runs/33245831329)).
+- 10M: same harness at its default scale — 8-vCPU AMD EPYC 9V74 (AVX-512, 62 GiB),
+  Azure Blob, commit `339e621`. Compare each scale against its own baseline.
 
 <details>
 <summary><b>Reproducing the charts</b></summary>
@@ -99,6 +94,22 @@ integer (`1000000`, not `1M`). The table tier defaults to 10M:
 | SQL, 10M | `cargo bench -- supertable sql warm` |
 | Any chart, 1M | prefix with `INFINO_BENCH_SUPERTABLE_DOCS=1000000` |
 
+To run against a real dataset instead of the synthetic corpus, pass a `corpus=` spec.
+It applies to one selected cell, so name a single tier and modality:
+
+```sh
+# Hugging Face parquet dataset — downloaded once into corpus-dir, reused after
+INFINO_BENCH_SUPERTABLE_DOCS=1000000 \
+  cargo bench -- supertable vector \
+  corpus=hf:KShivendu/dbpedia-entities-openai-1M corpus-dir=./corpora
+
+# Any local parquet shards (e.g. Cohere embeddings you already hold)
+cargo bench -- supertable vector corpus=parquet:/path/to/shards
+```
+
+`INFINO_BENCH_SUPERTABLE_DOCS` caps how many rows are ingested from the dataset. Recall is
+graded against brute-force exact ground truth on held-out queries, real corpus or synthetic.
+
 That runs against a local RustFS daemon, an HTTPS S3 stand-in, by default. To match CI:
 
 ```sh
@@ -118,22 +129,22 @@ Supertable FTS; the SQL shapes are `agg_max_title` (metadata), `WHERE key = ?` (
 
 </details>
 
-### Against the public benchmarks
+### Against other engines
 
-Infino has the lowest p99 on
-[VectorDBBench](https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch)
-([client](https://github.com/infino-ai/VectorDBBench/tree/main/vectordb_bench/backend/clients/infino)).
+![Vector search p99 vs vector databases, VectorDBBench Cohere 1M](docs/assets/readme/compare-vdb.svg)
 
-On [Search Benchmark, the Game](https://tantivy-search.github.io/bench/) it is within 19% of
-Lucene on search and faster on count
-([harness](https://github.com/quickwit-oss/search-benchmark-game)).
+![Quantized vector indexes vs embedded libraries, dbpedia-1536 100K, same queries and ground truth](docs/assets/readme/compare-embedded.svg)
 
-On [ClickBench](https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino%7CDataFusion%20%28Parquet%2C%20single%29%7CSpark%7CPostgreSQL%20%28with%20indexes%29&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot)
-it averages 12.8 vCPU-seconds per query, against 9.8 for DuckDB
-([port](https://github.com/infino-ai/clickbench/tree/add-infino/infino)).
+![Full-text latency relative to Lucene, Search Benchmark the Game](docs/assets/readme/compare-fts.svg)
 
-Lucene and DuckDB are the right yardsticks for the last two. Landing in their range while
-serving all four query types from one file is the goal.
+![SQL vCPU-seconds per query vs analytic engines, ClickBench 100M rows](docs/assets/readme/compare-sql.svg)
+
+- [VectorDBBench](https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch)
+  ([our client](https://github.com/infino-ai/VectorDBBench/tree/main/vectordb_bench/backend/clients/infino))
+- [Search Benchmark, the Game](https://tantivy-search.github.io/bench/)
+  ([harness](https://github.com/quickwit-oss/search-benchmark-game))
+- [ClickBench](https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino%7CDataFusion%20%28Parquet%2C%20single%29%7CSpark%7CPostgreSQL%20%28with%20indexes%29&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot)
+  ([our port](https://github.com/infino-ai/clickbench/tree/add-infino/infino))
 
 ## How it works
 
@@ -141,89 +152,68 @@ serving all four query types from one file is the goal.
 
 ### The indexes live inside the Parquet file
 
-Infino writes one Parquet file per batch, with the BM25 and vector indexes stored inside it.
-DuckDB, pyarrow, and DataFusion open that file and see a normal table, with Infino nowhere in
-the read path ([example](infino-python/examples/parquet_interop.py)). Infino opens the same
-bytes and uses the indexes.
-
-There is no second artifact to build, ship, or keep in sync with the data, and no step that
-loads an index at startup.
+- Each write produces one Parquet file with the BM25 and vector indexes embedded in it.
+- Any Parquet reader — DuckDB, pyarrow, DataFusion — opens that file and sees a normal
+  table. Infino opens the same file and also finds its indexes.
+- There is no separate index artifact to build, ship, or keep in sync, and nothing to load
+  at startup.
 
 ### A query reads byte ranges, not files
 
-The indexes are laid out by term and by vector cluster, so a top-10 resolves to a short list
-of byte offsets. On object storage those become HTTP range requests, a handful per query
-rather than a download. Each round trip to object storage costs 20–100 ms, so the number of
-them is what determines whether search on S3 is usable.
+- The indexes are sorted by term and by vector cluster, so a top-10 turns into a short list
+  of byte offsets. On object storage, that is a few HTTP range requests, not a download.
+- One object-store request takes 20–100 ms.
+- Fetched ranges are kept in a local disk cache and memory-mapped. A repeated query makes
+  zero network requests and answers in 125 µs.
+- The cache shrinks under memory pressure and empties on an idle table. Queries refill it.
 
-Fetched ranges are kept in a local disk cache and memory-mapped. A second query over the same
-terms reads from the page cache and touches the network zero times, which is where the 125 µs
-comes from. The cache is reclaimable: it shrinks under memory pressure, to nothing on an idle
-table, and refills on demand.
+### The text scorer is picked per query
 
-### Scoring is SIMD over quantized vectors
+Posting lists store, for each term, how many documents contain it and the best possible
+score in each block. With that on hand, the engine picks the cheapest correct algorithm for
+each query:
 
-The routed path scores 1-bit-per-dimension RaBitQ codes, which is `dim / 8` bytes per row —
-128 bytes for a 1024-dimension vector against 4 KB as float32. Finalists are rescored against
-a higher-precision copy, so the quantization costs latency rather than accuracy; measured
-recall@10 is 0.992.
+- A query mixing a rare word and a common word skips through the common word's list instead
+  of reading it (WAND / Block-Max WAND).
+- A query of comparably common words scores documents in fixed-size windows, dropping words
+  that can no longer reach the top 10 as the threshold rises (MaxScore).
+- Counting matches for a query dominated by one very common word reads a stored count
+  instead of walking the posting list.
+- Very dense queries switch to bitsets. Very sparse ANDs walk the shortest list and probe
+  the others.
+- The switch points were set by benchmark, and every algorithm is tested against a
+  brute-force BM25 implementation. The choice changes speed, never results.
 
-Distance kernels are hand-written intrinsics selected at runtime: AVX-512 where the CPU
-reports it, AVX2 otherwise, a portable 256-bit path elsewhere, and an int8 VNNI kernel for the
-graph walk.
+### Vector search is a three-stage funnel
+
+- Vectors are grouped into clusters. A query is compared to the cluster centers first, and
+  only the nearest clusters are read — 62 of 255, for a top-10 on a 1M-row table.
+- Rows in those clusters are scored with 1-bit-per-dimension codes: 192 bytes per
+  1536-dimension vector, instead of 6 KiB as float32.
+- The best candidates — 155 rows for that same top-10 — are re-scored with
+  2-byte-per-dimension codes to get the exact order.
+- How many clusters to read and how many rows to re-score are measured per table when the
+  index is built, and measured again when the data changes shape.
+- Measured recall@10 at 1M rows: 0.992, tested against exact brute-force nearest neighbors.
+- Distance kernels are runtime-dispatched: AVX-512, AVX2, a portable 256-bit path, and an
+  int8 VNNI kernel for graph navigation.
 
 ### Commits swap a manifest
 
-A table is a set of immutable files plus a manifest listing them. Appending writes new files
-and then replaces the manifest in one atomic operation, so a commit publishes all of its rows
-or none of them. A reader pins the manifest it opened with and reads that version to
-completion, so it never waits on a writer and never sees a partial commit. No lock service or
-leader election participates in this.
+- A table is a set of immutable files plus a manifest that lists them. A commit writes new
+  files, then replaces the manifest in one atomic step: all of its rows appear, or none.
+- A reader keeps the manifest it opened and finishes on that version. It never waits on a
+  writer and never sees half a commit.
+- No lock service, no leader election.
 
-## Vector index modes
+### `optimize()` fits the index to the data
 
-The index is one config line. Every mode falls back to the routed scan on its own when it
-cannot serve a query, so changing the line can cost recall or latency but not correctness.
-
-What a million 1536-dimension vectors cost to keep resident:
-
-| Mode | Resident | 1M × 1536d | vs float32 | recall@10 | warm p50 |
-|---|---|---|---|---|---|
-| float32, no index | 4 B/dim | 5.7 GiB | — | 1.000 | — |
-| `flat_ivf` | 0.5 B/dim, pinned | 726 MiB | 8× less | 0.938 | 20 ms |
-| `ivf` (default) | 2 B/dim, cached | ~2.9 GiB reclaimable, ~100 MiB pinned | ~2× less | 0.988 | 6.2 ms |
-| `hnsw_ivf` | ~3.2 B/dim, pinned | ~4.6 GiB | ~1.2× less | 0.995 | 0.59 ms |
-
-The `1M × 1536d` column is computed from the same corpus for every row, so the memory is
-comparable across modes. Recall and latency come from each mode's own measurement, and those
-are not the same corpus: `flat_ivf` on dbpedia at 1536 dimensions, `hnsw_ivf` on Cohere at
-768 dimensions, where it pins about 2.4 GiB.
-
-`flat_ivf` scans a 4-bit plane end to end and returns the codes' own ranking. No clusters, no
-graph, no rerank plane. It fetches nothing to serve a query, so cold and warm are the same
-number and the quoted latency is a worst case rather than a cache-dependent average. Cost is
-linear in rows: about 1.6 ms at 100K, 20 ms at 1M. Recall is set by the codec at roughly 0.94
-and does not move with scale. Cosine columns only.
-
-`ivf` is the default and the only mode that scales past memory. The index lives on object
-storage and pages into the reclaimable cache, so pinned memory stays near 100 MiB regardless
-of table size and the resident set drops to nothing when the table goes idle.
-
-`hnsw_ivf` walks a resident graph on an int8 plane and re-ranks the final beam at higher
-precision. It needs the graph in RAM, which bounds it to tables of 10M rows.
-
-At 100K rows, `flat_ivf` holds 77 MiB of plane where float32 needs 586 MiB, answers in
-1.6 ms, and beats the routed path below roughly 130K rows. Serving RSS all-in, including the
-manifest, is 153 MiB at 100K and 841 MiB at 1M. Build peaks are transient and released at
-commit.
-
-### Calibration
-
-You set a recall target and `optimize()` measures the corpus to decide how to reach it. A
-graph or a flat plane is published only if its calibrated recall clears the registration floor
-for that index type; otherwise the routed scan serves and nothing changes for the caller.
-Probe width and depth are re-fitted whenever compaction or a cell split moves the geometry
-they were measured against.
+- You set one number — `target_recall: 0.99`. `optimize()` measures the table and sizes
+  everything else: how many clusters, how many a query reads, how many rows get re-scored.
+- If you select the graph or flat index mode, it is built and its recall is measured. It
+  serves only if it reaches the bar on this data; otherwise the default index keeps serving
+  and nothing changes for the caller.
+- The measurements are redone whenever compaction or a cluster split changes the data.
 
 ```yaml
 # infino.yaml
@@ -237,15 +227,59 @@ table.optimize()    # drain, compact, recalibrate, sweep
 ```
 
 Every knob, and the measurement behind each default, is documented inline in
-[`src/config/config.yaml`](src/config/config.yaml). The bench tables in
-[benches/README.md](benches/README.md) report peak, median, and p90 RSS next to each latency.
+[`src/config/config.yaml`](src/config/config.yaml).
 
-## Search results are SQL tables
+## Vector index modes
+
+A million 1536-dimension vectors are 5.7 GiB of RAM as float32. `flat_ivf` serves them from
+841 MiB, all-in.
+
+![RAM to serve vector search, 100K and 1M vectors, versus the float32 baseline](docs/assets/readme/vector-modes-memory.svg)
+
+![Vector mode warm p50 at the recall each serves, 100K and 1M vectors](docs/assets/readme/vector-modes-latency.svg)
+
+![flat_ivf vs ivf warm p50 across table sizes](docs/assets/readme/vector-crossover.svg)
+
+Measured serving figures, each row on its own corpus:
+
+| Mode | Corpus | RAM to serve | recall@10 | warm p50 |
+|---|---|---|---|---|
+| `flat_ivf` | dbpedia 1M × 1536d | 841 MiB, pinned | 0.938 | 20 ms |
+| `ivf` (default) | dbpedia 1M × 1536d | 3.16 GiB working set, 109 MiB pinned | 0.988 | 6.2 ms |
+| `hnsw_ivf` | Cohere 1M × 768d | 2.5 GiB, pinned | 0.995 | 0.59 ms |
+
+- `flat_ivf` — exhaustive scan over a 4-bit plane; no clusters, no graph, no rerank plane.
+  Fetches nothing to serve, so cold equals warm and the quoted latency is a worst case.
+  Linear in rows: 1.6 ms at 100K, 20 ms at 1M. Recall is codec-set (~0.94) and does not
+  move with scale. Faster than the routed path below ~130K rows (chart above). Cosine only.
+- `ivf` (default) — the only mode that scales past RAM. The index lives on object storage
+  and pages through the reclaimable cache; pinned memory stays near 100 MiB at any scale.
+- `hnsw_ivf` — graph walk on an int8 plane, exact re-rank on the final beam. Needs the graph
+  resident, which bounds it to ~10M rows.
+- Every mode falls back to the routed scan when it cannot serve a query; changing the mode
+  can cost recall or latency, never correctness.
+
+## SQL
+
+SQL planning and execution is Apache DataFusion. When a `WHERE` clause hits a column that
+has a full-text index, Infino looks the value up in that index first and hands DataFusion
+the matching row numbers, so the scan decodes only those rows instead of the whole column.
+
+The chart is that lookup switched on and off — same query, same files:
+
+![SQL latency with and without the index lookup, same query, same files](docs/assets/readme/sql-pushdown.svg)
+
+- Equality on an unsorted column, where Parquet min/max stats can't skip anything:
+  21.9 ms without the index lookup, 1.44 ms with it. COUNT and AVG over the same
+  predicate: ~22.5 ms → ~1.8 ms.
+- A predicate matching every row, forced through the lookup anyway: 30.5 ms scanned,
+  66.1 ms through the index.
+- Before any of that, per-file min/max, Bloom, and term summaries drop whole files, and an
+  aggregate fully answered by the table's statistics never scans at all.
 
 `bm25_search`, `vector_search`, `hybrid_search`, `token_match`, and `exact_match` are SQL
-table-valued functions, so a ranked result set is a relation. Retrieval, filters, joins, and
-aggregation compose in one statement against one pinned snapshot, which replaces several
-round trips with one.
+table-valued functions, so a ranked result set is a relation — retrieval, filters, joins,
+and aggregation compose in one statement against one pinned snapshot:
 
 ```sql
 SELECT   s.team,
@@ -257,11 +291,6 @@ WHERE    h.ts > now() - interval '7 days'
 GROUP BY s.team
 ORDER BY hits DESC;
 ```
-
-SQL runs on Apache DataFusion. What Infino adds is the indexes it already wrote: a predicate
-on an indexed text column resolves through the posting list into a Parquet row selection, so
-DataFusion decodes only the matching rows, and file-level min/max and Bloom summaries drop
-whole files before any bytes are read.
 
 ## Limitations
 
