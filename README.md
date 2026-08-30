@@ -139,29 +139,66 @@ that range on each axis while serving all four query types from one file.
 
 ## Why it's fast
 
-Object storage is 20–100 ms away, which is the obvious objection to running search on it.
-
 ![Your app queries Infino, which caches in RAM and on disk over Parquet on object storage](docs/assets/readme/one-parquet-copy.svg)
 
-The index is byte-addressable. Infino writes a superfile: a valid Parquet file with BM25 and
-vector indexes spliced in. Posting lists and IVF cells are laid out so top-k resolves to a
-bounded set of byte ranges rather than the whole file. Cold, those are exact range GETs, and
-when the manifest carries the open batch, opening the superfile costs no GETs at all. There
-is no "load the index" step, because the index is read in place.
+### The index lives inside the data file
 
-Warm queries never leave the machine. Fetched ranges land in a disk-backed cache and are
-memory-mapped, so a repeat query is page-cache reads and SIMD scoring. That is where 591 µs
-comes from. The cache is reclaimable: it shrinks under memory pressure, down to zero on an
-idle table, and refills on the next query.
+Infino writes one file per batch, and that file is ordinary Parquet with the search indexes
+stored inside it. DuckDB, pyarrow, and DataFusion open it and see a normal table, with Infino
+nowhere in the read path ([example](infino-python/examples/parquet_interop.py)). Infino opens
+the same bytes and uses the indexes.
 
-Commits are a pointer swap. A manifest lists immutable superfiles; writers append new files
-and swap the manifest atomically while readers hold a pinned snapshot. There is no
-coordinator and no leader election, which is what lets this be a library instead of a
-service.
+So there is no second artifact to build, ship, load, or keep in sync with the data, and no
+"open the index" step at startup.
 
-Because the file is ordinary Parquet, DuckDB, pyarrow, and DataFusion read the columns with
-Infino nowhere in the read path — see
-[`parquet_interop.py`](infino-python/examples/parquet_interop.py).
+### A query reads a few byte ranges, not a file
+
+The indexes are laid out by term and by vector cluster, so a top-10 resolves to a short list
+of byte offsets. On object storage those are HTTP range requests — a handful of them, rather
+than a download. This is the part that makes running search directly on S3 practical, since
+each round trip costs 20–100 ms and the goal is to need very few.
+
+Fetched ranges are kept in a local disk cache and memory-mapped, so the next query over the
+same terms is page-cache reads with no network at all. That is where the 125 µs comes from.
+The cache is reclaimable: it shrinks under memory pressure, down to nothing on an idle table,
+and refills on demand.
+
+### Scoring is SIMD over compressed vectors
+
+Vectors are stored as 1-bit-per-dimension RaBitQ codes — `dim / 8` bytes per row, so 128
+bytes for a 1024-dimension vector against 4 KB as raw float32. That is 32× less to fetch and
+score, and it is small enough that a whole cluster of candidates stays in cache.
+
+The distance kernels are hand-written intrinsics chosen at runtime: AVX-512 where the CPU
+reports it, AVX2 otherwise, a portable 256-bit path elsewhere, and an int8 VNNI kernel for
+the graph walk. Finalists get rescored against a higher-precision copy, which is how the
+compression stays free — recall@10 is 0.992.
+
+### Writes append, and readers never block
+
+A table is a set of immutable files plus a small manifest listing them. Appending writes new
+files and then swaps the manifest in one atomic step, so a commit publishes everything or
+nothing. A query pins the manifest it started with and reads that version to completion,
+which means readers never wait on a writer and never see a half-finished commit.
+
+Nothing has to coordinate for that to hold — no lock service, no elected leader. That is what
+lets Infino be a library you link in rather than a service you operate.
+
+### Memory
+
+Only the codes need to be resident, and they are the compressed copy:
+
+| Vector dimensions | RaBitQ codes | Same data as float32 |
+|---|---|---|
+| 384 | 48 B/row | 1.5 KB/row |
+| 768 | 96 B/row | 3 KB/row |
+| 1024 | 128 B/row | 4 KB/row |
+
+At 1024 dimensions, 10M vectors is about 1.3 GB of codes. The higher-precision rerank copy is
+2 bytes per dimension and lives in the disk cache rather than in RAM; setting the rerank codec
+to `rabitq_only` drops it entirely. Every bench table in
+[benches/README.md](benches/README.md) reports peak, median, and p90 RSS alongside latency,
+so the memory cost of each shape is recorded next to its speed.
 
 ## Retrieval is a relation
 
