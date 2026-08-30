@@ -13,7 +13,18 @@ ordinary Parquet on local disk or object storage. Simple, scalable, and optimize
 pip install infino              # Python
 npm install @infino-ai/infino   # Node.js
 cargo add infino                # Rust
+
+or in Cargo.toml:
+
+toml
+[dependencies]
+infino = "0.1"
 ```
+
+Note: infino installs the [mimalloc](https://github.com/microsoft/mimalloc)
+global allocator by default. If you embed infino in a process that already
+sets a global allocator, turn it off to avoid a second one:
+`infino = { version = "0.1", default-features = false }`.
 
 ## Quickstart
 
