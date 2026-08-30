@@ -6,12 +6,13 @@
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**SQL, full-text, and vector search on Parquet — one copy on object storage.**
+**SQL, full-text, and vector search over one copy of your data on object storage.**
 
-Warm queries on a **1M-document** supertable (Azure CI): **591 µs** vector top-10
-(recall@10 **0.992**), **125 µs** BM25 top-10. At the default **10M-document**
-scale: **5 ms** vector p50 warm / **314 ms** cold. Full tables:
-[benches/README.md](benches/README.md) · [infino.ai](https://infino.ai/).
+Infino is an embedded retrieval engine. A "superfile" is a valid Apache Parquet file with
+BM25 and vector indexes spliced into it, so one copy serves all three query types — no
+daemon, no separate search cluster, no second copy to keep in sync.
+
+![BM25, vector, hybrid, and SQL query one Parquet copy through Infino](docs/assets/readme/one-parquet-copy.svg)
 
 ```sh
 pip install infino              # Python
@@ -21,30 +22,55 @@ cargo add infino                # Rust
 
 ## Performance
 
-All internal charts come from `cargo bench` ([harness guide](benches/README.md)).
-Engine behavior is configured in YAML — copy [`src/config/config.yaml`](src/config/config.yaml)
-to `./infino.yaml` (or `$XDG_CONFIG_HOME/infino/config.yaml`) and edit the
-`vector:` / `supertable:` sections; env vars do not override engine tuning.
+Warm p50, supertable on object storage:
 
-Doc count is the only bench env knob: `INFINO_BENCH_SUPERTABLE_DOCS` (plain integer,
-no `1M` suffix). Supertable defaults to **10M**; CI pins **1M** for cost.
+| | 1M docs | 10M docs |
+|---|---|---|
+| **Vector** top-10, recall@10 0.992 | **591 µs** | **5 ms** |
+| **BM25** top-10, incl. row fetch | **125 µs** | **2 ms** |
+| **SQL** point lookup → crosstab | **186 µs – 7.6 ms** | **260 µs – 75 ms** |
 
-### Vector search
+Cold — the first query against an idle table, while handles open and the cache fills — is
+114 ms / 314 ms for vector and 16 ms / 275 ms for BM25. Charts are log-scale, since warm
+and cold are ~200× apart.
 
-| Scale | Warm p50 | Cold p50 | Notes |
-|------:|---------:|---------:|-------|
-| **1M** | **591 µs** | **114 ms** | post-drain · 1024-d · top-10 · [CI run](https://github.com/infino-ai/infino/actions/runs/33245831329) |
-| **10M** | **5 ms** | **314 ms** | default supertable scale · top-10 |
+The two scales come from **separate measurement windows** and are not directly comparable
+to each other: 1M is Azure CI ([run 33245831329](https://github.com/infino-ai/infino/actions/runs/33245831329),
+4 cores pinned), 10M is the default supertable scale measured on its own run.
 
-<p align="center">
-  <img src="docs/assets/readme/vector-1m.svg" alt="Vector search latency at 1M docs" width="880"/>
-</p>
+![Vector search latency, log scale, 1M and 10M documents](docs/assets/readme/vector.svg)
 
-**Reproduce (1M, match CI):**
+![BM25 full-text search latency, log scale, 1M and 10M documents](docs/assets/readme/fts.svg)
+
+![SQL query shape latency, log scale, 1M and 10M rows](docs/assets/readme/sql.svg)
+
+<details>
+<summary><b>Reproduce these numbers</b> — config and exact commands</summary>
+
+Engine behavior is configured in YAML only; environment variables never override it. Start
+from the shipped defaults, which are what the charts above measure:
 
 ```sh
-cp src/config/config.yaml infino.yaml
+cp src/config/config.yaml infino.yaml    # or $XDG_CONFIG_HOME/infino/config.yaml
+```
 
+Edit the `vector:` block to change probe depth, rerank codec, or cell counts; `supertable:`
+for commit and cache behavior. Leave both alone to reproduce the charts as published.
+
+Corpus size is the one bench knob that *is* an environment variable, and it takes a plain
+integer (`1000000`, not `1M`). Supertable defaults to 10M:
+
+| Chart | Command |
+|---|---|
+| Vector, 10M | `cargo bench -- supertable vector warm cold` |
+| BM25, 10M | `cargo bench -- supertable fts warm cold` |
+| SQL, 10M | `cargo bench -- supertable sql warm` |
+| Any chart, 1M | prefix with `INFINO_BENCH_SUPERTABLE_DOCS=1000000` |
+
+That runs against a local RustFS daemon (an HTTPS S3 stand-in) by default. To match CI
+exactly, add the Azure backend:
+
+```sh
 INFINO_BENCH_SUPERTABLE_DOCS=1000000 \
 INFINO_BENCH_STORE=azure \
 INFINO_REAL_AZURE_CONTAINER=$CONTAINER \
@@ -53,132 +79,54 @@ AZURE_STORAGE_ACCOUNT_KEY=$KEY \
   cargo bench -- supertable vector warm cold
 ```
 
-Locally without Azure, omit `INFINO_BENCH_STORE=azure` (RustFS is the default HTTPS
-S3 stand-in). Read the **post-drain · default** row in the log.
+Reading the output: vector numbers are the **post-drain `default`** row; BM25 is
+`single_rare` under **Supertable FTS — queries + cost**; SQL query names are
+`agg_max_title` (metadata), `WHERE key = ?` (lookup), `AVG(rating) GROUP BY category`
+(scan), and `COUNT(*) GROUP BY bucket, category` (crosstab). Structured results land in
+`target/infino-bench/*.json`. Full methodology: [benches/README.md](benches/README.md).
 
-**Reproduce (10M, default scale):**
+</details>
 
-```sh
-cp src/config/config.yaml infino.yaml
-cargo bench -- supertable vector warm cold
-```
+### How Infino compares
 
-<p align="center">
-  <img src="docs/assets/readme/vector-10m.svg" alt="Vector search latency at 10M docs" width="880"/>
-</p>
+Infino is a retrieval engine that also runs analytics, so it is measured against
+specialists in each category on their own published harnesses.
 
-### Full-text search
+![Vector search versus vector databases on VectorDBBench](docs/assets/readme/compare-vdb.svg)
 
-| Scale | Warm p50 | Cold p50 | Query shape |
-|------:|---------:|---------:|-------------|
-| **1M** | **125 µs** | **16 ms** | BM25 · `single_rare` · top-10 + row fetch · [CI run](https://github.com/infino-ai/infino/actions/runs/33245831329) |
-| **10M** | **2 ms** | **275 ms** | BM25 · median query · top-10 |
+![Full-text search versus Lucene and Tantivy on Search Benchmark, the Game](docs/assets/readme/compare-fts.svg)
 
-<p align="center">
-  <img src="docs/assets/readme/fts-1m.svg" alt="Full-text search latency at 1M docs" width="880"/>
-</p>
+![SQL on Parquet versus analytic engines on ClickBench](docs/assets/readme/compare-sql.svg)
 
-**Reproduce (1M):**
+Read honestly: Infino leads on vector, trades with Lucene on full-text (19% slower on
+search, 26% faster on count), and lands mid-pack on ClickBench behind ClickHouse and
+DuckDB. The point is that one engine covers all three from a single Parquet copy while
+staying within range of each specialist.
 
-```sh
-cp src/config/config.yaml infino.yaml
+Harnesses: [VectorDBBench](https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch)
+(client in [infino-ai/VectorDBBench](https://github.com/infino-ai/VectorDBBench/tree/main/vectordb_bench/backend/clients/infino)) ·
+[Search Benchmark, the Game](https://tantivy-search.github.io/bench/)
+([harness](https://github.com/quickwit-oss/search-benchmark-game); Infino rows pending on the public board) ·
+[ClickBench](https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino%7CDataFusion%20%28Parquet%2C%20single%29%7CSpark%7CPostgreSQL%20%28with%20indexes%29&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot)
+([port](https://github.com/infino-ai/clickbench/tree/add-infino/infino)).
 
-INFINO_BENCH_SUPERTABLE_DOCS=1000000 \
-INFINO_BENCH_STORE=azure \
-INFINO_REAL_AZURE_CONTAINER=$CONTAINER \
-AZURE_STORAGE_ACCOUNT_NAME=$ACCOUNT \
-AZURE_STORAGE_ACCOUNT_KEY=$KEY \
-  cargo bench -- supertable fts warm cold
-```
+## Hybrid search is SQL
 
-**Reproduce (10M):**
+`bm25_search`, `vector_search`, `hybrid_search`, `token_match`, and `exact_match` are SQL
+table-valued functions, so a ranked result set is an ordinary relation. Retrieval, filters,
+joins, and aggregation compose in one statement against one pinned snapshot — no
+client-side stitching between a search engine and a database.
 
-```sh
-cp src/config/config.yaml infino.yaml
-cargo bench -- supertable fts warm cold
-```
-
-<p align="center">
-  <img src="docs/assets/readme/fts-10m.svg" alt="Full-text search latency at 10M docs" width="880"/>
-</p>
-
-### SQL
-
-Warm p50 on object storage. At 1M rows (CI); at 10M rows (default supertable scale).
-
-<p align="center">
-  <img src="docs/assets/readme/sql-1m.svg" alt="SQL query shapes at 1M rows" width="880"/>
-  <img src="docs/assets/readme/sql-10m.svg" alt="SQL query shapes at 10M rows" width="880"/>
-</p>
-
-**Reproduce:**
-
-```sh
-cp src/config/config.yaml infino.yaml
-
-# 1M (CI scale)
-INFINO_BENCH_SUPERTABLE_DOCS=1000000 \
-INFINO_BENCH_STORE=azure \
-INFINO_REAL_AZURE_CONTAINER=$CONTAINER \
-AZURE_STORAGE_ACCOUNT_NAME=$ACCOUNT \
-AZURE_STORAGE_ACCOUNT_KEY=$KEY \
-  cargo bench -- supertable sql warm
-
-# 10M (default)
-cargo bench -- supertable sql warm
-```
-
-Query names in the log: `agg_max_title`, `WHERE key = ?`, `AVG(rating) GROUP BY category`,
-`COUNT(*) GROUP BY bucket, category`.
-
-### vs vector databases
-
-[VectorDBBench](https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch) · Cohere 1M ·
-768-d · top-100 · serial p99 (lower is faster).
-
-<p align="center">
-  <img src="docs/assets/readme/compare-vdb.svg" alt="VectorDBBench comparison" width="880"/>
-</p>
-
-**Reproduce:** run the Infino client in
-[`infino-ai/VectorDBBench`](https://github.com/infino-ai/VectorDBBench/tree/main/vectordb_bench/backend/clients/infino)
-against the standard Cohere Medium harness, then compare to the published leaderboard.
-
-### vs search libraries
-
-[Search Benchmark, the Game](https://tantivy-search.github.io/bench/) · latency relative to
-Lucene = 1.00 (lower is faster). Infino submission pending on the public board.
-
-<p align="center">
-  <img src="docs/assets/readme/compare-fts.svg" alt="Search Benchmark the Game comparison" width="880"/>
-</p>
-
-**Reproduce:** build/submit via the
-[search-benchmark-game](https://github.com/quickwit-oss/search-benchmark-game) harness.
-
-### vs SQL on Parquet
-
-[ClickBench](https://benchmark.clickhouse.com/#system=+ClickHouse|DuckDB|Infino|DataFusion%20(Parquet,%20single)|Spark|PostgreSQL%20(with%20indexes)&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot)
-100M rows · vCPU-seconds per query · hot runs · c6a.4xlarge (lower is faster).
-
-<p align="center">
-  <img src="docs/assets/readme/compare-sql.svg" alt="ClickBench comparison" width="880"/>
-</p>
-
-**Reproduce:** [`infino-ai/clickbench`](https://github.com/infino-ai/clickbench/tree/add-infino/infino)
-— 43-query suite, 100M rows, Parquet single-file, hot runs on c6a.4xlarge.
-
----
-
-Regenerate chart SVGs after updating `scripts/readme_charts/bench_data.py`:
-
-```sh
-make readme-charts
+```sql
+SELECT _id, title, score
+FROM hybrid_search('logs', 'body', 'disk full', 'embedding', :q, 50)
+WHERE level = 'error'
+  AND ts > now() - interval '24 hours'
+ORDER BY score DESC
+LIMIT 10;
 ```
 
 ## Quickstart
-
-Index text and vectors on one table, then retrieve — BM25, vector kNN, hybrid, or SQL.
 
 ```python
 import infino
@@ -204,31 +152,20 @@ docs.append([
 hits = docs.hybrid_search("body", "cancel subscription", "embedding", billing, 5)
 ```
 
-Hybrid search composes as SQL — one snapshot, one pass over Parquet:
-
-```sql
-SELECT _id, title, score
-FROM hybrid_search('logs', 'body', 'disk full', 'embedding', :q, 50)
-WHERE level = 'error'
-  AND ts > now() - interval '24 hours'
-ORDER BY score DESC
-LIMIT 10;
-```
-
 | Language | Quickstart | Examples |
 |----------|------------|----------|
 | Python | [infino-python/](infino-python/) | [examples/](infino-python/examples/) |
 | Node.js | [infino-node/](infino-node/) | [examples/](infino-node/examples/) |
 | Rust | [docs.rs/infino](https://docs.rs/infino) | [examples/](examples/) |
 
-A superfile is valid Parquet — DuckDB, pyarrow, and DataFusion read the columns with no
-Infino in the read path. See
-[`infino-python/examples/parquet_interop.py`](infino-python/examples/parquet_interop.py).
+Because a superfile is valid Parquet, DuckDB, pyarrow, and DataFusion read the columns with
+no Infino in the read path — see
+[`parquet_interop.py`](infino-python/examples/parquet_interop.py).
 
 ## Architecture
 
-One Parquet file holds column data plus embedded BM25 and vector indexes. A supertable
-manifest composes many superfiles on object storage with snapshot-isolated reads.
+A supertable manifest composes many immutable superfiles on object storage, giving
+snapshot-isolated reads, append-only writes, and atomic commits.
 
 - **[Overview →](docs/architecture/overview.md)** — mental model and comparisons
 - **[Superfile format →](docs/architecture/superfile.md)** — on-disk layout
@@ -236,19 +173,18 @@ manifest composes many superfiles on object storage with snapshot-isolated reads
 
 Concepts and guides: **[infino.ai/docs](https://infino.ai/docs)**.
 
-## Stability
-
-Public API is pinned by `public-api.txt` (`make public-api`). Crate is 0.x; MSRV **1.95**.
-Python and Node version on their own SemVer lines — see [docs/versioning.md](docs/versioning.md).
-
 ## Development
 
 ```sh
 git clone git@github.com:infino-ai/infino.git && cd infino
 cargo build
 cargo run --example demo
-make ci          # before a PR
-make readme-charts   # refresh README performance SVGs
+make ci                # gates before a PR
+make readme-charts     # regenerate the charts above
 ```
+
+The public API is pinned by `public-api.txt` (`make public-api`). The crate is 0.x; MSRV
+**1.95**. Python and Node version on their own SemVer lines — see
+[docs/versioning.md](docs/versioning.md).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Licensed [Apache-2.0](LICENSE).

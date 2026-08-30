@@ -1,28 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Infino Authors
 
-"""Numbers and reproduction metadata for README performance charts.
+"""Numbers and provenance for the README performance charts.
 
-Internal 1M rows: CI Benchmark (Azure) run 33245831329 on commit 3aaffb64
-(2026-08-29). Internal 10M rows: measured supertable defaults (see benches/
-README.md); latencies match infino.ai as of the same measurement window.
+Two measurement windows feed these charts and they are *not* directly
+comparable — different commits, different hardware:
 
-External comparison rows mirror the published harnesses cited on infino.ai.
+  1M  — CI Benchmark (Azure Blob, 4 cores pinned), run 33245831329 on
+        commit 3aaffb64, 2026-08-29.
+  10M — the default supertable scale, measured separately (commit 339e621
+        window). See benches/README.md.
+
+Every chart therefore labels its scale groups and carries both provenances in
+the footnote. Footnote text is drawn straight into SVG, so it must stay plain:
+no markdown, no angle brackets.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Milliseconds is the single internal unit; the renderer picks µs/ms/s per value.
+US = 1 / 1000
+
 
 @dataclass(frozen=True)
-class LatencyRow:
+class Bar:
+    """One horizontal bar. `group` heads a run of consecutive bars."""
+
+    group: str
     label: str
-    warm_us: float | None = None
-    cold_us: float | None = None
-    warm_ms: float | None = None
-    cold_ms: float | None = None
-    note: str = ""
+    ms: float
+    cold: bool = False
 
 
 @dataclass(frozen=True)
@@ -34,199 +43,107 @@ class CompareRow:
     self_row: bool = False
 
 
-CONFIG_PATH = "src/config/config.yaml"
-PROJECT_CONFIG = "infino.yaml"
+CI_RUN = "33245831329"
+CI_RUN_URL = f"https://github.com/infino-ai/infino/actions/runs/{CI_RUN}"
+CI_COMMIT = "3aaffb64"
 
-# ── Internal: 1M supertable on Azure (CI) ───────────────────────────────────
+# Both windows in one line, plain text, for the chart footnotes.
+PROVENANCE = (
+    f"1M: Azure Blob, 4 cores pinned, CI run {CI_RUN} ({CI_COMMIT}) "
+    "· 10M: supertable default scale, separate run"
+)
 
-CI_RUN_URL = "https://github.com/infino-ai/infino/actions/runs/33245831329"
-CI_COMMIT = "3aaffb649f6afb119162c3050cfbbe2983d8eae6"
+# ── Internal latency ────────────────────────────────────────────────────────
 
-VECTOR_1M = {
-    "title": "Vector search · 1M docs",
+VECTOR = {
+    "title": "Vector search",
     "subtitle": "1024-d cosine · top-10 · post-drain · recall@10 0.992",
-    "footnote": f"Azure Blob · 4 cores pinned · [{CI_COMMIT[:7]}]({CI_RUN_URL})",
-    "rows": [
-        LatencyRow("p50", warm_us=591, cold_ms=114),
-        LatencyRow("p99", warm_us=687, cold_ms=114),
+    "footnote": PROVENANCE,
+    "bars": [
+        Bar("1M", "warm p50", 591 * US),
+        Bar("1M", "warm p99", 687 * US),
+        Bar("1M", "cold p50", 114, cold=True),
+        Bar("10M", "warm p50", 5),
+        Bar("10M", "warm p99", 12),
+        Bar("10M", "cold p50", 314, cold=True),
     ],
-    "repro": """\
-```sh
-# Start from shipped defaults (optional project override):
-cp {config} {project}
-
-# Match CI scale + backend (local alternative: omit INFINO_BENCH_STORE=azure):
-INFINO_BENCH_SUPERTABLE_DOCS=1000000 \\
-INFINO_BENCH_STORE=azure \\
-INFINO_REAL_AZURE_CONTAINER=$CONTAINER \\
-AZURE_STORAGE_ACCOUNT_NAME=$ACCOUNT \\
-AZURE_STORAGE_ACCOUNT_KEY=$KEY \\
-  cargo bench -- supertable vector warm cold
-```
-
-Post-drain `default` row in the log. Vector tuning knobs live under `vector:` in
-`{project}` (rerank codec, cell counts, fine-probe floor); defaults reproduce CI.""",
 }
 
-FTS_1M = {
-    "title": "Full-text search · 1M docs",
-    "subtitle": "BM25 · single_rare · top-10 · including row fetch",
-    "footnote": f"Azure Blob · 4 cores pinned · [{CI_COMMIT[:7]}]({CI_RUN_URL})",
-    "rows": [
-        LatencyRow("p50", warm_us=125, cold_ms=16.4),
-        LatencyRow("p99", warm_us=143, cold_ms=16.4),
+FTS = {
+    "title": "Full-text search (BM25)",
+    "subtitle": "top-10 including row fetch · 1M: single_rare · 10M: median shape",
+    "footnote": PROVENANCE,
+    "bars": [
+        Bar("1M", "warm p50", 125 * US),
+        Bar("1M", "warm p99", 143 * US),
+        Bar("1M", "cold p50", 16.4, cold=True),
+        Bar("10M", "warm p50", 2),
+        Bar("10M", "warm p99", 7),
+        Bar("10M", "cold p50", 275, cold=True),
     ],
-    "repro": """\
-```sh
-cp {config} {project}
-
-INFINO_BENCH_SUPERTABLE_DOCS=1000000 \\
-INFINO_BENCH_STORE=azure \\
-INFINO_REAL_AZURE_CONTAINER=$CONTAINER \\
-AZURE_STORAGE_ACCOUNT_NAME=$ACCOUNT \\
-AZURE_STORAGE_ACCOUNT_KEY=$KEY \\
-  cargo bench -- supertable fts warm cold
-```
-
-Look for `single_rare` in **Supertable FTS — queries + cost**. FTS tokenizer
-settings are compile-time; corpus shape is fixed Zipfian 200 tokens/doc in the
-harness (`benches/utils/corpus.rs`).""",
 }
 
-SQL_1M = {
-    "title": "SQL · 1M rows",
-    "subtitle": "Warm p50 · supertable on object storage",
-    "footnote": f"Azure Blob · [{CI_COMMIT[:7]}]({CI_RUN_URL})",
-    "rows": [
-        LatencyRow("metadata aggregate", warm_us=186, note="agg_max_title"),
-        LatencyRow("lookup aggregate", warm_ms=4.41, note="WHERE key = ?"),
-        LatencyRow("scan aggregate", warm_ms=5.16, note="AVG GROUP BY category"),
-        LatencyRow("crosstab aggregate", warm_ms=7.63, note="GROUP BY bucket, category"),
+SQL = {
+    "title": "SQL query shapes",
+    "subtitle": "warm p50 · supertable on object storage",
+    "footnote": PROVENANCE,
+    "bars": [
+        Bar("1M", "metadata", 186 * US),
+        Bar("1M", "lookup", 4.41),
+        Bar("1M", "scan", 5.16),
+        Bar("1M", "crosstab", 7.63),
+        Bar("10M", "metadata", 260 * US),
+        Bar("10M", "lookup", 2.74),
+        Bar("10M", "scan", 41.14),
+        Bar("10M", "crosstab", 75.14),
     ],
-    "repro": """\
-```sh
-cp {config} {project}
-
-INFINO_BENCH_SUPERTABLE_DOCS=1000000 \\
-INFINO_BENCH_STORE=azure \\
-INFINO_REAL_AZURE_CONTAINER=$CONTAINER \\
-AZURE_STORAGE_ACCOUNT_NAME=$ACCOUNT \\
-AZURE_STORAGE_ACCOUNT_KEY=$KEY \\
-  cargo bench -- supertable sql warm
-```
-
-Query names match the **Supertable SQL — queries + cost** table in the log.""",
-}
-
-# ── Internal: 10M supertable (default scale) ───────────────────────────────
-
-VECTOR_10M = {
-    "title": "Vector search · 10M docs",
-    "subtitle": "1024-d cosine · top-10 · supertable default scale",
-    "footnote": "Measured supertable path · see [benches/README.md](benches/README.md)",
-    "rows": [
-        LatencyRow("p50", warm_ms=5, cold_ms=314),
-        LatencyRow("p99", warm_ms=12, cold_ms=850),
-    ],
-    "repro": """\
-```sh
-cp {config} {project}
-
-# Default supertable scale is 10M docs (1024-d synthetic vectors):
-cargo bench -- supertable vector warm cold
-```
-
-Requires ~32 GiB+ RAM for the mmap corpus. Pin cores locally with
-`taskset`/`cpuset` if comparing across runs. Results land in
-`target/infino-bench/supertable_vector.json`.""",
-}
-
-FTS_10M = {
-    "title": "Full-text search · 10M docs",
-    "subtitle": "BM25 · median query shape · top-10",
-    "footnote": "Measured supertable path · see [benches/README.md](benches/README.md)",
-    "rows": [
-        LatencyRow("p50", warm_ms=2, cold_ms=275),
-        LatencyRow("p99", warm_ms=7, cold_ms=720),
-    ],
-    "repro": """\
-```sh
-cp {config} {project}
-
-cargo bench -- supertable fts warm cold
-```""",
-}
-
-SQL_10M = {
-    "title": "SQL · 10M rows",
-    "subtitle": "Warm p50 · bounded-result query shapes",
-    "footnote": "Measured supertable path (Azure, commit 339e621 window)",
-    "rows": [
-        LatencyRow("metadata aggregate", warm_ms=0.26),
-        LatencyRow("lookup aggregate", warm_ms=2.74),
-        LatencyRow("scan aggregate", warm_ms=41.14),
-        LatencyRow("crosstab aggregate", warm_ms=75.14),
-    ],
-    "repro": """\
-```sh
-cp {config} {project}
-
-cargo bench -- supertable sql warm
-```""",
 }
 
 # ── External comparisons ────────────────────────────────────────────────────
 
 VDB_ROWS: list[CompareRow] = [
-    CompareRow("Infino", 1.1, "1.1ms", "16c64g", self_row=True),
-    CompareRow("Zilliz Cloud", 2.0, "2.0ms", "8cu-perf"),
-    CompareRow("Qdrant Cloud", 6.4, "6.4ms", "16c64g"),
-    CompareRow("OpenSearch", 7.2, "7.2ms", "16c128g force-merge"),
-    CompareRow("Elastic Cloud", 9.5, "9.5ms", "8c60g force-merge"),
-    CompareRow("Pinecone", 13.7, "13.7ms", "p2.x8 1node"),
+    CompareRow("Infino", 1.1, "1.1 ms", "16c64g", self_row=True),
+    CompareRow("Zilliz Cloud", 2.0, "2.0 ms", "8cu-perf"),
+    CompareRow("Qdrant Cloud", 6.4, "6.4 ms", "16c64g"),
+    CompareRow("OpenSearch", 7.2, "7.2 ms", "16c128g force-merge"),
+    CompareRow("Elastic Cloud", 9.5, "9.5 ms", "8c60g force-merge"),
+    CompareRow("Pinecone", 13.7, "13.7 ms", "p2.x8 1node"),
 ]
 
 VDB_META = {
     "title": "Vector search vs vector databases",
-    "subtitle": "VectorDBBench · Cohere 1M · 768-d · top-100 · serial p99",
+    "subtitle": "VectorDBBench · Cohere 1M · 768-d · top-100 · serial p99 · lower is faster",
     "url": "https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch",
-    "repro": """\
-Infino ships a VectorDBBench client in
-[`infino-ai/VectorDBBench`](https://github.com/infino-ai/VectorDBBench/tree/main/vectordb_bench/backend/clients/infino).
-Follow the upstream harness, then compare against the published leaderboard row above.""",
 }
 
+# (name, version, search ratio, count ratio, is_infino)
 SBG_ROWS: list[tuple[str, str, float, float, bool]] = [
     ("Infino", "0.1", 1.19, 0.74, True),
     ("Lucene", "10.5.0", 1.0, 1.0, False),
-    ("Tantivy", "0.26", 1.15, 0.8, False),
+    ("Tantivy", "0.26", 1.15, 0.80, False),
 ]
 
 SBG_META = {
     "title": "Full-text vs search libraries",
-    "subtitle": "Search Benchmark, the Game · latency relative to Lucene = 1.00",
+    "subtitle": "Search Benchmark, the Game · latency vs Lucene = 1.00 · lower is faster",
     "url": "https://tantivy-search.github.io/bench/",
-    "repro": """\
-Submit/build via the [search-benchmark-game](https://github.com/quickwit-oss/search-benchmark-game)
-harness. Infino rows are pending publication on the public board; numbers above
-are from our submitted run.""",
 }
 
 SQL_EXT_ROWS: list[CompareRow] = [
-    CompareRow("ClickHouse", 6.8, "6.8", "18.4s suite"),
-    CompareRow("DuckDB", 9.8, "9.8", "26.3s suite"),
-    CompareRow("Infino", 12.8, "12.8", "34.0s suite", self_row=True),
-    CompareRow("DataFusion", 17.0, "17.0", "45.6s suite"),
-    CompareRow("Spark", 123.7, "123.7", "332.4s suite"),
-    CompareRow("Postgres", 1519.0, "1519", "4085.5s suite"),
+    CompareRow("ClickHouse", 6.8, "6.8", "18.4 s suite"),
+    CompareRow("DuckDB", 9.8, "9.8", "26.3 s suite"),
+    CompareRow("Infino", 12.8, "12.8", "34.0 s suite", self_row=True),
+    CompareRow("DataFusion", 17.0, "17.0", "45.6 s suite"),
+    CompareRow("Spark", 123.7, "123.7", "332.4 s suite"),
+    CompareRow("Postgres", 1519.0, "1519", "4085.5 s suite"),
 ]
 
 SQL_EXT_META = {
     "title": "SQL on Parquet vs analytic engines",
-    "subtitle": "ClickBench 100M rows · vCPU-seconds per query · hot runs · c6a.4xlarge",
-    "url": "https://benchmark.clickhouse.com/#system=+ClickHouse|DuckDB|Infino|DataFusion%20(Parquet,%20single)|Spark|PostgreSQL%20(with%20indexes)&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot",
-    "repro": """\
-Infino's ClickBench port lives in
-[`infino-ai/clickbench`](https://github.com/infino-ai/clickbench/tree/add-infino/infino).
-Run the 43-query suite on c6a.4xlarge at 100M rows, hot runs, Parquet single-file.""",
+    "subtitle": "ClickBench 100M rows · vCPU-sec per query · hot · c6a.4xlarge · lower is faster",
+    "url": (
+        "https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino"
+        "%7CDataFusion%20%28Parquet%2C%20single%29%7CSpark%7CPostgreSQL%20%28with%20indexes%29"
+        "&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot"
+    ),
 }

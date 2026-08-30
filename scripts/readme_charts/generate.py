@@ -2,7 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Infino Authors
 
-"""Generate README performance chart SVGs from scripts/readme_charts/bench_data.py."""
+"""Render the README performance charts from bench_data.py.
+
+Latency spans three or more orders of magnitude between a warm hit and a cold
+first query, so the internal charts use a base-10 log axis with a labelled
+gridline on every decade. A linear axis collapses the warm bar to a stub and
+hides the number the chart exists to show.
+"""
 
 from __future__ import annotations
 
@@ -10,18 +16,15 @@ import math
 from pathlib import Path
 
 from bench_data import (
-    FTS_1M,
-    FTS_10M,
+    FTS,
     SBG_META,
     SBG_ROWS,
-    SQL_1M,
-    SQL_10M,
+    SQL,
     SQL_EXT_META,
     SQL_EXT_ROWS,
     VDB_META,
     VDB_ROWS,
-    VECTOR_1M,
-    VECTOR_10M,
+    VECTOR,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,224 +38,275 @@ MUTED = "#5E5749"
 GRID = "#DCD6C7"
 FONT = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
 
+WIDTH = 880
+PAD = 26
+LABEL_X = 170
+TRACK_X = 184
+TRACK_W = 600
+VALUE_X = WIDTH - PAD
 
-def _ms(row) -> tuple[float, float]:
-    warm = row.warm_ms if row.warm_ms is not None else (row.warm_us or 0) / 1000
-    cold = row.cold_ms if row.cold_ms is not None else (row.cold_us or 0) / 1000
-    return warm, cold
+PLOT_TOP = 56
+BAR_H = 9
+ROW_PITCH = 22
+GROUP_GAP = 14
+
+# A bar whose value sits on the axis minimum would render as zero width.
+MIN_BAR_W = 3
+# Headroom above the largest value so its bar stops short of the frame.
+AXIS_HEADROOM = 1.15
+# Start the axis a decade lower when the smallest value sits near a decade
+# boundary, otherwise its bar is a stub against the axis origin.
+LOW_DECADE_MARGIN = 2
 
 
-def _fmt_ms(v: float) -> str:
-    if v >= 1:
-        return f"{v:.0f} ms" if v >= 10 else f"{v:.1f} ms"
-    if v >= 0.1:
-        return f"{v:.1f} ms"
-    return f"{v * 1000:.0f} µs"
+def esc(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def fmt_value(ms: float) -> str:
+    if ms < 1:
+        return f"{ms * 1000:.0f} µs"
+    if ms < 10:
+        return f"{ms:g} ms"
+    if ms < 1000:
+        return f"{ms:.0f} ms"
+    return f"{ms / 1000:g} s"
+
+
+def fmt_decade(ms: float) -> str:
+    return fmt_value(ms)
+
+
+def log_axis(values: list[float]) -> tuple[float, float, list[float]]:
+    """Return (axis min, axis max, decade tick values) for a log scale."""
+    lo_v, hi_v = min(values), max(values)
+    lo_dec = math.floor(math.log10(lo_v))
+    if lo_v / 10.0**lo_dec < LOW_DECADE_MARGIN:
+        lo_dec -= 1
+    lo = 10.0**lo_dec
+    hi = hi_v * AXIS_HEADROOM
+    ticks = []
+    dec = lo_dec
+    while 10.0**dec <= hi:
+        ticks.append(10.0**dec)
+        dec += 1
+    return lo, hi, ticks
+
+
+def text(x, y, s, *, size=12, fill=MUTED, anchor="start", weight=None) -> str:
+    w = f' font-weight="{weight}"' if weight else ""
+    a = f' text-anchor="{anchor}"' if anchor != "start" else ""
+    return (
+        f'<text x="{x:.1f}" y="{y:.1f}" font-family="{FONT}" font-size="{size}" '
+        f'fill="{fill}"{w}{a}>{esc(s)}</text>'
+    )
+
+
+def frame(height: int, title: str, subtitle: str) -> list[str]:
+    return [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{height}" '
+        f'viewBox="0 0 {WIDTH} {height}" role="img">',
+        f'<rect width="{WIDTH}" height="{height}" rx="10" fill="{BG}" stroke="{GRID}"/>',
+        text(PAD, 32, title, size=13, fill=INK, weight=600),
+        text(VALUE_X, 32, subtitle, size=11, anchor="end"),
+    ]
 
 
 def latency_chart(spec: dict, filename: str) -> None:
-    rows = spec["rows"]
-    values: list[tuple[str, float, float]] = []
+    bars = spec["bars"]
+    groups = []
+    for bar in bars:
+        if not groups or groups[-1][0] != bar.group:
+            groups.append((bar.group, []))
+        groups[-1][1].append(bar)
+
+    lo, hi, ticks = log_axis([b.ms for b in bars])
+    span = math.log10(hi / lo)
+
+    def bar_w(v: float) -> float:
+        return max((math.log10(v / lo) / span) * TRACK_W, MIN_BAR_W)
+
+    plot_h = len(bars) * ROW_PITCH + (len(groups) - 1) * GROUP_GAP
+    axis_y = PLOT_TOP + plot_h + 4
+    has_cold = any(b.cold for b in bars)
+    height = int(axis_y + 24 + (30 if has_cold else 26))
+
+    lines = frame(height, spec["title"], spec["subtitle"])
+
+    for tick in ticks:
+        gx = TRACK_X + (math.log10(tick / lo) / span) * TRACK_W
+        lines.append(
+            f'<line x1="{gx:.1f}" y1="{PLOT_TOP - 6}" x2="{gx:.1f}" y2="{axis_y}" '
+            f'stroke="{GRID}"/>'
+        )
+        lines.append(text(gx, axis_y + 16, fmt_decade(tick), size=10, anchor="middle"))
+
+    y = PLOT_TOP
+    for name, members in groups:
+        lines.append(text(PAD, y + BAR_H, name, size=12, fill=INK, weight=600))
+        for bar in members:
+            color = COLD if bar.cold else WARM
+            lines.append(text(LABEL_X, y + BAR_H, bar.label, size=11, anchor="end"))
+            lines.append(
+                f'<rect x="{TRACK_X}" y="{y}" width="{bar_w(bar.ms):.1f}" '
+                f'height="{BAR_H}" rx="1" fill="{color}"/>'
+            )
+            lines.append(
+                text(
+                    VALUE_X,
+                    y + BAR_H,
+                    fmt_value(bar.ms),
+                    size=11,
+                    fill=INK if not bar.cold else MUTED,
+                    anchor="end",
+                    weight=600,
+                )
+            )
+            y += ROW_PITCH
+        y += GROUP_GAP
+
+    foot_y = height - 12
+    if has_cold:
+        lines.append(f'<rect x="{PAD}" y="{foot_y - 21}" width="9" height="9" rx="1" fill="{WARM}"/>')
+        lines.append(text(PAD + 16, foot_y - 13, "warm cache", size=11))
+        lines.append(f'<rect x="130" y="{foot_y - 21}" width="9" height="9" rx="1" fill="{COLD}"/>')
+        lines.append(text(146, foot_y - 13, "cold · first query on an idle table", size=11))
+    lines.append(text(VALUE_X, foot_y, spec["footnote"], size=10, anchor="end"))
+    lines.append("</svg>")
+    (OUT / filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def compare_chart(meta: dict, rows: list, filename: str, *, log: bool = False) -> None:
+    label_x, track_x, track_w = 250, 264, 420
+    if log:
+        lo, hi, ticks = log_axis([r.value for r in rows])
+        span = math.log10(hi / lo)
+
+        def bar_w(v: float) -> float:
+            return max((math.log10(v / lo) / span) * track_w, MIN_BAR_W)
+
+    else:
+        hi = max(r.value for r in rows)
+        ticks = []
+
+        def bar_w(v: float) -> float:
+            return max(track_w * (v / hi), MIN_BAR_W)
+
+    plot_h = len(rows) * 34
+    axis_y = PLOT_TOP + plot_h
+    height = int(axis_y + (24 if log else 8) + 14)
+    lines = frame(height, meta["title"], meta["subtitle"])
+
+    for tick in ticks:
+        gx = track_x + (math.log10(tick / lo) / span) * track_w
+        lines.append(
+            f'<line x1="{gx:.1f}" y1="{PLOT_TOP - 6}" x2="{gx:.1f}" y2="{axis_y}" stroke="{GRID}"/>'
+        )
+        lines.append(text(gx, axis_y + 16, f"{tick:g}", size=10, anchor="middle"))
+
+    y = PLOT_TOP
     for row in rows:
-        warm, cold = _ms(row)
-        values.append((row.label, warm, cold))
-    max_v = max(max(w, c) for _, w, c in values) or 1
-
-    height = 56 + len(values) * 52 + 72
-    width = 880
-    track_x = 164
-    track_w = 520
-    lines = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
-        f'viewBox="0 0 {width} {height}" role="img">',
-        f'<rect width="{width}" height="{height}" rx="10" fill="{BG}" stroke="{GRID}"/>',
-        f'<text x="26" y="32" font-family="{FONT}" font-size="13" font-weight="600" fill="{INK}">{spec["title"]}</text>',
-        f'<text x="{width - 26}" y="32" font-family="{FONT}" font-size="11" fill="{MUTED}" text-anchor="end">{spec["subtitle"]}</text>',
-    ]
-
-    y = 58
-    for label, warm, cold in values:
+        color = WARM if row.self_row else COLD
         lines.append(
-            f'<text x="150" y="{y + 14}" font-family="{FONT}" font-size="12" fill="{MUTED}" text-anchor="end">{label}</text>'
+            text(
+                label_x,
+                y + 10,
+                row.name,
+                size=12,
+                fill=INK if row.self_row else MUTED,
+                weight=600 if row.self_row else None,
+                anchor="end",
+            )
         )
-        for val, color in ((warm, WARM), (cold, COLD)):
-            bar_w = max(track_w * (val / max_v), 4)
-            yy = y + (0 if color == WARM else 18)
-            lines.append(
-                f'<rect x="{track_x}" y="{yy}" width="{bar_w:.1f}" height="9" rx="1" fill="{color}"/>'
+        if row.config:
+            lines.append(text(label_x, y + 24, row.config, size=10, anchor="end"))
+        lines.append(
+            f'<rect x="{track_x}" y="{y + 4}" width="{bar_w(row.value):.1f}" '
+            f'height="{BAR_H}" rx="1" fill="{color}"/>'
+        )
+        lines.append(
+            text(
+                VALUE_X,
+                y + 12,
+                row.label,
+                size=11,
+                fill=INK if row.self_row else MUTED,
+                anchor="end",
+                weight=600,
             )
-            lines.append(
-                f'<text x="{width - 26}" y="{yy + 8}" font-family="{FONT}" font-size="11" '
-                f'font-weight="600" fill="{INK if color == WARM else MUTED}" text-anchor="end">{_fmt_ms(val)}</text>'
-            )
-        y += 52
-
-    foot_y = height - 22
-    lines.append(f'<line x1="26" y1="{foot_y - 14}" x2="{width - 26}" y2="{foot_y - 14}" stroke="{GRID}"/>')
-    lines.append(f'<rect x="26" y="{foot_y - 6}" width="9" height="9" rx="1" fill="{WARM}"/>')
-    lines.append(f'<text x="42" y="{foot_y + 1}" font-family="{FONT}" font-size="11" fill="{MUTED}">warm cache</text>')
-    lines.append(f'<rect x="130" y="{foot_y - 6}" width="9" height="9" rx="1" fill="{COLD}"/>')
-    lines.append(
-        f'<text x="146" y="{foot_y + 1}" font-family="{FONT}" font-size="11" fill="{MUTED}">cold · first query on idle table</text>'
-    )
-    lines.append(
-        f'<text x="{width - 26}" y="{foot_y + 1}" font-family="{FONT}" font-size="10" fill="{MUTED}" text-anchor="end">{spec["footnote"]}</text>'
-    )
+        )
+        y += 34
     lines.append("</svg>")
     (OUT / filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def sql_shapes_chart(spec: dict, filename: str) -> None:
-    rows = spec["rows"]
-    values = [(r.label, _ms(r)[0]) for r in rows]
-    max_v = max(v for _, v in values) or 1
-    height = 56 + len(values) * 36 + 48
-    width = 880
-    track_x = 220
-    track_w = 480
-    lines = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
-        f'viewBox="0 0 {width} {height}" role="img">',
-        f'<rect width="{width}" height="{height}" rx="10" fill="{BG}" stroke="{GRID}"/>',
-        f'<text x="26" y="32" font-family="{FONT}" font-size="13" font-weight="600" fill="{INK}">{spec["title"]}</text>',
-        f'<text x="{width - 26}" y="32" font-family="{FONT}" font-size="11" fill="{MUTED}" text-anchor="end">{spec["subtitle"]}</text>',
-    ]
-    y = 58
-    for label, val in values:
-        bar_w = max(track_w * (val / max_v), 4)
-        lines.append(
-            f'<text x="210" y="{y + 12}" font-family="{FONT}" font-size="12" fill="{MUTED}" text-anchor="end">{label}</text>'
-        )
-        lines.append(f'<rect x="{track_x}" y="{y + 3}" width="{bar_w:.1f}" height="9" rx="1" fill="{WARM}"/>')
-        lines.append(
-            f'<text x="{width - 26}" y="{y + 12}" font-family="{FONT}" font-size="11" font-weight="600" fill="{INK}" text-anchor="end">{_fmt_ms(val)}</text>'
-        )
-        y += 36
-    foot_y = height - 18
+def ratio_chart(meta: dict, rows: list, filename: str) -> None:
+    """Two bars per engine (search, count), as a ratio against a 1.00 baseline."""
+    label_x, track_x, track_w = 250, 264, 420
+    hi = max(max(search, count) for _, _, search, count, _ in rows)
+    height = PLOT_TOP + len(rows) * 44 + 40
+    lines = frame(height, meta["title"], meta["subtitle"])
+
+    base_x = track_x + (1.0 / hi) * track_w
     lines.append(
-        f'<text x="{width - 26}" y="{foot_y}" font-family="{FONT}" font-size="10" fill="{MUTED}" text-anchor="end">{spec["footnote"]}</text>'
+        f'<line x1="{base_x:.1f}" y1="{PLOT_TOP - 6}" x2="{base_x:.1f}" '
+        f'y2="{PLOT_TOP + len(rows) * 44 - 8}" stroke="{GRID}"/>'
     )
-    lines.append("</svg>")
-    (OUT / filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-
-def compare_chart(
-    title: str,
-    subtitle: str,
-    rows: list,
-    filename: str,
-    *,
-    log: bool = False,
-    dual: bool = False,
-) -> None:
-    if dual:
-        height = 56 + len(rows) * 44 + 56
-    else:
-        height = 56 + len(rows) * 34 + 48
-    width = 880
-    label_x = 250
-    track_x = 264
-    track_w = 420
-
-    if dual:
-        max_v = max(max(search, count) for _, _, search, count, _ in rows)
-
-        def pct(v: float) -> float:
-            return max(track_w * (v / max_v), 4)
-
-    elif log:
-        vals = [r.value for r in rows]
-        min_v = min(vals)
-        max_v = max(vals)
-        lead = 0.5
-
-        def pct(v: float) -> float:
-            span = math.log10(max_v / min_v) + lead
-            return max(((math.log10(v / min_v) + lead) / span) * track_w, 4)
-
-    else:
-        max_v = max(r.value for r in rows)
-
-        def pct(v: float) -> float:
-            return max(track_w * (v / max_v), 4)
-
-    lines = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
-        f'viewBox="0 0 {width} {height}" role="img">',
-        f'<rect width="{width}" height="{height}" rx="10" fill="{BG}" stroke="{GRID}"/>',
-        f'<text x="26" y="32" font-family="{FONT}" font-size="13" font-weight="600" fill="{INK}">{title}</text>',
-        f'<text x="{width - 26}" y="32" font-family="{FONT}" font-size="11" fill="{MUTED}" text-anchor="end">{subtitle}</text>',
-    ]
-    y = 56
-    if dual:
-        for name, cfg, search, count, self_row in rows:
-            color = WARM if self_row else COLD
+    y = PLOT_TOP
+    for name, version, search, count, is_self in rows:
+        lines.append(
+            text(
+                label_x,
+                y + 10,
+                name,
+                size=12,
+                fill=INK if is_self else MUTED,
+                weight=600 if is_self else None,
+                anchor="end",
+            )
+        )
+        lines.append(text(label_x, y + 24, version, size=10, anchor="end"))
+        for idx, val in enumerate((search, count)):
+            if is_self:
+                fill = WARM if idx == 0 else "#E8A090"
+            else:
+                fill = COLD if idx == 0 else "#CFCBC2"
+            yy = y + idx * 14
             lines.append(
-                f'<text x="{label_x}" y="{y + 10}" font-family="{FONT}" font-size="12" '
-                f'fill="{INK if self_row else MUTED}" text-anchor="end">{name}</text>'
+                f'<rect x="{track_x}" y="{yy}" width="{max(track_w * (val / hi), MIN_BAR_W):.1f}" '
+                f'height="8" rx="1" fill="{fill}"/>'
             )
             lines.append(
-                f'<text x="{label_x}" y="{y + 24}" font-family="{FONT}" font-size="10" fill="{MUTED}" text-anchor="end">{cfg}</text>'
-            )
-            for idx, val in enumerate((search, count)):
-                bar_w = pct(val)
-                yy = y + idx * 14
-                fill = color if idx == 0 else ("#E8A090" if self_row else "#CFCBC2")
-                lines.append(f'<rect x="{track_x}" y="{yy}" width="{bar_w:.1f}" height="8" rx="1" fill="{fill}"/>')
-                lines.append(
-                    f'<text x="{width - 26}" y="{yy + 7}" font-family="{FONT}" font-size="10" '
-                    f'font-weight="600" fill="{INK if self_row else MUTED}" text-anchor="end">{val:.2f}×</text>'
+                text(
+                    VALUE_X,
+                    yy + 7,
+                    f"{val:.2f}×",
+                    size=10,
+                    fill=INK if is_self else MUTED,
+                    anchor="end",
+                    weight=600,
                 )
-            y += 44
-        lines.append(f'<rect x="26" y="{height - 28}" width="9" height="9" rx="1" fill="{COLD}"/>')
-        lines.append(f'<text x="42" y="{height - 21}" font-family="{FONT}" font-size="11" fill="{MUTED}">search (top-k)</text>')
-        lines.append(f'<rect x="150" y="{height - 28}" width="9" height="9" rx="1" fill="#CFCBC2"/>')
-        lines.append(f'<text x="166" y="{height - 21}" font-family="{FONT}" font-size="11" fill="{MUTED}">count</text>')
-    else:
-        for row in rows:
-            color = WARM if row.self_row else COLD
-            bar_w = pct(row.value)
-            lines.append(
-                f'<text x="{label_x}" y="{y + 10}" font-family="{FONT}" font-size="12" '
-                f'fill="{INK if row.self_row else MUTED}" text-anchor="end">{row.name}</text>'
             )
-            if row.config:
-                lines.append(
-                    f'<text x="{label_x}" y="{y + 24}" font-family="{FONT}" font-size="10" fill="{MUTED}" text-anchor="end">{row.config}</text>'
-                )
-            lines.append(f'<rect x="{track_x}" y="{y + 4}" width="{bar_w:.1f}" height="9" rx="1" fill="{color}"/>')
-            lines.append(
-                f'<text x="{width - 26}" y="{y + 12}" font-family="{FONT}" font-size="11" '
-                f'font-weight="600" fill="{INK if row.self_row else MUTED}" text-anchor="end">{row.label}</text>'
-            )
-            y += 34
+        y += 44
+
+    foot_y = height - 14
+    lines.append(f'<rect x="{PAD}" y="{foot_y - 7}" width="9" height="9" rx="1" fill="{COLD}"/>')
+    lines.append(text(PAD + 16, foot_y, "search (top-k)", size=11))
+    lines.append(f'<rect x="150" y="{foot_y - 7}" width="9" height="9" rx="1" fill="#CFCBC2"/>')
+    lines.append(text(166, foot_y, "count", size=11))
     lines.append("</svg>")
     (OUT / filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
-    latency_chart(VECTOR_1M, "vector-1m.svg")
-    latency_chart(VECTOR_10M, "vector-10m.svg")
-    latency_chart(FTS_1M, "fts-1m.svg")
-    latency_chart(FTS_10M, "fts-10m.svg")
-    sql_shapes_chart(SQL_1M, "sql-1m.svg")
-    sql_shapes_chart(SQL_10M, "sql-10m.svg")
-    compare_chart(VDB_META["title"], VDB_META["subtitle"], VDB_ROWS, "compare-vdb.svg")
-    compare_chart(
-        SBG_META["title"],
-        SBG_META["subtitle"],
-        SBG_ROWS,
-        "compare-fts.svg",
-        dual=True,
-    )
-    compare_chart(
-        SQL_EXT_META["title"],
-        SQL_EXT_META["subtitle"],
-        SQL_EXT_ROWS,
-        "compare-sql.svg",
-        log=True,
-    )
+    latency_chart(VECTOR, "vector.svg")
+    latency_chart(FTS, "fts.svg")
+    latency_chart(SQL, "sql.svg")
+    compare_chart(VDB_META, VDB_ROWS, "compare-vdb.svg")
+    compare_chart(SQL_EXT_META, SQL_EXT_ROWS, "compare-sql.svg", log=True)
+    ratio_chart(SBG_META, SBG_ROWS, "compare-fts.svg")
     print(f"wrote charts to {OUT}")
 
 
