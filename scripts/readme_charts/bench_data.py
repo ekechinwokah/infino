@@ -259,16 +259,21 @@ SQL_EXT_META = {
 # ── Quantized indexes vs embedded libraries (retrievalbench, in-harness) ────
 #
 # dbpedia-1536 at 100K, box-threads, top-10: same queries and the same exact
-# ground truth for every engine. Infino's row is the shipped `flat_ivf` mode;
-# the comparators run in-process through their own libraries.
+# ground truth for every engine. Infino's row IS the shipped `flat_ivf` mode —
+# a table built through the public lifecycle (append → commit → optimize)
+# with `vector.search_mode: flat_ivf`, one YAML line — and its resident bytes
+# are the engine's own serialized index blob, matching how each comparator
+# reports its own index bytes. Comparators run in-process through their own
+# libraries. Run: retrievalbench `c883ce0` (engine pin `447ff2fc` = main
+# `3aaffb64` + benches-only commits), EPYC 9V74 4C/8T, 2026-08-30.
 EMBED_ROWS: list[CompareRow] = [
-    CompareRow("turbovec 2-bit", 0.41, "0.41 ms", "recall 0.835 · 38 MiB"),
+    CompareRow("turbovec 2-bit", 0.42, "0.42 ms", "recall 0.835 · 38 MiB"),
     CompareRow(
-        "Infino flat_ivf (4-bit)", 1.45, "1.45 ms", "recall 0.934 · 73 MiB", self_row=True
+        "Infino flat_ivf (4-bit)", 1.51, "1.51 ms", "recall 0.934 · 75 MiB", self_row=True
     ),
-    CompareRow("turbovec 4-bit", 1.55, "1.55 ms", "recall 0.945 · 75 MiB"),
-    CompareRow("FAISS PQ fastscan", 4.36, "4.36 ms", "recall 0.673 · 74 MiB"),
-    CompareRow("FAISS PQ 8-bit", 45.1, "45.1 ms", "recall 0.944 · 76 MiB"),
+    CompareRow("turbovec 4-bit", 1.55, "1.55 ms", "recall 0.944 · 75 MiB"),
+    CompareRow("FAISS PQ fastscan", 4.38, "4.38 ms", "recall 0.672 · 74 MiB"),
+    CompareRow("FAISS PQ 8-bit", 45.3, "45.3 ms", "recall 0.943 · 76 MiB"),
 ]
 
 EMBED_META = {
