@@ -207,7 +207,7 @@ The corpus downloads once into `corpus-dir`. Add `--features faiss` (after
 ![Full-text latency relative to Lucene, Search Benchmark the Game](docs/assets/readme/compare-fts.svg)
 
 [Search Benchmark, the Game](https://tantivy-search.github.io/bench/)
-([harness](https://github.com/quickwit-oss/search-benchmark-game))
+([our fork](https://github.com/infino-ai/search-benchmark-game))
 
 ![SQL vs analytic engines, ClickBench vCPU-seconds per query](docs/assets/readme/compare-sql.svg)
 
@@ -217,6 +217,7 @@ The corpus downloads once into `corpus-dir`. Add `--features faiss` (after
 ![SQL vs search engines, ClickBench vCPU-seconds per query](docs/assets/readme/compare-sql-search.svg)
 
 [ClickBench](https://benchmark.clickhouse.com/#system=-&type=+sac&machine=+c6a.4xlarge&cluster_size=-&opensource=-&hardware=+c&tuned=+n&metric=hot&queries=-)
+([our port](https://github.com/infino-ai/clickbench/tree/add-infino/infino))
 
 ## How it works
 
