@@ -354,7 +354,7 @@ Measured serving figures, each row on its own corpus:
 ## SQL and Hybrid Search
 
 SQL planning and execution is Apache DataFusion. Infino leverages the indexes it maintains for FTS
-so accelerate SQL queries by pruning bytes it does not need to touch. For example, DataFusion
+to accelerate SQL queries by pruning bytes it does not need to touch. For example, DataFusion
 prunes ordered, numeric columns via min/max limits, but Infino uses Bloomfilters, FSTs, bitmaps,
 and other data structures not usually available in DataFusion. For example, when a `WHERE` clause 
 hits a column that has a full-text index, Infino looks the value up in that index first and hands DataFusion
