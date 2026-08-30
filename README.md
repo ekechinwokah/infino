@@ -16,9 +16,8 @@ cargo add infino                # Rust
 
 or in Cargo.toml:
 
-toml
 [dependencies]
-infino = "0.1"
+infino = "0.5"
 ```
 
 Note: infino installs the [mimalloc](https://github.com/microsoft/mimalloc)
