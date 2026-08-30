@@ -402,8 +402,117 @@ def ratio_chart(meta: dict, rows: list, filename: str) -> None:
     (OUT / filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def architecture(filename: str) -> None:
+    """The how-it-works diagram, in the charts' own visual language.
+
+    One left-to-right read: your app calls the engine in-process, the
+    engine answers from its cache, misses become byte-range reads of
+    superfiles on object storage — and a superfile is one valid Parquet
+    file other readers open as a plain table. The previous version drew
+    query kinds pointing INTO the file with no cache layer, which read
+    as a write pipeline and hid the thing that explains warm latency.
+    """
+    H = 456
+    lines = frame(H, "One Parquet copy, every retrieval path",
+                  "columns and search indexes travel in one file, write to query")
+
+    def box(x, y, w, h, fill=BG, stroke=GRID, rx=8, dash=None):
+        d = f' stroke-dasharray="{dash}"' if dash else ""
+        lines.append(
+            f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{rx}" '
+            f'fill="{fill}" stroke="{stroke}"{d}/>'
+        )
+
+    def arrow(x1, y1, x2, y2):
+        lines.append(
+            f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{MUTED}" '
+            f'stroke-width="1.4" marker-end="url(#arr)"/>'
+        )
+
+    lines.insert(2,
+        f'<defs><marker id="arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" '
+        f'markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="{MUTED}"/>'
+        f"</marker></defs>")
+
+    # ── your app ─────────────────────────────────────────────────────
+    box(PAD, 96, 178, 168, fill="#FFFFFF")
+    lines.append(text(PAD + 14, 122, "YOUR APP", size=10, fill=MUTED))
+    for i, call in enumerate(
+        ["bm25_search()", "vector_search()", "hybrid_search()", "query_sql()"]
+    ):
+        lines.append(text(PAD + 14, 148 + i * 22, call, size=12, fill=INK))
+    lines.append(text(PAD + 14, 248, "one in-process library", size=10))
+
+    arrow(PAD + 178, 180, 262, 180)
+    lines.append(text((PAD + 178 + 262) / 2, 168, "calls", size=10, anchor="middle"))
+
+    # ── engine ───────────────────────────────────────────────────────
+    box(262, 96, 266, 250, fill="#FFFFFF")
+    lines.append(text(276, 122, "INFINO ENGINE", size=10, fill=WARM, weight=600))
+    for i, s_ in enumerate([
+        "every result is a relation:",
+        "filter, join, aggregate over",
+        "ranked hits in one statement",
+    ]):
+        lines.append(text(276, 148 + i * 18, s_, size=11, fill=INK))
+    for i, s_ in enumerate([
+        "reads pin a snapshot;",
+        "writers never block them",
+    ]):
+        lines.append(text(276, 216 + i * 18, s_, size=11, fill=MUTED))
+    box(276, 262, 238, 66, fill=BG)
+    lines.append(text(290, 284, "cache: RAM + local disk", size=11, fill=INK, weight=600))
+    lines.append(text(290, 302, "filled by queries, shrinks", size=10))
+    lines.append(text(290, 316, "when idle — warm reads stop here", size=10))
+
+    lines.append(text(561, 146, "on a miss:", size=10, anchor="middle"))
+    lines.append(text(561, 160, "byte ranges,", size=10, anchor="middle"))
+    lines.append(text(561, 174, "not files", size=10, anchor="middle"))
+    arrow(528, 188, 596, 188)
+
+    # ── object storage with superfiles ──────────────────────────────
+    box(596, 84, 258, 286, dash="4 3")
+    lines.append(text(610, 106, "OBJECT STORAGE — S3 / Azure / GCS / disk", size=9, fill=MUTED))
+    # ghost superfiles behind the front card
+    box(632, 122, 206, 226, fill="#FFFFFF")
+    box(622, 130, 206, 222, fill="#FFFFFF")
+    box(612, 138, 206, 216, fill="#FFFFFF", stroke=MUTED)
+    fx, fw = 612, 206
+    lines.append(text(fx + 12, 158, "SUPERFILE", size=10, fill=WARM, weight=600))
+    lines.append(text(fx + 12, 172, "one valid Parquet file", size=10, fill=MUTED))
+    region = [
+        ("Parquet columns", "your rows: text, numbers", "#FFFFFF"),
+        ("BM25 index", "dictionary + postings", "#F7E8DC"),
+        ("vector index", "clusters + codes + rerank", "#EDE9F3"),
+    ]
+    ry = 182
+    for name, sub, fill in region:
+        box(fx + 10, ry, fw - 20, 40, fill=fill, rx=5)
+        lines.append(text(fx + 20, ry + 17, name, size=11, fill=INK, weight=600))
+        lines.append(text(fx + 20, ry + 31, sub, size=9, fill=MUTED))
+        ry += 46
+    box(fx + 10, ry, fw - 20, 22, fill=BG, rx=5)
+    lines.append(text(fx + 20, ry + 15, "standard Parquet footer", size=9, fill=MUTED))
+
+    # ── ecosystem claim, drawn not implied ───────────────────────────
+    arrow(fx + 100, 356, fx + 100, 396)
+    lines.append(
+        text(fx + 103, 416, "DuckDB, pyarrow, DataFusion", size=11, fill=INK, anchor="middle")
+    )
+    lines.append(
+        text(fx + 103, 431, "open the same file as a plain table", size=10, anchor="middle")
+    )
+    lines.append(
+        text(PAD, 416, "no daemon, no cluster: commit swaps a manifest naming", size=10)
+    )
+    lines.append(text(PAD, 431, "immutable superfiles — all of a batch appears, or none", size=10))
+    lines.append("</svg>")
+    (OUT / filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
+    architecture("one-parquet-copy.svg")
     latency_chart(VECTOR, "vector.svg")
     latency_chart(FTS, "fts.svg")
     latency_chart(SQL, "sql.svg")

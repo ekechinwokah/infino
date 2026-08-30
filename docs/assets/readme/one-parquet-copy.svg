@@ -1,83 +1,53 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
-  <title id="title">Infino query paths over one Parquet copy</title>
-  <desc id="desc">BM25, vector, hybrid, and SQL queries pass through one engine to a valid Parquet superfile containing column data and embedded BM25 and vector index regions, stored on object storage or local disk.</desc>
-  <defs>
-    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#0b1220"/>
-      <stop offset="1" stop-color="#111c32"/>
-    </linearGradient>
-    <linearGradient id="file" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#172554"/>
-      <stop offset="1" stop-color="#101a33"/>
-    </linearGradient>
-    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
-      <path d="M0 0L10 5L0 10Z" fill="#67e8f9"/>
-    </marker>
-    <style>
-      .title { fill: #f8fafc; font: 600 28px Inter, ui-sans-serif, system-ui, sans-serif; }
-      .label { fill: #f8fafc; font: 600 20px Inter, ui-sans-serif, system-ui, sans-serif; }
-      .item-title { fill: #f8fafc; font: 600 18px Inter, ui-sans-serif, system-ui, sans-serif; }
-      .small { fill: #cbd5e1; font: 500 15px Inter, ui-sans-serif, system-ui, sans-serif; }
-      .eyebrow { fill: #67e8f9; font: 700 13px Inter, ui-sans-serif, system-ui, sans-serif; letter-spacing: 1.5px; }
-      .query { fill: #0f1a30; stroke: #385275; stroke-width: 1.5; }
-      .rule { stroke: #385275; stroke-width: 1.5; }
-    </style>
-  </defs>
-
-  <rect width="1200" height="520" rx="24" fill="url(#background)"/>
-  <text x="56" y="58" class="title">One Parquet copy, every retrieval path</text>
-  <text x="56" y="86" class="small">Columns and search indexes stay together from write to query.</text>
-
-  <text x="56" y="132" class="eyebrow">QUERY</text>
-  <rect x="56" y="150" width="188" height="54" rx="12" class="query"/>
-  <circle cx="80" cy="177" r="7" fill="#fbbf24"/>
-  <text x="98" y="184" class="label">BM25</text>
-
-  <rect x="56" y="218" width="188" height="54" rx="12" class="query"/>
-  <circle cx="80" cy="245" r="7" fill="#a78bfa"/>
-  <text x="98" y="252" class="label">vector kNN</text>
-
-  <rect x="56" y="286" width="188" height="54" rx="12" class="query"/>
-  <circle cx="80" cy="313" r="7" fill="#fb7185"/>
-  <text x="98" y="320" class="label">hybrid</text>
-
-  <rect x="56" y="354" width="188" height="54" rx="12" class="query"/>
-  <circle cx="80" cy="381" r="7" fill="#4ade80"/>
-  <text x="98" y="388" class="label">SQL</text>
-
-  <path d="M244 177H300M244 245H300M244 313H300M244 381H300" class="rule"/>
-  <path d="M300 177V381" class="rule"/>
-  <path d="M300 279H354" stroke="#67e8f9" stroke-width="2.5" marker-end="url(#arrow)"/>
-
-  <rect x="366" y="190" width="278" height="178" rx="18" fill="#102a43" stroke="#22d3ee" stroke-width="2"/>
-  <text x="392" y="224" class="eyebrow">INFINO QUERY ENGINE</text>
-  <text x="392" y="264" class="label">Search is a relation</text>
-  <text x="392" y="298" class="small">table-valued retrieval</text>
-  <text x="392" y="324" class="small">filters / joins / aggregates / windows</text>
-  <text x="392" y="350" class="small">snapshot-pinned reads</text>
-
-  <path d="M644 279H700" stroke="#67e8f9" stroke-width="2.5" marker-end="url(#arrow)"/>
-
-  <rect x="714" y="118" width="430" height="326" rx="18" fill="url(#file)" stroke="#818cf8" stroke-width="2"/>
-  <path d="M1080 118v54h64" fill="#243b67" stroke="#818cf8" stroke-width="2"/>
-  <text x="744" y="153" class="eyebrow">SUPERFILE</text>
-  <text x="744" y="184" class="label">one valid Parquet file</text>
-
-  <rect x="744" y="208" width="370" height="56" rx="10" fill="#143349" stroke="#38bdf8"/>
-  <text x="764" y="233" class="item-title">Parquet columns</text>
-  <text x="764" y="253" class="small">text / numeric / metadata</text>
-
-  <rect x="744" y="276" width="370" height="56" rx="10" fill="#3b2c18" stroke="#fbbf24"/>
-  <text x="764" y="301" class="item-title">BM25 index region</text>
-  <text x="764" y="321" class="small">term dictionary / postings</text>
-
-  <rect x="744" y="344" width="370" height="56" rx="10" fill="#30234d" stroke="#a78bfa"/>
-  <text x="764" y="369" class="item-title">Vector index region</text>
-  <text x="764" y="389" class="small">clusters / codes / rerank data</text>
-
-  <text x="744" y="426" class="small">standard Parquet footer</text>
-
-  <path d="M929 444V464" stroke="#67e8f9" stroke-width="2.5" marker-end="url(#arrow)"/>
-  <rect x="714" y="472" width="430" height="32" rx="10" fill="#0f2942" stroke="#385275"/>
-  <text x="929" y="493" class="small" text-anchor="middle">Object storage (S3 / Azure / GCS) or local disk</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="456" viewBox="0 0 880 456" role="img">
+<rect width="880" height="456" rx="10" fill="#FBF9F3" stroke="#DCD6C7"/>
+<defs><marker id="arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#5E5749"/></marker></defs>
+<text x="26.0" y="32.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#17130F" font-weight="600">One Parquet copy, every retrieval path</text>
+<text x="854.0" y="32.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">columns and search indexes travel in one file, write to query</text>
+<rect x="26" y="96" width="178" height="168" rx="8" fill="#FFFFFF" stroke="#DCD6C7"/>
+<text x="40.0" y="122.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749">YOUR APP</text>
+<text x="40.0" y="148.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#17130F">bm25_search()</text>
+<text x="40.0" y="170.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#17130F">vector_search()</text>
+<text x="40.0" y="192.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#17130F">hybrid_search()</text>
+<text x="40.0" y="214.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#17130F">query_sql()</text>
+<text x="40.0" y="248.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749">one in-process library</text>
+<line x1="204" y1="180" x2="262" y2="180" stroke="#5E5749" stroke-width="1.4" marker-end="url(#arr)"/>
+<text x="233.0" y="168.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">calls</text>
+<rect x="262" y="96" width="266" height="250" rx="8" fill="#FFFFFF" stroke="#DCD6C7"/>
+<text x="276.0" y="122.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#D6400F" font-weight="600">INFINO ENGINE</text>
+<text x="276.0" y="148.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F">every result is a relation:</text>
+<text x="276.0" y="166.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F">filter, join, aggregate over</text>
+<text x="276.0" y="184.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F">ranked hits in one statement</text>
+<text x="276.0" y="216.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749">reads pin a snapshot;</text>
+<text x="276.0" y="234.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749">writers never block them</text>
+<rect x="276" y="262" width="238" height="66" rx="8" fill="#FBF9F3" stroke="#DCD6C7"/>
+<text x="290.0" y="284.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600">cache: RAM + local disk</text>
+<text x="290.0" y="302.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749">filled by queries, shrinks</text>
+<text x="290.0" y="316.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749">when idle — warm reads stop here</text>
+<text x="561.0" y="146.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">on a miss:</text>
+<text x="561.0" y="160.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">byte ranges,</text>
+<text x="561.0" y="174.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">not files</text>
+<line x1="528" y1="188" x2="596" y2="188" stroke="#5E5749" stroke-width="1.4" marker-end="url(#arr)"/>
+<rect x="596" y="84" width="258" height="286" rx="8" fill="#FBF9F3" stroke="#DCD6C7" stroke-dasharray="4 3"/>
+<text x="610.0" y="106.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="9" fill="#5E5749">OBJECT STORAGE — S3 / Azure / GCS / disk</text>
+<rect x="632" y="122" width="206" height="226" rx="8" fill="#FFFFFF" stroke="#DCD6C7"/>
+<rect x="622" y="130" width="206" height="222" rx="8" fill="#FFFFFF" stroke="#DCD6C7"/>
+<rect x="612" y="138" width="206" height="216" rx="8" fill="#FFFFFF" stroke="#5E5749"/>
+<text x="624.0" y="158.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#D6400F" font-weight="600">SUPERFILE</text>
+<text x="624.0" y="172.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749">one valid Parquet file</text>
+<rect x="622" y="182" width="186" height="40" rx="5" fill="#FFFFFF" stroke="#DCD6C7"/>
+<text x="632.0" y="199.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600">Parquet columns</text>
+<text x="632.0" y="213.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="9" fill="#5E5749">your rows: text, numbers</text>
+<rect x="622" y="228" width="186" height="40" rx="5" fill="#F7E8DC" stroke="#DCD6C7"/>
+<text x="632.0" y="245.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600">BM25 index</text>
+<text x="632.0" y="259.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="9" fill="#5E5749">dictionary + postings</text>
+<rect x="622" y="274" width="186" height="40" rx="5" fill="#EDE9F3" stroke="#DCD6C7"/>
+<text x="632.0" y="291.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600">vector index</text>
+<text x="632.0" y="305.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="9" fill="#5E5749">clusters + codes + rerank</text>
+<rect x="622" y="320" width="186" height="22" rx="5" fill="#FBF9F3" stroke="#DCD6C7"/>
+<text x="632.0" y="335.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="9" fill="#5E5749">standard Parquet footer</text>
+<line x1="712" y1="356" x2="712" y2="396" stroke="#5E5749" stroke-width="1.4" marker-end="url(#arr)"/>
+<text x="715.0" y="416.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" text-anchor="middle">DuckDB, pyarrow, DataFusion</text>
+<text x="715.0" y="431.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">open the same file as a plain table</text>
+<text x="26.0" y="416.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749">no daemon, no cluster: commit swaps a manifest naming</text>
+<text x="26.0" y="431.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749">immutable superfiles — all of a batch appears, or none</text>
 </svg>
