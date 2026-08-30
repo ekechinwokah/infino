@@ -171,26 +171,6 @@ Supertable FTS; the SQL shapes are `agg_max_title` (metadata), `WHERE key = ?` (
 
 [RetrievalBench](https://github.com/infino-ai/retrievalbench)([Repro](https://github.com/infino-ai/retrievalbench))
 
-<details>
-<summary><b>Reproducing this chart</b></summary>
-
-Every engine runs in one process against the same queries and brute-force exact ground
-truth; results are committed with host/commit provenance. Infino's row is the shipped
-`flat_ivf` mode, selected by one config line:
-
-```sh
-git clone https://github.com/infino-ai/retrievalbench && cd retrievalbench
-printf 'vector:\n  search_mode: flat_ivf\n' > infino.yaml
-INFINO_BENCH_SUPERTABLE_DOCS=100000 \
-  cargo bench -- vector-codec \
-  corpus=hf:KShivendu/dbpedia-entities-openai-1M corpus-dir=./corpora
-```
-
-The corpus downloads once into `corpus-dir`. Add `--features faiss` (after
-`scripts/build_faiss.sh`) for the FAISS rows.
-
-</details>
-
 ![Full-text latency relative to Lucene, Search Benchmark the Game](docs/assets/readme/compare-fts.svg)
 
 [Search Benchmark, the Game](https://tantivy-search.github.io/bench/)
