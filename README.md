@@ -210,6 +210,8 @@ The corpus downloads once into `corpus-dir`. Add `--features faiss` (after
 
 ![Your app queries Infino, which caches in RAM and on disk over Parquet on object storage](docs/assets/readme/one-parquet-copy.svg)
 
+### Summary
+
 - One Parquet file per data batch, with the BM25 and vector indexes inside it.
   DuckDB, pyarrow, and DataFusion open the same file as a normal table
   ([example](infino-python/examples/parquet_interop.py)).
