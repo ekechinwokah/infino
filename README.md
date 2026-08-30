@@ -68,7 +68,8 @@ run these summaries quote — live in [benches/README.md](benches/README.md).
 cargo bench -- supertable vector warm cold
 ```
 
-10M is the default scale; prefix `INFINO_BENCH_SUPERTABLE_DOCS=1000000` for the 1M rows.
+Bare `cargo bench` runs the 10M tier; the 1M rows (what CI runs) are
+`INFINO_BENCH_SUPERTABLE_DOCS=1000000` prefixed to the same command.
 </details>
 
 ![BM25 full-text search latency, log scale, 1M and 10M documents](docs/assets/readme/fts.svg)
@@ -80,7 +81,8 @@ cargo bench -- supertable vector warm cold
 cargo bench -- supertable fts warm cold
 ```
 
-10M is the default scale; prefix `INFINO_BENCH_SUPERTABLE_DOCS=1000000` for the 1M rows.
+Bare `cargo bench` runs the 10M tier; the 1M rows (what CI runs) are
+`INFINO_BENCH_SUPERTABLE_DOCS=1000000` prefixed to the same command.
 </details>
 
 ![SQL query shape latency, log scale, 1M and 10M rows](docs/assets/readme/sql.svg)
@@ -92,7 +94,8 @@ cargo bench -- supertable fts warm cold
 cargo bench -- supertable sql warm
 ```
 
-10M is the default scale; prefix `INFINO_BENCH_SUPERTABLE_DOCS=1000000` for the 1M rows.
+Bare `cargo bench` runs the 10M tier; the 1M rows (what CI runs) are
+`INFINO_BENCH_SUPERTABLE_DOCS=1000000` prefixed to the same command.
 </details>
 
 ![Ingest throughput, 1M docs](docs/assets/readme/ingest.svg)
