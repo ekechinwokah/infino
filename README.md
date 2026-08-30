@@ -6,8 +6,6 @@
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Turbovec's byte count on vectors, DuckDB-class speeds on SQL, and ~10x more efficient than Elastic on search.**
-
 **Infino is a fast embedded retrieval library: full-text, vector, hybrid, and SQL over one table, stored as
 ordinary Parquet on local disk or object storage. Simple, scalable, and optimized for cost.**
 
