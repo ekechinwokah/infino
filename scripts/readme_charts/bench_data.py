@@ -230,7 +230,7 @@ VDB_ROWS: list[CompareRow] = [
 
 VDB_META = {
     "title": "Vector search vs vector databases",
-    "subtitle": "VectorDBBench · six widely deployed services · Cohere 1M · serial p99",
+    "subtitle": "VectorDBBench · Cohere 1M · 768-d · top-100 · serial p99 · lower is faster",
     "url": "https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch",
     "value_header": "p99",
     # Deployment tier strings carry no signal a reader can act on; the
@@ -261,7 +261,7 @@ SQL_EXT_ROWS: list[CompareRow] = [
 
 SQL_EXT_META = {
     "title": "SQL on Parquet vs analytic engines",
-    "subtitle": "ClickBench · the engines run on Parquet-scale data · 100M rows · hot",
+    "subtitle": "ClickBench 100M rows · vCPU-sec per query · hot · c6a.4xlarge · lower is faster",
     "value_header": "vCPU-s/query",
     "columns": ("full suite",),
     "url": (
