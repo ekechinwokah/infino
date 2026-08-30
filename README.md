@@ -133,31 +133,43 @@ Supertable FTS; the SQL shapes are `agg_max_title` (metadata), `WHERE key = ?` (
 
 ![Vector search p99 vs vector databases, VectorDBBench Cohere 1M](docs/assets/readme/compare-vdb.svg)
 
+[VectorDBBench](https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch)
+([our client](https://github.com/infino-ai/VectorDBBench/tree/main/vectordb_bench/backend/clients/infino))
+
 ![Quantized vector indexes vs embedded libraries, dbpedia-1536 100K, same queries and ground truth](docs/assets/readme/compare-embedded.svg)
+
+[RetrievalBench](https://github.com/infino-ai/retrievalbench)
+([results](https://github.com/infino-ai/retrievalbench/tree/main/results/inprocess))
+
+<details>
+<summary><b>Reproducing this chart</b></summary>
+
+Every engine runs in one process against the same queries and brute-force exact ground
+truth; results are committed with host/commit provenance. Infino's row is the shipped
+`flat_ivf` mode, selected by one config line:
+
+```sh
+git clone https://github.com/infino-ai/retrievalbench && cd retrievalbench
+printf 'vector:\n  search_mode: flat_ivf\n' > infino.yaml
+INFINO_BENCH_SUPERTABLE_DOCS=100000 \
+  cargo bench -- vector-codec \
+  corpus=hf:KShivendu/dbpedia-entities-openai-1M corpus-dir=./corpora
+```
+
+The corpus downloads once into `corpus-dir`. Add `--features faiss` (after
+`scripts/build_faiss.sh`) for the FAISS rows.
+
+</details>
 
 ![Full-text latency relative to Lucene, Search Benchmark the Game](docs/assets/readme/compare-fts.svg)
 
+[Search Benchmark, the Game](https://tantivy-search.github.io/bench/)
+([harness](https://github.com/quickwit-oss/search-benchmark-game))
+
 ![SQL vCPU-seconds per query vs analytic engines, ClickBench 100M rows](docs/assets/readme/compare-sql.svg)
 
-- [VectorDBBench](https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch)
-  ([our client](https://github.com/infino-ai/VectorDBBench/tree/main/vectordb_bench/backend/clients/infino))
-- Embedded libraries: [retrievalbench](https://github.com/infino-ai/retrievalbench) — every
-  engine in one process, same queries, brute-force exact ground truth, results committed with
-  host/commit provenance ([results](https://github.com/infino-ai/retrievalbench/tree/main/results/inprocess)).
-  Infino's row is the shipped `flat_ivf` mode, selected by one config line:
-
-  ```sh
-  git clone https://github.com/infino-ai/retrievalbench && cd retrievalbench
-  printf 'vector:\n  search_mode: flat_ivf\n' > infino.yaml
-  INFINO_BENCH_SUPERTABLE_DOCS=100000 \
-    cargo bench -- vector-codec \
-    corpus=hf:KShivendu/dbpedia-entities-openai-1M corpus-dir=./corpora
-  ```
-
-- [Search Benchmark, the Game](https://tantivy-search.github.io/bench/)
-  ([harness](https://github.com/quickwit-oss/search-benchmark-game))
-- [ClickBench](https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino%7CDataFusion%20%28Parquet%2C%20single%29%7CSpark%7CPostgreSQL%20%28with%20indexes%29&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot)
-  ([our port](https://github.com/infino-ai/clickbench/tree/add-infino/infino))
+[ClickBench](https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino%7CDataFusion%20%28Parquet%2C%20single%29%7CSpark%7CPostgreSQL%20%28with%20indexes%29&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot)
+([our port](https://github.com/infino-ai/clickbench/tree/add-infino/infino))
 
 ## How it works
 
