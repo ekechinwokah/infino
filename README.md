@@ -351,7 +351,7 @@ Measured serving figures, each row on its own corpus:
 - Every mode falls back to the routed scan when it cannot serve a query; changing the mode
   can cost recall or latency, never correctness.
 
-## SQL and Hybrid Search
+## SQL
 
 SQL planning and execution is Apache DataFusion. Infino leverages the indexes it maintains for FTS
 to accelerate SQL queries by pruning bytes it does not need to touch. For example, DataFusion
@@ -382,9 +382,29 @@ The battery emits both arms — the same query through the index lookup and thro
 - Before any of that, per-file min/max, Bloom, and term summaries drop whole files, and an
   aggregate fully answered by the table's statistics never scans at all.
 
+## Hybrid Search
+
+The combination of SQL and search functions makes it simpler to express complex queries.
 `bm25_search`, `vector_search`, `hybrid_search`, `token_match`, and `exact_match` are SQL
-table-valued functions, so a ranked result set is a relation — retrieval, filters, joins,
-and aggregation compose in one statement against one pinned snapshot:
+table-valued functions, let search results compose as ordinary SQL tables. 
+
+The ranked result sets are relations so operations like retrieval, filters, joins,
+and aggregation compose in one statement against one pinned snapshot. 
+
+```sql
+SELECT   _id, title, score
+FROM     hybrid_search(                       -- FTS + vector, fused by RRF
+           'logs', 'body', 'disk full',       --   the text side
+           'embedding', :q, 50                --   the vector side, top 50
+         )
+WHERE    level = 'error'                      -- pushed-down filter
+  AND    ts > now() - interval '24 hours'     -- on the same pass
+ORDER BY score DESC                           -- one fused ranking
+LIMIT    10;
+```
+
+Follow-up questions can stay in SQL, inline in the same query. 
+Getting from “find disk-full errors” to “which team had them” takes a single query.
 
 ```sql
 SELECT   s.team,
@@ -396,6 +416,7 @@ WHERE    h.ts > now() - interval '7 days'
 GROUP BY s.team
 ORDER BY hits DESC;
 ```
+
 
 ## Limitations
 
