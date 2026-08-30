@@ -279,5 +279,5 @@ EMBED_ROWS: list[CompareRow] = [
 EMBED_META = {
     "title": "Quantized vector indexes vs embedded libraries",
     "subtitle": "dbpedia-1536 · 100K · top-10 · warm p50 · same queries, same ground truth",
-    "url": "",
+    "url": "https://github.com/infino-ai/retrievalbench",
 }
