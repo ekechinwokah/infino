@@ -139,6 +139,8 @@ Supertable FTS; the SQL shapes are `agg_max_title` (metadata), `WHERE key = ?` (
 
 ![SQL vCPU-seconds per query vs analytic engines, ClickBench 100M rows](docs/assets/readme/compare-sql.svg)
 
+- [VectorDBBench](https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch)
+  ([our client](https://github.com/infino-ai/VectorDBBench/tree/main/vectordb_bench/backend/clients/infino))
 - Embedded libraries: [retrievalbench](https://github.com/infino-ai/retrievalbench) — every
   engine in one process, same queries, brute-force exact ground truth, results committed with
   host/commit provenance ([results](https://github.com/infino-ai/retrievalbench/tree/main/results/inprocess)).
@@ -152,8 +154,6 @@ Supertable FTS; the SQL shapes are `agg_max_title` (metadata), `WHERE key = ?` (
     corpus=hf:KShivendu/dbpedia-entities-openai-1M corpus-dir=./corpora
   ```
 
-- [VectorDBBench](https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch)
-  ([our client](https://github.com/infino-ai/VectorDBBench/tree/main/vectordb_bench/backend/clients/infino))
 - [Search Benchmark, the Game](https://tantivy-search.github.io/bench/)
   ([harness](https://github.com/quickwit-oss/search-benchmark-game))
 - [ClickBench](https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino%7CDataFusion%20%28Parquet%2C%20single%29%7CSpark%7CPostgreSQL%20%28with%20indexes%29&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot)
