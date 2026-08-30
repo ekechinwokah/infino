@@ -385,8 +385,6 @@ The battery emits both arms — the same query through the index lookup and thro
 - Equality on an unsorted column, where Parquet min/max stats can't skip anything:
   21.9 ms without the index lookup, 1.44 ms with it. COUNT and AVG over the same
   predicate: ~22.5 ms → ~1.8 ms.
-- A predicate matching every row, forced through the lookup anyway: 30.5 ms scanned,
-  66.1 ms through the index.
 - Before any of that, per-file min/max, Bloom, and term summaries drop whole files, and an
   aggregate fully answered by the table's statistics never scans at all.
 

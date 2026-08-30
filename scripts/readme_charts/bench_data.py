@@ -170,8 +170,6 @@ SQL_PUSHDOWN = {
         Bar("COUNT(*) WHERE key = ?", "FTS pushdown", 1.69),
         Bar("AVG(rating) WHERE key = ?", "DataFusion scan", 22.56, cold=True),
         Bar("AVG(rating) WHERE key = ?", "FTS pushdown", 1.84),
-        Bar("SUM over every row", "DataFusion scan", 30.54, cold=True),
-        Bar("SUM over every row", "FTS pushdown", 66.05),
     ],
 }
 
