@@ -1,40 +1,40 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="880" height="300" viewBox="0 0 880 300" role="img">
-<rect width="880" height="300" rx="10" fill="#FBF9F3" stroke="#DCD6C7"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="338" viewBox="0 0 880 338" role="img">
+<rect width="880" height="338" rx="10" fill="#FBF9F3" stroke="#DCD6C7"/>
 <text x="26.0" y="32.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#17130F" font-weight="600">SQL query shapes</text>
 <text x="854.0" y="32.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">warm p50 · supertable on object storage</text>
-<line x1="184.0" y1="50" x2="184.0" y2="250" stroke="#DCD6C7"/>
-<text x="184.0" y="266.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">10 µs</text>
-<line x1="336.4" y1="50" x2="336.4" y2="250" stroke="#DCD6C7"/>
-<text x="336.4" y="266.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">100 µs</text>
-<line x1="488.8" y1="50" x2="488.8" y2="250" stroke="#DCD6C7"/>
-<text x="488.8" y="266.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">1 ms</text>
-<line x1="641.3" y1="50" x2="641.3" y2="250" stroke="#DCD6C7"/>
-<text x="641.3" y="266.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">10 ms</text>
-<text x="26.0" y="65.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#17130F" font-weight="600">1M</text>
-<text x="170.0" y="65.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">metadata</text>
-<rect x="184" y="56" width="193.5" height="9" rx="1" fill="#D6400F"/>
-<text x="854.0" y="65.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">186 µs</text>
-<text x="170.0" y="87.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">lookup</text>
-<rect x="184" y="78" width="403.1" height="9" rx="1" fill="#D6400F"/>
-<text x="854.0" y="87.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">4.41 ms</text>
-<text x="170.0" y="109.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">scan</text>
-<rect x="184" y="100" width="413.5" height="9" rx="1" fill="#D6400F"/>
-<text x="854.0" y="109.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">5.16 ms</text>
-<text x="170.0" y="131.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">crosstab</text>
-<rect x="184" y="122" width="439.3" height="9" rx="1" fill="#D6400F"/>
-<text x="854.0" y="131.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">7.63 ms</text>
-<text x="26.0" y="167.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#17130F" font-weight="600">10M</text>
-<text x="170.0" y="167.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">metadata</text>
-<rect x="184" y="158" width="215.7" height="9" rx="1" fill="#D6400F"/>
-<text x="854.0" y="167.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">260 µs</text>
-<text x="170.0" y="189.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">lookup</text>
-<rect x="184" y="180" width="371.6" height="9" rx="1" fill="#D6400F"/>
-<text x="854.0" y="189.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">2.74 ms</text>
-<text x="170.0" y="211.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">scan</text>
-<rect x="184" y="202" width="550.9" height="9" rx="1" fill="#D6400F"/>
-<text x="854.0" y="211.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">41 ms</text>
-<text x="170.0" y="233.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">crosstab</text>
-<rect x="184" y="224" width="590.7" height="9" rx="1" fill="#D6400F"/>
-<text x="854.0" y="233.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">75 ms</text>
-<text x="854.0" y="288.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">1M: Azure Blob, 4 cores pinned, CI run 33245831329 (3aaffb64) · 10M: EPYC 9V74 8 vCPU, Azure Blob, 339e621</text>
+<line x1="184.0" y1="50" x2="184.0" y2="288" stroke="#DCD6C7"/>
+<text x="184.0" y="304.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">10 µs</text>
+<line x1="336.4" y1="50" x2="336.4" y2="288" stroke="#DCD6C7"/>
+<text x="336.4" y="304.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">100 µs</text>
+<line x1="488.8" y1="50" x2="488.8" y2="288" stroke="#DCD6C7"/>
+<text x="488.8" y="304.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">1 ms</text>
+<line x1="641.3" y1="50" x2="641.3" y2="288" stroke="#DCD6C7"/>
+<text x="641.3" y="304.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">10 ms</text>
+<text x="26.0" y="66.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#17130F" font-weight="600">1M</text>
+<text x="170.0" y="85.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">metadata</text>
+<rect x="184" y="76" width="193.5" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="85.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">186 µs</text>
+<text x="170.0" y="107.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">lookup</text>
+<rect x="184" y="98" width="403.1" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="107.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">4.41 ms</text>
+<text x="170.0" y="129.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">scan</text>
+<rect x="184" y="120" width="413.5" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="129.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">5.16 ms</text>
+<text x="170.0" y="151.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">crosstab</text>
+<rect x="184" y="142" width="439.3" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="151.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">7.63 ms</text>
+<text x="26.0" y="186.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#17130F" font-weight="600">10M</text>
+<text x="170.0" y="205.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">metadata</text>
+<rect x="184" y="196" width="215.7" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="205.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">260 µs</text>
+<text x="170.0" y="227.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">lookup</text>
+<rect x="184" y="218" width="371.6" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="227.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">2.74 ms</text>
+<text x="170.0" y="249.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">scan</text>
+<rect x="184" y="240" width="550.9" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="249.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">41 ms</text>
+<text x="170.0" y="271.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">crosstab</text>
+<rect x="184" y="262" width="590.7" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="271.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">75 ms</text>
+<text x="854.0" y="326.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">1M: Azure Blob, 4 cores pinned, CI run 33245831329 (3aaffb64) · 10M: EPYC 9V74 8 vCPU, Azure Blob, 339e621</text>
 </svg>

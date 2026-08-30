@@ -36,10 +36,15 @@ class Bar:
 
 @dataclass(frozen=True)
 class CompareRow:
+    """One engine in a comparison: the bar value, its printed label, and
+    the extra data columns (matched positionally to the chart meta's
+    `columns` headers). Columns render full-size — recall and resident
+    memory decide choices and must not hide in sublabel text."""
+
     name: str
     value: float
     label: str
-    config: str = ""
+    cols: tuple[str, ...] = ()
     self_row: bool = False
 
 
@@ -117,6 +122,8 @@ MODES_MEMORY = {
     "subtitle": "all-in: index + manifest + working set · dbpedia-1536",
     "footnote": MODES_PROVENANCE,
     "unit": "mib",
+    "scale": "linear",
+    "ratio_vs_cold": True,
     "legend_warm": "measured, serving",
     "legend_cold": "float32 vectors, for scale",
     "bars": [
@@ -181,6 +188,7 @@ INGEST = {
     "subtitle": "1M docs · 16 commits · object storage",
     "footnote": "recorded battery blocks, benches/README.md at 3aaffb64",
     "unit": "kps",
+    "scale": "linear",
     "bars": [
         Bar("1M docs", "vector", 40.6),
         Bar("1M docs", "FTS", 38.7),
@@ -214,18 +222,21 @@ CROSSOVER = {
 # ── External comparisons ────────────────────────────────────────────────────
 
 VDB_ROWS: list[CompareRow] = [
-    CompareRow("Infino", 1.1, "1.1 ms", "16c64g", self_row=True),
-    CompareRow("Zilliz Cloud", 2.0, "2.0 ms", "8cu-perf"),
-    CompareRow("Qdrant Cloud", 6.4, "6.4 ms", "16c64g"),
-    CompareRow("OpenSearch", 7.2, "7.2 ms", "16c128g force-merge"),
-    CompareRow("Elastic Cloud", 9.5, "9.5 ms", "8c60g force-merge"),
-    CompareRow("Pinecone", 13.7, "13.7 ms", "p2.x8 1node"),
+    CompareRow("Infino", 1.1, "1.1 ms", self_row=True),
+    CompareRow("Zilliz Cloud", 2.0, "2.0 ms"),
+    CompareRow("Qdrant Cloud", 6.4, "6.4 ms"),
+    CompareRow("OpenSearch", 7.2, "7.2 ms"),
+    CompareRow("Elastic Cloud", 9.5, "9.5 ms"),
+    CompareRow("Pinecone", 13.7, "13.7 ms"),
 ]
 
 VDB_META = {
     "title": "Vector search vs vector databases",
     "subtitle": "VectorDBBench · Cohere 1M · 768-d · top-100 · serial p99 · lower is faster",
     "url": "https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch",
+    "value_header": "p99",
+    # Deployment tier strings carry no signal a reader can act on; the
+    # leaderboard link in the README is the place for configuration detail.
 }
 
 # (name, version, search ratio, count ratio, is_infino)
@@ -242,17 +253,19 @@ SBG_META = {
 }
 
 SQL_EXT_ROWS: list[CompareRow] = [
-    CompareRow("ClickHouse", 6.8, "6.8", "18.4 s suite"),
-    CompareRow("DuckDB", 9.8, "9.8", "26.3 s suite"),
-    CompareRow("Infino", 12.8, "12.8", "34.0 s suite", self_row=True),
-    CompareRow("DataFusion", 17.0, "17.0", "45.6 s suite"),
-    CompareRow("Spark", 123.7, "123.7", "332.4 s suite"),
-    CompareRow("Postgres", 1519.0, "1519", "4085.5 s suite"),
+    CompareRow("ClickHouse", 6.8, "6.8", ("18.4 s",)),
+    CompareRow("DuckDB", 9.8, "9.8", ("26.3 s",)),
+    CompareRow("Infino", 12.8, "12.8", ("34.0 s",), self_row=True),
+    CompareRow("DataFusion", 17.0, "17.0", ("45.6 s",)),
+    CompareRow("Spark", 123.7, "123.7", ("332.4 s",)),
+    CompareRow("Postgres", 1519.0, "1519", ("4085.5 s",)),
 ]
 
 SQL_EXT_META = {
     "title": "SQL on Parquet vs analytic engines",
     "subtitle": "ClickBench 100M rows · vCPU-sec per query · hot · c6a.4xlarge · lower is faster",
+    "value_header": "vCPU-s/query",
+    "columns": ("full suite",),
     "url": (
         "https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino"
         "%7CDataFusion%20%28Parquet%2C%20single%29%7CSpark%7CPostgreSQL%20%28with%20indexes%29"
@@ -272,17 +285,17 @@ SQL_EXT_META = {
 # libraries. Run: retrievalbench `c883ce0` (engine pin `447ff2fc` = main
 # `3aaffb64` + benches-only commits), EPYC 9V74 4C/8T, 2026-08-30.
 EMBED_ROWS: list[CompareRow] = [
-    CompareRow("turbovec 2-bit", 0.42, "0.42 ms", "recall 0.835 · 38 MiB"),
-    CompareRow(
-        "Infino flat_ivf (4-bit)", 1.51, "1.51 ms", "recall 0.934 · 75 MiB", self_row=True
-    ),
-    CompareRow("turbovec 4-bit", 1.55, "1.55 ms", "recall 0.944 · 75 MiB"),
-    CompareRow("FAISS PQ fastscan", 4.38, "4.38 ms", "recall 0.672 · 74 MiB"),
-    CompareRow("FAISS PQ 8-bit", 45.3, "45.3 ms", "recall 0.943 · 76 MiB"),
+    CompareRow("turbovec 2-bit", 0.42, "0.42 ms", ("0.835", "38 MiB")),
+    CompareRow("Infino flat_ivf (4-bit)", 1.51, "1.51 ms", ("0.934", "75 MiB"), self_row=True),
+    CompareRow("turbovec 4-bit", 1.55, "1.55 ms", ("0.944", "75 MiB")),
+    CompareRow("FAISS PQ fastscan", 4.38, "4.38 ms", ("0.672", "74 MiB")),
+    CompareRow("FAISS PQ 8-bit", 45.3, "45.3 ms", ("0.943", "76 MiB")),
 ]
 
 EMBED_META = {
     "title": "Quantized vector indexes vs embedded libraries",
-    "subtitle": "dbpedia-1536 · 100K · top-10 · warm p50 · same queries, same ground truth",
+    "subtitle": "dbpedia-1536 · 100K · top-10 · same queries, same ground truth",
     "url": "https://github.com/infino-ai/retrievalbench",
+    "value_header": "warm p50",
+    "columns": ("recall@10", "resident"),
 }
