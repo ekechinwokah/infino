@@ -182,7 +182,6 @@ Supertable FTS; the SQL shapes are `agg_max_title` (metadata), `WHERE key = ?` (
 ![Quantized vector indexes vs embedded libraries, dbpedia-1536 100K, same queries and ground truth](docs/assets/readme/compare-embedded.svg)
 
 [RetrievalBench](https://github.com/infino-ai/retrievalbench)
-([results](https://github.com/infino-ai/retrievalbench/tree/main/results/inprocess))
 
 <details>
 <summary><b>Reproducing this chart</b></summary>
