@@ -5,9 +5,9 @@
 """Render the README performance charts from bench_data.py.
 
 Latency spans three or more orders of magnitude between a warm hit and a cold
-first query, so the internal charts use a base-10 log axis with a labelled
-gridline on every decade. A linear axis collapses the warm bar to a stub and
-hides the number the chart exists to show.
+first query, so the charts use a base-10 log axis with a labelled gridline on
+every decade. A linear axis collapses the warm bar to a stub and hides the
+number the chart exists to show.
 """
 
 from __future__ import annotations
@@ -15,17 +15,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-from bench_data import (
-    FTS,
-    SBG_META,
-    SBG_ROWS,
-    SQL,
-    SQL_EXT_META,
-    SQL_EXT_ROWS,
-    VDB_META,
-    VDB_ROWS,
-    VECTOR,
-)
+from bench_data import FTS, SQL, VECTOR
 
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "docs" / "assets" / "readme"
@@ -73,10 +63,6 @@ def fmt_value(ms: float) -> str:
     return f"{ms / 1000:g} s"
 
 
-def fmt_decade(ms: float) -> str:
-    return fmt_value(ms)
-
-
 def log_axis(values: list[float]) -> tuple[float, float, list[float]]:
     """Return (axis min, axis max, decade tick values) for a log scale."""
     lo_v, hi_v = min(values), max(values)
@@ -114,7 +100,7 @@ def frame(height: int, title: str, subtitle: str) -> list[str]:
 
 def latency_chart(spec: dict, filename: str) -> None:
     bars = spec["bars"]
-    groups = []
+    groups: list[tuple[str, list]] = []
     for bar in bars:
         if not groups or groups[-1][0] != bar.group:
             groups.append((bar.group, []))
@@ -139,7 +125,7 @@ def latency_chart(spec: dict, filename: str) -> None:
             f'<line x1="{gx:.1f}" y1="{PLOT_TOP - 6}" x2="{gx:.1f}" y2="{axis_y}" '
             f'stroke="{GRID}"/>'
         )
-        lines.append(text(gx, axis_y + 16, fmt_decade(tick), size=10, anchor="middle"))
+        lines.append(text(gx, axis_y + 16, fmt_value(tick), size=10, anchor="middle"))
 
     y = PLOT_TOP
     for name, members in groups:
@@ -157,7 +143,7 @@ def latency_chart(spec: dict, filename: str) -> None:
                     y + BAR_H,
                     fmt_value(bar.ms),
                     size=11,
-                    fill=INK if not bar.cold else MUTED,
+                    fill=MUTED if bar.cold else INK,
                     anchor="end",
                     weight=600,
                 )
@@ -167,134 +153,15 @@ def latency_chart(spec: dict, filename: str) -> None:
 
     foot_y = height - 12
     if has_cold:
-        lines.append(f'<rect x="{PAD}" y="{foot_y - 21}" width="9" height="9" rx="1" fill="{WARM}"/>')
+        lines.append(
+            f'<rect x="{PAD}" y="{foot_y - 21}" width="9" height="9" rx="1" fill="{WARM}"/>'
+        )
         lines.append(text(PAD + 16, foot_y - 13, "warm cache", size=11))
-        lines.append(f'<rect x="130" y="{foot_y - 21}" width="9" height="9" rx="1" fill="{COLD}"/>')
+        lines.append(
+            f'<rect x="130" y="{foot_y - 21}" width="9" height="9" rx="1" fill="{COLD}"/>'
+        )
         lines.append(text(146, foot_y - 13, "cold · first query on an idle table", size=11))
     lines.append(text(VALUE_X, foot_y, spec["footnote"], size=10, anchor="end"))
-    lines.append("</svg>")
-    (OUT / filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def compare_chart(meta: dict, rows: list, filename: str, *, log: bool = False) -> None:
-    label_x, track_x, track_w = 250, 264, 420
-    if log:
-        lo, hi, ticks = log_axis([r.value for r in rows])
-        span = math.log10(hi / lo)
-
-        def bar_w(v: float) -> float:
-            return max((math.log10(v / lo) / span) * track_w, MIN_BAR_W)
-
-    else:
-        hi = max(r.value for r in rows)
-        ticks = []
-
-        def bar_w(v: float) -> float:
-            return max(track_w * (v / hi), MIN_BAR_W)
-
-    plot_h = len(rows) * 34
-    axis_y = PLOT_TOP + plot_h
-    height = int(axis_y + (24 if log else 8) + 14)
-    lines = frame(height, meta["title"], meta["subtitle"])
-
-    for tick in ticks:
-        gx = track_x + (math.log10(tick / lo) / span) * track_w
-        lines.append(
-            f'<line x1="{gx:.1f}" y1="{PLOT_TOP - 6}" x2="{gx:.1f}" y2="{axis_y}" stroke="{GRID}"/>'
-        )
-        lines.append(text(gx, axis_y + 16, f"{tick:g}", size=10, anchor="middle"))
-
-    y = PLOT_TOP
-    for row in rows:
-        color = WARM if row.self_row else COLD
-        lines.append(
-            text(
-                label_x,
-                y + 10,
-                row.name,
-                size=12,
-                fill=INK if row.self_row else MUTED,
-                weight=600 if row.self_row else None,
-                anchor="end",
-            )
-        )
-        if row.config:
-            lines.append(text(label_x, y + 24, row.config, size=10, anchor="end"))
-        lines.append(
-            f'<rect x="{track_x}" y="{y + 4}" width="{bar_w(row.value):.1f}" '
-            f'height="{BAR_H}" rx="1" fill="{color}"/>'
-        )
-        lines.append(
-            text(
-                VALUE_X,
-                y + 12,
-                row.label,
-                size=11,
-                fill=INK if row.self_row else MUTED,
-                anchor="end",
-                weight=600,
-            )
-        )
-        y += 34
-    lines.append("</svg>")
-    (OUT / filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def ratio_chart(meta: dict, rows: list, filename: str) -> None:
-    """Two bars per engine (search, count), as a ratio against a 1.00 baseline."""
-    label_x, track_x, track_w = 250, 264, 420
-    hi = max(max(search, count) for _, _, search, count, _ in rows)
-    height = PLOT_TOP + len(rows) * 44 + 40
-    lines = frame(height, meta["title"], meta["subtitle"])
-
-    base_x = track_x + (1.0 / hi) * track_w
-    lines.append(
-        f'<line x1="{base_x:.1f}" y1="{PLOT_TOP - 6}" x2="{base_x:.1f}" '
-        f'y2="{PLOT_TOP + len(rows) * 44 - 8}" stroke="{GRID}"/>'
-    )
-
-    y = PLOT_TOP
-    for name, version, search, count, is_self in rows:
-        lines.append(
-            text(
-                label_x,
-                y + 10,
-                name,
-                size=12,
-                fill=INK if is_self else MUTED,
-                weight=600 if is_self else None,
-                anchor="end",
-            )
-        )
-        lines.append(text(label_x, y + 24, version, size=10, anchor="end"))
-        for idx, val in enumerate((search, count)):
-            if is_self:
-                fill = WARM if idx == 0 else "#E8A090"
-            else:
-                fill = COLD if idx == 0 else "#CFCBC2"
-            yy = y + idx * 14
-            lines.append(
-                f'<rect x="{track_x}" y="{yy}" width="{max(track_w * (val / hi), MIN_BAR_W):.1f}" '
-                f'height="8" rx="1" fill="{fill}"/>'
-            )
-            lines.append(
-                text(
-                    VALUE_X,
-                    yy + 7,
-                    f"{val:.2f}×",
-                    size=10,
-                    fill=INK if is_self else MUTED,
-                    anchor="end",
-                    weight=600,
-                )
-            )
-        y += 44
-
-    foot_y = height - 14
-    lines.append(f'<rect x="{PAD}" y="{foot_y - 7}" width="9" height="9" rx="1" fill="{COLD}"/>')
-    lines.append(text(PAD + 16, foot_y, "search (top-k)", size=11))
-    lines.append(f'<rect x="150" y="{foot_y - 7}" width="9" height="9" rx="1" fill="#CFCBC2"/>')
-    lines.append(text(166, foot_y, "count", size=11))
     lines.append("</svg>")
     (OUT / filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -304,9 +171,6 @@ def main() -> None:
     latency_chart(VECTOR, "vector.svg")
     latency_chart(FTS, "fts.svg")
     latency_chart(SQL, "sql.svg")
-    compare_chart(VDB_META, VDB_ROWS, "compare-vdb.svg")
-    compare_chart(SQL_EXT_META, SQL_EXT_ROWS, "compare-sql.svg", log=True)
-    ratio_chart(SBG_META, SBG_ROWS, "compare-fts.svg")
     print(f"wrote charts to {OUT}")
 
 

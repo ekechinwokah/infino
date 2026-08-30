@@ -34,15 +34,6 @@ class Bar:
     cold: bool = False
 
 
-@dataclass(frozen=True)
-class CompareRow:
-    name: str
-    value: float
-    label: str
-    config: str = ""
-    self_row: bool = False
-
-
 CI_RUN = "33245831329"
 CI_RUN_URL = f"https://github.com/infino-ai/infino/actions/runs/{CI_RUN}"
 CI_COMMIT = "3aaffb64"
@@ -97,53 +88,4 @@ SQL = {
         Bar("10M", "scan", 41.14),
         Bar("10M", "crosstab", 75.14),
     ],
-}
-
-# ── External comparisons ────────────────────────────────────────────────────
-
-VDB_ROWS: list[CompareRow] = [
-    CompareRow("Infino", 1.1, "1.1 ms", "16c64g", self_row=True),
-    CompareRow("Zilliz Cloud", 2.0, "2.0 ms", "8cu-perf"),
-    CompareRow("Qdrant Cloud", 6.4, "6.4 ms", "16c64g"),
-    CompareRow("OpenSearch", 7.2, "7.2 ms", "16c128g force-merge"),
-    CompareRow("Elastic Cloud", 9.5, "9.5 ms", "8c60g force-merge"),
-    CompareRow("Pinecone", 13.7, "13.7 ms", "p2.x8 1node"),
-]
-
-VDB_META = {
-    "title": "Vector search vs vector databases",
-    "subtitle": "VectorDBBench · Cohere 1M · 768-d · top-100 · serial p99 · lower is faster",
-    "url": "https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch",
-}
-
-# (name, version, search ratio, count ratio, is_infino)
-SBG_ROWS: list[tuple[str, str, float, float, bool]] = [
-    ("Infino", "0.1", 1.19, 0.74, True),
-    ("Lucene", "10.5.0", 1.0, 1.0, False),
-    ("Tantivy", "0.26", 1.15, 0.80, False),
-]
-
-SBG_META = {
-    "title": "Full-text vs search libraries",
-    "subtitle": "Search Benchmark, the Game · latency vs Lucene = 1.00 · lower is faster",
-    "url": "https://tantivy-search.github.io/bench/",
-}
-
-SQL_EXT_ROWS: list[CompareRow] = [
-    CompareRow("ClickHouse", 6.8, "6.8", "18.4 s suite"),
-    CompareRow("DuckDB", 9.8, "9.8", "26.3 s suite"),
-    CompareRow("Infino", 12.8, "12.8", "34.0 s suite", self_row=True),
-    CompareRow("DataFusion", 17.0, "17.0", "45.6 s suite"),
-    CompareRow("Spark", 123.7, "123.7", "332.4 s suite"),
-    CompareRow("Postgres", 1519.0, "1519", "4085.5 s suite"),
-]
-
-SQL_EXT_META = {
-    "title": "SQL on Parquet vs analytic engines",
-    "subtitle": "ClickBench 100M rows · vCPU-sec per query · hot · c6a.4xlarge · lower is faster",
-    "url": (
-        "https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino"
-        "%7CDataFusion%20%28Parquet%2C%20single%29%7CSpark%7CPostgreSQL%20%28with%20indexes%29"
-        "&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot"
-    ),
 }

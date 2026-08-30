@@ -6,10 +6,10 @@
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-# Fast hybrid search, embedded.
+# Fast, embedded search and analytics.
 
-Infino is a retrieval library you link into your process. Full-text, vector, hybrid, and
-SQL over the same table, with **125 µs** BM25 and **591 µs** vector top-10 warm.
+Infino is a drop-in library for searching and analyzing your data. Full-text, vector,
+hybrid, and SQL over the same table, with **125 µs** BM25 and **591 µs** vector top-10 warm.
 
 It starts in memory on your laptop. When the data outgrows RAM, you change the connection
 string and nothing else — the tables are Parquet on object storage, and the engine reads
@@ -119,21 +119,23 @@ Reading the output: vector is the post-drain `default` row; BM25 is `single_rare
 
 </details>
 
-On the public retrieval benchmarks, Infino has the lowest p99 on
-[VectorDBBench](https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch)
-([client](https://github.com/infino-ai/VectorDBBench/tree/main/vectordb_bench/backend/clients/infino)),
-and on [Search Benchmark, the Game](https://tantivy-search.github.io/bench/) it is 19%
-slower than Lucene on search and 26% faster on count.
+### Where it lands
 
-![Vector search versus vector databases on VectorDBBench](docs/assets/readme/compare-vdb.svg)
+The goal is one library that stays close to the specialized engine in each category.
+Measured on the public harnesses:
 
-![Full-text search versus Lucene and Tantivy on Search Benchmark, the Game](docs/assets/readme/compare-fts.svg)
+- **Vector** — lowest p99 on [VectorDBBench](https://zilliz.com/vdbbench-leaderboard?dataset=vectorSearch)
+  ([client](https://github.com/infino-ai/VectorDBBench/tree/main/vectordb_bench/backend/clients/infino))
+- **Full-text** — within 19% of Lucene on search, and faster on count, at
+  [Search Benchmark, the Game](https://tantivy-search.github.io/bench/)
+  ([harness](https://github.com/quickwit-oss/search-benchmark-game))
+- **SQL** — 12.8 vCPU-seconds per query on
+  [ClickBench](https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino%7CDataFusion%20%28Parquet%2C%20single%29%7CSpark%7CPostgreSQL%20%28with%20indexes%29&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot),
+  in the same range as DuckDB at 9.8
+  ([port](https://github.com/infino-ai/clickbench/tree/add-infino/infino))
 
-The SQL engine is DataFusion and exists to make retrieval composable, not to compete with
-an analytics warehouse. For reference, Infino's
-[ClickBench](https://benchmark.clickhouse.com/#system=+ClickHouse%7CDuckDB%7CInfino%7CDataFusion%20%28Parquet%2C%20single%29%7CSpark%7CPostgreSQL%20%28with%20indexes%29&machine=+c6a.4xlarge&cluster_size=-&type=-&metric=hot)
-run sits behind ClickHouse and DuckDB and ahead of DataFusion
-([port](https://github.com/infino-ai/clickbench/tree/add-infino/infino)).
+Lucene and DuckDB are excellent, and they are the right yardsticks. The goal is to be in
+that range on each axis while serving all four query types from one file.
 
 ## Why it's fast
 
@@ -211,9 +213,8 @@ Every knob, with the measurement behind each default, is documented inline in
   via tombstones. There are no transactions across tables.
 - **You need many concurrent writers on one table.** Writes go through a single writer slot.
   Readers are unbounded and never blocked.
-- **You want a server.** This crate is embedded, with a SQL and Arrow surface. REST, the
-  Elasticsearch-compatible query DSL, and the hosted control plane are not in this
-  repository.
+- **You want a server.** This crate is embedded, with a SQL and Arrow surface. There is no
+  daemon to run, no REST endpoint, and no cluster to operate.
 
 The crate is 0.x and the API can still move. The public surface is pinned by
 `public-api.txt`.
