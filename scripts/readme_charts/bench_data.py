@@ -170,16 +170,21 @@ SQL_PUSHDOWN = {
 }
 
 
-# ── Ingest throughput (recorded Latest-CI table, benches/README.md) ────────
+# ── Ingest throughput (recorded battery blocks, benches/README.md) ─────────
+#
+# From the per-battery recorded blocks on main `3aaffb64`, NOT the summary
+# table at the top of that file — the summary still carries a pre-#665/#671
+# run where vector ingest measured 7.8 K/s. The recorded blocks postdate
+# the n_cent, pack-scratch, and pipelined-upload fixes.
 INGEST = {
     "title": "Ingest throughput",
     "subtitle": "1M docs · 16 commits · object storage",
-    "footnote": "recorded CI battery, benches/README.md (run 32825375037)",
+    "footnote": "recorded battery blocks, benches/README.md at 3aaffb64",
     "unit": "kps",
     "bars": [
-        Bar("1M docs", "FTS", 62.1),
-        Bar("1M docs", "SQL", 17.0),
-        Bar("1M docs", "vector", 7.8),
+        Bar("1M docs", "vector", 40.6),
+        Bar("1M docs", "FTS", 38.7),
+        Bar("1M docs", "SQL", 24.2),
     ],
 }
 

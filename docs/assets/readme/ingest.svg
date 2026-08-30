@@ -3,18 +3,16 @@
 <text x="26.0" y="32.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#17130F" font-weight="600">Ingest throughput</text>
 <text x="854.0" y="32.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">1M docs · 16 commits · object storage</text>
 <line x1="184.0" y1="50" x2="184.0" y2="126" stroke="#DCD6C7"/>
-<text x="184.0" y="142.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">1 K docs/s</text>
-<line x1="507.7" y1="50" x2="507.7" y2="126" stroke="#DCD6C7"/>
-<text x="507.7" y="142.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">10 K docs/s</text>
+<text x="184.0" y="142.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">10 K docs/s</text>
 <text x="26.0" y="65.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#17130F" font-weight="600">1M docs</text>
-<text x="170.0" y="65.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">FTS</text>
-<rect x="184" y="56" width="580.4" height="9" rx="1" fill="#D6400F"/>
-<text x="854.0" y="65.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">62.1 K docs/s</text>
-<text x="170.0" y="87.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">SQL</text>
-<rect x="184" y="78" width="398.2" height="9" rx="1" fill="#D6400F"/>
-<text x="854.0" y="87.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">17 K docs/s</text>
-<text x="170.0" y="109.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">vector</text>
-<rect x="184" y="100" width="288.7" height="9" rx="1" fill="#D6400F"/>
-<text x="854.0" y="109.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">7.8 K docs/s</text>
-<text x="854.0" y="164.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">recorded CI battery, benches/README.md (run 32825375037)</text>
+<text x="170.0" y="65.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">vector</text>
+<rect x="184" y="56" width="545.6" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="65.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">40.6 K docs/s</text>
+<text x="170.0" y="87.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">FTS</text>
+<rect x="184" y="78" width="526.9" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="87.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">38.7 K docs/s</text>
+<text x="170.0" y="109.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#5E5749" text-anchor="end">SQL</text>
+<rect x="184" y="100" width="344.1" height="9" rx="1" fill="#D6400F"/>
+<text x="854.0" y="109.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#17130F" font-weight="600" text-anchor="end">24.2 K docs/s</text>
+<text x="854.0" y="164.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">recorded battery blocks, benches/README.md at 3aaffb64</text>
 </svg>
