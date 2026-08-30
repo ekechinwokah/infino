@@ -122,7 +122,6 @@ MODES_MEMORY = {
     "subtitle": "all-in: index + manifest + working set · dbpedia-1536",
     "footnote": MODES_PROVENANCE,
     "unit": "mib",
-    "scale": "linear",
     "ratio_vs_cold": True,
     "legend_warm": "measured, serving",
     "legend_cold": "float32 vectors, for scale",
@@ -188,7 +187,6 @@ INGEST = {
     "subtitle": "1M docs · 16 commits · object storage",
     "footnote": "recorded battery blocks, benches/README.md at 3aaffb64",
     "unit": "kps",
-    "scale": "linear",
     "bars": [
         Bar("1M docs", "vector", 40.6),
         Bar("1M docs", "FTS", 38.7),

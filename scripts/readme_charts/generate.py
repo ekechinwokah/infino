@@ -142,7 +142,7 @@ def latency_chart(spec: dict, filename: str) -> None:
         groups[-1][1].append(bar)
 
     fmt_value = FORMATTERS[spec.get("unit", "ms")]
-    linear = spec.get("scale") == "linear"
+    linear = spec.get("scale") != "log"
     if linear:
         # Memory (and anything else spanning ~one order of magnitude)
         # reads on a linear axis: log is a rescue for latency's decades,
@@ -189,6 +189,8 @@ def latency_chart(spec: dict, filename: str) -> None:
             f'stroke="{GRID}"/>'
         )
         lines.append(text(gx, axis_y + 16, fmt_value(tick), size=10, anchor="middle"))
+    if not linear:
+        lines.append(text(PAD, axis_y + 16, "log scale", size=10))
 
     y = PLOT_TOP
     lone_group = len(groups) == 1
@@ -298,6 +300,8 @@ def compare_chart(meta: dict, rows: list, filename: str, *, log: bool = False) -
             f'<line x1="{gx:.1f}" y1="{row_top - 6}" x2="{gx:.1f}" y2="{axis_y}" stroke="{GRID}"/>'
         )
         lines.append(text(gx, axis_y + 16, f"{tick:g}", size=10, anchor="middle"))
+    if log:
+        lines.append(text(PAD, axis_y + 16, "log scale", size=10))
 
     # Column headers, right-aligned over their lanes.
     value_header = meta.get("value_header", "")
@@ -522,7 +526,7 @@ def main() -> None:
     latency_chart(INGEST, "ingest.svg")
     latency_chart(CROSSOVER, "vector-crossover.svg")
     compare_chart(VDB_META, VDB_ROWS, "compare-vdb.svg")
-    compare_chart(EMBED_META, EMBED_ROWS, "compare-embedded.svg", log=True)
+    compare_chart(EMBED_META, EMBED_ROWS, "compare-embedded.svg")
     compare_chart(SQL_EXT_META, SQL_EXT_ROWS, "compare-sql.svg", log=True)
     ratio_chart(SBG_META, SBG_ROWS, "compare-fts.svg")
     print(f"wrote charts to {OUT}")

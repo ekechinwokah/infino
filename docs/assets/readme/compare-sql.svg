@@ -10,6 +10,7 @@
 <text x="512.7" y="246.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">100</text>
 <line x1="653.0" y1="62" x2="653.0" y2="230" stroke="#DCD6C7"/>
 <text x="653.0" y="246.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="middle">1000</text>
+<text x="26.0" y="246.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749">log scale</text>
 <text x="765.0" y="52.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">vCPU-s/query</text>
 <text x="854.0" y="52.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">full suite</text>
 <text x="218.0" y="78.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">ClickHouse</text>
