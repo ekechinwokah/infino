@@ -2,7 +2,7 @@
         coverage coverage-summary \
         bench bench-quick miri asan ci clean \
         public-api public-api-update api-parity api-parity-update \
-        version-sync release-prep doc-check bench-gate \
+        version-sync release-prep doc-check bench-gate readme-charts \
         python-test python-typecheck python-wheel python-examples-test \
         node-test node-build node-verify node-example
 
@@ -49,6 +49,10 @@ api-parity:
 
 api-parity-update:
 	python3 scripts/check_api_parity.py --update
+
+# Regenerate docs/assets/readme/*.svg from scripts/readme_charts/bench_data.py.
+readme-charts:
+	python3 scripts/readme_charts/generate.py
 
 # Version-sync guard: the crate and both bindings must sit on one
 # `major.minor` release line (patch is independent per package), the
