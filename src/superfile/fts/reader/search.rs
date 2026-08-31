@@ -878,8 +878,12 @@ impl FtsReader {
         // that makes `peek()` the current kth-best score.
         let mut heap: BinaryHeap<TopKEntry> =
             BinaryHeap::with_capacity(k.min(term_meta.num_blocks * BLOCK_LEN).max(1));
-        let mut buf_d = vec![0u32; BLOCK_LEN];
-        let mut buf_t = vec![0u32; BLOCK_LEN];
+        // Stack-resident decode scratch: `BLOCK_LEN` is a compile-time
+        // const and these never cross an await (the whole scoring walk
+        // below is synchronous), so they stay off the heap — no per-query
+        // malloc/free on the most common query shape.
+        let mut buf_d = [0u32; BLOCK_LEN];
+        let mut buf_t = [0u32; BLOCK_LEN];
 
         let coarse_span = format::fts::COARSE_BLOCK_MAX_SPAN;
         // The coarse block-max table exists only on V5 blobs; on V1–V4 the
@@ -932,8 +936,13 @@ impl FtsReader {
             }
             let m = m_want.min(cand.len());
             cand.select_nth_unstable_by(m.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
-            // Decode those blocks, score, keep a k-sized seed heap.
-            let mut seed_heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(k);
+            // Decode those blocks, score, keep a k-sized seed heap. Clamp the
+            // preallocation to the corpus size: `k` is caller-controlled and may
+            // be `usize::MAX` (an unbounded "return everything" request), which
+            // would overflow `with_capacity`. The heap never holds more than the
+            // docs in scope anyway.
+            let mut seed_heap: BinaryHeap<TopKEntry> =
+                BinaryHeap::with_capacity(top_k_initial_capacity(k, u64::from(self.n_docs), None));
             for &(_, bi) in &cand[..m] {
                 let (_, off, _) = term_meta.skip_entry(postings, bi);
                 let end = term_meta.block_end_in_term(postings, bi);
@@ -1084,6 +1093,11 @@ impl FtsReader {
     /// Missing terms (FST miss) are silently dropped — fine for OR
     /// semantics where a missing term contributes nothing. Returned
     /// `Vec` may be empty (all terms missed) or shorter than `terms`.
+    ///
+    /// A thin wrapper over [`Self::build_term_cursors_opt`] that discards
+    /// the per-term slot positions; callers that need to know *which*
+    /// term missed (bare-atom builds, which keep a `None` slot for it)
+    /// use the `_opt` form directly.
     pub(super) async fn build_term_cursors(
         &self,
         column_id: u32,
@@ -1091,6 +1105,27 @@ impl FtsReader {
         global_idf: Option<&GlobalTermIdf>,
         count_only: bool,
     ) -> Result<Vec<TermCursor>, FtsError> {
+        Ok(self
+            .build_term_cursors_opt(column_id, terms, global_idf, count_only)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
+    /// Build a `TermCursor` for every term, **preserving input order and
+    /// arity**: the result has one slot per input term, `None` where the
+    /// term is absent from the FST. One FST open and one parallel postings
+    /// fan-out for the whole batch — so a multi-term build costs a single
+    /// dictionary fetch and a single overlapped range wave, not one of each
+    /// per term.
+    pub(super) async fn build_term_cursors_opt(
+        &self,
+        column_id: u32,
+        terms: &[&str],
+        global_idf: Option<&GlobalTermIdf>,
+        count_only: bool,
+    ) -> Result<Vec<Option<TermCursor>>, FtsError> {
         let fst_bytes = self.dict_bytes_async().await?;
         let dict = DictReader::open(&fst_bytes).map_err(|e| {
             FtsError::Read(ReadError::MalformedVersion(format!(
@@ -1099,14 +1134,14 @@ impl FtsReader {
         })?;
         let col_meta = &self.columns[column_id as usize];
 
-        // Resolve each present term to either an inline (df=1) value or
-        // a PFOR metadata offset, preserving query order. FST misses
-        // are dropped (fine for OR; AND callers length-check). Collect
-        // the PFOR offsets so all their byte ranges can be fetched in
-        // one parallel fan-out below — never the whole postings region.
-        // Each resolved entry carries its term's global idf (when in
-        // `Bm25Stats::Global`) so the cursor is built with the global
-        // value; `None` per term falls back to this superfile's local idf.
+        // Resolve each term to an inline (df=1) value, a PFOR metadata
+        // offset, or a miss — preserving query order and arity (a miss is a
+        // `None` slot, so the caller can tell which term was absent). Collect
+        // the PFOR offsets so all their byte ranges can be fetched in one
+        // parallel fan-out below — never the whole postings region. Each
+        // resolved entry carries its term's global idf (when in
+        // `Bm25Stats::Global`) so the cursor is built with the global value;
+        // `None` per term falls back to this superfile's local idf.
         enum Resolved {
             Inline {
                 doc_id: u32,
@@ -1118,17 +1153,18 @@ impl FtsReader {
                 header_probed: bool,
             },
         }
-        let mut resolved: Vec<Resolved> = Vec::with_capacity(terms.len());
+        let mut resolved: Vec<Option<Resolved>> = Vec::with_capacity(terms.len());
         let mut pfor_offsets: Vec<(usize, Option<usize>)> = Vec::new();
         for term in terms {
             let key = make_key(&col_meta.name, term);
             let Some(packed) = dict.lookup(&key) else {
+                resolved.push(None);
                 continue;
             };
             let gidf = global_idf.and_then(|m| m.get(*term).copied());
             match FstValue::unpack(packed) {
                 FstValue::Inline { doc_id, tf } => {
-                    resolved.push(Resolved::Inline { doc_id, tf, gidf });
+                    resolved.push(Some(Resolved::Inline { doc_id, tf, gidf }));
                 }
                 FstValue::Pfor {
                     metadata_offset,
@@ -1141,10 +1177,10 @@ impl FtsReader {
                     // A hint-less slot (21-bit length overflow) costs a
                     // header probe BEFORE the body fetch — two planned
                     // ranges, recorded on the cursor for the tallies.
-                    resolved.push(Resolved::Pfor {
+                    resolved.push(Some(Resolved::Pfor {
                         gidf,
                         header_probed: postings_length_hint.is_none(),
-                    });
+                    }));
                 }
             }
         }
@@ -1152,10 +1188,11 @@ impl FtsReader {
         let pfor_bytes = self.fetch_term_postings(&pfor_offsets).await?;
         let mut pfor_iter = pfor_bytes.into_iter();
 
-        let mut cursors: Vec<TermCursor> = Vec::with_capacity(resolved.len());
+        let mut cursors: Vec<Option<TermCursor>> = Vec::with_capacity(resolved.len());
         for r in resolved {
             match r {
-                Resolved::Inline { doc_id, tf, gidf } => {
+                None => cursors.push(None),
+                Some(Resolved::Inline { doc_id, tf, gidf }) => {
                     // On a positional column the inline slot carries
                     // the term's single position, tf implied 1 — the
                     // builder only inlines tf == 1 postings there.
@@ -1167,20 +1204,20 @@ impl FtsReader {
                         false => tf,
                     };
                     let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
-                    cursors.push(TermCursor::new_inline(
+                    cursors.push(Some(TermCursor::new_inline(
                         doc_id,
                         tf,
                         self.n_docs as u64,
                         dl_norm_k1,
                         gidf,
-                    ));
+                    )));
                 }
-                Resolved::Pfor {
+                Some(Resolved::Pfor {
                     gidf,
                     header_probed,
-                } => {
+                }) => {
                     let term_bytes = pfor_iter.next().expect("one fetched range per PFOR term");
-                    cursors.push(TermCursor::new(
+                    cursors.push(Some(TermCursor::new(
                         term_bytes,
                         self.n_docs as u64,
                         col_meta.positions,
@@ -1188,7 +1225,7 @@ impl FtsReader {
                         header_probed,
                         count_only,
                         self.has_coarse_block_max,
-                    )?);
+                    )?));
                 }
             }
         }
