@@ -240,6 +240,45 @@ pub struct BuilderOptions {
 /// walks), not page decode volume.
 pub const DEFAULT_ID_PAGE_SIZE_LIMIT: usize = 8 * 1024;
 
+/// Append one batch's `_id` values to a stable-id sidecar buffer: each id as
+/// a little-endian `i128`, in the batch's row order. Returns `false` (leaving
+/// `out` untouched for this batch) when the id column is absent or not
+/// `Decimal128`, so callers can abandon the sidecar and fall back to the
+/// Parquet id column. Used by both the whole-corpus and streaming-merge build
+/// paths so the two produce a byte-identical sidecar.
+fn append_stable_id_sidecar(out: &mut Vec<u8>, batch: &RecordBatch, id_column: &str) -> bool {
+    let Ok(idx) = batch.schema().index_of(id_column) else {
+        return false;
+    };
+    let Some(col) = batch.column(idx).as_any().downcast_ref::<Decimal128Array>() else {
+        return false;
+    };
+    out.reserve(col.len() * format::ID_SIDECAR_ENTRY_BYTES);
+    for i in 0..col.len() {
+        out.extend_from_slice(&col.value(i).to_le_bytes());
+    }
+    true
+}
+
+/// Materialize the stable-id sidecar from the accumulated batches: one
+/// little-endian `i128` per row, in Parquet row order — which is local doc
+/// id order, since rows are appended in `add_batch` order and both the FTS
+/// and vector indices number local doc ids the same way. The sidecar mirrors
+/// the `_id` column so a hit → `_id` resolve reads a fixed-width slice
+/// instead of decompressing the Parquet id pages. Returns an empty vec when
+/// the id column is absent or not `Decimal128` (the reader then falls back to
+/// the Parquet id column), so callers can pass the result through unchecked.
+fn stable_id_sidecar_bytes(batches: &[RecordBatch], id_column: &str) -> Vec<u8> {
+    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    let mut out = Vec::with_capacity(total_rows * format::ID_SIDECAR_ENTRY_BYTES);
+    for batch in batches {
+        if !append_stable_id_sidecar(&mut out, batch, id_column) {
+            return Vec::new();
+        }
+    }
+    out
+}
+
 impl BuilderOptions {
     /// Default `row_group_size = 65_536`, `compression = ZSTD(3)`.
     ///
@@ -1289,6 +1328,14 @@ impl SuperfileBuilder {
         let mut merged_doc_lengths: Vec<Vec<u32>> = vec![Vec::new(); n_fts_columns as usize];
         let mut stats_collector = Vec::with_capacity(readers.len());
         let mut base: u32 = 0;
+        // Stream the stable-id sidecar from the merged rows as they are written
+        // to the body, in the same order — so the compacted superfile resolves
+        // `_id` from the sidecar just like a fresh build. `ids_ok` clears on the
+        // first batch missing the id column, falling the whole file back to the
+        // Parquet id column.
+        let mut id_sidecar_bytes: Vec<u8> = Vec::new();
+        let mut ids_ok = true;
+        let id_column = superfile_builder.opts.id_column.clone();
 
         for (idx, (reader, deleted)) in readers.iter().enumerate() {
             superfile_builder.opts.check_mergeability(
@@ -1384,6 +1431,14 @@ impl SuperfileBuilder {
             // prebuilt postings.
             let n_rows = record_batch.num_rows() as u32;
             body_encoder.write_batch(&record_batch)?;
+            // Sidecar from the same rows, same order, before the batch is
+            // dropped. Read from `record_batch` (not the FTS remap) so it
+            // aligns with the body exactly.
+            if ids_ok && !append_stable_id_sidecar(&mut id_sidecar_bytes, &record_batch, &id_column)
+            {
+                ids_ok = false;
+                id_sidecar_bytes = Vec::new();
+            }
             drop(record_batch);
             superfile_builder.next_local_doc_id += n_rows;
             base += n_rows;
@@ -1404,7 +1459,8 @@ impl SuperfileBuilder {
             return Ok(SuperfileStats::from_children(stats_collector.as_slice()));
         }
         let body = body_encoder.finish()?;
-        superfile_builder.finish_to_with_body(body, output)?;
+        let ids_bytes: &[u8] = if ids_ok { &id_sidecar_bytes } else { &[] };
+        superfile_builder.finish_to_with_body(body, ids_bytes, output)?;
         Ok(SuperfileStats::from_children(stats_collector.as_slice()))
     }
 
@@ -1446,6 +1502,8 @@ impl SuperfileBuilder {
                 fts_length: 0,
                 vec_offset: 0,
                 vec_length: 0,
+                ids_offset: 0,
+                ids_length: 0,
             });
         }
         let n_docs = self.next_local_doc_id as u64;
@@ -1517,7 +1575,8 @@ impl SuperfileBuilder {
             let (fts_file, vec_file) = blobs_res?;
             (body_res?, fts_file, vec_file)
         };
-        splice_body_and_blobs_to(body, fts_file, vec_file, &kvs, output)
+        let ids_bytes = stable_id_sidecar_bytes(&self.batches, &self.opts.id_column);
+        splice_body_and_blobs_to(body, fts_file, vec_file, &ids_bytes, &kvs, output)
     }
 
     /// Finish the build with a Parquet body the caller **already encoded** —
@@ -1531,6 +1590,7 @@ impl SuperfileBuilder {
     pub(crate) fn finish_to_with_body<W: Write>(
         mut self,
         body: EncodedBody,
+        ids_bytes: &[u8],
         output: W,
     ) -> Result<ParquetLayout, BuildError> {
         let n_docs = self.next_local_doc_id as u64;
@@ -1548,7 +1608,10 @@ impl SuperfileBuilder {
             cell_posting_builder,
             prebuilt_multi_cell,
         )?;
-        splice_body_and_blobs_to(body, fts_file, vec_file, &kvs, output)
+        // The caller streams the sidecar from the merged rows as it writes the
+        // body (empty ⇒ the id column wasn't available; reader falls back to
+        // the Parquet id column).
+        splice_body_and_blobs_to(body, fts_file, vec_file, ids_bytes, &kvs, output)
     }
 
     /// Finish the build and return the assembled superfile bytes.
@@ -1623,12 +1686,15 @@ impl SuperfileBuilder {
         vector_file
             .seek(SeekFrom::Start(0))
             .map_err(BuildError::Io)?;
+        let ids_bytes = stable_id_sidecar_bytes(&self.batches, &self.opts.id_column);
         splice_index_streams_to(
             body,
             BufReader::new(Cursor::new(Vec::<u8>::new())),
             0,
             BufReader::new(vector_file),
             vector_length,
+            Cursor::new(&ids_bytes),
+            ids_bytes.len() as u64,
             &kvs,
             &mut output,
         )?;
@@ -1811,6 +1877,7 @@ fn splice_body_and_blobs_to<W: Write>(
     body: EncodedBody,
     fts_file: NamedTempFile,
     vec_file: NamedTempFile,
+    ids_bytes: &[u8],
     kvs: &[(String, String)],
     output: W,
 ) -> Result<ParquetLayout, BuildError> {
@@ -1822,6 +1889,8 @@ fn splice_body_and_blobs_to<W: Write>(
         fts_length,
         BufReader::new(vec_file.reopen().map_err(BuildError::Io)?),
         vec_length,
+        Cursor::new(ids_bytes),
+        ids_bytes.len() as u64,
         kvs,
         output,
     )?;
@@ -3117,6 +3186,97 @@ mod tests {
 
         // Should have 4 rows total (2 + 2)
         assert_eq!(merged_batch.num_rows(), 4);
+    }
+
+    /// A compacted (merged) superfile carries the stable-id sidecar — the
+    /// build path `optimize()` uses — and resolving `_id` through it matches
+    /// the merged Parquet id column, over non-contiguous ids where span
+    /// arithmetic can't apply.
+    #[test]
+    fn merged_superfile_writes_sidecar_and_resolves_id() {
+        use crate::superfile::format::footer::read_kv_metadata;
+
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig {
+                column: "title".into(),
+                positions: false,
+            }],
+            vec![],
+            Some(default_tokenizer()),
+        );
+        let schema = opts.schema.clone();
+
+        let mut b1 = SuperfileBuilder::new(opts.clone()).expect("new b1");
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(decimal128_ids(vec![100u64, 305])),
+                Arc::new(LargeStringArray::from(vec!["alpha beta", "gamma delta"])),
+                Arc::new(LargeStringArray::from(vec!["x", "y"])),
+            ],
+        )
+        .expect("batch1");
+        b1.add_batch(&batch1, &[]).expect("add b1");
+        let bytes1 = b1.finish().expect("finish b1");
+
+        let mut b2 = SuperfileBuilder::new(opts).expect("new b2");
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(decimal128_ids(vec![7u64, 90_210])),
+                Arc::new(LargeStringArray::from(vec!["foo bar", "baz qux"])),
+                Arc::new(LargeStringArray::from(vec!["p", "q"])),
+            ],
+        )
+        .expect("batch2");
+        b2.add_batch(&batch2, &[]).expect("add b2");
+        let bytes2 = b2.finish().expect("finish b2");
+
+        let r1 = SuperfileReader::open(Bytes::from(bytes1)).expect("open r1");
+        let r2 = SuperfileReader::open(Bytes::from(bytes2)).expect("open r2");
+        let (merged_bytes, _) = SuperfileBuilder::build_from_readers(&[
+            (Arc::new(r1), empty_bitmap()),
+            (Arc::new(r2), empty_bitmap()),
+        ])
+        .expect("merge");
+
+        // The merge path wrote the sidecar (this is the compaction path).
+        let kvs = read_kv_metadata(&merged_bytes).expect("kv metadata");
+        assert!(
+            kvs.contains_key(kv::IDS_LENGTH),
+            "merge/compaction writes the stable-id sidecar"
+        );
+
+        let merged = SuperfileReader::open(Bytes::from(merged_bytes)).expect("open merged");
+        let n = merged.n_docs() as u32;
+        let locals: Vec<u32> = (0..n).collect();
+        // Resolves through the sidecar (present on open).
+        let resolved = merged
+            .take_by_local_doc_ids(&locals, &["doc_id"])
+            .expect("resolve via sidecar");
+        let resolved = resolved
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal ids");
+
+        // Ground truth: the merged id column read in row order.
+        let full = merged.get_record_batch(None).expect("full batch");
+        let idx = full.schema().index_of("doc_id").expect("doc_id column");
+        let truth = full
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal ids");
+
+        let resolved: Vec<i128> = (0..resolved.len()).map(|i| resolved.value(i)).collect();
+        let truth: Vec<i128> = (0..truth.len()).map(|i| truth.value(i)).collect();
+        assert_eq!(
+            resolved, truth,
+            "sidecar-resolved ids match the merged Parquet id column"
+        );
     }
 
     /// Turn a slice of file-local doc ids into a tombstone bitmap, or `None`

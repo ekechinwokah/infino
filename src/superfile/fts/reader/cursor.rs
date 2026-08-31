@@ -43,9 +43,6 @@ use crate::superfile::{
 pub(super) struct TermMeta {
     /// Document frequency — number of docs containing the term.
     pub(super) df: u64,
-    /// Byte length of the term's whole region (header + skip table +
-    /// blocks), relative to the term's `metadata_offset`.
-    pub(super) postings_length: usize,
     /// Number of PFOR blocks (= number of skip-table entries).
     pub(super) num_blocks: usize,
     /// Absolute offset (within the postings region) of the first
@@ -63,6 +60,17 @@ pub(super) struct TermMeta {
     /// skip table on a `VERSION_V3` positional term. `None` on
     /// `V1`/`V2` (no sub-index) and on positionless terms.
     pub(super) subindex_start: Option<usize>,
+    /// Absolute offset (within the postings region) of the coarse
+    /// block-max table — `ceil(num_blocks / COARSE_BLOCK_MAX_SPAN)`
+    /// fixed-point `u32`s at the tail of the term region.
+    pub(super) coarse_start: usize,
+    /// Term-relative end of the last posting block: `postings_length`
+    /// minus the coarse table's bytes. The blocks end here; the coarse
+    /// table follows.
+    pub(super) blocks_end_in_term: usize,
+    /// Whether this term carries a coarse block-max table (V5 blobs).
+    /// `false` for V1–V4 — the ranked walk then skips the coarse level.
+    pub(super) has_coarse: bool,
 }
 
 impl TermMeta {
@@ -75,6 +83,7 @@ impl TermMeta {
         metadata_offset: usize,
         positional: bool,
         has_subindex: bool,
+        has_coarse: bool,
     ) -> Result<Self, FtsError> {
         // Positional columns carry the extended 32-byte header (the
         // term's positions offset + length after `num_blocks`); the
@@ -149,15 +158,63 @@ impl TermMeta {
             }
             false => None,
         };
+        // Coarse block-max table (V5 only): `ceil(num_blocks / span)` u32s at
+        // the tail of the term region, so the blocks end where it begins.
+        // V1–V4 blobs have no such table — the blocks run to `postings_length`
+        // and the ranked walk skips the coarse level.
+        let coarse_size = match has_coarse {
+            true => num_blocks.div_ceil(format::fts::COARSE_BLOCK_MAX_SPAN) * U32_BYTES,
+            false => 0,
+        };
+        if coarse_size > postings_length {
+            return Err(FtsError::Read(ReadError::MalformedVersion(
+                "coarse block-max table larger than the term region".into(),
+            )));
+        }
+        let blocks_end_in_term = postings_length - coarse_size;
+        let coarse_start = metadata_offset + blocks_end_in_term;
         Ok(Self {
             df,
-            postings_length,
             num_blocks,
             skip_start,
             positions_offset,
             positions_length,
             subindex_start,
+            coarse_start,
+            blocks_end_in_term,
+            has_coarse,
         })
+    }
+
+    /// Decode a 4-byte block-max slot (a per-block skip entry's field or a
+    /// coarse-table entry) into a guaranteed upper bound on the BM25 score.
+    /// V5 stores the exact `f32` bits; legacy `V1`-`V4` store
+    /// `ceil(max × scale)` as fixed-point. Both return a value at or above
+    /// the true max:
+    /// - V5 nudges the exact stored max up one `f32` ULP. The stored value
+    ///   equals the reader's per-doc score for the block's max doc, so for
+    ///   local scoring it is already an exact bound; the ULP guards the
+    ///   cross-superfile idf-rescale multiply, whose f32 rounding could
+    ///   otherwise dip a hair below a score-tied doc and drop tied hits.
+    /// - Legacy adds one fixed-point step, covering both the `x1000 / scale`
+    ///   division rounding and files written before the encode-side `ceil`.
+    #[inline]
+    fn decode_block_max(&self, raw: u32) -> f32 {
+        if self.has_coarse {
+            f32::from_bits(raw).next_up()
+        } else {
+            raw.saturating_add(1) as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE
+        }
+    }
+
+    /// Decode coarse block-max entry `g` into a guaranteed upper bound
+    /// on the BM25 score of every block in span `g` (blocks
+    /// `[g*SPAN .. (g+1)*SPAN)`). Coarse entries exist only on V5, where
+    /// they are `f32` bits.
+    #[inline]
+    pub(super) fn coarse_entry(&self, postings: &[u8], g: usize) -> f32 {
+        let at = self.coarse_start + g * U32_BYTES;
+        self.decode_block_max(read_u32_le(&postings[at..at + U32_BYTES]))
     }
 
     /// For a `VERSION_V3` positional term, the run offset of the nearest
@@ -202,25 +259,20 @@ impl TermMeta {
             &postings[entry_off + skip_entry::BLOCK_OFFSET_OFF
                 ..entry_off + skip_entry::BLOCK_OFFSET_OFF + U32_BYTES],
         ) as usize;
-        let max_bm25_x1000 = read_u32_le(
+        let block_max_raw = read_u32_le(
             &postings[entry_off + skip_entry::MAX_BM25_OFF
                 ..entry_off + skip_entry::MAX_BM25_OFF + U32_BYTES],
         );
-        // Decode to a guaranteed upper bound on the block's BM25. The
-        // builder ceil()s on encode, but `x1000 as f32 / SCALE` can still
-        // round a hair below the true max (f32 division), and superfiles
-        // written before the encode-side ceil truncated outright. Add one
-        // fixed-point step before unscaling so the decoded bound is always
-        // >= the true block max. This matters for the cross-superfile
-        // floor: block-skip compares `block_max <= floor`, and a bound
-        // that dips below a score-tied block's true max would let a rising
-        // floor skip that block, dropping tied hits by completion order
-        // (nondeterministic top-k). The +1 step costs ~1/SCALE of pruning
-        // tightness — negligible — and keeps the top-k deterministic.
+        // Decode to a guaranteed upper bound on the block's BM25 (V5 exact
+        // f32 + one ULP; legacy fixed-point + one step). The upper-bound
+        // guarantee matters for the cross-superfile floor: block-skip
+        // compares `block_max <= floor`, and a bound that dips below a
+        // score-tied block's true max would let a rising floor skip it,
+        // dropping tied hits by completion order (nondeterministic top-k).
         (
             last_doc_id,
             block_offset,
-            max_bm25_x1000.saturating_add(1) as f32 / format::fts::BLOCK_MAX_BM25_FIXED_POINT_SCALE,
+            self.decode_block_max(block_max_raw),
         )
     }
 
@@ -247,7 +299,9 @@ impl TermMeta {
             let next_off = self.skip_start + (i + 1) * SKIP_ENTRY_SIZE;
             read_u32_le(&postings[next_off + 4..next_off + 8]) as usize
         } else {
-            self.postings_length
+            // The coarse block-max table follows the last block, so the
+            // blocks end before it — not at `postings_length`.
+            self.blocks_end_in_term
         }
     }
 }
@@ -375,13 +429,16 @@ impl TermCursor {
         global_idf: Option<f32>,
         header_probed: bool,
         count_only: bool,
+        has_coarse: bool,
     ) -> Result<Self, FtsError> {
         let postings: &[u8] = term_bytes.as_ref();
         let metadata_offset = 0usize;
 
         // The plain-term cursor never decodes positions, so it needs no
         // sub-index (it reads block offsets straight from the skip table).
-        let term_meta = TermMeta::parse(postings, metadata_offset, positional, false)?;
+        // `has_coarse` (V5) tells it the last block ends before the coarse
+        // table, not at `postings_length`.
+        let term_meta = TermMeta::parse(postings, metadata_offset, positional, false, has_coarse)?;
         let local_idf = bm25::idf(n_docs, term_meta.df);
         let idf = global_idf.unwrap_or(local_idf);
         // Stored per-block BMW upper bounds bake in the LOCAL idf. Only a
