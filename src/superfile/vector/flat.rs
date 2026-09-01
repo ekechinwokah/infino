@@ -269,7 +269,10 @@ impl Sq4FlatIndex {
         codes.len()
             + residual.map_or(0, <[u8]>::len)
             + (offset.len() + step.len()) * RULER_ENTRY_BYTES
-            + self.inv_norms.as_ref().map_or(0, |n| n.len() * NORM_ENTRY_BYTES)
+            + self
+                .inv_norms
+                .as_ref()
+                .map_or(0, |n| n.len() * NORM_ENTRY_BYTES)
     }
 
     /// The byte floor for these codes, recomputed from `dim` and the
@@ -872,8 +875,7 @@ mod tests {
         // A non-finite correction norm is corruption, not a correction.
         let norms_off = FLAT_FIXED_BYTES + rows * 16 + dim * 2 * RULER_ENTRY_BYTES;
         let mut bad_norm = good.clone();
-        bad_norm[norms_off..norms_off + NORM_ENTRY_BYTES]
-            .copy_from_slice(&f32::NAN.to_le_bytes());
+        bad_norm[norms_off..norms_off + NORM_ENTRY_BYTES].copy_from_slice(&f32::NAN.to_le_bytes());
         assert!(
             Sq4FlatIndex::decode(&Bytes::from(bad_norm)).is_none(),
             "a NaN correction norm must decline, not scale scores by NaN"
